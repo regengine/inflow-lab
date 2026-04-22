@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import uuid
 from typing import Any
 
 import httpx
@@ -22,6 +23,7 @@ class LiveRegEngineClient:
             "Content-Type": "application/json",
             "X-RegEngine-API-Key": api_key,
             "X-Tenant-ID": tenant_id,
+            "Idempotency-Key": uuid.uuid4().hex,
         }
         async with httpx.AsyncClient(timeout=20.0) as client:
             response = await client.post(endpoint, headers=headers, json=payload.model_dump(mode="json"))
