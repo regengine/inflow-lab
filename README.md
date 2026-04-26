@@ -65,6 +65,7 @@ app/
   codex/prompts/autobuild.md
   workflows/ci.yml
   workflows/codex-autopilot.yml
+  workflows/remote-smoke.yml
 scripts/
   smoke_regression.py    # End-to-end API smoke for demo-ready release checks
   remote_smoke.py        # HTTP smoke harness for deployed shared-demo instances
@@ -136,6 +137,8 @@ python3 scripts/remote_smoke.py
 ```
 
 `scripts/remote_smoke.py` uses `httpx` with normal TLS verification to check `/api/healthz`, Basic Auth enforcement, credentialed CORS allow/block behavior, mock fixture loading, transformed-lot lineage, FDA CSV export, and EPCIS JSON-LD export. The tenant defaults to `remote-smoke`, fixture delivery stays in `mock` mode, and failure messages redact configured passwords and credential-like environment values.
+
+GitHub also has a manual **Remote Smoke** workflow for deployed demo validation. Configure repository secrets `REGENGINE_REMOTE_USERNAME` and `REGENGINE_REMOTE_PASSWORD`, then run `.github/workflows/remote-smoke.yml` with optional `base_url` and `tenant` inputs.
 
 Use `RELEASE_CHECKLIST.md` as the full demo-ready gate. Use `DESIGN_PARTNER_DEMO_SCRIPT.md` for the call flow, expected talking points, fixture reset commands, and recovery steps.
 
