@@ -85,7 +85,9 @@ PROMPT_FOR_CODEX.md      # Paste-ready Codex task prompt
 RELEASE_CHECKLIST.md     # Demo-ready release gate
 pyproject.toml
 railway.json             # Railway Docker build and healthcheck config
-requirements.txt
+requirements.txt         # Runtime dependencies used by Docker/shared demo
+requirements-dev.txt     # Local test, audit, and maintenance tooling
+requirements-browser.txt # Runtime + Playwright for dashboard smoke checks
 ```
 
 ## Quick start (local dev)
@@ -96,7 +98,7 @@ Requires **Python 3.11+**.
 # From the project root
 python3 -m venv .venv
 source .venv/bin/activate
-pip install -r requirements.txt
+pip install -r requirements-dev.txt
 
 # Run the dev server (auto-reload)
 uvicorn app.main:app --reload
@@ -115,6 +117,7 @@ Event records are stored as JSONL at `config.persist_path` (`data/events.jsonl` 
 ## Running tests
 
 ```bash
+pip install -r requirements-dev.txt
 pytest
 ```
 
@@ -303,7 +306,7 @@ The dashboard fixture loader resets the current event log before loading the sel
 
 ## FDA export presets
 
-`GET /api/mock/regengine/export/fda-request` still returns the same 11-column FDA request CSV and remains backward compatible with optional `start_date` and `end_date` filters. It now also accepts:
+`GET /api/mock/regengine/export/fda-request` still returns the same 11-column FDA request CSV and remains backward compatible with optional `start_date` and `end_date` filters. Date filters must be valid inclusive `YYYY-MM-DD` dates, and `start_date` must not be later than `end_date`. It now also accepts:
 
 - `preset`: one of `all_records`, `lot_trace`, `shipment_handoff`, `receiving_log`, or `transformation_batches`
 - `traceability_lot_code`: optional for most presets, required for `lot_trace`
@@ -319,6 +322,8 @@ Supported query parameters:
 - `start_date`: optional inclusive `YYYY-MM-DD`
 - `end_date`: optional inclusive `YYYY-MM-DD`
 - `traceability_lot_code`: optional lot code; when supplied, the export uses the same transitive lineage graph as `/api/lineage/{traceability_lot_code}`
+
+Invalid date formats, impossible dates, and inverted ranges return `400` so operators catch export filter mistakes before sharing files.
 
 The dashboard exposes a `Download EPCIS` control beside the FDA CSV export. It uses the same optional lot code and date filters as the CSV export panel, but does not apply FDA-only preset filters.
 
@@ -697,6 +702,8 @@ Common failure patterns:
 - Volume/storage failures: `/api/health` should report tenant-scoped paths under `REGENGINE_DATA_DIR`; confirm Railway has a volume mounted at `/data` and `REGENGINE_DATA_DIR=/data`.
 - Stale deployment failures: `/api/healthz` should report the expected `build.commit_sha_short`; if it does not, redeploy current `main` and update `REGENGINE_BUILD_SHA`.
 - Live delivery failures: request logs identify the route and tenant while dashboard delivery stats show the sanitized delivery error; confirm endpoint, API key, and tenant id before retrying.
+- Local dependency conflicts: create a fresh `.venv` and install `requirements-dev.txt` before diagnosing app failures; global Python packages such as OpenTelemetry or Semgrep can drift independently of this repo.
+- Railway startup log noise: Uvicorn startup messages may appear with `level=error` in Railway logs. Treat them as noise unless there is a traceback, failed deployment, or HTTP 5xx.
 
 If the health check fails before request logs appear, the first place to look is `uvicorn.err.log` or `railway logs --deployment` for a Python traceback or startup error.
 

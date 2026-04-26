@@ -11,7 +11,7 @@ from fastapi.testclient import TestClient
 from app.build_info import BRANCH_ENV_VARS, COMMIT_SHA_ENV_VARS, DEPLOYMENT_ID_ENV_VARS
 from app.main import app, controller, cors_origins_from_env, scenario_saves
 from app.models import SimulationConfig
-from app.regengine_client import LiveIngestResult
+from app.regengine_client import LiveIngestResult, LiveRegEngineDeliveryError
 from app.scenarios import ScenarioId, get_scenario
 
 
@@ -919,6 +919,23 @@ def test_epcis_export_supports_date_filters_and_missing_lot_errors(tmp_path):
     assert missing_response.status_code == 404
 
 
+@pytest.mark.parametrize(
+    "path",
+    [
+        "/api/mock/regengine/export/fda-request?start_date=banana",
+        "/api/mock/regengine/export/fda-request?end_date=2026-99-99",
+        "/api/mock/regengine/export/fda-request?start_date=2026-03-01&end_date=2026-02-01",
+        "/api/mock/regengine/export/epcis?start_date=banana",
+        "/api/mock/regengine/export/epcis?end_date=2026-99-99",
+        "/api/mock/regengine/export/epcis?start_date=2026-03-01&end_date=2026-02-01",
+    ],
+)
+def test_exports_reject_invalid_date_filters(path):
+    response = client.get(path)
+
+    assert response.status_code == 400
+
+
 def test_start_applies_configured_persist_path_and_keeps_mock_default(tmp_path):
     custom_path = tmp_path / "start-events.jsonl"
     response = client.post(
@@ -940,6 +957,61 @@ def test_start_applies_configured_persist_path_and_keeps_mock_default(tmp_path):
         assert body["stats"]["persist_path"] == str(custom_path)
     finally:
         client.post("/api/simulate/stop")
+
+
+def test_start_rejects_live_delivery_without_credentials(tmp_path):
+    custom_path = tmp_path / "start-live-missing-creds.jsonl"
+    response = client.post(
+        "/api/simulate/start",
+        json={
+            "config": {
+                "interval_seconds": 0.01,
+                "batch_size": 1,
+                "seed": 204,
+                "persist_path": str(custom_path),
+                "delivery": {"mode": "live"},
+            }
+        },
+    )
+
+    assert response.status_code == 400
+    assert response.json()["detail"] == "Live delivery requires both api_key and tenant_id"
+    assert client.get("/api/simulate/status").json()["running"] is False
+    assert not custom_path.exists()
+
+
+def test_live_delivery_operations_reject_missing_credentials(tmp_path):
+    custom_path = tmp_path / "live-missing-creds-events.jsonl"
+    client.post(
+        "/api/simulate/reset",
+        json={
+            "batch_size": 1,
+            "seed": 204,
+            "persist_path": str(custom_path),
+            "delivery": {"mode": "live"},
+        },
+    )
+
+    operations = [
+        client.post("/api/simulate/step"),
+        client.post("/api/simulate/replay"),
+        client.post(
+            "/api/demo-fixtures/fresh_cut_transformation/load",
+            json={"delivery": {"mode": "live"}},
+        ),
+        client.post(
+            "/api/import/csv",
+            json={
+                "import_type": "seed_lots",
+                "csv_text": "traceability_lot_code,product_description,quantity,unit_of_measure,location_name\nTLC-LIVE,Romaine,1,cases,Farm",
+                "delivery": {"mode": "live"},
+            },
+        ),
+    ]
+
+    for response in operations:
+        assert response.status_code == 400
+        assert response.json()["detail"] == "Live delivery requires both api_key and tenant_id"
 
 
 def test_reset_applies_configured_persist_path_for_next_step(tmp_path):
@@ -967,18 +1039,40 @@ def test_reset_applies_configured_persist_path_for_next_step(tmp_path):
 
 
 def test_failed_live_delivery_surfaces_retry_feedback_and_can_retry_to_mock(tmp_path):
-    custom_path = tmp_path / "failed-delivery-events.jsonl"
-    client.post(
-        "/api/simulate/reset",
-        json={
-            "batch_size": 1,
-            "seed": 204,
-            "persist_path": str(custom_path),
-            "delivery": {"mode": "live"},
-        },
-    )
+    class FailingLiveClient:
+        async def ingest(self, payload, config):  # noqa: ANN001
+            raise LiveRegEngineDeliveryError(
+                "temporary outage",
+                {
+                    "delivery_mode": "live",
+                    "endpoint_host": "www.regengine.co",
+                    "endpoint_path": "/api/v1/webhooks/ingest",
+                    "idempotency_key": "idem-failure-123",
+                    "status_code": 503,
+                },
+            )
 
-    step_response = client.post("/api/simulate/step")
+    original_live_client = controller.live_client
+    controller.live_client = FailingLiveClient()
+    custom_path = tmp_path / "failed-delivery-events.jsonl"
+    try:
+        client.post(
+            "/api/simulate/reset",
+            json={
+                "batch_size": 1,
+                "seed": 204,
+                "persist_path": str(custom_path),
+                "delivery": {
+                    "mode": "live",
+                    "api_key": "live-api-secret",
+                    "tenant_id": "live-tenant-secret",
+                },
+            },
+        )
+
+        step_response = client.post("/api/simulate/step")
+    finally:
+        controller.live_client = original_live_client
 
     assert step_response.status_code == 200
     step_body = step_response.json()
@@ -988,13 +1082,13 @@ def test_failed_live_delivery_surfaces_retry_feedback_and_can_retry_to_mock(tmp_
     assert step_body["delivery_status"] == "failed"
     assert step_body["delivery_mode"] == "live"
     assert step_body["delivery_attempts"] == 1
-    assert "api_key" in step_body["error"]
+    assert "temporary outage" in step_body["error"]
 
     status = client.get("/api/simulate/status").json()
     assert status["stats"]["delivery"]["failed"] == 1
     assert status["stats"]["delivery"]["retryable"] == 1
     assert status["stats"]["delivery"]["attempts"] == 1
-    assert "api_key" in status["stats"]["delivery"]["last_error"]
+    assert "temporary outage" in status["stats"]["delivery"]["last_error"]
 
     failed_record = client.get("/api/events?limit=1").json()["events"][0]
     assert failed_record["delivery_status"] == "failed"

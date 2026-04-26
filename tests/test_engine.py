@@ -21,6 +21,20 @@ def test_initial_packing_sources_previously_cooled_lots():
     assert packing_seen
 
 
+def test_harvest_immediate_subsequent_recipients_are_coolers():
+    engine = LegitFlowEngine(seed=204)
+    cooler_names = {cooler.name for cooler in engine.coolers}
+    harvest_recipients = set()
+
+    for _ in range(80):
+        event, _ = engine.next_event()
+        if event.cte_type == CTEType.HARVESTING:
+            harvest_recipients.add(event.kdes["immediate_subsequent_recipient"])
+
+    assert harvest_recipients
+    assert harvest_recipients <= cooler_names
+
+
 def test_engine_emits_all_supported_ctes_and_lineage():
     engine = LegitFlowEngine(seed=204)
     expected_ctes = set(CTEType)

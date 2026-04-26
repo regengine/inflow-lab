@@ -52,7 +52,8 @@ class LegitFlowEngine:
         self.reset(seed, scenario=scenario)
 
     def reset(self, seed: int | None = None, scenario: ScenarioId | str | None = None) -> None:
-        self.rng = random.Random(seed if seed is not None else self._initial_seed)
+        # Deterministic simulator RNG, not security-sensitive.
+        self.rng = random.Random(seed if seed is not None else self._initial_seed)  # nosec B311
         self._lot_counter = count(1)
         self._ref_counter = count(1)
         self._time_cursor = datetime.now(UTC) - timedelta(hours=12)
@@ -166,7 +167,7 @@ class LegitFlowEngine:
                 "harvest_date": timestamp.date().isoformat(),
                 "farm_location": farm.name,
                 "field_name": f"Field-{self.rng.randint(1, 18)}",
-                "immediate_subsequent_recipient": self.rng.choice(self.coolers + self.packers).name,
+                "immediate_subsequent_recipient": self.rng.choice(self.coolers).name,
                 "reference_document_type": lot.current_reference_type,
                 "reference_document_number": reference_number,
                 "traceability_lot_code_source_reference": lot.tlc_source_reference,

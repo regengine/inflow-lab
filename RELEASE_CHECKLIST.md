@@ -9,6 +9,9 @@ Use this checklist before tagging a demo-ready build or handing the simulator to
 - [ ] `python3 scripts/browser_smoke.py`
 - [ ] `node --check app/static/app.js`
 - [ ] `python3 -m compileall app scripts`
+- [ ] `pip check`
+- [ ] `pip-audit -r requirements.txt`
+- [ ] `bandit -q -r app scripts`
 - [ ] `git diff --check`
 
 ## Contract Checks

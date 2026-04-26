@@ -298,6 +298,7 @@ Use these patterns when diagnosing a shared demo:
 - `status=403` on simulator actions with valid Basic Auth usually means the browser `Origin` or `Referer` is not in `REGENGINE_CORS_ORIGINS`.
 - Empty state after restart usually means the Railway volume is missing or `REGENGINE_DATA_DIR` is not `/data`.
 - Live delivery failures should be diagnosed from the dashboard delivery monitor and sanitized record status before retrying with corrected live endpoint, API key, and tenant id.
+- Uvicorn startup `INFO` lines can appear as `level=error` in Railway logs. Treat that as log-label noise unless there is a Python traceback, failed deployment status, or HTTP 5xx.
 
 ## Profile Verification Checklist
 

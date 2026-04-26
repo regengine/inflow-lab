@@ -4,10 +4,11 @@ import asyncio
 import json
 import logging
 import os
+import re
 import shutil
 import time
 from contextlib import asynccontextmanager
-from datetime import UTC, datetime
+from datetime import UTC, date, datetime
 from pathlib import Path
 from threading import RLock
 from typing import Any
@@ -516,6 +517,7 @@ async def mock_fda_request_export(
     traceability_lot_code: str | None = Query(default=None),
 ) -> PlainTextResponse:
     active_controller = _active_controller(request)
+    start_filter, end_filter = _parse_export_date_filters(start_date=start_date, end_date=end_date)
     definition = FDA_EXPORT_PRESETS[preset]
     if definition.requires_lot_code and not traceability_lot_code:
         raise HTTPException(status_code=400, detail="traceability_lot_code is required for this export preset")
@@ -524,9 +526,12 @@ async def mock_fda_request_export(
         records = active_controller.store.lineage(traceability_lot_code)
         if not records:
             raise HTTPException(status_code=404, detail="No records found for that lot code")
-        records = _filter_records_between(records, start_date=start_date, end_date=end_date)
+        records = _filter_records_between(records, start_date=start_filter, end_date=end_filter)
     else:
-        records = active_controller.store.all_between(start_date=start_date, end_date=end_date)
+        records = active_controller.store.all_between(
+            start_date=start_filter.isoformat() if start_filter else None,
+            end_date=end_filter.isoformat() if end_filter else None,
+        )
     records = apply_fda_export_preset(records, preset)
     csv_text = render_fda_request_csv(records, location_gln=active_controller.engine.location_gln)
     return PlainTextResponse(
@@ -544,13 +549,17 @@ async def mock_epcis_export(
     traceability_lot_code: str | None = Query(default=None),
 ) -> JSONResponse:
     active_controller = _active_controller(request)
+    start_filter, end_filter = _parse_export_date_filters(start_date=start_date, end_date=end_date)
     if traceability_lot_code:
         records = active_controller.store.lineage(traceability_lot_code)
         if not records:
             raise HTTPException(status_code=404, detail="No records found for that lot code")
-        records = _filter_records_between(records, start_date=start_date, end_date=end_date)
+        records = _filter_records_between(records, start_date=start_filter, end_date=end_filter)
     else:
-        records = active_controller.store.all_between(start_date=start_date, end_date=end_date)
+        records = active_controller.store.all_between(
+            start_date=start_filter.isoformat() if start_filter else None,
+            end_date=end_filter.isoformat() if end_filter else None,
+        )
 
     document = render_epcis_document(
         records,
@@ -566,18 +575,40 @@ async def mock_epcis_export(
 
 def _filter_records_between(
     records: list[Any],
-    start_date: str | None = None,
-    end_date: str | None = None,
+    start_date: date | None = None,
+    end_date: date | None = None,
 ) -> list[Any]:
     filtered = []
     for record in records:
-        day = record.event.timestamp.date().isoformat()
+        day = record.event.timestamp.date()
         if start_date and day < start_date:
             continue
         if end_date and day > end_date:
             continue
         filtered.append(record)
     return sorted(filtered, key=lambda record: record.event.timestamp)
+
+
+def _parse_export_date_filters(
+    start_date: str | None,
+    end_date: str | None,
+) -> tuple[date | None, date | None]:
+    start_filter = _parse_export_date("start_date", start_date)
+    end_filter = _parse_export_date("end_date", end_date)
+    if start_filter and end_filter and start_filter > end_filter:
+        raise HTTPException(status_code=400, detail="start_date must be before or equal to end_date")
+    return start_filter, end_filter
+
+
+def _parse_export_date(field_name: str, value: str | None) -> date | None:
+    if value is None:
+        return None
+    if not re.fullmatch(r"\d{4}-\d{2}-\d{2}", value):
+        raise HTTPException(status_code=400, detail=f"{field_name} must be YYYY-MM-DD")
+    try:
+        return date.fromisoformat(value)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=f"{field_name} must be a valid date") from exc
 
 
 def _tenant_context(request: Request) -> TenantContext:

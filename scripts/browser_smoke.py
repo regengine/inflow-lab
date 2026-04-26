@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import os
 import socket
-import subprocess
+import subprocess  # nosec B404
 import sys
 import tempfile
 import time
@@ -76,7 +76,8 @@ def _base_url(configured_base_url: str | None) -> Iterator[str]:
         env["REGENGINE_CORS_ORIGINS"] = base_url
         env.pop("REGENGINE_BASIC_AUTH_USERNAME", None)
         env.pop("REGENGINE_BASIC_AUTH_PASSWORD", None)
-        process = subprocess.Popen(
+        # Local smoke harness starts a fixed uvicorn argv with no user input.
+        process = subprocess.Popen(  # nosec B603
             [
                 sys.executable,
                 "-m",
@@ -180,7 +181,7 @@ def _run_dashboard_smoke(base_url: str, config: BrowserSmokeConfig) -> None:
                 output_dir.mkdir(parents=True, exist_ok=True)
                 page.screenshot(path=str(output_dir / "browser_smoke_failure.png"), full_page=True)
             except Exception:
-                pass
+                console_errors.append("Could not capture failure screenshot")
         raise
     finally:
         if console_errors and not failed:

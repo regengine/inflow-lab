@@ -15,6 +15,7 @@ from .models import (
     DemoFixtureId,
     DemoFixtureLoadRequest,
     DemoFixtureLoadResponse,
+    DeliveryConfig,
     DeliveryRetryRequest,
     DeliveryRetryResponse,
     DestinationMode,
@@ -81,6 +82,7 @@ class SimulationController:
 
     async def start(self, config: SimulationConfig) -> None:
         async with self._lock:
+            _validate_live_delivery(config.delivery)
             previous_config = self.config
             self.config = config
             self.store.configure(config.persist_path)
@@ -95,8 +97,10 @@ class SimulationController:
         if not self.running:
             return
         self._stop_event.set()
-        assert self._task is not None
-        await self._task
+        task = self._task
+        if task is None:
+            return
+        await task
         self._task = None
         await self._publish_update()
 
@@ -116,6 +120,7 @@ class SimulationController:
 
     async def step(self, batch_size: int | None = None) -> StepResponse:
         async with self._lock:
+            _validate_live_delivery(self.config.delivery)
             size = batch_size or self.config.batch_size
             events = []
             lineages = []
@@ -170,6 +175,7 @@ class SimulationController:
             persist_path = request.persist_path or self.config.persist_path
             source = request.source or self.config.source
             delivery = request.delivery or self.config.delivery
+            _validate_live_delivery(delivery)
             replay_config = self.config.model_copy(
                 update={
                     "source": source,
@@ -220,6 +226,7 @@ class SimulationController:
         async with self._lock:
             source = request.source or self.config.source
             delivery = request.delivery or self.config.delivery
+            _validate_live_delivery(delivery)
             import_config = self.config.model_copy(
                 update={
                     "source": source,
@@ -303,6 +310,7 @@ class SimulationController:
         async with self._lock:
             source = request.source or self.config.source
             delivery = request.delivery or self.config.delivery
+            _validate_live_delivery(delivery)
             self.config = self.config.model_copy(
                 update={
                     "source": source,
@@ -448,6 +456,7 @@ class SimulationController:
                     error="Retry requires mock or live delivery mode.",
                 )
             else:
+                _validate_live_delivery(delivery)
                 posted = 0
                 failed = 0
                 updated_records: list[StoredEventRecord] = []
@@ -660,3 +669,8 @@ class SimulationController:
             persist_path=snapshot.config.persist_path,
             delivery_mode=snapshot.config.delivery.mode,
         )
+
+
+def _validate_live_delivery(delivery: DeliveryConfig) -> None:
+    if delivery.mode == DestinationMode.LIVE and (not delivery.api_key or not delivery.tenant_id):
+        raise ValueError("Live delivery requires both api_key and tenant_id")

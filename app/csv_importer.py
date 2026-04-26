@@ -90,7 +90,11 @@ def parse_csv_import(
         if row_errors:
             errors.extend(row_errors)
             continue
-        assert event is not None
+        if event is None:
+            errors.append(
+                CSVImportError(row=row_number, field="row", message="Row could not be parsed")
+            )
+            continue
         events.append(event)
         parent_lot_codes.append(parents)
         warnings.extend(row_warnings)
