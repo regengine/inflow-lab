@@ -255,7 +255,7 @@ python3 scripts/browser_smoke.py
 
 The browser smoke forces dashboard delivery back to `mock`, uses the dedicated browser-smoke tenant, and verifies the real dashboard start/stop, reset, single-batch, fixture, lineage, and CSV warning flows without printing the password.
 
-You can run the same checks from GitHub Actions with the manual **Remote Smoke** and **Remote Browser Smoke** workflows. Configure these repository secrets first:
+You can run the same checks from GitHub Actions with the manual and nightly **Remote Smoke** and **Remote Browser Smoke** workflows. Configure these repository secrets first:
 
 ```text
 REGENGINE_REMOTE_USERNAME=demo
@@ -269,7 +269,7 @@ Then run `.github/workflows/remote-smoke.yml` or `.github/workflows/remote-brows
 | `base_url` | `https://regengine-inflow-lab-production.up.railway.app` | Deployed shared-demo URL to validate |
 | `tenant` | `remote-smoke` or `remote-browser-smoke` | Tenant used for isolated smoke data |
 
-The workflows install repo dependencies and run `python3 scripts/remote_smoke.py` or `python3 scripts/browser_smoke.py`. They do not require live RegEngine credentials and keep delivery in `mock` mode.
+The workflows install repo dependencies and run `python3 scripts/remote_smoke.py` or `python3 scripts/browser_smoke.py`. They do not require live RegEngine credentials and keep delivery in `mock` mode. Nightly scheduled runs target the Railway shared-demo URL with `remote-smoke-nightly` and `remote-browser-smoke-nightly` tenants.
 
 Railway log triage:
 
@@ -300,6 +300,7 @@ Use these patterns when diagnosing a shared demo:
 - `python3 scripts/remote_smoke.py` passes for the deployed shared-demo URL.
 - The manual GitHub **Remote Smoke** workflow passes with the same shared-demo URL and smoke tenant.
 - The manual GitHub **Remote Browser Smoke** workflow passes with the same shared-demo URL and browser-smoke tenant.
+- Nightly GitHub **Remote Smoke** and **Remote Browser Smoke** schedules are enabled after the shared-demo secrets are configured.
 - Lineage for `TLC-DEMO-FC-OUT-001` includes upstream harvest and packed lots.
 - FDA CSV and EPCIS exports are derivable from stored records.
 - No generated `data/` files or secrets are staged before committing.

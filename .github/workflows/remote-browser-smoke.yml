@@ -1,6 +1,8 @@
 name: Remote Browser Smoke
 
 on:
+  schedule:
+    - cron: '47 10 * * *'
   workflow_dispatch:
     inputs:
       base_url:
@@ -18,7 +20,7 @@ permissions:
   contents: read
 
 concurrency:
-  group: remote-browser-smoke-${{ github.event.inputs.base_url }}-${{ github.event.inputs.tenant }}
+  group: remote-browser-smoke-${{ github.event.inputs.base_url || 'https://regengine-inflow-lab-production.up.railway.app' }}-${{ github.event.inputs.tenant || 'remote-browser-smoke-nightly' }}
   cancel-in-progress: false
 
 jobs:
@@ -56,8 +58,8 @@ jobs:
 
       - name: Run remote browser smoke
         env:
-          REGENGINE_BROWSER_BASE_URL: ${{ inputs.base_url }}
+          REGENGINE_BROWSER_BASE_URL: ${{ github.event.inputs.base_url || 'https://regengine-inflow-lab-production.up.railway.app' }}
           REGENGINE_BROWSER_USERNAME: ${{ secrets.REGENGINE_REMOTE_USERNAME }}
           REGENGINE_BROWSER_PASSWORD: ${{ secrets.REGENGINE_REMOTE_PASSWORD }}
-          REGENGINE_BROWSER_TENANT: ${{ inputs.tenant }}
+          REGENGINE_BROWSER_TENANT: ${{ github.event.inputs.tenant || 'remote-browser-smoke-nightly' }}
         run: python3 scripts/browser_smoke.py

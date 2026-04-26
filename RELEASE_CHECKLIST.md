@@ -39,6 +39,7 @@ Use this checklist before tagging a demo-ready build or handing the simulator to
 - [ ] For shared-demo releases, `python3 scripts/remote_smoke.py` passes against the deployed HTTPS URL.
 - [ ] For shared-demo releases, the manual GitHub **Remote Smoke** workflow passes with repository secrets `REGENGINE_REMOTE_USERNAME` and `REGENGINE_REMOTE_PASSWORD`.
 - [ ] For shared-demo releases, the manual GitHub **Remote Browser Smoke** workflow passes with repository secrets `REGENGINE_REMOTE_USERNAME` and `REGENGINE_REMOTE_PASSWORD`.
+- [ ] For shared-demo releases, nightly GitHub **Remote Smoke** and **Remote Browser Smoke** schedules are enabled after those repository secrets are configured.
 - [ ] For live-trial prep, `python3 scripts/live_trial.py --dry-run-only` passes before any confirmed live batch.
 
 ## Handoff Notes
