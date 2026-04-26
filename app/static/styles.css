@@ -118,6 +118,11 @@ label {
   font-size: 0.95rem;
 }
 
+.field-action {
+  display: flex;
+  align-items: flex-end;
+}
+
 input,
 select,
 button {

@@ -12,6 +12,7 @@ A mock-first FSMA 204 traceability simulator that emits **RegEngine-compatible i
 - [Replay mode](#replay-mode)
 - [CSV import](#csv-import)
 - [Scenario presets](#scenario-presets)
+- [Demo fixtures](#demo-fixtures)
 - [FDA export presets](#fda-export-presets)
 - [API reference](#api-reference)
 - [RegEngine payload contract](#regengine-payload-contract)
@@ -41,6 +42,7 @@ Each event is persisted with `event_id`, `sha256_hash`, and `chain_hash` so the 
 ```text
 app/
   controller.py          # Simulator lifecycle (start/stop/step/reset)
+  demo_fixtures.py       # Deterministic demo playback fixtures
   engine.py              # CTE generation and lot lineage logic
   fda_export.py          # FDA-request CSV export presets and rendering
   main.py                # FastAPI app and route wiring
@@ -83,7 +85,7 @@ Then open:
 http://127.0.0.1:8000
 ```
 
-The dashboard lets you choose a scenario preset, start/stop/step/reset the simulator, replay the current persisted event log, import CSV seed lots or scheduled events, inspect recent events, trace lot lineage, and export mock FDA request CSV presets. It subscribes to live status/event snapshots with Server-Sent Events and falls back to refresh polling if the stream disconnects. Delivery mode defaults to **`mock`** so no credentials are required.
+The dashboard lets you choose a scenario preset, load deterministic demo fixtures, start/stop/step/reset the simulator, replay the current persisted event log, import CSV seed lots or scheduled events, inspect recent events, trace lot lineage, and export mock FDA request CSV presets. It subscribes to live status/event snapshots with Server-Sent Events and falls back to refresh polling if the stream disconnects. Delivery mode defaults to **`mock`** so no credentials are required.
 
 Event records are stored as JSONL at `config.persist_path` (`data/events.jsonl` by default). Existing records at that path are loaded when the app starts or when a start/reset request points at a different path; reset clears the currently configured event log. Replay reads the JSONL log without appending, duplicating, or rewriting stored events.
 
@@ -187,6 +189,20 @@ Use `config.scenario` to pick a deterministic product/location/flow mix without 
 
 Scenario selection is available in the dashboard, in `SimulationConfig`, and via `GET /api/scenarios`. The default is `leafy_greens_supplier`, and delivery still defaults to **`mock`**.
 
+## Demo fixtures
+
+Use `GET /api/demo-fixtures` to list deterministic demo playback fixtures. Each fixture contains fixed RegEngine-shaped events with stable timestamps, lot codes, reference documents, and parent-lot lineage. `POST /api/demo-fixtures/{fixture_id}/load` loads a fixture into the event store and optionally delivers it through `mock`, `live`, or `none` delivery.
+
+Supported fixture IDs:
+
+| Fixture | Value | Demo emphasis |
+|---|---|---|
+| Leafy greens trace | `leafy_greens_trace` | One leafy greens lot from harvest through DC receipt |
+| Fresh-cut transformation | `fresh_cut_transformation` | Two ingredient lots transformed into one fresh-cut output lot |
+| Retailer handoff | `retailer_handoff` | Retail-ready cases through DC and store receipts |
+
+The dashboard fixture loader resets the current event log before loading the selected fixture so demos start from a known state.
+
 ## FDA export presets
 
 `GET /api/mock/regengine/export/fda-request` still returns the same 11-column FDA request CSV and remains backward compatible with optional `start_date` and `end_date` filters. It now also accepts:
@@ -204,6 +220,8 @@ If a lot code is supplied, the export is scoped to that lot's transitive lineage
 |---|---|---|
 | `GET` | `/api/health` | Liveness probe + current config snapshot |
 | `GET` | `/api/scenarios` | List available scenario presets |
+| `GET` | `/api/demo-fixtures` | List deterministic demo playback fixtures |
+| `POST` | `/api/demo-fixtures/{fixture_id}/load` | Load a deterministic fixture into the event store |
 | `GET` | `/api/simulate/status` | Running state, config, and aggregate stats |
 | `POST` | `/api/simulate/start` | Start the loop (accepts a `config` body) |
 | `POST` | `/api/simulate/stop` | Stop the loop |
@@ -271,6 +289,19 @@ curl -X POST http://127.0.0.1:8000/api/simulate/step
 ```bash
 curl -X POST http://127.0.0.1:8000/api/simulate/step
 curl http://127.0.0.1:8000/api/events
+```
+
+### Example: load a deterministic fresh-cut demo fixture
+
+```bash
+curl -X POST http://127.0.0.1:8000/api/demo-fixtures/fresh_cut_transformation/load \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "reset": true,
+    "delivery": {
+      "mode": "mock"
+    }
+  }'
 ```
 
 ### Example: replay the current persisted log
