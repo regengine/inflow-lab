@@ -20,6 +20,8 @@ from .mock_service import MockRegEngineService
 from .models import (
     CSVImportRequest,
     CSVImportResponse,
+    DeliveryRetryRequest,
+    DeliveryRetryResponse,
     EventListResponse,
     IngestPayload,
     LineageResponse,
@@ -173,6 +175,11 @@ async def simulate_replay(request: ReplayRequest | None = None) -> ReplayRespons
 @app.post("/api/import/csv", response_model=CSVImportResponse)
 async def import_csv(request: CSVImportRequest) -> CSVImportResponse:
     return await controller.import_csv(request)
+
+
+@app.post("/api/delivery/retry", response_model=DeliveryRetryResponse)
+async def retry_failed_delivery(request: DeliveryRetryRequest | None = None) -> DeliveryRetryResponse:
+    return await controller.retry_failed_delivery(request)
 
 
 @app.get("/api/events", response_model=EventListResponse)

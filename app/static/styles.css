@@ -158,6 +158,12 @@ select {
   filter: brightness(1.06);
 }
 
+.button:disabled {
+  cursor: not-allowed;
+  filter: grayscale(0.7);
+  opacity: 0.55;
+}
+
 .table-wrap {
   overflow-x: auto;
 }
@@ -190,6 +196,35 @@ th {
   text-transform: uppercase;
 }
 
+.status-pill {
+  display: inline-flex;
+  border-radius: 999px;
+  padding: 4px 10px;
+  background: rgba(255, 255, 255, 0.08);
+  color: var(--muted);
+  font-size: 0.82rem;
+  text-transform: uppercase;
+}
+
+.status-pill[data-tone="success"],
+.delivery-card[data-tone="success"] {
+  background: rgba(77, 212, 172, 0.12);
+  color: var(--success);
+}
+
+.status-pill[data-tone="error"],
+.delivery-card[data-tone="error"] {
+  background: rgba(255, 107, 107, 0.12);
+  color: var(--danger);
+}
+
+.status-error {
+  display: block;
+  max-width: 320px;
+  margin-top: 6px;
+  color: var(--danger);
+}
+
 .link-button {
   background: none;
   border: none;
@@ -202,6 +237,58 @@ th {
 .empty-state {
   text-align: center;
   color: var(--muted);
+}
+
+.delivery-summary {
+  display: grid;
+  gap: 14px;
+}
+
+.delivery-cards {
+  display: grid;
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+  gap: 10px;
+}
+
+.delivery-card {
+  padding: 14px;
+  border-radius: 8px;
+  background: rgba(255, 255, 255, 0.03);
+  border: 1px solid rgba(255, 255, 255, 0.08);
+}
+
+.delivery-card span,
+.delivery-details dt {
+  display: block;
+  color: var(--muted);
+}
+
+.delivery-card strong {
+  display: block;
+  margin-top: 6px;
+  font-size: 1.1rem;
+}
+
+.delivery-details {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 10px;
+  margin: 0;
+}
+
+.delivery-details div {
+  padding: 12px 14px;
+  border-radius: 8px;
+  background: rgba(255, 255, 255, 0.03);
+}
+
+.delivery-details dd {
+  margin: 6px 0 0;
+  word-break: break-word;
+}
+
+.delivery-details dd[data-tone="error"] {
+  color: var(--danger);
 }
 
 .lineage-results {
@@ -361,6 +448,8 @@ th {
 
   .grid.two-up,
   .stats-grid,
+  .delivery-cards,
+  .delivery-details,
   .lineage-overview {
     grid-template-columns: 1fr;
   }

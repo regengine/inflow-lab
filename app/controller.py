@@ -11,6 +11,8 @@ from .mock_service import MockRegEngineService
 from .models import (
     CSVImportRequest,
     CSVImportResponse,
+    DeliveryRetryRequest,
+    DeliveryRetryResponse,
     DestinationMode,
     IngestPayload,
     ReplayRequest,
@@ -29,6 +31,9 @@ class DeliveryOutcome:
     delivery_status: str = "generated"
     posted: int = 0
     failed: int = 0
+    delivery_attempts: int = 0
+    attempted_at: datetime | None = None
+    completed_at: datetime | None = None
     error_message: str | None = None
 
 
@@ -118,6 +123,11 @@ class SimulationController:
                         parent_lot_codes=lineages[index],
                         destination_mode=self.config.delivery.mode,
                         delivery_status=outcome.delivery_status,
+                        delivery_attempts=outcome.delivery_attempts,
+                        last_delivery_attempt_at=outcome.attempted_at,
+                        last_delivery_success_at=outcome.completed_at
+                        if outcome.delivery_status == "posted"
+                        else None,
                         delivery_response=event_response,
                         error=outcome.error_message,
                     )
@@ -129,7 +139,11 @@ class SimulationController:
                 posted=outcome.posted,
                 failed=outcome.failed,
                 lot_codes=[event.traceability_lot_code for event in events],
+                delivery_status=outcome.delivery_status,
+                delivery_mode=self.config.delivery.mode,
+                delivery_attempts=outcome.delivery_attempts,
                 response=outcome.response,
+                error=outcome.error_message,
             )
         await self._publish_update()
         return result
@@ -160,6 +174,7 @@ class SimulationController:
                     source=source,
                     persist_path=persist_path,
                     delivery_mode=delivery.mode,
+                    delivery_attempts=0,
                 )
             else:
                 payload = IngestPayload(source=source, events=events)
@@ -178,6 +193,7 @@ class SimulationController:
                     source=source,
                     persist_path=persist_path,
                     delivery_mode=delivery.mode,
+                    delivery_attempts=outcome.delivery_attempts,
                     response=outcome.response,
                     error=outcome.error_message,
                 )
@@ -216,6 +232,11 @@ class SimulationController:
                             parent_lot_codes=parsed.parent_lot_codes[index],
                             destination_mode=delivery.mode,
                             delivery_status=outcome.delivery_status,
+                            delivery_attempts=outcome.delivery_attempts,
+                            last_delivery_attempt_at=outcome.attempted_at,
+                            last_delivery_success_at=outcome.completed_at
+                            if outcome.delivery_status == "posted"
+                            else None,
                             delivery_response=event_response,
                             error=outcome.error_message,
                         )
@@ -243,6 +264,7 @@ class SimulationController:
                 failed=outcome.failed,
                 source=source,
                 delivery_mode=delivery.mode,
+                delivery_attempts=outcome.delivery_attempts,
                 lot_codes=[event.traceability_lot_code for event in parsed.events],
                 errors=parsed.errors,
                 response=outcome.response,
@@ -251,19 +273,155 @@ class SimulationController:
         await self._publish_update()
         return result
 
+    async def retry_failed_delivery(
+        self,
+        request: DeliveryRetryRequest | None = None,
+    ) -> DeliveryRetryResponse:
+        request = request or DeliveryRetryRequest()
+        async with self._lock:
+            delivery = request.delivery or self.config.delivery
+            candidates = self.store.failed_delivery_records(request.record_ids, limit=request.limit)
+            requested = len(request.record_ids) if request.record_ids else len(candidates)
+            skipped = max(0, requested - len(candidates))
+
+            if not candidates:
+                result = DeliveryRetryResponse(
+                    status="empty",
+                    requested=requested,
+                    retryable=0,
+                    attempted=0,
+                    posted=0,
+                    failed=0,
+                    skipped=skipped,
+                    delivery_mode=delivery.mode,
+                    record_ids=[],
+                )
+            elif delivery.mode == DestinationMode.NONE:
+                result = DeliveryRetryResponse(
+                    status="skipped",
+                    requested=requested,
+                    retryable=len(candidates),
+                    attempted=0,
+                    posted=0,
+                    failed=0,
+                    skipped=skipped + len(candidates),
+                    delivery_mode=delivery.mode,
+                    record_ids=[record.record_id for record in candidates],
+                    error="Retry requires mock or live delivery mode.",
+                )
+            else:
+                posted = 0
+                failed = 0
+                updated_records: list[StoredEventRecord] = []
+                responses: list[dict[str, Any]] = []
+                grouped_records: dict[str, list[StoredEventRecord]] = {}
+                for record in candidates:
+                    source = request.source or record.payload_source
+                    grouped_records.setdefault(source, []).append(record)
+
+                for source, records in grouped_records.items():
+                    retry_config = self.config.model_copy(
+                        update={
+                            "source": source,
+                            "delivery": delivery,
+                        },
+                        deep=True,
+                    )
+                    payload = IngestPayload(source=source, events=[record.event for record in records])
+                    outcome = await self._deliver_payload(payload, retry_config)
+                    response_events = (outcome.response or {}).get("events", []) if outcome.response else []
+                    responses.append(
+                        {
+                            "source": source,
+                            "delivery_status": outcome.delivery_status,
+                            "posted": outcome.posted,
+                            "failed": outcome.failed,
+                            "response": outcome.response,
+                            "error": outcome.error_message,
+                        }
+                    )
+
+                    for index, record in enumerate(records):
+                        event_response = response_events[index] if index < len(response_events) else None
+                        next_attempts = record.delivery_attempts + outcome.delivery_attempts
+                        updated_records.append(
+                            record.model_copy(
+                                update={
+                                    "destination_mode": delivery.mode,
+                                    "delivery_status": outcome.delivery_status,
+                                    "delivery_attempts": next_attempts,
+                                    "last_delivery_attempt_at": outcome.attempted_at
+                                    or record.last_delivery_attempt_at,
+                                    "last_delivery_success_at": outcome.completed_at
+                                    if outcome.delivery_status == "posted"
+                                    else record.last_delivery_success_at,
+                                    "delivery_response": event_response,
+                                    "error": None
+                                    if outcome.delivery_status == "posted"
+                                    else outcome.error_message,
+                                },
+                                deep=True,
+                            )
+                        )
+                    posted += outcome.posted
+                    failed += outcome.failed
+
+                self.store.update_many(updated_records)
+                if posted and failed:
+                    status = "partial"
+                elif failed:
+                    status = "failed"
+                else:
+                    status = "posted"
+                result = DeliveryRetryResponse(
+                    status=status,
+                    requested=requested,
+                    retryable=len(candidates),
+                    attempted=len(candidates),
+                    posted=posted,
+                    failed=failed,
+                    skipped=skipped,
+                    delivery_mode=delivery.mode,
+                    record_ids=[record.record_id for record in candidates],
+                    responses=responses,
+                    error=next((item["error"] for item in responses if item.get("error")), None),
+                )
+        await self._publish_update()
+        return result
+
     async def _deliver_payload(self, payload: IngestPayload, config: SimulationConfig) -> DeliveryOutcome:
+        if config.delivery.mode == DestinationMode.NONE:
+            return DeliveryOutcome()
+
+        attempted_at = datetime.now(UTC)
         try:
             if config.delivery.mode == DestinationMode.MOCK:
                 response = self.mock_service.ingest(payload).model_dump(mode="json")
-                return DeliveryOutcome(response=response, delivery_status="posted", posted=len(payload.events))
+                return DeliveryOutcome(
+                    response=response,
+                    delivery_status="posted",
+                    posted=len(payload.events),
+                    delivery_attempts=1,
+                    attempted_at=attempted_at,
+                    completed_at=datetime.now(UTC),
+                )
             if config.delivery.mode == DestinationMode.LIVE:
                 response = await self.live_client.ingest(payload, config)
-                return DeliveryOutcome(response=response, delivery_status="posted", posted=len(payload.events))
+                return DeliveryOutcome(
+                    response=response,
+                    delivery_status="posted",
+                    posted=len(payload.events),
+                    delivery_attempts=1,
+                    attempted_at=attempted_at,
+                    completed_at=datetime.now(UTC),
+                )
             return DeliveryOutcome()
         except Exception as exc:  # pragma: no cover - exercised by live integration, not unit tests
             return DeliveryOutcome(
                 delivery_status="failed",
                 failed=len(payload.events),
+                delivery_attempts=1,
+                attempted_at=attempted_at,
                 error_message=str(exc),
             )
 

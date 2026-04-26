@@ -26,6 +26,8 @@ const ids = {
   importResults: document.getElementById('importResults'),
   statusMessage: document.getElementById('statusMessage'),
   statsGrid: document.getElementById('statsGrid'),
+  deliverySummary: document.getElementById('deliverySummary'),
+  retryFailedBtn: document.getElementById('retryFailedBtn'),
   eventsBody: document.getElementById('eventsBody'),
   lotLookup: document.getElementById('lotLookup'),
   lineageResults: document.getElementById('lineageResults'),
@@ -123,6 +125,64 @@ function renderStats(status) {
     .join('');
 }
 
+function deliveryTone(deliveryStatus) {
+  if (deliveryStatus === 'posted') {
+    return 'success';
+  }
+  if (deliveryStatus === 'failed') {
+    return 'error';
+  }
+  return 'neutral';
+}
+
+function renderDeliverySummary(status) {
+  const delivery = status?.stats?.delivery || {};
+  const retryable = Number(delivery.retryable || 0);
+  ids.retryFailedBtn.disabled = retryable < 1;
+  const cards = [
+    ['Posted', delivery.posted ?? 0, 'success'],
+    ['Failed', delivery.failed ?? 0, retryable > 0 ? 'error' : 'neutral'],
+    ['Generated only', delivery.generated ?? 0, 'neutral'],
+    ['Attempts', delivery.attempts ?? 0, 'neutral'],
+  ];
+  const lastAttempt = delivery.last_attempt_at ? new Date(delivery.last_attempt_at).toLocaleString() : 'No attempts yet';
+  const lastSuccess = delivery.last_success_at ? new Date(delivery.last_success_at).toLocaleString() : 'No successful delivery yet';
+  ids.deliverySummary.innerHTML = `
+    <div class="delivery-cards">
+      ${cards
+        .map(
+          ([label, value, tone]) => `
+            <article class="delivery-card" data-tone="${tone}">
+              <span>${escapeHtml(label)}</span>
+              <strong>${escapeHtml(value)}</strong>
+            </article>
+          `,
+        )
+        .join('')}
+    </div>
+    <dl class="delivery-details">
+      <div>
+        <dt>Last attempt</dt>
+        <dd>${escapeHtml(lastAttempt)}</dd>
+      </div>
+      <div>
+        <dt>Last success</dt>
+        <dd>${escapeHtml(lastSuccess)}</dd>
+      </div>
+      ${
+        delivery.last_error
+          ? `
+            <div>
+              <dt>Last error</dt>
+              <dd data-tone="error">${escapeHtml(delivery.last_error)}</dd>
+            </div>
+          `
+          : ''
+      }
+    </dl>
+  `;
+}
+
 function escapeHtml(text) {
   return String(text)
     .replaceAll('&', '&amp;')
@@ -154,7 +214,7 @@ function renderEvents(events) {
   if (!events.length) {
     ids.eventsBody.innerHTML = `
       <tr>
-        <td colspan="7" class="empty-state">No events yet.</td>
+        <td colspan="9" class="empty-state">No events yet.</td>
       </tr>
     `;
     return;
@@ -170,7 +230,12 @@ function renderEvents(events) {
           <td>${escapeHtml(event.product_description)}</td>
           <td>${escapeHtml(event.location_name)}</td>
           <td>${escapeHtml(new Date(event.timestamp).toLocaleString())}</td>
-          <td>${escapeHtml(record.delivery_status)}</td>
+          <td>${escapeHtml(record.destination_mode)}</td>
+          <td>${escapeHtml(record.delivery_attempts || 0)}</td>
+          <td>
+            <span class="status-pill" data-tone="${deliveryTone(record.delivery_status)}">${escapeHtml(record.delivery_status)}</span>
+            ${record.error ? `<small class="status-error">${escapeHtml(record.error)}</small>` : ''}
+          </td>
         </tr>
       `;
     })
@@ -331,6 +396,7 @@ function renderSnapshot(status, events) {
   state.status = status;
   state.events = events;
   renderStats(status);
+  renderDeliverySummary(status);
   renderEvents(events);
   if (Date.now() >= state.statusHoldUntil) {
     setStatus(status.running ? 'Simulator loop is running.' : 'Simulator loop is stopped.');
@@ -423,7 +489,35 @@ async function stopLoop() {
 async function stepOnce() {
   try {
     const result = await api('/api/simulate/step', { method: 'POST' });
-    setStatus(`Generated ${result.generated} event(s).`, 'success', 2500);
+    if (result.delivery_status === 'failed') {
+      setStatus(`Generated ${result.generated} event(s), but delivery failed: ${result.error || 'delivery error'}`, 'error', 7000);
+    } else if (result.delivery_status === 'generated') {
+      setStatus(`Generated ${result.generated} event(s) without delivery.`, 'success', 2500);
+    } else {
+      setStatus(`Generated and posted ${result.posted} event(s).`, 'success', 2500);
+    }
+    await refresh();
+  } catch (error) {
+    setStatus(error.message, 'error', 5000);
+  }
+}
+
+async function retryFailedDeliveries() {
+  try {
+    const config = buildConfig();
+    const result = await api('/api/delivery/retry', {
+      method: 'POST',
+      body: JSON.stringify({ delivery: config.delivery, source: config.source }),
+    });
+    if (result.status === 'empty') {
+      setStatus('No failed deliveries are waiting to retry.', 'success', 2500);
+    } else if (result.status === 'skipped') {
+      setStatus(result.error || 'Retry skipped.', 'error', 5000);
+    } else if (result.failed > 0) {
+      setStatus(`Retried ${result.attempted} record(s): ${result.posted} posted, ${result.failed} failed.`, 'error', 7000);
+    } else {
+      setStatus(`Retried and posted ${result.posted} failed delivery record(s).`, 'success', 3500);
+    }
     await refresh();
   } catch (error) {
     setStatus(error.message, 'error', 5000);
@@ -515,6 +609,7 @@ document.getElementById('stopBtn').addEventListener('click', stopLoop);
 document.getElementById('stepBtn').addEventListener('click', stepOnce);
 document.getElementById('replayBtn').addEventListener('click', replayCurrentLog);
 document.getElementById('importCsvBtn').addEventListener('click', importCsv);
+document.getElementById('retryFailedBtn').addEventListener('click', retryFailedDeliveries);
 document.getElementById('resetBtn').addEventListener('click', resetState);
 document.getElementById('refreshBtn').addEventListener('click', refresh);
 document.getElementById('lineageBtn').addEventListener('click', lookupLineage);

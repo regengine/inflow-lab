@@ -180,6 +180,78 @@ def test_reset_applies_configured_persist_path_for_next_step(tmp_path):
     assert len(custom_path.read_text(encoding="utf-8").splitlines()) == 1
 
 
+def test_failed_live_delivery_surfaces_retry_feedback_and_can_retry_to_mock(tmp_path):
+    custom_path = tmp_path / "failed-delivery-events.jsonl"
+    client.post(
+        "/api/simulate/reset",
+        json={
+            "batch_size": 1,
+            "seed": 204,
+            "persist_path": str(custom_path),
+            "delivery": {"mode": "live"},
+        },
+    )
+
+    step_response = client.post("/api/simulate/step")
+
+    assert step_response.status_code == 200
+    step_body = step_response.json()
+    assert step_body["generated"] == 1
+    assert step_body["posted"] == 0
+    assert step_body["failed"] == 1
+    assert step_body["delivery_status"] == "failed"
+    assert step_body["delivery_mode"] == "live"
+    assert step_body["delivery_attempts"] == 1
+    assert "api_key" in step_body["error"]
+
+    status = client.get("/api/simulate/status").json()
+    assert status["stats"]["delivery"]["failed"] == 1
+    assert status["stats"]["delivery"]["retryable"] == 1
+    assert status["stats"]["delivery"]["attempts"] == 1
+    assert "api_key" in status["stats"]["delivery"]["last_error"]
+
+    failed_record = client.get("/api/events?limit=1").json()["events"][0]
+    assert failed_record["delivery_status"] == "failed"
+    assert failed_record["delivery_attempts"] == 1
+    assert failed_record["last_delivery_attempt_at"]
+    assert failed_record["last_delivery_success_at"] is None
+
+    retry_response = client.post("/api/delivery/retry", json={"delivery": {"mode": "mock"}})
+
+    assert retry_response.status_code == 200
+    retry_body = retry_response.json()
+    assert retry_body["status"] == "posted"
+    assert retry_body["requested"] == 1
+    assert retry_body["retryable"] == 1
+    assert retry_body["attempted"] == 1
+    assert retry_body["posted"] == 1
+    assert retry_body["failed"] == 0
+    assert retry_body["delivery_mode"] == "mock"
+    assert retry_body["record_ids"] == [failed_record["record_id"]]
+
+    events = client.get("/api/events?limit=10").json()["events"]
+    assert len(events) == 1
+    retried_record = events[0]
+    assert retried_record["record_id"] == failed_record["record_id"]
+    assert retried_record["delivery_status"] == "posted"
+    assert retried_record["destination_mode"] == "mock"
+    assert retried_record["delivery_attempts"] == 2
+    assert retried_record["last_delivery_success_at"]
+    assert retried_record["error"] is None
+
+
+def test_delivery_retry_empty_when_no_failed_records():
+    response = client.post("/api/delivery/retry")
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["status"] == "empty"
+    assert body["requested"] == 0
+    assert body["retryable"] == 0
+    assert body["attempted"] == 0
+    assert body["record_ids"] == []
+
+
 def test_replay_current_persisted_log_posts_without_rewriting_records(tmp_path):
     custom_path = tmp_path / "replay-events.jsonl"
     reset_response = client.post(

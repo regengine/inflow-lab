@@ -70,9 +70,52 @@ class EventStore:
                     stored.append(record)
         return stored
 
+    def update_many(self, records: Iterable[StoredEventRecord]) -> list[StoredEventRecord]:
+        replacements = {record.record_id: record for record in records}
+        if not replacements:
+            return []
+
+        with self._lock:
+            current_records = list(self._records)
+            updated_records: list[StoredEventRecord] = []
+            for record in current_records:
+                replacement = replacements.get(record.record_id)
+                if replacement:
+                    replacement.sequence_no = record.sequence_no
+                    updated_records.append(replacement)
+                else:
+                    updated_records.append(record)
+
+            self._records = deque(updated_records, maxlen=self.max_records)
+            persisted_records = sorted(updated_records, key=lambda record: record.sequence_no)
+            tmp_path = self.persist_path.with_suffix(f"{self.persist_path.suffix}.tmp")
+            with tmp_path.open("w", encoding="utf-8") as handle:
+                for record in persisted_records:
+                    handle.write(json.dumps(record.model_dump(mode="json")) + "\n")
+            tmp_path.replace(self.persist_path)
+            self._counter = max((record.sequence_no for record in persisted_records), default=0)
+
+        return [record for record in updated_records if record.record_id in replacements]
+
     def recent(self, limit: int = 100) -> list[StoredEventRecord]:
         with self._lock:
             return list(self._records)[:limit]
+
+    def failed_delivery_records(
+        self,
+        record_ids: list[str] | None = None,
+        limit: int = 50,
+    ) -> list[StoredEventRecord]:
+        record_id_filter = set(record_ids or [])
+        with self._lock:
+            records = sorted(self._records, key=lambda record: record.sequence_no)
+        failed_records = [
+            record
+            for record in records
+            if record.delivery_status == "failed"
+            and (not record_id_filter or record.record_id in record_id_filter)
+        ]
+        return failed_records[:limit]
 
     def stats(self) -> dict[str, Any]:
         with self._lock:
@@ -81,12 +124,40 @@ class EventStore:
         status_counter = Counter(record.delivery_status for record in records)
         destination_counter = Counter(record.destination_mode.value for record in records)
         unique_lots = {record.event.traceability_lot_code for record in records}
+        last_attempt_at = max(
+            (record.last_delivery_attempt_at for record in records if record.last_delivery_attempt_at),
+            default=None,
+        )
+        last_success_at = max(
+            (record.last_delivery_success_at for record in records if record.last_delivery_success_at),
+            default=None,
+        )
+        failed_records = [
+            record
+            for record in records
+            if record.delivery_status == "failed" and record.error
+        ]
+        latest_failure = max(
+            failed_records,
+            key=lambda record: record.last_delivery_attempt_at or record.created_at,
+            default=None,
+        )
         return {
             "total_records": len(records),
             "unique_lots": len(unique_lots),
             "by_cte_type": dict(cte_counter),
             "by_delivery_status": dict(status_counter),
             "by_destination": dict(destination_counter),
+            "delivery": {
+                "posted": status_counter.get("posted", 0),
+                "failed": status_counter.get("failed", 0),
+                "generated": status_counter.get("generated", 0),
+                "retryable": status_counter.get("failed", 0),
+                "attempts": sum(record.delivery_attempts for record in records),
+                "last_attempt_at": last_attempt_at.isoformat() if last_attempt_at else None,
+                "last_success_at": last_success_at.isoformat() if last_success_at else None,
+                "last_error": latest_failure.error if latest_failure else None,
+            },
             "persist_path": str(self.persist_path),
         }
 

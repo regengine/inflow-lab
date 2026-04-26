@@ -110,6 +110,8 @@ Sends real traffic to a RegEngine workspace. Configure from the dashboard or via
 ### `none`
 Generates and persists events locally without delivering them anywhere. Useful for seeding fixtures.
 
+Every stored record tracks `delivery_status`, `destination_mode`, `delivery_attempts`, and last delivery timestamps. The dashboard delivery monitor summarizes posted, failed, generated-only, and retryable records. Failed records can be retried through the dashboard or `POST /api/delivery/retry` after switching to a working `mock` or `live` delivery configuration.
+
 ## Replay mode
 
 Replay mode reads previously persisted `StoredEventRecord` JSONL lines, rebuilds the RegEngine ingest payload as:
@@ -134,7 +136,7 @@ Replay mode reads previously persisted `StoredEventRecord` JSONL lines, rebuilds
 
 By default, `POST /api/simulate/replay` uses the current `config.persist_path`, `config.source`, and `config.delivery`. You can override the JSONL path, source, or delivery mode in the request body. Delivery still uses the same `mock`, `live`, and `none` branches as normal generation.
 
-Replay responses include `status`, `read`, `replayed`, `posted`, `failed`, `source`, `persist_path`, `delivery_mode`, and any delivery `response` or `error`. Replay does not create new stored records.
+Replay responses include `status`, `read`, `replayed`, `posted`, `failed`, `source`, `persist_path`, `delivery_mode`, `delivery_attempts`, and any delivery `response` or `error`. Replay does not create new stored records.
 
 ## CSV import
 
@@ -169,7 +171,7 @@ traceability_lot_code,product_description,quantity,unit_of_measure,location_name
 
 Seed lots become valid `harvesting` events. Optional `timestamp`, `harvest_date`, `field_name`, `immediate_subsequent_recipient`, reference document columns, `kdes` JSON, and other KDE columns are preserved. If no timestamp is supplied, the import time is used.
 
-Import responses include `status`, `total`, `accepted`, `rejected`, `stored`, `posted`, `failed`, `lot_codes`, and `errors[]` with row number, field, and message.
+Import responses include `status`, `total`, `accepted`, `rejected`, `stored`, `posted`, `failed`, `delivery_attempts`, `lot_codes`, and `errors[]` with row number, field, and message.
 
 ## Scenario presets
 
@@ -199,6 +201,7 @@ Scenario selection is available in the dashboard, in `SimulationConfig`, and via
 | `POST` | `/api/simulate/reset` | Clear state and persisted events |
 | `GET` | `/api/simulate/stream` | Server-Sent Events snapshots for live dashboard updates |
 | `POST` | `/api/import/csv` | Bulk import scheduled events or seed lots from CSV text |
+| `POST` | `/api/delivery/retry` | Retry failed stored deliveries with the current or supplied delivery config |
 
 ### Inspection
 
@@ -285,6 +288,18 @@ curl -N http://127.0.0.1:8000/api/simulate/stream
 ```
 
 Each SSE `snapshot` includes a monotonic `revision`, the same status payload returned by `/api/simulate/status`, and recent event records from `/api/events`. Use `limit` to control the number of recent events and `once=true` for a one-shot smoke check.
+
+### Example: retry failed deliveries in mock mode
+
+```bash
+curl -X POST http://127.0.0.1:8000/api/delivery/retry \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "delivery": {
+      "mode": "mock"
+    }
+  }'
+```
 
 ### Example: trace a lot
 

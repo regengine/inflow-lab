@@ -55,6 +55,29 @@ def test_store_loads_existing_jsonl_records_on_initialization(tmp_path):
     assert stored[0].sequence_no == 3
 
 
+def test_store_updates_delivery_retry_metadata_on_disk(tmp_path):
+    persist_path = tmp_path / "events.jsonl"
+    store = EventStore(persist_path=str(persist_path))
+    stored = store.add_many([make_record("TLC-RETRY-000001", CTEType.HARVESTING, 0)])
+    failed_record = stored[0].model_copy(
+        update={
+            "delivery_status": "failed",
+            "delivery_attempts": 1,
+            "error": "temporary outage",
+        }
+    )
+    store.update_many([failed_record])
+
+    reloaded = EventStore(persist_path=str(persist_path))
+    record = reloaded.recent()[0]
+
+    assert record.record_id == stored[0].record_id
+    assert record.sequence_no == 1
+    assert record.delivery_status == "failed"
+    assert record.delivery_attempts == 1
+    assert record.error == "temporary outage"
+
+
 def test_lineage_for_transformed_output_includes_upstream_history_and_direct_query(tmp_path):
     store = EventStore(persist_path=str(tmp_path / "events.jsonl"))
     records = [

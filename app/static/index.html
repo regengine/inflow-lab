@@ -106,6 +106,14 @@
 
       <section class="grid stats-grid" id="statsGrid"></section>
 
+      <section class="panel delivery-monitor">
+        <div class="section-head">
+          <h2>Delivery monitor</h2>
+          <button class="button secondary" id="retryFailedBtn" type="button">Retry failed deliveries</button>
+        </div>
+        <div id="deliverySummary" class="delivery-summary"></div>
+      </section>
+
       <section class="panel">
         <div class="section-head">
           <h2>Recent events</h2>
@@ -121,6 +129,8 @@
                 <th>Product</th>
                 <th>Location</th>
                 <th>Timestamp</th>
+                <th>Mode</th>
+                <th>Attempts</th>
                 <th>Status</th>
               </tr>
             </thead>

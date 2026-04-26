@@ -85,6 +85,9 @@ class StoredEventRecord(BaseModel):
     parent_lot_codes: list[str] = Field(default_factory=list)
     destination_mode: DestinationMode = DestinationMode.NONE
     delivery_status: Literal["generated", "posted", "failed"] = "generated"
+    delivery_attempts: int = 0
+    last_delivery_attempt_at: datetime | None = None
+    last_delivery_success_at: datetime | None = None
     delivery_response: dict[str, Any] | None = None
     error: str | None = None
     created_at: datetime = Field(default_factory=lambda: datetime.now(UTC))
@@ -132,7 +135,39 @@ class StepResponse(BaseModel):
     posted: int
     failed: int
     lot_codes: list[str]
+    delivery_status: Literal["generated", "posted", "failed"]
+    delivery_mode: DestinationMode
+    delivery_attempts: int
     response: dict[str, Any] | None = None
+    error: str | None = None
+
+
+class DeliveryRetryRequest(BaseModel):
+    record_ids: list[str] | None = None
+    limit: int = 50
+    source: str | None = None
+    delivery: DeliveryConfig | None = None
+
+    @field_validator("limit")
+    @classmethod
+    def validate_limit(cls, value: int) -> int:
+        if value < 1 or value > 500:
+            raise ValueError("limit must be between 1 and 500")
+        return value
+
+
+class DeliveryRetryResponse(BaseModel):
+    status: Literal["empty", "posted", "partial", "failed", "skipped"]
+    requested: int
+    retryable: int
+    attempted: int
+    posted: int
+    failed: int
+    skipped: int
+    delivery_mode: DestinationMode
+    record_ids: list[str]
+    responses: list[dict[str, Any]] = Field(default_factory=list)
+    error: str | None = None
 
 
 class ReplayRequest(BaseModel):
@@ -150,6 +185,7 @@ class ReplayResponse(BaseModel):
     source: str
     persist_path: str
     delivery_mode: DestinationMode
+    delivery_attempts: int = 0
     response: dict[str, Any] | None = None
     error: str | None = None
 
@@ -178,6 +214,7 @@ class CSVImportResponse(BaseModel):
     failed: int
     source: str
     delivery_mode: DestinationMode
+    delivery_attempts: int = 0
     lot_codes: list[str]
     errors: list[CSVImportError] = Field(default_factory=list)
     response: dict[str, Any] | None = None
