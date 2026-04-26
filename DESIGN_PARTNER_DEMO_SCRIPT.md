@@ -110,6 +110,113 @@ If Basic Auth is enabled, also add:
 -u "$REGENGINE_BASIC_AUTH_USERNAME:$REGENGINE_BASIC_AUTH_PASSWORD"
 ```
 
+## Remote Demo Operator Runbook
+
+Use this section for the shared Railway demo when a non-engineer needs to prep, run, or clean up a partner call without touching live RegEngine traffic.
+
+Remote demo facts:
+
+- URL: `https://regengine-inflow-lab-production.up.railway.app`
+- Username: stored in Railway as `REGENGINE_BASIC_AUTH_USERNAME`
+- Password: stored in Railway as `REGENGINE_BASIC_AUTH_PASSWORD`; the current local operator copy is expected at `/tmp/regengine_inflow_lab_demo_basic_auth_password`
+- Storage: tenant-scoped event logs under the Railway `/data` volume
+- Delivery mode: keep `mock` for normal partner demos
+
+Set operator shell variables before running the commands below:
+
+```bash
+export DEMO_BASE_URL='https://regengine-inflow-lab-production.up.railway.app'
+export DEMO_USERNAME='demo'
+export DEMO_PASSWORD="$(cat /tmp/regengine_inflow_lab_demo_basic_auth_password)"
+export DEMO_TENANT='partner-acme'
+```
+
+Rotate the shared-demo password between external demos:
+
+```bash
+NEW_DEMO_PASSWORD="$(openssl rand -base64 24)"
+printf '%s' "$NEW_DEMO_PASSWORD" | railway variable set REGENGINE_BASIC_AUTH_PASSWORD --stdin
+printf '%s' "$NEW_DEMO_PASSWORD" | gh secret set REGENGINE_REMOTE_PASSWORD --repo PetrefiedThunder/regengine_codex_workspace
+printf '%s' "$NEW_DEMO_PASSWORD" > /tmp/regengine_inflow_lab_demo_basic_auth_password
+chmod 600 /tmp/regengine_inflow_lab_demo_basic_auth_password
+export DEMO_PASSWORD="$NEW_DEMO_PASSWORD"
+```
+
+After rotation, wait for Railway to redeploy, then verify:
+
+```bash
+curl -fsS -u "$DEMO_USERNAME:$DEMO_PASSWORD" \
+  -H "X-RegEngine-Tenant: $DEMO_TENANT" \
+  "$DEMO_BASE_URL/api/health" | python3 -m json.tool | head -40
+```
+
+Reset a tenant to a blank fresh-cut mock scenario:
+
+```bash
+curl -fsS -u "$DEMO_USERNAME:$DEMO_PASSWORD" \
+  -H "X-RegEngine-Tenant: $DEMO_TENANT" \
+  -X POST "$DEMO_BASE_URL/api/simulate/stop"
+
+curl -fsS -u "$DEMO_USERNAME:$DEMO_PASSWORD" \
+  -H "X-RegEngine-Tenant: $DEMO_TENANT" \
+  -H 'Content-Type: application/json' \
+  -X POST "$DEMO_BASE_URL/api/simulate/reset" \
+  -d '{"scenario":"fresh_cut_processor","batch_size":3,"seed":204,"delivery":{"mode":"mock"}}'
+```
+
+Load the fresh-cut fixture in mock mode:
+
+```bash
+curl -fsS -u "$DEMO_USERNAME:$DEMO_PASSWORD" \
+  -H "X-RegEngine-Tenant: $DEMO_TENANT" \
+  -H 'Content-Type: application/json' \
+  -X POST "$DEMO_BASE_URL/api/demo-fixtures/fresh_cut_transformation/load" \
+  -d '{"reset":true,"source":"remote-demo","delivery":{"mode":"mock"}}' \
+  | python3 -m json.tool
+```
+
+Verify lineage and exports:
+
+```bash
+curl -fsS -u "$DEMO_USERNAME:$DEMO_PASSWORD" \
+  -H "X-RegEngine-Tenant: $DEMO_TENANT" \
+  "$DEMO_BASE_URL/api/lineage/TLC-DEMO-FC-OUT-001" \
+  | python3 -m json.tool | head -80
+
+curl -fsS -u "$DEMO_USERNAME:$DEMO_PASSWORD" \
+  -H "X-RegEngine-Tenant: $DEMO_TENANT" \
+  "$DEMO_BASE_URL/api/mock/regengine/export/fda-request?preset=lot_trace&traceability_lot_code=TLC-DEMO-FC-OUT-001" \
+  | head -20
+
+curl -fsS -u "$DEMO_USERNAME:$DEMO_PASSWORD" \
+  -H "X-RegEngine-Tenant: $DEMO_TENANT" \
+  "$DEMO_BASE_URL/api/mock/regengine/export/epcis?traceability_lot_code=TLC-DEMO-FC-OUT-001" \
+  | python3 -m json.tool | head -80
+```
+
+Pre-call checklist:
+
+- Confirm the partner tenant name in `DEMO_TENANT`.
+- Run `python3 scripts/remote_smoke.py` or the GitHub **Remote Smoke** workflow.
+- Reset the tenant and load the fresh-cut fixture in `mock` mode.
+- Confirm lineage for `TLC-DEMO-FC-OUT-001` includes upstream packed and harvest lots.
+- Confirm the FDA lot-trace export includes `BATCH-DEMO-FC-001`.
+
+During-call checklist:
+
+- Keep the dashboard delivery mode on `Mock RegEngine`.
+- Do not paste live API keys, live tenant ids, partner secrets, or downloaded exports into chat.
+- If a route fails, check the visible dashboard error first, then Railway request logs by tenant and path.
+- If the loop starts unexpectedly, click `Stop` before resetting or loading fixtures.
+
+Post-call cleanup checklist:
+
+- Stop the simulation loop for the demo tenant.
+- Reset the tenant if the partner should not retain event history.
+- Rotate the shared password after external demos.
+- Do not commit generated exports, request logs, tenant event data, or local credential files.
+- Capture product feedback and missing CTE/KDE notes in the follow-up tracker, not in fixture data.
+
 ## Recovery Notes
 
 - If the dashboard looks stale, click `Refresh` or reload the browser tab.
