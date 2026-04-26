@@ -39,6 +39,7 @@ Use this checklist before tagging a demo-ready build or handing the simulator to
 
 - [ ] README has the current API surface and setup instructions.
 - [ ] `DESIGN_PARTNER_DEMO_SCRIPT.md` matches the current fixture names, lot codes, expected exports, and reset flow.
+- [ ] `DESIGN_PARTNER_DEMO_SCRIPT.md` remote operator runbook uses env vars and mock delivery for shared-demo commands.
 - [ ] `DEPLOYMENT_PROFILES.md` matches the intended local, shared-demo, and live-ingest operating modes.
 - [ ] `AUTOPILOT_TASKS.md` reflects the current backlog state.
 - [ ] No generated data files are staged.
