@@ -129,6 +129,26 @@ export REGENGINE_DATA_DIR=/data
 uvicorn app.main:app --host 127.0.0.1 --port 8000
 ```
 
+Preferred gated script flow:
+
+```bash
+export REGENGINE_REMOTE_BASE_URL=https://regengine-inflow-lab-production.up.railway.app
+export REGENGINE_REMOTE_USERNAME=demo
+export REGENGINE_REMOTE_PASSWORD='<shared-demo-password>'
+export REGENGINE_REMOTE_TENANT=live-trial
+export REGENGINE_LIVE_ENDPOINT=https://www.regengine.co/api/v1/webhooks/ingest
+export REGENGINE_LIVE_API_KEY='<approved-live-key>'
+export REGENGINE_LIVE_TENANT_ID='<approved-live-tenant-id>'
+
+# Mock dry-run only. This sends no live RegEngine traffic.
+python3 scripts/live_trial.py --dry-run-only
+
+# Live trial. This first performs the mock dry-run, then sends exactly one live batch.
+python3 scripts/live_trial.py --confirm-live
+```
+
+The script refuses to run without either `--dry-run-only` or `--confirm-live`. It never prints the Basic Auth password, live API key, or live tenant id. Stop after the first live result and review the posted/failed status before any further volume.
+
 Dry-run the exact scenario without live traffic:
 
 ```bash

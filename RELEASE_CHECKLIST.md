@@ -16,6 +16,7 @@ Use this checklist before tagging a demo-ready build or handing the simulator to
 - [ ] Each event still includes `cte_type`, `traceability_lot_code`, `product_description`, `quantity`, `unit_of_measure`, `location_name`, `timestamp`, and `kdes`.
 - [ ] Mock mode remains the default delivery mode.
 - [ ] Live delivery still requires `api_key` and `tenant_id`.
+- [ ] Live-trial tooling refuses live traffic without `--confirm-live` and mock mode remains the dry-run/default safety path.
 - [ ] New export or dashboard behavior is derived from stored records and does not mutate the ingest contract.
 
 ## Operator Flow Checks
@@ -34,6 +35,7 @@ Use this checklist before tagging a demo-ready build or handing the simulator to
 - [ ] Tenant-scoped requests keep separate event logs and scenario saves.
 - [ ] For shared-demo releases, `python3 scripts/remote_smoke.py` passes against the deployed HTTPS URL.
 - [ ] For shared-demo releases, the manual GitHub **Remote Smoke** workflow passes with repository secrets `REGENGINE_REMOTE_USERNAME` and `REGENGINE_REMOTE_PASSWORD`.
+- [ ] For live-trial prep, `python3 scripts/live_trial.py --dry-run-only` passes before any confirmed live batch.
 
 ## Handoff Notes
 

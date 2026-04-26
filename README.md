@@ -69,6 +69,7 @@ app/
 scripts/
   smoke_regression.py    # End-to-end API smoke for demo-ready release checks
   remote_smoke.py        # HTTP smoke harness for deployed shared-demo instances
+  live_trial.py          # Gated one-batch live-ingest trial runner
 tests/
 .dockerignore
 AGENTS.md                # Repository instructions for Codex-style agents
@@ -155,6 +156,8 @@ Sends real traffic to a RegEngine workspace. Configure from the dashboard or via
 - `api_key`
 - `tenant_id`
 - Optional `endpoint` override (defaults to `https://www.regengine.co/api/v1/webhooks/ingest`)
+
+For controlled live workspace validation, use `scripts/live_trial.py`. It refuses to send live traffic unless `--confirm-live` is supplied, always performs a mock dry-run first, and sends exactly one live batch before stopping.
 
 ### `none`
 Generates and persists events locally without delivering them anywhere. Useful for seeding fixtures.
