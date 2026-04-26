@@ -19,6 +19,8 @@ const state = {
   },
 };
 
+const DEFAULT_LIVE_INGEST_ENDPOINT = 'https://www.regengine.co/api/v1/webhooks/ingest';
+
 const ids = {
   source: document.getElementById('source'),
   scenario: document.getElementById('scenario'),
@@ -68,7 +70,7 @@ function setStatus(message, tone = 'neutral', holdMs = 0) {
 }
 
 function buildConfig() {
-  const endpoint = ids.endpoint.value.trim();
+  const endpoint = ids.endpoint.value.trim() || DEFAULT_LIVE_INGEST_ENDPOINT;
   const apiKey = ids.apiKey.value.trim();
   const tenantId = ids.tenantId.value.trim();
   const seedValue = ids.seed.value.trim();
@@ -84,6 +86,7 @@ function buildConfig() {
       endpoint: endpoint || null,
       api_key: apiKey || null,
       tenant_id: tenantId || null,
+      live_confirmed: ids.liveConfirmed.checked,
     },
   };
 }

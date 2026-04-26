@@ -118,7 +118,7 @@ class SimulationController:
             self.mock_service.reset()
         await self._publish_update()
 
-    async def step(self, batch_size: int | None = None) -> StepResponse:
+    async def step(self, batch_size: int | None = None, config: SimulationConfig | None = None) -> StepResponse:
         async with self._lock:
             _validate_live_delivery(self.config.delivery)
             size = batch_size or self.config.batch_size

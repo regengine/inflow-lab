@@ -226,6 +226,26 @@ input::placeholder {
   color: #8b989b;
 }
 
+.checkbox-row {
+  display: grid;
+  grid-template-columns: auto 1fr;
+  align-items: center;
+  grid-column: 1 / -1;
+  gap: 10px;
+}
+
+.checkbox-row input {
+  width: auto;
+}
+
+.live-confirmation {
+  border: 1px solid rgba(255, 107, 107, 0.38);
+  border-radius: 12px;
+  color: var(--text);
+  padding: 12px 14px;
+  background: rgba(255, 107, 107, 0.08);
+}
+
 .button {
   min-height: 42px;
   border: 1px solid transparent;
@@ -402,6 +422,12 @@ input::placeholder {
   display: grid;
   grid-template-columns: minmax(0, 1fr) auto;
   align-items: stretch;
+}
+
+.button:disabled {
+  cursor: not-allowed;
+  filter: grayscale(0.45);
+  opacity: 0.55;
 }
 
 .table-wrap {

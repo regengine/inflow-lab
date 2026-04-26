@@ -9,6 +9,22 @@ from typing import Any, Iterable
 from .models import LineageEdge, LineageNode, StoredEventRecord
 
 
+MASKED_SECRET = "***MASKED***"
+SECRET_FIELD_NAMES = {"api_key", "apikey", "x_regengine_api_key", "authorization"}
+
+
+def _scrub_secrets(value: Any) -> Any:
+    if isinstance(value, dict):
+        scrubbed: dict[str, Any] = {}
+        for key, item in value.items():
+            normalized_key = key.lower().replace("-", "_")
+            scrubbed[key] = MASKED_SECRET if normalized_key in SECRET_FIELD_NAMES else _scrub_secrets(item)
+        return scrubbed
+    if isinstance(value, list):
+        return [_scrub_secrets(item) for item in value]
+    return value
+
+
 class EventStore:
     def __init__(self, persist_path: str = "data/events.jsonl", max_records: int = 5000) -> None:
         self.persist_path = Path(persist_path)
@@ -66,7 +82,7 @@ class EventStore:
                     self._counter += 1
                     record.sequence_no = self._counter
                     self._records.appendleft(record)
-                    handle.write(json.dumps(record.model_dump(mode="json")) + "\n")
+                    handle.write(json.dumps(_scrub_secrets(record.model_dump(mode="json"))) + "\n")
                     stored.append(record)
         return stored
 

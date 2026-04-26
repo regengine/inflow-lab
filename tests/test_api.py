@@ -17,6 +17,9 @@ from app.scenarios import ScenarioId, get_scenario
 
 client = TestClient(app)
 
+SECRET = "regengine-live-secret"
+PUBLIC_ENDPOINT = "https://www.regengine.co/api/v1/webhooks/ingest"
+
 
 def basic_auth_header(username: str, password: str) -> dict[str, str]:
     token = base64.b64encode(f"{username}:{password}".encode("utf-8")).decode("ascii")
@@ -42,6 +45,8 @@ def test_single_step_generates_mock_events():
     payload = response.json()
     assert payload["generated"] == 3
     assert len(payload["lot_codes"]) == 3
+    assert payload["posted"] == 3
+    assert payload["failed"] == 0
 
     events_response = client.get("/api/events?limit=10")
     assert events_response.status_code == 200

@@ -65,6 +65,7 @@ class DeliveryConfig(BaseModel):
     endpoint: HttpUrl | None = None
     api_key: str | None = None
     tenant_id: str | None = None
+    live_confirmed: bool = False
 
 
 class SimulationConfig(BaseModel):
@@ -127,6 +128,10 @@ class MockIngestResponse(BaseModel):
 
 class StartRequest(BaseModel):
     config: SimulationConfig
+
+
+class StepRequest(BaseModel):
+    config: SimulationConfig | None = None
 
 
 class StatusResponse(BaseModel):
@@ -255,6 +260,8 @@ class DemoFixtureLoadResponse(BaseModel):
 class StepResponse(BaseModel):
     generated: int
     posted: int
+    accepted: int = 0
+    rejected: int = 0
     failed: int
     lot_codes: list[str]
     delivery_status: Literal["generated", "posted", "failed"]
