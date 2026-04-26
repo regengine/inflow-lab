@@ -44,7 +44,12 @@ from .models import (
     ReplayRequest,
     ReplayResponse,
     ResetResponse,
+    ScenarioLoadResponse,
     ScenarioListResponse,
+    ScenarioSaveListResponse,
+    ScenarioSaveRequest,
+    ScenarioSaveResponse,
+    ScenarioSaveSummary,
     ScenarioSummary,
     SimulationConfig,
     StartRequest,
@@ -52,16 +57,19 @@ from .models import (
     StepResponse,
 )
 from .regengine_client import LiveRegEngineClient
-from .scenarios import list_scenario_summaries
+from .scenario_saves import ScenarioSaveStore
+from .scenarios import ScenarioId, list_scenario_summaries
 from .store import EventStore
 
 
 engine = LegitFlowEngine(seed=204)
 store = EventStore(persist_path="data/events.jsonl")
+scenario_saves = ScenarioSaveStore()
 mock_service = MockRegEngineService()
 controller = SimulationController(
     engine=engine,
     store=store,
+    scenario_saves=scenario_saves,
     mock_service=mock_service,
     live_client=LiveRegEngineClient(),
 )
@@ -116,6 +124,32 @@ async def list_scenarios() -> ScenarioListResponse:
     return ScenarioListResponse(
         scenarios=[ScenarioSummary.model_validate(summary) for summary in list_scenario_summaries()]
     )
+
+
+@app.get("/api/scenario-saves", response_model=ScenarioSaveListResponse)
+async def list_saved_scenarios() -> ScenarioSaveListResponse:
+    return ScenarioSaveListResponse(
+        saves=[
+            ScenarioSaveSummary.model_validate(summary)
+            for summary in controller.list_scenario_saves().saves
+        ]
+    )
+
+
+@app.post("/api/scenario-saves/{scenario_id}", response_model=ScenarioSaveResponse)
+async def save_scenario(
+    scenario_id: ScenarioId,
+    request: ScenarioSaveRequest | None = None,
+) -> ScenarioSaveResponse:
+    return await controller.save_scenario(scenario_id, request)
+
+
+@app.post("/api/scenario-saves/{scenario_id}/load", response_model=ScenarioLoadResponse)
+async def load_saved_scenario(scenario_id: ScenarioId) -> ScenarioLoadResponse:
+    try:
+        return await controller.load_scenario_save(scenario_id)
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail="No saved scenario found") from exc
 
 
 @app.get("/api/demo-fixtures", response_model=DemoFixtureListResponse)

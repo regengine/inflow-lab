@@ -97,6 +97,19 @@ class EventStore:
 
         return [record for record in updated_records if record.record_id in replacements]
 
+    def replace_all(self, records: Iterable[StoredEventRecord]) -> list[StoredEventRecord]:
+        persisted_records = sorted(list(records), key=lambda record: record.sequence_no)
+        with self._lock:
+            self.persist_path.parent.mkdir(parents=True, exist_ok=True)
+            tmp_path = self.persist_path.with_suffix(f"{self.persist_path.suffix}.tmp")
+            with tmp_path.open("w", encoding="utf-8") as handle:
+                for record in persisted_records:
+                    handle.write(json.dumps(record.model_dump(mode="json")) + "\n")
+            tmp_path.replace(self.persist_path)
+            self._records = deque(reversed(persisted_records), maxlen=self.max_records)
+            self._counter = max((record.sequence_no for record in persisted_records), default=0)
+        return persisted_records
+
     def recent(self, limit: int = 100) -> list[StoredEventRecord]:
         with self._lock:
             return list(self._records)[:limit]

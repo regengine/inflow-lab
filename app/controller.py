@@ -21,11 +21,19 @@ from .models import (
     IngestPayload,
     ReplayRequest,
     ReplayResponse,
+    ScenarioLoadResponse,
+    ScenarioSaveListResponse,
+    ScenarioSaveRequest,
+    ScenarioSaveResponse,
+    ScenarioSaveSnapshot,
+    ScenarioSaveSummary,
     SimulationConfig,
     StepResponse,
     StoredEventRecord,
 )
 from .regengine_client import LiveRegEngineClient
+from .scenario_saves import ScenarioSaveStore
+from .scenarios import ScenarioId, get_scenario
 from .store import EventStore
 
 
@@ -46,11 +54,13 @@ class SimulationController:
         self,
         engine: LegitFlowEngine,
         store: EventStore,
+        scenario_saves: ScenarioSaveStore,
         mock_service: MockRegEngineService,
         live_client: LiveRegEngineClient,
     ) -> None:
         self.engine = engine
         self.store = store
+        self.scenario_saves = scenario_saves
         self.mock_service = mock_service
         self.live_client = live_client
         self.config = SimulationConfig()
@@ -345,6 +355,57 @@ class SimulationController:
         await self._publish_update()
         return result
 
+    def list_scenario_saves(self) -> ScenarioSaveListResponse:
+        return ScenarioSaveListResponse(
+            saves=[
+                self._scenario_save_summary(snapshot)
+                for snapshot in self.scenario_saves.list()
+            ]
+        )
+
+    async def save_scenario(
+        self,
+        scenario_id: ScenarioId,
+        request: ScenarioSaveRequest | None = None,
+    ) -> ScenarioSaveResponse:
+        request = request or ScenarioSaveRequest()
+        async with self._lock:
+            config = request.config or self.config
+            config = config.model_copy(update={"scenario": scenario_id}, deep=True)
+            config = self._sanitize_saved_config(config)
+            records = self.store.all_between()
+            snapshot = self.scenario_saves.save_snapshot(
+                scenario=scenario_id,
+                config=config,
+                records=records,
+            )
+            result = ScenarioSaveResponse(
+                status="saved",
+                save=self._scenario_save_summary(snapshot),
+                config=snapshot.config,
+            )
+        return result
+
+    async def load_scenario_save(self, scenario_id: ScenarioId) -> ScenarioLoadResponse:
+        await self.stop()
+        snapshot = self.scenario_saves.get(scenario_id)
+        if snapshot is None:
+            raise KeyError(scenario_id.value)
+
+        async with self._lock:
+            self.config = snapshot.config
+            self.store.configure(self.config.persist_path)
+            loaded_records = self.store.replace_all(snapshot.records)
+            self.engine.reset(self.config.seed, scenario=self.config.scenario)
+            result = ScenarioLoadResponse(
+                status="loaded",
+                save=self._scenario_save_summary(snapshot),
+                config=self.config,
+                loaded_records=len(loaded_records),
+            )
+        await self._publish_update()
+        return result
+
     async def retry_failed_delivery(
         self,
         request: DeliveryRetryRequest | None = None,
@@ -537,3 +598,35 @@ class SimulationController:
                 "engine": self.engine.snapshot(),
             },
         }
+
+    def _sanitize_saved_config(self, config: SimulationConfig) -> SimulationConfig:
+        delivery = config.delivery.model_copy(update={"api_key": None}, deep=True)
+        if delivery.mode == DestinationMode.LIVE:
+            delivery = delivery.model_copy(
+                update={
+                    "mode": DestinationMode.MOCK,
+                    "endpoint": None,
+                    "tenant_id": None,
+                    "api_key": None,
+                },
+                deep=True,
+            )
+        return config.model_copy(update={"delivery": delivery}, deep=True)
+
+    def _scenario_save_summary(self, snapshot: ScenarioSaveSnapshot) -> ScenarioSaveSummary:
+        lot_codes = []
+        for record in sorted(snapshot.records, key=lambda item: item.sequence_no):
+            lot_code = record.event.traceability_lot_code
+            if lot_code not in lot_codes:
+                lot_codes.append(lot_code)
+        scenario = get_scenario(snapshot.scenario)
+        return ScenarioSaveSummary(
+            scenario=snapshot.scenario,
+            label=scenario.label,
+            saved_at=snapshot.saved_at,
+            record_count=len(snapshot.records),
+            lot_codes=lot_codes,
+            source=snapshot.config.source,
+            persist_path=snapshot.config.persist_path,
+            delivery_mode=snapshot.config.delivery.mode,
+        )

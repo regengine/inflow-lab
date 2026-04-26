@@ -51,6 +51,7 @@ app/
   mock_service.py        # Built-in mock RegEngine ingest endpoint
   models.py              # Pydantic models for config, events, payloads
   regengine_client.py    # HTTP client for live RegEngine delivery
+  scenario_saves.py      # Per-scenario saved config and event-log snapshots
   scenarios.py           # Named scenario presets for product/location/flow mixes
   store.py               # Event persistence (JSONL)
   static/                # Dashboard (vanilla JS, HTML, CSS)
@@ -87,7 +88,7 @@ Then open:
 http://127.0.0.1:8000
 ```
 
-The dashboard lets you choose a scenario preset, load deterministic demo fixtures, start/stop/step/reset the simulator, replay the current persisted event log, import CSV seed lots or scheduled events, inspect recent events, trace lot lineage, and export mock FDA request CSV presets. API users can also derive scaffolded EPCIS 2.0 JSON-LD exports from the same stored records. It subscribes to live status/event snapshots with Server-Sent Events and falls back to refresh polling if the stream disconnects. Delivery mode defaults to **`mock`** so no credentials are required.
+The dashboard lets you choose a scenario preset, save/load per-scenario demo states, load deterministic demo fixtures, start/stop/step/reset the simulator, replay the current persisted event log, import CSV seed lots or scheduled events, inspect recent events, trace lot lineage, and export mock FDA request CSV presets. API users can also derive scaffolded EPCIS 2.0 JSON-LD exports from the same stored records. It subscribes to live status/event snapshots with Server-Sent Events and falls back to refresh polling if the stream disconnects. Delivery mode defaults to **`mock`** so no credentials are required.
 
 Event records are stored as JSONL at `config.persist_path` (`data/events.jsonl` by default). Existing records at that path are loaded when the app starts or when a start/reset request points at a different path; reset clears the currently configured event log. Replay reads the JSONL log without appending, duplicating, or rewriting stored events.
 
@@ -191,6 +192,8 @@ Use `config.scenario` to pick a deterministic product/location/flow mix without 
 
 Scenario selection is available in the dashboard, in `SimulationConfig`, and via `GET /api/scenarios`. The default is `leafy_greens_supplier`, and delivery still defaults to **`mock`**.
 
+Per-scenario save/load stores one saved slot per scenario under `data/scenario_saves/`. A saved scenario includes the sanitized simulator config and the current stored event records, so operators can restore repeatable demo states after switching scenarios. Live API keys are never saved; live delivery settings are restored as mock delivery to preserve mock-first safety.
+
 ## Demo fixtures
 
 Use `GET /api/demo-fixtures` to list deterministic demo playback fixtures. Each fixture contains fixed RegEngine-shaped events with stable timestamps, lot codes, reference documents, and parent-lot lineage. `POST /api/demo-fixtures/{fixture_id}/load` loads a fixture into the event store and optionally delivers it through `mock`, `live`, or `none` delivery.
@@ -234,6 +237,9 @@ The export returns an `EPCISDocument` with `ObjectEvent` records for harvesting,
 |---|---|---|
 | `GET` | `/api/health` | Liveness probe + current config snapshot |
 | `GET` | `/api/scenarios` | List available scenario presets |
+| `GET` | `/api/scenario-saves` | List saved per-scenario demo states |
+| `POST` | `/api/scenario-saves/{scenario_id}` | Save the current or supplied config and event log for a scenario |
+| `POST` | `/api/scenario-saves/{scenario_id}/load` | Restore a saved scenario config and event log |
 | `GET` | `/api/demo-fixtures` | List deterministic demo playback fixtures |
 | `POST` | `/api/demo-fixtures/{fixture_id}/load` | Load a deterministic fixture into the event store |
 | `GET` | `/api/simulate/status` | Running state, config, and aggregate stats |
@@ -317,6 +323,13 @@ curl -X POST http://127.0.0.1:8000/api/demo-fixtures/fresh_cut_transformation/lo
       "mode": "mock"
     }
   }'
+```
+
+### Example: save and reload a scenario state
+
+```bash
+curl -X POST http://127.0.0.1:8000/api/scenario-saves/fresh_cut_processor
+curl -X POST http://127.0.0.1:8000/api/scenario-saves/fresh_cut_processor/load
 ```
 
 ### Example: replay the current persisted log

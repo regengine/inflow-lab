@@ -12,6 +12,7 @@ const state = {
   demoFixtureDescriptions: {
     leafy_greens_trace: 'Harvest through cooling, packout, shipment, and DC receipt for one leafy greens lot.',
   },
+  scenarioSaves: [],
   exportPresetDescriptions: {
     all_records: 'Full FDA-request export for the selected date range.',
   },
@@ -30,6 +31,10 @@ const ids = {
   csvImportType: document.getElementById('csvImportType'),
   csvFile: document.getElementById('csvFile'),
   importResults: document.getElementById('importResults'),
+  scenarioSave: document.getElementById('scenarioSave'),
+  scenarioSaveDescription: document.getElementById('scenarioSaveDescription'),
+  saveScenarioBtn: document.getElementById('saveScenarioBtn'),
+  loadScenarioBtn: document.getElementById('loadScenarioBtn'),
   demoFixture: document.getElementById('demoFixture'),
   demoFixtureDescription: document.getElementById('demoFixtureDescription'),
   loadFixtureBtn: document.getElementById('loadFixtureBtn'),
@@ -111,6 +116,61 @@ function renderScenarioOptions(scenarios) {
 async function loadScenarios() {
   const payload = await api('/api/scenarios');
   renderScenarioOptions(payload.scenarios || []);
+}
+
+function applyConfigToForm(config) {
+  if (!config) {
+    return;
+  }
+  ids.source.value = config.source || 'codex-simulator';
+  ids.scenario.value = config.scenario || 'leafy_greens_supplier';
+  ids.interval.value = config.interval_seconds ?? 1.5;
+  ids.batchSize.value = config.batch_size ?? 3;
+  ids.seed.value = config.seed ?? '';
+  ids.deliveryMode.value = config.delivery?.mode || 'mock';
+  ids.endpoint.value = config.delivery?.endpoint || '';
+  ids.apiKey.value = '';
+  ids.tenantId.value = config.delivery?.tenant_id || '';
+}
+
+function renderScenarioSaveOptions(saves) {
+  const selected = ids.scenarioSave.value;
+  state.scenarioSaves = saves || [];
+  if (!state.scenarioSaves.length) {
+    ids.scenarioSave.innerHTML = '<option value="">No saved scenarios</option>';
+    ids.scenarioSave.value = '';
+    ids.loadScenarioBtn.disabled = true;
+    updateScenarioSaveDescription();
+    return;
+  }
+  ids.scenarioSave.innerHTML = state.scenarioSaves
+    .map(
+      (save) => `
+        <option value="${escapeHtml(save.scenario)}">${escapeHtml(save.label)}</option>
+      `,
+    )
+    .join('');
+  ids.scenarioSave.value = state.scenarioSaves.some((save) => save.scenario === selected)
+    ? selected
+    : state.scenarioSaves[0].scenario;
+  ids.loadScenarioBtn.disabled = false;
+  updateScenarioSaveDescription();
+}
+
+async function loadScenarioSaves() {
+  const payload = await api('/api/scenario-saves');
+  renderScenarioSaveOptions(payload.saves || []);
+}
+
+function updateScenarioSaveDescription() {
+  const selected = ids.scenarioSave.value;
+  const save = state.scenarioSaves.find((item) => item.scenario === selected);
+  if (!save) {
+    ids.scenarioSaveDescription.textContent = 'Save the current scenario controls and event log for later demos.';
+    return;
+  }
+  const savedAt = new Date(save.saved_at).toLocaleString();
+  ids.scenarioSaveDescription.textContent = `${save.label}: ${save.record_count} event(s), ${save.lot_codes.length} lot(s), saved ${savedAt}.`;
 }
 
 function renderDemoFixtureOptions(fixtures) {
@@ -606,6 +666,45 @@ async function retryFailedDeliveries() {
   }
 }
 
+async function saveCurrentScenario() {
+  try {
+    const config = buildConfig();
+    const result = await api(`/api/scenario-saves/${encodeURIComponent(config.scenario)}`, {
+      method: 'POST',
+      body: JSON.stringify({ config }),
+    });
+    await loadScenarioSaves();
+    ids.scenarioSave.value = result.save.scenario;
+    updateScenarioSaveDescription();
+    setStatus(`Saved ${result.save.label} with ${result.save.record_count} event(s).`, 'success', 3500);
+  } catch (error) {
+    setStatus(error.message, 'error', 5000);
+  }
+}
+
+async function loadSavedScenario() {
+  const scenarioId = ids.scenarioSave.value;
+  if (!scenarioId) {
+    setStatus('Save a scenario first.', 'error', 5000);
+    return;
+  }
+  try {
+    const result = await api(`/api/scenario-saves/${encodeURIComponent(scenarioId)}/load`, {
+      method: 'POST',
+    });
+    applyConfigToForm(result.config);
+    ids.lineageResults.innerHTML = '';
+    ids.importResults.innerHTML = '';
+    await refresh();
+    await loadScenarioSaves();
+    ids.scenarioSave.value = result.save.scenario;
+    updateScenarioSaveDescription();
+    setStatus(`Loaded ${result.save.label} with ${result.loaded_records} saved event(s).`, 'success', 3500);
+  } catch (error) {
+    setStatus(error.message, 'error', 5000);
+  }
+}
+
 async function loadSelectedDemoFixture() {
   try {
     const config = buildConfig();
@@ -719,10 +818,13 @@ document.getElementById('stepBtn').addEventListener('click', stepOnce);
 document.getElementById('replayBtn').addEventListener('click', replayCurrentLog);
 document.getElementById('importCsvBtn').addEventListener('click', importCsv);
 document.getElementById('retryFailedBtn').addEventListener('click', retryFailedDeliveries);
+document.getElementById('saveScenarioBtn').addEventListener('click', saveCurrentScenario);
+document.getElementById('loadScenarioBtn').addEventListener('click', loadSavedScenario);
 document.getElementById('loadFixtureBtn').addEventListener('click', loadSelectedDemoFixture);
 document.getElementById('resetBtn').addEventListener('click', resetState);
 document.getElementById('refreshBtn').addEventListener('click', refresh);
 document.getElementById('lineageBtn').addEventListener('click', lookupLineage);
+ids.scenarioSave.addEventListener('change', updateScenarioSaveDescription);
 ids.demoFixture.addEventListener('change', updateDemoFixtureDescription);
 ids.exportPreset.addEventListener('change', updateExportLink);
 ids.exportLot.addEventListener('input', updateExportLink);
@@ -730,6 +832,9 @@ ids.exportStartDate.addEventListener('change', updateExportLink);
 ids.exportEndDate.addEventListener('change', updateExportLink);
 
 loadScenarios().catch((error) => {
+  setStatus(error.message, 'error', 5000);
+});
+loadScenarioSaves().catch((error) => {
   setStatus(error.message, 'error', 5000);
 });
 loadDemoFixtures().catch((error) => {
