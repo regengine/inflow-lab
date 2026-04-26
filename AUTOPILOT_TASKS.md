@@ -30,6 +30,13 @@ This file is the standing backlog for unattended Codex runs.
 - [x] Add per-scenario save/load support.
 - [x] Add basic auth and tenant-scoped storage boundaries.
 
+## Priority 4
+
+- [x] Add release smoke regression harness and checklist.
+- [ ] Add tenant/auth status and EPCIS export controls to the dashboard.
+- [ ] Add a design-partner demo script with expected talking points and reset steps.
+- [ ] Add deployment profile examples for local, shared demo, and live-ingest modes.
+
 ## Progress notes
 
 - Start with the smallest safe change that materially improves demo readiness.

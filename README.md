@@ -8,6 +8,7 @@ A mock-first FSMA 204 traceability simulator that emits **RegEngine-compatible i
 - [Project layout](#project-layout)
 - [Quick start (local dev)](#quick-start-local-dev)
 - [Running tests](#running-tests)
+- [Release smoke regression](#release-smoke-regression)
 - [Delivery modes](#delivery-modes)
 - [Basic auth and tenant storage](#basic-auth-and-tenant-storage)
 - [Replay mode](#replay-mode)
@@ -62,10 +63,13 @@ app/
   codex/prompts/autobuild.md
   workflows/ci.yml
   workflows/codex-autopilot.yml
+scripts/
+  smoke_regression.py    # End-to-end API smoke for demo-ready release checks
 tests/
 AGENTS.md                # Repository instructions for Codex-style agents
 AUTOPILOT_TASKS.md       # Standing backlog for unattended runs
 PROMPT_FOR_CODEX.md      # Paste-ready Codex task prompt
+RELEASE_CHECKLIST.md     # Demo-ready release gate
 pyproject.toml
 requirements.txt
 ```
@@ -101,6 +105,18 @@ pytest
 ```
 
 The suite covers payload shape, engine determinism, and the HTTP API contract.
+
+## Release smoke regression
+
+Run the release smoke harness before tagging or handing the simulator to a design partner:
+
+```bash
+python3 scripts/smoke_regression.py
+```
+
+The smoke harness uses FastAPI's in-process `TestClient` to exercise the operator-critical path: tenant-scoped fixture load, lineage lookup, FDA export, EPCIS export, scenario save/load, replay, and tenant isolation. If Basic Auth env vars are set, it sends matching Basic credentials automatically. Temporary smoke tenants are cleaned up after the run.
+
+Use `RELEASE_CHECKLIST.md` as the full demo-ready gate.
 
 ## Delivery modes
 
