@@ -129,7 +129,9 @@ python3 -m playwright install chromium
 python3 scripts/browser_smoke.py
 ```
 
-The smoke starts a temporary local server with mock delivery, drives Chromium through the dashboard start/stop, reset, single-batch, fixture load, transformed-lot lineage lookup, and CSV warning display flows, then exits nonzero with a clear failure message if a browser assertion fails. Set `REGENGINE_BROWSER_BASE_URL` to run against an already-started local instance instead of letting the script start one.
+The smoke starts a temporary local server with mock delivery, drives Chromium through the dashboard start/stop, reset, single-batch, fixture load, transformed-lot lineage lookup, and CSV warning display flows, then exits nonzero with a clear failure message if a browser assertion fails. It forces the dashboard delivery mode to `mock` before taking any action.
+
+Set `REGENGINE_BROWSER_BASE_URL` to run against an already-started local or remote instance instead of letting the script start one. For Basic Auth deployments, set `REGENGINE_BROWSER_USERNAME` and `REGENGINE_BROWSER_PASSWORD`; set `REGENGINE_BROWSER_TENANT` to send `X-RegEngine-Tenant` for an isolated smoke tenant. The script also accepts the equivalent `REGENGINE_REMOTE_*` variables used by `scripts/remote_smoke.py`.
 
 ## Release smoke regression
 
@@ -153,7 +155,7 @@ python3 scripts/remote_smoke.py
 
 `scripts/remote_smoke.py` uses `httpx` with normal TLS verification to check `/api/healthz`, Basic Auth enforcement, credentialed CORS allow/block behavior, mock fixture loading, transformed-lot lineage, FDA CSV export, and EPCIS JSON-LD export. The tenant defaults to `remote-smoke`, fixture delivery stays in `mock` mode, and failure messages redact configured passwords and credential-like environment values.
 
-GitHub also has a manual **Remote Smoke** workflow for deployed demo validation. Configure repository secrets `REGENGINE_REMOTE_USERNAME` and `REGENGINE_REMOTE_PASSWORD`, then run `.github/workflows/remote-smoke.yml` with optional `base_url` and `tenant` inputs.
+GitHub also has manual **Remote Smoke** and **Remote Browser Smoke** workflows for deployed demo validation. Configure repository secrets `REGENGINE_REMOTE_USERNAME` and `REGENGINE_REMOTE_PASSWORD`, then run `.github/workflows/remote-smoke.yml` for API/export checks or `.github/workflows/remote-browser-smoke.yml` for authenticated dashboard checks with optional `base_url` and `tenant` inputs.
 
 Use `RELEASE_CHECKLIST.md` as the full demo-ready gate. Use `DESIGN_PARTNER_DEMO_SCRIPT.md` for the call flow, expected talking points, fixture reset commands, and recovery steps.
 

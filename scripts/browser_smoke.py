@@ -23,17 +23,34 @@ harvesting,TLC-BROWSER-WARN,Romaine Lettuce,10,cases,Valley Fresh Farms,2026-02-
 class BrowserSmokeConfig:
     base_url: str | None
     headless: bool
+    username: str | None
+    password: str | None
+    tenant: str | None
 
 
 def main() -> int:
-    config = BrowserSmokeConfig(
-        base_url=_env_text("REGENGINE_BROWSER_BASE_URL"),
-        headless=os.getenv("REGENGINE_BROWSER_HEADLESS", "1").lower() not in {"0", "false", "no"},
-    )
+    config = _load_config()
     with _base_url(config.base_url) as base_url:
-        _run_dashboard_smoke(base_url=base_url, headless=config.headless)
+        _run_dashboard_smoke(base_url=base_url, config=config)
     print("Browser smoke passed.")
     return 0
+
+
+def _load_config() -> BrowserSmokeConfig:
+    username = _env_text("REGENGINE_BROWSER_USERNAME") or _env_text("REGENGINE_REMOTE_USERNAME")
+    password = _env_text("REGENGINE_BROWSER_PASSWORD") or _env_text("REGENGINE_REMOTE_PASSWORD")
+    if bool(username) != bool(password):
+        raise RuntimeError(
+            "REGENGINE_BROWSER_USERNAME and REGENGINE_BROWSER_PASSWORD must be provided together"
+        )
+
+    return BrowserSmokeConfig(
+        base_url=_env_text("REGENGINE_BROWSER_BASE_URL") or _env_text("REGENGINE_REMOTE_BASE_URL"),
+        headless=os.getenv("REGENGINE_BROWSER_HEADLESS", "1").lower() not in {"0", "false", "no"},
+        username=username,
+        password=password,
+        tenant=_env_text("REGENGINE_BROWSER_TENANT") or _env_text("REGENGINE_REMOTE_TENANT"),
+    )
 
 
 @contextmanager
@@ -76,7 +93,7 @@ def _base_url(configured_base_url: str | None) -> Iterator[str]:
             _terminate(process)
 
 
-def _run_dashboard_smoke(base_url: str, headless: bool) -> None:
+def _run_dashboard_smoke(base_url: str, config: BrowserSmokeConfig) -> None:
     try:
         from playwright.sync_api import expect, sync_playwright
     except ModuleNotFoundError as exc:
@@ -91,17 +108,24 @@ def _run_dashboard_smoke(base_url: str, headless: bool) -> None:
     failed = False
     try:
         with sync_playwright() as playwright:
-            browser = playwright.chromium.launch(headless=headless)
-            page = browser.new_page()
+            browser = playwright.chromium.launch(headless=config.headless)
+            context_options = _browser_context_options(config)
+            context = browser.new_context(**context_options)
+            page = context.new_page()
             page.on("console", lambda message: console_errors.append(message.text) if message.type == "error" else None)
             page.on("pageerror", lambda error: console_errors.append(str(error)))
 
             page.goto(base_url, wait_until="domcontentloaded")
             expect(page.get_by_role("heading", name="RegEngine Inflow Lab")).to_be_visible()
-            expect(page.locator("#statusMessage")).to_contain_text("Simulator loop is stopped")
 
             page.locator("#batchSize").fill("1")
             page.locator("#interval").fill("0.1")
+            page.locator("#deliveryMode").select_option("mock")
+            page.locator("#endpoint").fill("")
+            page.locator("#apiKey").fill("")
+            page.locator("#tenantId").fill("")
+            page.locator("#stopBtn").click()
+            expect(page.locator("#statusMessage")).to_contain_text("Stopped simulator loop")
 
             page.locator("#startBtn").click()
             expect(page.locator("#statusMessage")).to_contain_text("Started simulator loop")
@@ -149,6 +173,18 @@ def _run_dashboard_smoke(base_url: str, headless: bool) -> None:
     finally:
         if console_errors and not failed:
             raise RuntimeError(f"Browser console errors: {console_errors}")
+
+
+def _browser_context_options(config: BrowserSmokeConfig) -> dict[str, object]:
+    options: dict[str, object] = {}
+    if config.username and config.password:
+        options["http_credentials"] = {
+            "username": config.username,
+            "password": config.password,
+        }
+    if config.tenant:
+        options["extra_http_headers"] = {"X-RegEngine-Tenant": config.tenant}
+    return options
 
 
 def _wait_for_healthz(base_url: str, process: subprocess.Popen[str]) -> None:

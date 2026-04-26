@@ -1,0 +1,63 @@
+name: Remote Browser Smoke
+
+on:
+  workflow_dispatch:
+    inputs:
+      base_url:
+        description: Deployed shared-demo base URL
+        required: false
+        type: string
+        default: https://regengine-inflow-lab-production.up.railway.app
+      tenant:
+        description: Tenant used for isolated remote browser smoke data
+        required: false
+        type: string
+        default: remote-browser-smoke
+
+permissions:
+  contents: read
+
+concurrency:
+  group: remote-browser-smoke-${{ github.event.inputs.base_url }}-${{ github.event.inputs.tenant }}
+  cancel-in-progress: false
+
+jobs:
+  remote-browser-smoke:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v6
+
+      - name: Set up Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: '3.11'
+          cache: pip
+          cache-dependency-path: |
+            requirements.txt
+            requirements-browser.txt
+            pyproject.toml
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements-browser.txt
+          python -m playwright install --with-deps chromium
+
+      - name: Validate remote browser smoke secrets
+        env:
+          REGENGINE_REMOTE_USERNAME: ${{ secrets.REGENGINE_REMOTE_USERNAME }}
+          REGENGINE_REMOTE_PASSWORD: ${{ secrets.REGENGINE_REMOTE_PASSWORD }}
+        run: |
+          test -n "$REGENGINE_REMOTE_USERNAME" || { echo "REGENGINE_REMOTE_USERNAME secret is required"; exit 1; }
+          test -n "$REGENGINE_REMOTE_PASSWORD" || { echo "REGENGINE_REMOTE_PASSWORD secret is required"; exit 1; }
+
+      - name: Run remote browser smoke
+        env:
+          REGENGINE_BROWSER_BASE_URL: ${{ inputs.base_url }}
+          REGENGINE_BROWSER_USERNAME: ${{ secrets.REGENGINE_REMOTE_USERNAME }}
+          REGENGINE_BROWSER_PASSWORD: ${{ secrets.REGENGINE_REMOTE_PASSWORD }}
+          REGENGINE_BROWSER_TENANT: ${{ inputs.tenant }}
+        run: python3 scripts/browser_smoke.py

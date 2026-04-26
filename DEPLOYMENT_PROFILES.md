@@ -243,21 +243,33 @@ python3 scripts/remote_smoke.py
 
 The harness keeps delivery in `mock` mode, uses the dedicated smoke tenant by default, and verifies health, Basic Auth, CORS, fixture load, lineage, FDA CSV, and EPCIS JSON-LD without printing the password.
 
-You can run the same check from GitHub Actions with the manual **Remote Smoke** workflow. Configure these repository secrets first:
+Validate the deployed browser dashboard through the same shared-demo auth path:
+
+```bash
+export REGENGINE_BROWSER_BASE_URL=https://regengine-inflow-lab-production.up.railway.app
+export REGENGINE_BROWSER_USERNAME=demo
+export REGENGINE_BROWSER_PASSWORD='<shared-demo-password>'
+export REGENGINE_BROWSER_TENANT=remote-browser-smoke
+python3 scripts/browser_smoke.py
+```
+
+The browser smoke forces dashboard delivery back to `mock`, uses the dedicated browser-smoke tenant, and verifies the real dashboard start/stop, reset, single-batch, fixture, lineage, and CSV warning flows without printing the password.
+
+You can run the same checks from GitHub Actions with the manual **Remote Smoke** and **Remote Browser Smoke** workflows. Configure these repository secrets first:
 
 ```text
 REGENGINE_REMOTE_USERNAME=demo
 REGENGINE_REMOTE_PASSWORD=<shared-demo-password>
 ```
 
-Then run `.github/workflows/remote-smoke.yml` from the Actions tab. The workflow inputs are:
+Then run `.github/workflows/remote-smoke.yml` or `.github/workflows/remote-browser-smoke.yml` from the Actions tab. The workflow inputs are:
 
 | Input | Default | Purpose |
 |---|---|---|
 | `base_url` | `https://regengine-inflow-lab-production.up.railway.app` | Deployed shared-demo URL to validate |
-| `tenant` | `remote-smoke` | Tenant used for isolated smoke data |
+| `tenant` | `remote-smoke` or `remote-browser-smoke` | Tenant used for isolated smoke data |
 
-The workflow installs the repo dependencies and runs `python3 scripts/remote_smoke.py`. It does not require live RegEngine credentials and still loads the fixture with `delivery.mode=mock`.
+The workflows install repo dependencies and run `python3 scripts/remote_smoke.py` or `python3 scripts/browser_smoke.py`. They do not require live RegEngine credentials and keep delivery in `mock` mode.
 
 Railway log triage:
 
@@ -287,6 +299,7 @@ Use these patterns when diagnosing a shared demo:
 - `POST /api/demo-fixtures/fresh_cut_transformation/load` succeeds in `mock` mode.
 - `python3 scripts/remote_smoke.py` passes for the deployed shared-demo URL.
 - The manual GitHub **Remote Smoke** workflow passes with the same shared-demo URL and smoke tenant.
+- The manual GitHub **Remote Browser Smoke** workflow passes with the same shared-demo URL and browser-smoke tenant.
 - Lineage for `TLC-DEMO-FC-OUT-001` includes upstream harvest and packed lots.
 - FDA CSV and EPCIS exports are derivable from stored records.
 - No generated `data/` files or secrets are staged before committing.

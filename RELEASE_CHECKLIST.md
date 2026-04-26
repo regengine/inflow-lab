@@ -38,6 +38,7 @@ Use this checklist before tagging a demo-ready build or handing the simulator to
 - [ ] Protected tenant operations can list, reset, and delete a test tenant when Basic Auth is enabled.
 - [ ] For shared-demo releases, `python3 scripts/remote_smoke.py` passes against the deployed HTTPS URL.
 - [ ] For shared-demo releases, the manual GitHub **Remote Smoke** workflow passes with repository secrets `REGENGINE_REMOTE_USERNAME` and `REGENGINE_REMOTE_PASSWORD`.
+- [ ] For shared-demo releases, the manual GitHub **Remote Browser Smoke** workflow passes with repository secrets `REGENGINE_REMOTE_USERNAME` and `REGENGINE_REMOTE_PASSWORD`.
 - [ ] For live-trial prep, `python3 scripts/live_trial.py --dry-run-only` passes before any confirmed live batch.
 
 ## Handoff Notes
