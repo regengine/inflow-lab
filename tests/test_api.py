@@ -45,8 +45,8 @@ def test_single_step_generates_mock_events():
     payload = response.json()
     assert payload["generated"] == 3
     assert len(payload["lot_codes"]) == 3
-    assert payload["accepted"] == 3
-    assert payload["rejected"] == 0
+    assert payload["posted"] == 3
+    assert payload["failed"] == 0
 
     events_response = client.get("/api/events?limit=10")
     assert events_response.status_code == 200
