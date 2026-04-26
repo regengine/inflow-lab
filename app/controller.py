@@ -6,11 +6,15 @@ from datetime import UTC, datetime
 from typing import Any
 
 from .csv_importer import parse_csv_import
+from .demo_fixtures import get_demo_fixture
 from .engine import LegitFlowEngine
 from .mock_service import MockRegEngineService
 from .models import (
     CSVImportRequest,
     CSVImportResponse,
+    DemoFixtureId,
+    DemoFixtureLoadRequest,
+    DemoFixtureLoadResponse,
     DeliveryRetryRequest,
     DeliveryRetryResponse,
     DestinationMode,
@@ -267,6 +271,74 @@ class SimulationController:
                 delivery_attempts=outcome.delivery_attempts,
                 lot_codes=[event.traceability_lot_code for event in parsed.events],
                 errors=parsed.errors,
+                response=outcome.response,
+                error=outcome.error_message,
+            )
+        await self._publish_update()
+        return result
+
+    async def load_demo_fixture(
+        self,
+        fixture_id: DemoFixtureId,
+        request: DemoFixtureLoadRequest | None = None,
+    ) -> DemoFixtureLoadResponse:
+        request = request or DemoFixtureLoadRequest()
+        fixture = get_demo_fixture(fixture_id)
+        await self.stop()
+
+        async with self._lock:
+            source = request.source or self.config.source
+            delivery = request.delivery or self.config.delivery
+            self.config = self.config.model_copy(
+                update={
+                    "source": source,
+                    "scenario": fixture.scenario,
+                    "delivery": delivery,
+                },
+                deep=True,
+            )
+            self.store.configure(self.config.persist_path)
+            self.engine.reset(self.config.seed, scenario=fixture.scenario)
+            if request.reset:
+                self.store.reset()
+                self.mock_service.reset()
+
+            events = [fixture_event.event for fixture_event in fixture.events]
+            payload = IngestPayload(source=source, events=events)
+            outcome = await self._deliver_payload(payload, self.config)
+            response_events = (outcome.response or {}).get("events", []) if outcome.response else []
+            stored_records = []
+            for index, fixture_event in enumerate(fixture.events):
+                event_response = response_events[index] if index < len(response_events) else None
+                stored_records.append(
+                    StoredEventRecord(
+                        payload_source=source,
+                        event=fixture_event.event,
+                        parent_lot_codes=list(fixture_event.parent_lot_codes),
+                        destination_mode=delivery.mode,
+                        delivery_status=outcome.delivery_status,
+                        delivery_attempts=outcome.delivery_attempts,
+                        last_delivery_attempt_at=outcome.attempted_at,
+                        last_delivery_success_at=outcome.completed_at
+                        if outcome.delivery_status == "posted"
+                        else None,
+                        delivery_response=event_response,
+                        error=outcome.error_message,
+                    )
+                )
+            self.store.add_many(stored_records)
+            result = DemoFixtureLoadResponse(
+                status="delivery_failed" if outcome.delivery_status == "failed" else "loaded",
+                fixture_id=fixture.id,
+                scenario=fixture.scenario,
+                loaded=len(events),
+                stored=len(stored_records),
+                posted=outcome.posted,
+                failed=outcome.failed,
+                source=source,
+                delivery_mode=delivery.mode,
+                delivery_attempts=outcome.delivery_attempts,
+                lot_codes=fixture.lot_codes,
                 response=outcome.response,
                 error=outcome.error_message,
             )

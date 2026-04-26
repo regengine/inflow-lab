@@ -22,7 +22,7 @@ This file is the standing backlog for unattended Codex runs.
 - [x] Add clearer lot-lineage views in the dashboard for transformed lots.
 - [x] Add richer operator-visible delivery status and retry feedback.
 - [x] Add export presets that mimic common FDA-request slices.
-- [ ] Add deterministic scenario fixtures for demo playback.
+- [x] Add deterministic scenario fixtures for demo playback.
 
 ## Priority 3
 

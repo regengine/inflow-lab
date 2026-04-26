@@ -13,6 +13,7 @@ from fastapi.responses import FileResponse, JSONResponse, PlainTextResponse, Str
 from fastapi.staticfiles import StaticFiles
 
 from .controller import SimulationController
+from .demo_fixtures import list_demo_fixture_summaries
 from .engine import LegitFlowEngine
 from .fda_export import (
     FDA_EXPORT_PRESETS,
@@ -25,6 +26,11 @@ from .mock_service import MockRegEngineService
 from .models import (
     CSVImportRequest,
     CSVImportResponse,
+    DemoFixtureId,
+    DemoFixtureListResponse,
+    DemoFixtureLoadRequest,
+    DemoFixtureLoadResponse,
+    DemoFixtureSummary,
     DeliveryRetryRequest,
     DeliveryRetryResponse,
     EventListResponse,
@@ -109,6 +115,24 @@ async def list_scenarios() -> ScenarioListResponse:
     return ScenarioListResponse(
         scenarios=[ScenarioSummary.model_validate(summary) for summary in list_scenario_summaries()]
     )
+
+
+@app.get("/api/demo-fixtures", response_model=DemoFixtureListResponse)
+async def list_demo_fixtures() -> DemoFixtureListResponse:
+    return DemoFixtureListResponse(
+        fixtures=[
+            DemoFixtureSummary.model_validate(summary)
+            for summary in list_demo_fixture_summaries()
+        ]
+    )
+
+
+@app.post("/api/demo-fixtures/{fixture_id}/load", response_model=DemoFixtureLoadResponse)
+async def load_demo_fixture(
+    fixture_id: DemoFixtureId,
+    request: DemoFixtureLoadRequest | None = None,
+) -> DemoFixtureLoadResponse:
+    return await controller.load_demo_fixture(fixture_id, request)
 
 
 def sse_message(event_name: str, payload: dict[str, Any]) -> str:

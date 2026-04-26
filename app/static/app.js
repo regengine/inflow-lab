@@ -9,6 +9,9 @@ const state = {
     fresh_cut_processor: 'Fresh-cut processor',
     retailer_readiness_demo: 'Retailer readiness demo',
   },
+  demoFixtureDescriptions: {
+    leafy_greens_trace: 'Harvest through cooling, packout, shipment, and DC receipt for one leafy greens lot.',
+  },
   exportPresetDescriptions: {
     all_records: 'Full FDA-request export for the selected date range.',
   },
@@ -27,6 +30,9 @@ const ids = {
   csvImportType: document.getElementById('csvImportType'),
   csvFile: document.getElementById('csvFile'),
   importResults: document.getElementById('importResults'),
+  demoFixture: document.getElementById('demoFixture'),
+  demoFixtureDescription: document.getElementById('demoFixtureDescription'),
+  loadFixtureBtn: document.getElementById('loadFixtureBtn'),
   exportPreset: document.getElementById('exportPreset'),
   exportLot: document.getElementById('exportLot'),
   exportStartDate: document.getElementById('exportStartDate'),
@@ -105,6 +111,32 @@ function renderScenarioOptions(scenarios) {
 async function loadScenarios() {
   const payload = await api('/api/scenarios');
   renderScenarioOptions(payload.scenarios || []);
+}
+
+function renderDemoFixtureOptions(fixtures) {
+  const selected = ids.demoFixture.value || 'leafy_greens_trace';
+  state.demoFixtureDescriptions = Object.fromEntries(
+    fixtures.map((fixture) => [fixture.id, fixture.description]),
+  );
+  ids.demoFixture.innerHTML = fixtures
+    .map(
+      (fixture) => `
+        <option value="${escapeHtml(fixture.id)}">${escapeHtml(fixture.label)}</option>
+      `,
+    )
+    .join('');
+  ids.demoFixture.value = state.demoFixtureDescriptions[selected] ? selected : fixtures[0]?.id || 'leafy_greens_trace';
+  updateDemoFixtureDescription();
+}
+
+async function loadDemoFixtures() {
+  const payload = await api('/api/demo-fixtures');
+  renderDemoFixtureOptions(payload.fixtures || []);
+}
+
+function updateDemoFixtureDescription() {
+  const fixtureId = ids.demoFixture.value || 'leafy_greens_trace';
+  ids.demoFixtureDescription.textContent = state.demoFixtureDescriptions[fixtureId] || 'Deterministic demo fixture.';
 }
 
 function renderExportPresetOptions(presets) {
@@ -574,6 +606,33 @@ async function retryFailedDeliveries() {
   }
 }
 
+async function loadSelectedDemoFixture() {
+  try {
+    const config = buildConfig();
+    const fixtureId = ids.demoFixture.value || 'leafy_greens_trace';
+    const result = await api(`/api/demo-fixtures/${encodeURIComponent(fixtureId)}/load`, {
+      method: 'POST',
+      body: JSON.stringify({
+        reset: true,
+        source: config.source,
+        delivery: config.delivery,
+      }),
+    });
+    ids.scenario.value = result.scenario;
+    ids.lineageResults.innerHTML = '';
+    if (result.status === 'delivery_failed') {
+      setStatus(`Loaded ${result.stored} fixture event(s), but delivery failed: ${result.error || 'delivery error'}`, 'error', 7000);
+    } else if (result.delivery_mode === 'none') {
+      setStatus(`Loaded ${result.stored} fixture event(s) without delivery.`, 'success', 3500);
+    } else {
+      setStatus(`Loaded fixture and posted ${result.posted} event(s).`, 'success', 3500);
+    }
+    await refresh();
+  } catch (error) {
+    setStatus(error.message, 'error', 5000);
+  }
+}
+
 async function replayCurrentLog() {
   try {
     const result = await api('/api/simulate/replay', { method: 'POST' });
@@ -660,15 +719,20 @@ document.getElementById('stepBtn').addEventListener('click', stepOnce);
 document.getElementById('replayBtn').addEventListener('click', replayCurrentLog);
 document.getElementById('importCsvBtn').addEventListener('click', importCsv);
 document.getElementById('retryFailedBtn').addEventListener('click', retryFailedDeliveries);
+document.getElementById('loadFixtureBtn').addEventListener('click', loadSelectedDemoFixture);
 document.getElementById('resetBtn').addEventListener('click', resetState);
 document.getElementById('refreshBtn').addEventListener('click', refresh);
 document.getElementById('lineageBtn').addEventListener('click', lookupLineage);
+ids.demoFixture.addEventListener('change', updateDemoFixtureDescription);
 ids.exportPreset.addEventListener('change', updateExportLink);
 ids.exportLot.addEventListener('input', updateExportLink);
 ids.exportStartDate.addEventListener('change', updateExportLink);
 ids.exportEndDate.addEventListener('change', updateExportLink);
 
 loadScenarios().catch((error) => {
+  setStatus(error.message, 'error', 5000);
+});
+loadDemoFixtures().catch((error) => {
   setStatus(error.message, 'error', 5000);
 });
 loadExportPresets().catch((error) => {

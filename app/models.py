@@ -38,6 +38,12 @@ class FDAExportPreset(str, Enum):
     TRANSFORMATION_BATCHES = "transformation_batches"
 
 
+class DemoFixtureId(str, Enum):
+    LEAFY_GREENS_TRACE = "leafy_greens_trace"
+    FRESH_CUT_TRANSFORMATION = "fresh_cut_transformation"
+    RETAILER_HANDOFF = "retailer_handoff"
+
+
 class RegEngineEvent(BaseModel):
     cte_type: CTEType
     traceability_lot_code: str
@@ -147,6 +153,41 @@ class FDAExportPresetSummary(BaseModel):
 
 class FDAExportPresetListResponse(BaseModel):
     presets: list[FDAExportPresetSummary]
+
+
+class DemoFixtureSummary(BaseModel):
+    id: DemoFixtureId
+    label: str
+    description: str
+    scenario: ScenarioId
+    event_count: int
+    lot_codes: list[str]
+
+
+class DemoFixtureListResponse(BaseModel):
+    fixtures: list[DemoFixtureSummary]
+
+
+class DemoFixtureLoadRequest(BaseModel):
+    reset: bool = True
+    source: str | None = None
+    delivery: DeliveryConfig | None = None
+
+
+class DemoFixtureLoadResponse(BaseModel):
+    status: Literal["loaded", "delivery_failed"]
+    fixture_id: DemoFixtureId
+    scenario: ScenarioId
+    loaded: int
+    stored: int
+    posted: int
+    failed: int
+    source: str
+    delivery_mode: DestinationMode
+    delivery_attempts: int = 0
+    lot_codes: list[str]
+    response: dict[str, Any] | None = None
+    error: str | None = None
 
 
 class StepResponse(BaseModel):
