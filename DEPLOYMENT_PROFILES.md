@@ -67,6 +67,7 @@ Use this profile when more than one person or partner may access the service. Pu
 export REGENGINE_BASIC_AUTH_USERNAME=demo
 export REGENGINE_BASIC_AUTH_PASSWORD='replace-with-a-strong-password'
 export REGENGINE_DEFAULT_TENANT=demo-default
+export REGENGINE_CORS_ORIGINS=https://demo.example.com
 uvicorn app.main:app --host 0.0.0.0 --port 8000
 ```
 
@@ -107,6 +108,7 @@ Shared-demo operating notes:
 - Keep delivery mode set to `mock` unless there is an explicit live-ingest trial.
 - Use a distinct tenant value per partner or workshop.
 - Rotate `REGENGINE_BASIC_AUTH_PASSWORD` between external demos.
+- Keep `REGENGINE_CORS_ORIGINS` limited to the HTTPS origins that should run the browser dashboard.
 - Back up or delete `data/tenants/{tenant_id}/` according to the partner's data-retention expectation.
 
 ## Live Ingest Trial Profile
@@ -119,6 +121,7 @@ Start the server with shared-demo protections:
 export REGENGINE_BASIC_AUTH_USERNAME=demo
 export REGENGINE_BASIC_AUTH_PASSWORD='replace-with-a-strong-password'
 export REGENGINE_DEFAULT_TENANT=live-trial
+export REGENGINE_CORS_ORIGINS=https://live-trial.example.com
 uvicorn app.main:app --host 127.0.0.1 --port 8000
 ```
 
@@ -178,6 +181,7 @@ Live-trial safeguards:
 - Confirm the dashboard delivery monitor shows `posted` before increasing volume.
 - If delivery fails, do not keep retrying with the same credentials blindly; inspect the displayed error and confirm endpoint, API key, and tenant id.
 - Use `POST /api/delivery/retry` only after correcting the delivery config.
+- Keep the live-trial dashboard origin explicit in `REGENGINE_CORS_ORIGINS`; do not use wildcard CORS with Basic Auth.
 - Do not commit API keys, tenant ids, partner names, downloaded exports, or event logs from live trials.
 
 ## Service Wrappers
@@ -185,12 +189,13 @@ Live-trial safeguards:
 For a persistent local or shared demo service, use the macOS LaunchAgent, Linux systemd unit, or Docker examples in `README.md`. Keep these profile choices the same inside the service wrapper:
 
 - Local demo: bind `127.0.0.1`, Basic Auth unset.
-- Shared demo: bind to the private interface or proxy target, Basic Auth set.
-- Live trial: prefer private network access, Basic Auth set, and live delivery enabled only per operator action.
+- Shared demo: bind to the private interface or proxy target, Basic Auth set, CORS origins explicit.
+- Live trial: prefer private network access, Basic Auth set, CORS origins explicit, and live delivery enabled only per operator action.
 
 ## Profile Verification Checklist
 
 - `GET /api/health` returns the expected tenant and auth context.
+- Browser requests from the intended HTTPS origin receive the `access-control-allow-origin` response header; untrusted origins do not.
 - Dashboard stats match the chosen tenant/auth/storage profile.
 - `POST /api/demo-fixtures/fresh_cut_transformation/load` succeeds in `mock` mode.
 - Lineage for `TLC-DEMO-FC-OUT-001` includes upstream harvest and packed lots.

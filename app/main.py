@@ -2,11 +2,13 @@ from __future__ import annotations
 
 import asyncio
 import json
+import os
 from contextlib import asynccontextmanager
 from datetime import UTC, datetime
 from pathlib import Path
 from threading import RLock
 from typing import Any
+from urllib.parse import urlparse
 
 from fastapi import FastAPI, HTTPException, Query, Request
 from fastapi.middleware.cors import CORSMiddleware
@@ -65,6 +67,7 @@ from .store import EventStore
 
 
 TENANT_DATA_ROOT = Path("data/tenants")
+DEFAULT_CORS_ORIGINS = ("http://127.0.0.1:8000", "http://localhost:8000")
 
 engine = LegitFlowEngine(seed=204)
 store = EventStore(persist_path="data/events.jsonl")
@@ -88,6 +91,42 @@ async def lifespan(app: FastAPI):
         await tenant_controller.shutdown()
 
 
+def cors_origins_from_env() -> list[str]:
+    raw_origins = os.getenv("REGENGINE_CORS_ORIGINS")
+    if not raw_origins or not raw_origins.strip():
+        return list(DEFAULT_CORS_ORIGINS)
+
+    origins: list[str] = []
+    for raw_origin in raw_origins.split(","):
+        origin = _normalize_cors_origin(raw_origin)
+        if origin and origin not in origins:
+            origins.append(origin)
+    return origins or list(DEFAULT_CORS_ORIGINS)
+
+
+def _normalize_cors_origin(raw_origin: str) -> str | None:
+    origin = raw_origin.strip().rstrip("/")
+    if not origin:
+        return None
+    if origin == "*":
+        raise ValueError("REGENGINE_CORS_ORIGINS cannot contain '*' while credentialed requests are enabled")
+
+    parsed = urlparse(origin)
+    if (
+        parsed.scheme not in {"http", "https"}
+        or not parsed.netloc
+        or parsed.params
+        or parsed.query
+        or parsed.fragment
+        or parsed.path not in {"", "/"}
+    ):
+        raise ValueError(
+            "REGENGINE_CORS_ORIGINS entries must be comma-separated HTTP(S) origins such as "
+            "https://demo.example.com"
+        )
+    return f"{parsed.scheme}://{parsed.netloc}"
+
+
 app = FastAPI(
     title="RegEngine Inflow Lab",
     description="Mock-first FSMA 204 CTE data-flow simulator for RegEngine-compatible payloads.",
@@ -96,7 +135,7 @@ app = FastAPI(
 )
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=cors_origins_from_env(),
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],

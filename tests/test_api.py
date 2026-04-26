@@ -4,9 +4,10 @@ import csv
 import io
 import json
 
+import pytest
 from fastapi.testclient import TestClient
 
-from app.main import app, controller, scenario_saves
+from app.main import app, controller, cors_origins_from_env, scenario_saves
 from app.models import SimulationConfig
 from app.scenarios import ScenarioId, get_scenario
 
@@ -69,6 +70,33 @@ def test_scenario_catalog_endpoint_lists_supported_presets():
         "retailer_readiness_demo",
     ]
     assert all(scenario["label"] for scenario in scenarios)
+
+
+def test_cors_defaults_allow_local_origins_and_block_unknown_origins():
+    allowed = client.get("/api/health", headers={"Origin": "http://127.0.0.1:8000"})
+    assert allowed.status_code == 200
+    assert allowed.headers["access-control-allow-origin"] == "http://127.0.0.1:8000"
+    assert allowed.headers["access-control-allow-credentials"] == "true"
+
+    blocked = client.get("/api/health", headers={"Origin": "https://untrusted.example"})
+    assert blocked.status_code == 200
+    assert "access-control-allow-origin" not in blocked.headers
+
+
+def test_cors_origins_can_be_configured_without_wildcard_credentials(monkeypatch):
+    monkeypatch.setenv(
+        "REGENGINE_CORS_ORIGINS",
+        " https://demo.example.com/, http://localhost:3000, https://demo.example.com ",
+    )
+    assert cors_origins_from_env() == ["https://demo.example.com", "http://localhost:3000"]
+
+    monkeypatch.setenv("REGENGINE_CORS_ORIGINS", "*")
+    with pytest.raises(ValueError, match="cannot contain"):
+        cors_origins_from_env()
+
+    monkeypatch.setenv("REGENGINE_CORS_ORIGINS", "https://demo.example.com/path")
+    with pytest.raises(ValueError, match="HTTP\\(S\\) origins"):
+        cors_origins_from_env()
 
 
 def test_basic_auth_is_optional_but_enforced_when_configured(monkeypatch):

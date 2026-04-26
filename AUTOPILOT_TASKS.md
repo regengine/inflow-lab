@@ -37,6 +37,10 @@ This file is the standing backlog for unattended Codex runs.
 - [x] Add a design-partner demo script with expected talking points and reset steps.
 - [x] Add deployment profile examples for local, shared demo, and live-ingest modes.
 
+## Priority 5
+
+- [x] Restrict credentialed CORS to configured browser origins for shared demo and live-ingest profiles.
+
 ## Progress notes
 
 - Start with the smallest safe change that materially improves demo readiness.

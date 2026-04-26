@@ -22,6 +22,7 @@ Use this checklist before tagging a demo-ready build or handing the simulator to
 
 - [ ] Dashboard loads without credentials when Basic Auth env vars are unset.
 - [ ] Basic Auth returns `401` without valid credentials when env vars are set.
+- [ ] Shared-demo or live-trial deployments set explicit `REGENGINE_CORS_ORIGINS` values instead of wildcard CORS.
 - [ ] Demo fixture loading resets to a known event log.
 - [ ] Start, stop, single-step, and reset work from the dashboard.
 - [ ] Scenario save/load restores both config and event records.
