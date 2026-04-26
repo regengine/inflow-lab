@@ -31,6 +31,14 @@
             <input id="source" name="source" value="codex-simulator" />
           </label>
           <label>
+            Scenario preset
+            <select id="scenario" name="scenario">
+              <option value="leafy_greens_supplier" selected>Leafy greens supplier</option>
+              <option value="fresh_cut_processor">Fresh-cut processor</option>
+              <option value="retailer_readiness_demo">Retailer readiness demo</option>
+            </select>
+          </label>
+          <label>
             Interval seconds
             <input id="interval" name="interval" type="number" min="0" step="0.1" value="1.5" />
           </label>
@@ -67,9 +75,33 @@
           <button class="button" id="startBtn" type="button">Start loop</button>
           <button class="button secondary" id="stopBtn" type="button">Stop</button>
           <button class="button secondary" id="stepBtn" type="button">Single batch</button>
+          <button class="button secondary" id="replayBtn" type="button">Replay current log</button>
           <button class="button danger" id="resetBtn" type="button">Reset state</button>
         </div>
         <p class="note" id="statusMessage">Ready.</p>
+      </section>
+
+      <section class="panel">
+        <div class="section-head">
+          <h2>CSV bulk import</h2>
+        </div>
+        <div class="grid two-up">
+          <label>
+            CSV type
+            <select id="csvImportType" name="csvImportType">
+              <option value="scheduled_events" selected>Scheduled events</option>
+              <option value="seed_lots">Seed lots</option>
+            </select>
+          </label>
+          <label>
+            CSV file
+            <input id="csvFile" name="csvFile" type="file" accept=".csv,text/csv" />
+          </label>
+        </div>
+        <div class="actions">
+          <button class="button secondary" id="importCsvBtn" type="button">Import CSV</button>
+        </div>
+        <div id="importResults" class="import-results"></div>
       </section>
 
       <section class="grid stats-grid" id="statsGrid"></section>

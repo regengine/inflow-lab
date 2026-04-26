@@ -8,7 +8,7 @@ import httpx
 from .models import IngestPayload, SimulationConfig
 
 
-DEFAULT_LIVE_INGEST_ENDPOINT = "https://regengine.co/api/ingestion/api/v1/webhooks/ingest"
+DEFAULT_LIVE_INGEST_ENDPOINT = "https://www.regengine.co/api/v1/webhooks/ingest"
 
 
 class LiveRegEngineClient:

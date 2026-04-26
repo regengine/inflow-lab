@@ -9,6 +9,9 @@ A mock-first FSMA 204 traceability simulator that emits **RegEngine-compatible i
 - [Quick start (local dev)](#quick-start-local-dev)
 - [Running tests](#running-tests)
 - [Delivery modes](#delivery-modes)
+- [Replay mode](#replay-mode)
+- [CSV import](#csv-import)
+- [Scenario presets](#scenario-presets)
 - [API reference](#api-reference)
 - [RegEngine payload contract](#regengine-payload-contract)
 - [Deployment](#deployment)
@@ -30,7 +33,7 @@ The generator walks lots through a realistic supply-chain lifecycle so the resul
 6. **Transformation** consumes input lots and emits a new output lot
 7. **Downstream shipping + receiving** moves transformed lots to DCs and retail
 
-Each event is persisted with `event_id`, `sha256_hash`, and `chain_hash` so the flow feels production-like, and you can trace lot lineage forward and backward through the dashboard or API.
+Each event is persisted with `event_id`, `sha256_hash`, and `chain_hash` so the flow feels production-like, and you can trace transitive lot lineage forward and backward through the dashboard or API.
 
 ## Project layout
 
@@ -42,6 +45,7 @@ app/
   mock_service.py        # Built-in mock RegEngine ingest endpoint
   models.py              # Pydantic models for config, events, payloads
   regengine_client.py    # HTTP client for live RegEngine delivery
+  scenarios.py           # Named scenario presets for product/location/flow mixes
   store.py               # Event persistence (JSONL)
   static/                # Dashboard (vanilla JS, HTML, CSS)
 .agents/skills/regengine-api-contract/
@@ -77,7 +81,9 @@ Then open:
 http://127.0.0.1:8000
 ```
 
-The dashboard lets you start/stop/step/reset the simulator, inspect recent events, trace lot lineage, and export a mock FDA request CSV. Delivery mode defaults to **`mock`** so no credentials are required.
+The dashboard lets you choose a scenario preset, start/stop/step/reset the simulator, replay the current persisted event log, import CSV seed lots or scheduled events, inspect recent events, trace lot lineage, and export a mock FDA request CSV. It subscribes to live status/event snapshots with Server-Sent Events and falls back to refresh polling if the stream disconnects. Delivery mode defaults to **`mock`** so no credentials are required.
+
+Event records are stored as JSONL at `config.persist_path` (`data/events.jsonl` by default). Existing records at that path are loaded when the app starts or when a start/reset request points at a different path; reset clears the currently configured event log. Replay reads the JSONL log without appending, duplicating, or rewriting stored events.
 
 ## Running tests
 
@@ -104,6 +110,79 @@ Sends real traffic to a RegEngine workspace. Configure from the dashboard or via
 ### `none`
 Generates and persists events locally without delivering them anywhere. Useful for seeding fixtures.
 
+## Replay mode
+
+Replay mode reads previously persisted `StoredEventRecord` JSONL lines, rebuilds the RegEngine ingest payload as:
+
+```json
+{
+  "source": "codex-simulator",
+  "events": [
+    {
+      "cte_type": "receiving",
+      "traceability_lot_code": "TLC-20260421-000003",
+      "product_description": "Romaine Lettuce",
+      "quantity": 500,
+      "unit_of_measure": "cases",
+      "location_name": "Distribution Center #4",
+      "timestamp": "2026-02-05T08:30:00Z",
+      "kdes": {}
+    }
+  ]
+}
+```
+
+By default, `POST /api/simulate/replay` uses the current `config.persist_path`, `config.source`, and `config.delivery`. You can override the JSONL path, source, or delivery mode in the request body. Delivery still uses the same `mock`, `live`, and `none` branches as normal generation.
+
+Replay responses include `status`, `read`, `replayed`, `posted`, `failed`, `source`, `persist_path`, `delivery_mode`, and any delivery `response` or `error`. Replay does not create new stored records.
+
+## CSV import
+
+`POST /api/import/csv` accepts CSV text and imports either scheduled RegEngine-shaped events or seed lots. Valid rows are delivered through the selected delivery mode and persisted as `StoredEventRecord` JSONL entries. Invalid rows are skipped, with deterministic row-level errors in the response. The default dashboard/API delivery remains **`mock`** unless you explicitly submit a different `delivery` object.
+
+Request body:
+
+```json
+{
+  "import_type": "scheduled_events",
+  "csv_text": "cte_type,traceability_lot_code,...",
+  "source": "codex-simulator",
+  "delivery": {
+    "mode": "mock"
+  }
+}
+```
+
+For `scheduled_events`, each row must include the current RegEngine event fields:
+
+```text
+cte_type,traceability_lot_code,product_description,quantity,unit_of_measure,location_name,timestamp
+```
+
+Optional `kdes` may be a JSON object. Additional non-empty columns are imported as KDEs, so columns such as `source_traceability_lot_code`, `input_traceability_lot_codes`, `reference_document_type`, and `reference_document_number` preserve lineage and FDA-export context. `parent_lot_codes` is optional and can be a JSON array or a `|`, `;`, or comma-separated list.
+
+For `seed_lots`, each row must include:
+
+```text
+traceability_lot_code,product_description,quantity,unit_of_measure,location_name
+```
+
+Seed lots become valid `harvesting` events. Optional `timestamp`, `harvest_date`, `field_name`, `immediate_subsequent_recipient`, reference document columns, `kdes` JSON, and other KDE columns are preserved. If no timestamp is supplied, the import time is used.
+
+Import responses include `status`, `total`, `accepted`, `rejected`, `stored`, `posted`, `failed`, `lot_codes`, and `errors[]` with row number, field, and message.
+
+## Scenario presets
+
+Use `config.scenario` to pick a deterministic product/location/flow mix without changing the RegEngine ingest payload shape. Supported values:
+
+| Scenario | Value | Demo emphasis |
+|---|---|---|
+| Leafy greens supplier | `leafy_greens_supplier` | Farm-origin leafy greens through cooling, packout, and outbound cold chain |
+| Fresh-cut processor | `fresh_cut_processor` | Ingredient lots routed into processor inventory and transformed into fresh-cut outputs |
+| Retailer readiness demo | `retailer_readiness_demo` | Retail-ready cases moving quickly through DC receiving and store-level receipts |
+
+Scenario selection is available in the dashboard, in `SimulationConfig`, and via `GET /api/scenarios`. The default is `leafy_greens_supplier`, and delivery still defaults to **`mock`**.
+
 ## API reference
 
 ### Simulator control
@@ -111,11 +190,15 @@ Generates and persists events locally without delivering them anywhere. Useful f
 | Method | Path | Purpose |
 |---|---|---|
 | `GET` | `/api/health` | Liveness probe + current config snapshot |
+| `GET` | `/api/scenarios` | List available scenario presets |
 | `GET` | `/api/simulate/status` | Running state, config, and aggregate stats |
 | `POST` | `/api/simulate/start` | Start the loop (accepts a `config` body) |
 | `POST` | `/api/simulate/stop` | Stop the loop |
 | `POST` | `/api/simulate/step` | Emit one batch synchronously |
+| `POST` | `/api/simulate/replay` | Replay persisted JSONL events through the configured delivery mode |
 | `POST` | `/api/simulate/reset` | Clear state and persisted events |
+| `GET` | `/api/simulate/stream` | Server-Sent Events snapshots for live dashboard updates |
+| `POST` | `/api/import/csv` | Bulk import scheduled events or seed lots from CSV text |
 
 ### Inspection
 
@@ -139,6 +222,7 @@ curl -X POST http://127.0.0.1:8000/api/simulate/start \
   -d '{
     "config": {
       "source": "codex-simulator",
+      "scenario": "fresh_cut_processor",
       "interval_seconds": 1.0,
       "batch_size": 3,
       "seed": 204,
@@ -153,6 +237,20 @@ curl -X POST http://127.0.0.1:8000/api/simulate/start \
   }'
 ```
 
+### Example: reset into a retailer readiness scenario
+
+```bash
+curl -X POST http://127.0.0.1:8000/api/simulate/reset \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "scenario": "retailer_readiness_demo",
+    "batch_size": 3,
+    "seed": 204,
+    "persist_path": "data/events.jsonl"
+  }'
+curl -X POST http://127.0.0.1:8000/api/simulate/step
+```
+
 ### Example: step once and inspect events
 
 ```bash
@@ -160,11 +258,41 @@ curl -X POST http://127.0.0.1:8000/api/simulate/step
 curl http://127.0.0.1:8000/api/events
 ```
 
+### Example: replay the current persisted log
+
+```bash
+curl -X POST http://127.0.0.1:8000/api/simulate/replay
+```
+
+### Example: replay another JSONL file without delivery
+
+```bash
+curl -X POST http://127.0.0.1:8000/api/simulate/replay \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "persist_path": "data/events.jsonl",
+    "source": "codex-simulator",
+    "delivery": {
+      "mode": "none"
+    }
+  }'
+```
+
+### Example: subscribe to live dashboard updates
+
+```bash
+curl -N http://127.0.0.1:8000/api/simulate/stream
+```
+
+Each SSE `snapshot` includes a monotonic `revision`, the same status payload returned by `/api/simulate/status`, and recent event records from `/api/events`. Use `limit` to control the number of recent events and `once=true` for a one-shot smoke check.
+
 ### Example: trace a lot
 
 ```bash
 curl http://127.0.0.1:8000/api/lineage/TLC-20260421-000003
 ```
+
+The lineage response keeps the original `records[]` event timeline and adds `nodes[]` plus `edges[]` so transformed outputs can be displayed as a lot graph. `nodes[]` summarizes each related lot, and `edges[]` links source/input lot codes to downstream packed or transformed lots.
 
 ## RegEngine payload contract
 

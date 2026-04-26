@@ -1,7 +1,9 @@
 from __future__ import annotations
 
+import asyncio
 import csv
 import io
+import json
 from contextlib import asynccontextmanager
 from datetime import UTC, datetime
 from pathlib import Path
@@ -9,24 +11,31 @@ from typing import Any
 
 from fastapi import FastAPI, HTTPException, Query, Request
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse, JSONResponse, PlainTextResponse
+from fastapi.responses import FileResponse, JSONResponse, PlainTextResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 
 from .controller import SimulationController
 from .engine import LegitFlowEngine
 from .mock_service import MockRegEngineService
 from .models import (
+    CSVImportRequest,
+    CSVImportResponse,
     EventListResponse,
     IngestPayload,
     LineageResponse,
     MockIngestResponse,
+    ReplayRequest,
+    ReplayResponse,
     ResetResponse,
+    ScenarioListResponse,
+    ScenarioSummary,
     SimulationConfig,
     StartRequest,
     StatusResponse,
     StepResponse,
 )
 from .regengine_client import LiveRegEngineClient
+from .scenarios import list_scenario_summaries
 from .store import EventStore
 
 
@@ -85,6 +94,54 @@ async def simulate_status() -> StatusResponse:
     return StatusResponse.model_validate(status)
 
 
+@app.get("/api/scenarios", response_model=ScenarioListResponse)
+async def list_scenarios() -> ScenarioListResponse:
+    return ScenarioListResponse(
+        scenarios=[ScenarioSummary.model_validate(summary) for summary in list_scenario_summaries()]
+    )
+
+
+def sse_message(event_name: str, payload: dict[str, Any]) -> str:
+    data = json.dumps(payload, separators=(",", ":"))
+    return f"event: {event_name}\ndata: {data}\n\n"
+
+
+@app.get("/api/simulate/stream")
+async def simulate_stream(
+    request: Request,
+    limit: int = Query(default=100, ge=1, le=500),
+    once: bool = Query(default=False),
+) -> StreamingResponse:
+    async def event_generator():
+        snapshot = controller.snapshot(event_limit=limit)
+        last_revision = snapshot["revision"]
+        yield sse_message("snapshot", snapshot)
+        if once:
+            return
+
+        while True:
+            if await request.is_disconnected():
+                break
+            try:
+                last_revision = await controller.wait_for_revision(last_revision)
+            except asyncio.TimeoutError:
+                yield ": keep-alive\n\n"
+                continue
+
+            snapshot = controller.snapshot(event_limit=limit)
+            last_revision = snapshot["revision"]
+            yield sse_message("snapshot", snapshot)
+
+    return StreamingResponse(
+        event_generator(),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "X-Accel-Buffering": "no",
+        },
+    )
+
+
 @app.post("/api/simulate/start", response_model=StatusResponse)
 async def simulate_start(request: StartRequest) -> StatusResponse:
     await controller.start(request.config)
@@ -108,6 +165,16 @@ async def simulate_step(batch_size: int | None = Query(default=None, ge=1, le=10
     return await controller.step(batch_size=batch_size)
 
 
+@app.post("/api/simulate/replay", response_model=ReplayResponse)
+async def simulate_replay(request: ReplayRequest | None = None) -> ReplayResponse:
+    return await controller.replay(request)
+
+
+@app.post("/api/import/csv", response_model=CSVImportResponse)
+async def import_csv(request: CSVImportRequest) -> CSVImportResponse:
+    return await controller.import_csv(request)
+
+
 @app.get("/api/events", response_model=EventListResponse)
 async def list_events(limit: int = Query(default=100, ge=1, le=500)) -> EventListResponse:
     return EventListResponse(events=store.recent(limit=limit))
@@ -118,7 +185,12 @@ async def get_lineage(traceability_lot_code: str) -> LineageResponse:
     records = store.lineage(traceability_lot_code)
     if not records:
         raise HTTPException(status_code=404, detail="No records found for that lot code")
-    return LineageResponse(traceability_lot_code=traceability_lot_code, records=records)
+    return LineageResponse(
+        traceability_lot_code=traceability_lot_code,
+        records=records,
+        nodes=store.lineage_nodes(records),
+        edges=store.lineage_edges(records),
+    )
 
 
 @app.post("/api/mock/regengine/ingest", response_model=MockIngestResponse)

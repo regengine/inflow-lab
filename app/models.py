@@ -7,6 +7,8 @@ from uuid import uuid4
 
 from pydantic import BaseModel, Field, HttpUrl, field_validator
 
+from .scenarios import ScenarioId
+
 
 class CTEType(str, Enum):
     HARVESTING = "harvesting"
@@ -21,6 +23,11 @@ class DestinationMode(str, Enum):
     MOCK = "mock"
     LIVE = "live"
     NONE = "none"
+
+
+class CSVImportType(str, Enum):
+    SCHEDULED_EVENTS = "scheduled_events"
+    SEED_LOTS = "seed_lots"
 
 
 class RegEngineEvent(BaseModel):
@@ -48,6 +55,7 @@ class DeliveryConfig(BaseModel):
 
 class SimulationConfig(BaseModel):
     source: str = "codex-simulator"
+    scenario: ScenarioId = ScenarioId.LEAFY_GREENS_SUPPLIER
     interval_seconds: float = 1.5
     batch_size: int = 3
     seed: int | None = 204
@@ -109,6 +117,16 @@ class StatusResponse(BaseModel):
     stats: dict[str, Any]
 
 
+class ScenarioSummary(BaseModel):
+    id: ScenarioId
+    label: str
+    description: str
+
+
+class ScenarioListResponse(BaseModel):
+    scenarios: list[ScenarioSummary]
+
+
 class StepResponse(BaseModel):
     generated: int
     posted: int
@@ -117,13 +135,81 @@ class StepResponse(BaseModel):
     response: dict[str, Any] | None = None
 
 
+class ReplayRequest(BaseModel):
+    persist_path: str | None = None
+    source: str | None = None
+    delivery: DeliveryConfig | None = None
+
+
+class ReplayResponse(BaseModel):
+    status: Literal["empty", "posted", "rebuilt", "failed"]
+    read: int
+    replayed: int
+    posted: int
+    failed: int
+    source: str
+    persist_path: str
+    delivery_mode: DestinationMode
+    response: dict[str, Any] | None = None
+    error: str | None = None
+
+
+class CSVImportRequest(BaseModel):
+    import_type: CSVImportType
+    csv_text: str
+    source: str | None = None
+    delivery: DeliveryConfig | None = None
+
+
+class CSVImportError(BaseModel):
+    row: int
+    field: str | None = None
+    message: str
+
+
+class CSVImportResponse(BaseModel):
+    status: Literal["accepted", "partial", "rejected", "delivery_failed"]
+    import_type: CSVImportType
+    total: int
+    accepted: int
+    rejected: int
+    stored: int
+    posted: int
+    failed: int
+    source: str
+    delivery_mode: DestinationMode
+    lot_codes: list[str]
+    errors: list[CSVImportError] = Field(default_factory=list)
+    response: dict[str, Any] | None = None
+    error: str | None = None
+
+
 class ResetResponse(BaseModel):
     status: str
+
+
+class LineageNode(BaseModel):
+    lot_code: str
+    product_description: str
+    event_count: int
+    cte_types: list[CTEType]
+    first_seen: datetime
+    last_seen: datetime
+    locations: list[str]
+
+
+class LineageEdge(BaseModel):
+    source_lot_code: str
+    target_lot_code: str
+    cte_type: CTEType
+    event_sequence_no: int
 
 
 class LineageResponse(BaseModel):
     traceability_lot_code: str
     records: list[StoredEventRecord]
+    nodes: list[LineageNode]
+    edges: list[LineageEdge]
 
 
 class EventListResponse(BaseModel):

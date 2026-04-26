@@ -205,17 +205,100 @@ th {
 }
 
 .lineage-results {
-  display: grid;
-  grid-template-columns: repeat(auto-fit, minmax(260px, 1fr));
-  gap: 14px;
   margin-top: 16px;
 }
 
+.lineage-overview,
+.lineage-flow,
+.lineage-timeline {
+  margin-top: 14px;
+}
+
+.lineage-overview {
+  display: grid;
+  grid-template-columns: minmax(220px, 1fr) 2fr;
+  gap: 14px;
+  align-items: stretch;
+}
+
+.lineage-focus,
+.lineage-stat,
+.lineage-lot,
 .lineage-card {
   padding: 16px;
-  border-radius: 14px;
+  border-radius: 8px;
   background: rgba(255, 255, 255, 0.03);
   border: 1px solid rgba(255, 255, 255, 0.08);
+}
+
+.lineage-focus span,
+.lineage-stat span,
+.lineage-lot small {
+  display: block;
+  color: var(--muted);
+}
+
+.lineage-focus strong,
+.lineage-stat strong {
+  display: block;
+  margin-top: 6px;
+  font-size: 1.1rem;
+}
+
+.lineage-focus p,
+.lineage-lot p {
+  margin-bottom: 0;
+}
+
+.lineage-stats,
+.lineage-lots,
+.lineage-cards {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
+  gap: 10px;
+}
+
+.lineage-lot {
+  border-color: rgba(110, 168, 254, 0.18);
+}
+
+.lineage-lot.is-current {
+  border-color: var(--accent);
+}
+
+.lineage-lot header {
+  display: flex;
+  justify-content: space-between;
+  gap: 8px;
+}
+
+.lineage-flow ul {
+  display: grid;
+  gap: 8px;
+  margin: 14px 0 0;
+  padding: 0;
+  list-style: none;
+}
+
+.lineage-flow li {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 8px;
+  padding: 10px 12px;
+  border-radius: 8px;
+  background: rgba(255, 255, 255, 0.03);
+}
+
+.flow-arrow,
+.flow-meta {
+  color: var(--muted);
+}
+
+.flow-meta {
+  margin-left: auto;
+  text-transform: uppercase;
+  font-size: 0.78rem;
 }
 
 .lineage-card header {
@@ -229,6 +312,36 @@ th {
   margin: 12px 0 0;
   padding-left: 18px;
   color: var(--muted);
+}
+
+.import-results {
+  margin-top: 14px;
+  color: var(--muted);
+}
+
+.import-summary {
+  padding: 12px 14px;
+  border-radius: 12px;
+  background: rgba(255, 255, 255, 0.04);
+  border: 1px solid rgba(255, 255, 255, 0.08);
+}
+
+.import-summary span {
+  display: block;
+  margin-top: 6px;
+}
+
+.import-summary[data-tone="success"] {
+  color: var(--success);
+}
+
+.import-summary[data-tone="error"] {
+  color: var(--danger);
+}
+
+.import-results ul {
+  margin: 10px 0 0;
+  padding-left: 20px;
 }
 
 .note[data-tone="error"],
@@ -247,7 +360,8 @@ th {
   }
 
   .grid.two-up,
-  .stats-grid {
+  .stats-grid,
+  .lineage-overview {
     grid-template-columns: 1fr;
   }
 }
