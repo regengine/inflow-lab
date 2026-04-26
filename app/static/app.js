@@ -3,6 +3,8 @@ const state = {
   events: [],
 };
 
+const DEFAULT_LIVE_INGEST_ENDPOINT = 'https://www.regengine.co/api/v1/webhooks/ingest';
+
 const ids = {
   source: document.getElementById('source'),
   interval: document.getElementById('interval'),
@@ -12,6 +14,10 @@ const ids = {
   endpoint: document.getElementById('endpoint'),
   apiKey: document.getElementById('apiKey'),
   tenantId: document.getElementById('tenantId'),
+  liveConfirmBlock: document.getElementById('liveConfirmBlock'),
+  liveConfirmed: document.getElementById('liveConfirmed'),
+  startBtn: document.getElementById('startBtn'),
+  stepBtn: document.getElementById('stepBtn'),
   statusMessage: document.getElementById('statusMessage'),
   statsGrid: document.getElementById('statsGrid'),
   eventsBody: document.getElementById('eventsBody'),
@@ -25,7 +31,7 @@ function setStatus(message, tone = 'neutral') {
 }
 
 function buildConfig() {
-  const endpoint = ids.endpoint.value.trim();
+  const endpoint = ids.endpoint.value.trim() || DEFAULT_LIVE_INGEST_ENDPOINT;
   const apiKey = ids.apiKey.value.trim();
   const tenantId = ids.tenantId.value.trim();
   const seedValue = ids.seed.value.trim();
@@ -40,6 +46,7 @@ function buildConfig() {
       endpoint: endpoint || null,
       api_key: apiKey || null,
       tenant_id: tenantId || null,
+      live_confirmed: ids.liveConfirmed.checked,
     },
   };
 }
@@ -63,10 +70,14 @@ async function api(path, options = {}) {
 function renderStats(status) {
   const stats = status?.stats || {};
   const engine = stats.engine || {};
+  const deliveryStatuses = stats.by_delivery_status || {};
   const cards = [
     ['Loop status', status?.running ? 'Running' : 'Stopped'],
     ['Total records', stats.total_records ?? 0],
     ['Unique lots', stats.unique_lots ?? 0],
+    ['Accepted', deliveryStatuses.accepted ?? 0],
+    ['Rejected', deliveryStatuses.rejected ?? 0],
+    ['Failed', deliveryStatuses.failed ?? 0],
     ['Persist path', stats.persist_path ?? 'data/events.jsonl'],
     ['Harvested queue', engine.harvested ?? 0],
     ['In transit', engine.in_transit ?? 0],
@@ -83,6 +94,54 @@ function renderStats(status) {
       `,
     )
     .join('');
+}
+
+function responseMessages(payload) {
+  if (!payload || typeof payload !== 'object') {
+    return [];
+  }
+  const messages = [];
+  ['detail', 'error', 'message'].forEach((key) => {
+    const value = payload[key];
+    if (typeof value === 'string' && value.trim()) {
+      messages.push(value);
+    }
+  });
+  const errors = payload.errors;
+  if (Array.isArray(errors)) {
+    errors.forEach((error) => messages.push(typeof error === 'string' ? error : JSON.stringify(error)));
+  } else if (typeof errors === 'string' && errors.trim()) {
+    messages.push(errors);
+  }
+  return messages;
+}
+
+function deliveryDetail(record) {
+  const messages = [...responseMessages(record.delivery_response)];
+  if (record.error) {
+    messages.unshift(record.error);
+  }
+  return messages.filter(Boolean).slice(0, 3).join(' | ');
+}
+
+function stepSummary(result) {
+  const pieces = [`Generated ${result.generated} event(s)`];
+  if ((result.accepted ?? 0) > 0) {
+    pieces.push(`${result.accepted} accepted`);
+  }
+  if ((result.rejected ?? 0) > 0) {
+    pieces.push(`${result.rejected} rejected`);
+  }
+  if ((result.failed ?? 0) > 0) {
+    pieces.push(`${result.failed} failed`);
+  }
+  const validationErrors = (result.response?.events || [])
+    .flatMap((event) => responseMessages(event))
+    .filter(Boolean);
+  if (validationErrors.length) {
+    pieces.push(validationErrors.slice(0, 2).join(' | '));
+  }
+  return pieces.join('. ') + '.';
 }
 
 function escapeHtml(text) {
@@ -114,7 +173,10 @@ function renderEvents(events) {
           <td>${escapeHtml(event.product_description)}</td>
           <td>${escapeHtml(event.location_name)}</td>
           <td>${escapeHtml(new Date(event.timestamp).toLocaleString())}</td>
-          <td>${escapeHtml(record.delivery_status)}</td>
+          <td>
+            <span class="status-badge" data-status="${escapeHtml(record.delivery_status)}">${escapeHtml(record.delivery_status)}</span>
+            ${deliveryDetail(record) ? `<div class="delivery-detail">${escapeHtml(deliveryDetail(record))}</div>` : ''}
+          </td>
         </tr>
       `;
     })
@@ -190,8 +252,12 @@ async function stopLoop() {
 
 async function stepOnce() {
   try {
-    const result = await api('/api/simulate/step', { method: 'POST' });
-    setStatus(`Generated ${result.generated} event(s).`, 'success');
+    const result = await api('/api/simulate/step', {
+      method: 'POST',
+      body: JSON.stringify({ config: buildConfig() }),
+    });
+    const hasErrors = (result.rejected ?? 0) > 0 || (result.failed ?? 0) > 0;
+    setStatus(stepSummary(result), hasErrors ? 'error' : 'success');
     await refresh();
   } catch (error) {
     setStatus(error.message, 'error');
@@ -234,6 +300,19 @@ document.getElementById('stepBtn').addEventListener('click', stepOnce);
 document.getElementById('resetBtn').addEventListener('click', resetState);
 document.getElementById('refreshBtn').addEventListener('click', refresh);
 document.getElementById('lineageBtn').addEventListener('click', lookupLineage);
+ids.deliveryMode.addEventListener('change', updateLiveControls);
+ids.liveConfirmed.addEventListener('change', updateLiveControls);
+
+function updateLiveControls() {
+  const isLive = ids.deliveryMode.value === 'live';
+  ids.liveConfirmBlock.hidden = !isLive;
+  ids.endpoint.required = isLive;
+  ids.apiKey.required = isLive;
+  ids.tenantId.required = isLive;
+  const liveBlocked = isLive && !ids.liveConfirmed.checked;
+  ids.startBtn.disabled = liveBlocked;
+  ids.stepBtn.disabled = liveBlocked;
+}
 
 setInterval(() => {
   refresh().catch((error) => {
@@ -241,6 +320,7 @@ setInterval(() => {
   });
 }, 2000);
 
+updateLiveControls();
 refresh().catch((error) => {
   setStatus(error.message, 'error');
 });

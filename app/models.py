@@ -44,6 +44,7 @@ class DeliveryConfig(BaseModel):
     endpoint: HttpUrl | None = None
     api_key: str | None = None
     tenant_id: str | None = None
+    live_confirmed: bool = False
 
 
 class SimulationConfig(BaseModel):
@@ -76,7 +77,7 @@ class StoredEventRecord(BaseModel):
     event: RegEngineEvent
     parent_lot_codes: list[str] = Field(default_factory=list)
     destination_mode: DestinationMode = DestinationMode.NONE
-    delivery_status: Literal["generated", "posted", "failed"] = "generated"
+    delivery_status: Literal["generated", "posted", "accepted", "rejected", "failed"] = "generated"
     delivery_response: dict[str, Any] | None = None
     error: str | None = None
     created_at: datetime = Field(default_factory=lambda: datetime.now(UTC))
@@ -103,6 +104,10 @@ class StartRequest(BaseModel):
     config: SimulationConfig
 
 
+class StepRequest(BaseModel):
+    config: SimulationConfig | None = None
+
+
 class StatusResponse(BaseModel):
     running: bool
     config: SimulationConfig
@@ -112,6 +117,8 @@ class StatusResponse(BaseModel):
 class StepResponse(BaseModel):
     generated: int
     posted: int
+    accepted: int = 0
+    rejected: int = 0
     failed: int
     lot_codes: list[str]
     response: dict[str, Any] | None = None

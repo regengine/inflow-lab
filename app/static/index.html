@@ -52,7 +52,12 @@
           </label>
           <label>
             Live endpoint override
-            <input id="endpoint" name="endpoint" placeholder="https://www.regengine.co/api/v1/webhooks/ingest" />
+            <input
+              id="endpoint"
+              name="endpoint"
+              value="https://www.regengine.co/api/v1/webhooks/ingest"
+              placeholder="https://www.regengine.co/api/v1/webhooks/ingest"
+            />
           </label>
           <label>
             RegEngine API key
@@ -61,6 +66,10 @@
           <label>
             Tenant ID
             <input id="tenantId" name="tenantId" autocomplete="off" />
+          </label>
+          <label class="checkbox-row live-confirmation" id="liveConfirmBlock" hidden>
+            <input id="liveConfirmed" name="liveConfirmed" type="checkbox" />
+            <span>I confirm this batch may post to live RegEngine.</span>
           </label>
         </form>
         <div class="actions">

@@ -7,7 +7,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
-from fastapi import FastAPI, HTTPException, Query, Request
+from fastapi import Body, FastAPI, HTTPException, Query, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, JSONResponse, PlainTextResponse
 from fastapi.staticfiles import StaticFiles
@@ -25,6 +25,7 @@ from .models import (
     StartRequest,
     StatusResponse,
     StepResponse,
+    StepRequest,
 )
 from .regengine_client import LiveRegEngineClient
 from .store import EventStore
@@ -104,8 +105,11 @@ async def simulate_reset(config: SimulationConfig | None = None) -> ResetRespons
 
 
 @app.post("/api/simulate/step", response_model=StepResponse)
-async def simulate_step(batch_size: int | None = Query(default=None, ge=1, le=100)) -> StepResponse:
-    return await controller.step(batch_size=batch_size)
+async def simulate_step(
+    request: StepRequest | None = Body(default=None),
+    batch_size: int | None = Query(default=None, ge=1, le=100),
+) -> StepResponse:
+    return await controller.step(batch_size=batch_size, config=request.config if request else None)
 
 
 @app.get("/api/events", response_model=EventListResponse)
