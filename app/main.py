@@ -5,6 +5,7 @@ import json
 from contextlib import asynccontextmanager
 from datetime import UTC, datetime
 from pathlib import Path
+from threading import RLock
 from typing import Any
 
 from fastapi import FastAPI, HTTPException, Query, Request
@@ -12,6 +13,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, JSONResponse, PlainTextResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 
+from .auth import DEFAULT_TENANT_ID, TenantContext, tenant_context_from_request
 from .controller import SimulationController
 from .demo_fixtures import list_demo_fixture_summaries
 from .engine import LegitFlowEngine
@@ -62,6 +64,8 @@ from .scenarios import ScenarioId, list_scenario_summaries
 from .store import EventStore
 
 
+TENANT_DATA_ROOT = Path("data/tenants")
+
 engine = LegitFlowEngine(seed=204)
 store = EventStore(persist_path="data/events.jsonl")
 scenario_saves = ScenarioSaveStore()
@@ -73,12 +77,15 @@ controller = SimulationController(
     mock_service=mock_service,
     live_client=LiveRegEngineClient(),
 )
+_tenant_controllers: dict[str, SimulationController] = {DEFAULT_TENANT_ID: controller}
+_tenant_lock = RLock()
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     yield
-    await controller.shutdown()
+    for tenant_controller in set(_tenant_controllers.values()):
+        await tenant_controller.shutdown()
 
 
 app = FastAPI(
@@ -95,6 +102,18 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+
+@app.middleware("http")
+async def auth_and_tenant_middleware(request: Request, call_next):
+    if request.method == "OPTIONS":
+        return await call_next(request)
+
+    context = tenant_context_from_request(request)
+    if isinstance(context, JSONResponse):
+        return context
+    request.state.tenant_context = context
+    return await call_next(request)
+
 static_dir = Path(__file__).parent / "static"
 app.mount("/static", StaticFiles(directory=static_dir), name="static")
 
@@ -105,17 +124,19 @@ async def root() -> FileResponse:
 
 
 @app.get("/api/health")
-async def health() -> dict[str, Any]:
+async def health(request: Request) -> dict[str, Any]:
+    active_controller = _active_controller(request)
     return {
         "ok": True,
         "utc_time": datetime.now(UTC).isoformat(),
-        "status": controller.status(),
+        "tenant": _tenant_context(request).tenant_id,
+        "status": active_controller.status(),
     }
 
 
 @app.get("/api/simulate/status", response_model=StatusResponse)
-async def simulate_status() -> StatusResponse:
-    status = controller.status()
+async def simulate_status(request: Request) -> StatusResponse:
+    status = _active_controller(request).status()
     return StatusResponse.model_validate(status)
 
 
@@ -127,27 +148,31 @@ async def list_scenarios() -> ScenarioListResponse:
 
 
 @app.get("/api/scenario-saves", response_model=ScenarioSaveListResponse)
-async def list_saved_scenarios() -> ScenarioSaveListResponse:
+async def list_saved_scenarios(request: Request) -> ScenarioSaveListResponse:
+    active_controller = _active_controller(request)
     return ScenarioSaveListResponse(
         saves=[
             ScenarioSaveSummary.model_validate(summary)
-            for summary in controller.list_scenario_saves().saves
+            for summary in active_controller.list_scenario_saves().saves
         ]
     )
 
 
 @app.post("/api/scenario-saves/{scenario_id}", response_model=ScenarioSaveResponse)
 async def save_scenario(
+    http_request: Request,
     scenario_id: ScenarioId,
     request: ScenarioSaveRequest | None = None,
 ) -> ScenarioSaveResponse:
-    return await controller.save_scenario(scenario_id, request)
+    active_controller = _active_controller(http_request)
+    scoped_request = _scope_scenario_save_request(http_request, request)
+    return await active_controller.save_scenario(scenario_id, scoped_request)
 
 
 @app.post("/api/scenario-saves/{scenario_id}/load", response_model=ScenarioLoadResponse)
-async def load_saved_scenario(scenario_id: ScenarioId) -> ScenarioLoadResponse:
+async def load_saved_scenario(http_request: Request, scenario_id: ScenarioId) -> ScenarioLoadResponse:
     try:
-        return await controller.load_scenario_save(scenario_id)
+        return await _active_controller(http_request).load_scenario_save(scenario_id)
     except KeyError as exc:
         raise HTTPException(status_code=404, detail="No saved scenario found") from exc
 
@@ -164,10 +189,11 @@ async def list_demo_fixtures() -> DemoFixtureListResponse:
 
 @app.post("/api/demo-fixtures/{fixture_id}/load", response_model=DemoFixtureLoadResponse)
 async def load_demo_fixture(
+    http_request: Request,
     fixture_id: DemoFixtureId,
     request: DemoFixtureLoadRequest | None = None,
 ) -> DemoFixtureLoadResponse:
-    return await controller.load_demo_fixture(fixture_id, request)
+    return await _active_controller(http_request).load_demo_fixture(fixture_id, request)
 
 
 def sse_message(event_name: str, payload: dict[str, Any]) -> str:
@@ -181,8 +207,10 @@ async def simulate_stream(
     limit: int = Query(default=100, ge=1, le=500),
     once: bool = Query(default=False),
 ) -> StreamingResponse:
+    active_controller = _active_controller(request)
+
     async def event_generator():
-        snapshot = controller.snapshot(event_limit=limit)
+        snapshot = active_controller.snapshot(event_limit=limit)
         last_revision = snapshot["revision"]
         yield sse_message("snapshot", snapshot)
         if once:
@@ -192,12 +220,12 @@ async def simulate_stream(
             if await request.is_disconnected():
                 break
             try:
-                last_revision = await controller.wait_for_revision(last_revision)
+                last_revision = await active_controller.wait_for_revision(last_revision)
             except asyncio.TimeoutError:
                 yield ": keep-alive\n\n"
                 continue
 
-            snapshot = controller.snapshot(event_limit=limit)
+            snapshot = active_controller.snapshot(event_limit=limit)
             last_revision = snapshot["revision"]
             yield sse_message("snapshot", snapshot)
 
@@ -212,64 +240,76 @@ async def simulate_stream(
 
 
 @app.post("/api/simulate/start", response_model=StatusResponse)
-async def simulate_start(request: StartRequest) -> StatusResponse:
-    await controller.start(request.config)
-    return StatusResponse.model_validate(controller.status())
+async def simulate_start(http_request: Request, request: StartRequest) -> StatusResponse:
+    active_controller = _active_controller(http_request)
+    await active_controller.start(_scope_config(http_request, request.config))
+    return StatusResponse.model_validate(active_controller.status())
 
 
 @app.post("/api/simulate/stop", response_model=StatusResponse)
-async def simulate_stop() -> StatusResponse:
-    await controller.stop()
-    return StatusResponse.model_validate(controller.status())
+async def simulate_stop(request: Request) -> StatusResponse:
+    active_controller = _active_controller(request)
+    await active_controller.stop()
+    return StatusResponse.model_validate(active_controller.status())
 
 
 @app.post("/api/simulate/reset", response_model=ResetResponse)
-async def simulate_reset(config: SimulationConfig | None = None) -> ResetResponse:
-    await controller.reset(config)
+async def simulate_reset(request: Request, config: SimulationConfig | None = None) -> ResetResponse:
+    await _active_controller(request).reset(_scope_config(request, config) if config else None)
     return ResetResponse(status="reset")
 
 
 @app.post("/api/simulate/step", response_model=StepResponse)
-async def simulate_step(batch_size: int | None = Query(default=None, ge=1, le=100)) -> StepResponse:
-    return await controller.step(batch_size=batch_size)
+async def simulate_step(
+    request: Request,
+    batch_size: int | None = Query(default=None, ge=1, le=100),
+) -> StepResponse:
+    return await _active_controller(request).step(batch_size=batch_size)
 
 
 @app.post("/api/simulate/replay", response_model=ReplayResponse)
-async def simulate_replay(request: ReplayRequest | None = None) -> ReplayResponse:
-    return await controller.replay(request)
+async def simulate_replay(http_request: Request, request: ReplayRequest | None = None) -> ReplayResponse:
+    return await _active_controller(http_request).replay(_scope_replay_request(http_request, request))
 
 
 @app.post("/api/import/csv", response_model=CSVImportResponse)
-async def import_csv(request: CSVImportRequest) -> CSVImportResponse:
-    return await controller.import_csv(request)
+async def import_csv(http_request: Request, request: CSVImportRequest) -> CSVImportResponse:
+    return await _active_controller(http_request).import_csv(request)
 
 
 @app.post("/api/delivery/retry", response_model=DeliveryRetryResponse)
-async def retry_failed_delivery(request: DeliveryRetryRequest | None = None) -> DeliveryRetryResponse:
-    return await controller.retry_failed_delivery(request)
+async def retry_failed_delivery(
+    http_request: Request,
+    request: DeliveryRetryRequest | None = None,
+) -> DeliveryRetryResponse:
+    return await _active_controller(http_request).retry_failed_delivery(request)
 
 
 @app.get("/api/events", response_model=EventListResponse)
-async def list_events(limit: int = Query(default=100, ge=1, le=500)) -> EventListResponse:
-    return EventListResponse(events=store.recent(limit=limit))
+async def list_events(
+    request: Request,
+    limit: int = Query(default=100, ge=1, le=500),
+) -> EventListResponse:
+    return EventListResponse(events=_active_controller(request).store.recent(limit=limit))
 
 
 @app.get("/api/lineage/{traceability_lot_code}", response_model=LineageResponse)
-async def get_lineage(traceability_lot_code: str) -> LineageResponse:
-    records = store.lineage(traceability_lot_code)
+async def get_lineage(request: Request, traceability_lot_code: str) -> LineageResponse:
+    active_controller = _active_controller(request)
+    records = active_controller.store.lineage(traceability_lot_code)
     if not records:
         raise HTTPException(status_code=404, detail="No records found for that lot code")
     return LineageResponse(
         traceability_lot_code=traceability_lot_code,
         records=records,
-        nodes=store.lineage_nodes(records),
-        edges=store.lineage_edges(records),
+        nodes=active_controller.store.lineage_nodes(records),
+        edges=active_controller.store.lineage_edges(records),
     )
 
 
 @app.post("/api/mock/regengine/ingest", response_model=MockIngestResponse)
-async def mock_regengine_ingest(payload: IngestPayload) -> MockIngestResponse:
-    return mock_service.ingest(payload)
+async def mock_regengine_ingest(request: Request, payload: IngestPayload) -> MockIngestResponse:
+    return _active_controller(request).mock_service.ingest(payload)
 
 
 @app.get("/api/mock/regengine/export/presets", response_model=FDAExportPresetListResponse)
@@ -284,24 +324,26 @@ async def mock_fda_request_export_presets() -> FDAExportPresetListResponse:
 
 @app.get("/api/mock/regengine/export/fda-request")
 async def mock_fda_request_export(
+    request: Request,
     start_date: str | None = Query(default=None, description="Inclusive YYYY-MM-DD"),
     end_date: str | None = Query(default=None, description="Inclusive YYYY-MM-DD"),
     preset: FDAExportPreset = Query(default=FDAExportPreset.ALL_RECORDS),
     traceability_lot_code: str | None = Query(default=None),
 ) -> PlainTextResponse:
+    active_controller = _active_controller(request)
     definition = FDA_EXPORT_PRESETS[preset]
     if definition.requires_lot_code and not traceability_lot_code:
         raise HTTPException(status_code=400, detail="traceability_lot_code is required for this export preset")
 
     if traceability_lot_code:
-        records = store.lineage(traceability_lot_code)
+        records = active_controller.store.lineage(traceability_lot_code)
         if not records:
             raise HTTPException(status_code=404, detail="No records found for that lot code")
         records = _filter_records_between(records, start_date=start_date, end_date=end_date)
     else:
-        records = store.all_between(start_date=start_date, end_date=end_date)
+        records = active_controller.store.all_between(start_date=start_date, end_date=end_date)
     records = apply_fda_export_preset(records, preset)
-    csv_text = render_fda_request_csv(records, location_gln=engine.location_gln)
+    csv_text = render_fda_request_csv(records, location_gln=active_controller.engine.location_gln)
     return PlainTextResponse(
         content=csv_text,
         media_type="text/csv",
@@ -311,22 +353,24 @@ async def mock_fda_request_export(
 
 @app.get("/api/mock/regengine/export/epcis")
 async def mock_epcis_export(
+    request: Request,
     start_date: str | None = Query(default=None, description="Inclusive YYYY-MM-DD"),
     end_date: str | None = Query(default=None, description="Inclusive YYYY-MM-DD"),
     traceability_lot_code: str | None = Query(default=None),
 ) -> JSONResponse:
+    active_controller = _active_controller(request)
     if traceability_lot_code:
-        records = store.lineage(traceability_lot_code)
+        records = active_controller.store.lineage(traceability_lot_code)
         if not records:
             raise HTTPException(status_code=404, detail="No records found for that lot code")
         records = _filter_records_between(records, start_date=start_date, end_date=end_date)
     else:
-        records = store.all_between(start_date=start_date, end_date=end_date)
+        records = active_controller.store.all_between(start_date=start_date, end_date=end_date)
 
     document = render_epcis_document(
         records,
-        source=controller.config.source,
-        location_gln=engine.location_gln,
+        source=active_controller.config.source,
+        location_gln=active_controller.engine.location_gln,
     )
     return JSONResponse(
         content=document,
@@ -349,6 +393,84 @@ def _filter_records_between(
             continue
         filtered.append(record)
     return sorted(filtered, key=lambda record: record.event.timestamp)
+
+
+def _tenant_context(request: Request) -> TenantContext:
+    return getattr(request.state, "tenant_context", TenantContext(tenant_id=DEFAULT_TENANT_ID))
+
+
+def _active_controller(request: Request) -> SimulationController:
+    context = _tenant_context(request)
+    if context.uses_default_storage:
+        return controller
+
+    with _tenant_lock:
+        existing_controller = _tenant_controllers.get(context.tenant_id)
+        if existing_controller is not None:
+            return existing_controller
+
+        tenant_controller = _create_tenant_controller(context.tenant_id)
+        _tenant_controllers[context.tenant_id] = tenant_controller
+        return tenant_controller
+
+
+def _create_tenant_controller(tenant_id: str) -> SimulationController:
+    persist_path = _tenant_events_path(tenant_id)
+    tenant_engine = LegitFlowEngine(seed=204)
+    tenant_store = EventStore(persist_path=str(persist_path))
+    tenant_saves = ScenarioSaveStore(save_dir=str(_tenant_saves_path(tenant_id)))
+    return SimulationController(
+        engine=tenant_engine,
+        store=tenant_store,
+        scenario_saves=tenant_saves,
+        mock_service=MockRegEngineService(),
+        live_client=LiveRegEngineClient(),
+    )
+
+
+def _scope_config(request: Request, config: SimulationConfig) -> SimulationConfig:
+    context = _tenant_context(request)
+    if context.uses_default_storage:
+        return config
+    return config.model_copy(
+        update={"persist_path": str(_tenant_events_path(context.tenant_id))},
+        deep=True,
+    )
+
+
+def _scope_replay_request(request: Request, replay_request: ReplayRequest | None) -> ReplayRequest | None:
+    context = _tenant_context(request)
+    if context.uses_default_storage:
+        return replay_request
+    request_body = replay_request or ReplayRequest()
+    return request_body.model_copy(
+        update={"persist_path": str(_tenant_events_path(context.tenant_id))},
+        deep=True,
+    )
+
+
+def _scope_scenario_save_request(
+    request: Request,
+    save_request: ScenarioSaveRequest | None,
+) -> ScenarioSaveRequest | None:
+    if save_request is None or save_request.config is None:
+        return save_request
+    return save_request.model_copy(
+        update={"config": _scope_config(request, save_request.config)},
+        deep=True,
+    )
+
+
+def _tenant_dir(tenant_id: str) -> Path:
+    return TENANT_DATA_ROOT / tenant_id
+
+
+def _tenant_events_path(tenant_id: str) -> Path:
+    return _tenant_dir(tenant_id) / "events.jsonl"
+
+
+def _tenant_saves_path(tenant_id: str) -> Path:
+    return _tenant_dir(tenant_id) / "scenario_saves"
 
 
 @app.exception_handler(ValueError)

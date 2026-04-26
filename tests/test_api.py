@@ -1,4 +1,5 @@
 import asyncio
+import base64
 import csv
 import io
 import json
@@ -11,6 +12,11 @@ from app.scenarios import ScenarioId, get_scenario
 
 
 client = TestClient(app)
+
+
+def basic_auth_header(username: str, password: str) -> dict[str, str]:
+    token = base64.b64encode(f"{username}:{password}".encode("utf-8")).decode("ascii")
+    return {"Authorization": f"Basic {token}"}
 
 
 def setup_function() -> None:
@@ -63,6 +69,66 @@ def test_scenario_catalog_endpoint_lists_supported_presets():
         "retailer_readiness_demo",
     ]
     assert all(scenario["label"] for scenario in scenarios)
+
+
+def test_basic_auth_is_optional_but_enforced_when_configured(monkeypatch):
+    assert client.get("/api/health").status_code == 200
+
+    monkeypatch.setenv("REGENGINE_BASIC_AUTH_USERNAME", "demo-user")
+    monkeypatch.setenv("REGENGINE_BASIC_AUTH_PASSWORD", "demo-pass")
+
+    unauthorized = client.get("/api/health")
+    assert unauthorized.status_code == 401
+    assert unauthorized.headers["www-authenticate"] == 'Basic realm="RegEngine Inflow Lab"'
+
+    bad_password = client.get("/api/health", headers=basic_auth_header("demo-user", "wrong"))
+    assert bad_password.status_code == 401
+
+    authorized = client.get("/api/health", headers=basic_auth_header("demo-user", "demo-pass"))
+    assert authorized.status_code == 200
+    assert authorized.json()["tenant"] == "demo-user"
+
+
+def test_tenant_header_scopes_event_storage_and_rejects_invalid_ids(tmp_path):
+    alpha_headers = {"X-RegEngine-Tenant": "tenant-alpha"}
+    beta_headers = {"X-RegEngine-Tenant": "tenant-beta"}
+    alpha_path = tmp_path / "alpha-escape-attempt.jsonl"
+
+    reset_response = client.post(
+        "/api/simulate/reset",
+        headers=alpha_headers,
+        json={
+            "batch_size": 1,
+            "seed": 204,
+            "persist_path": str(alpha_path),
+            "delivery": {"mode": "none"},
+        },
+    )
+    assert reset_response.status_code == 200
+    assert client.post(
+        "/api/simulate/reset",
+        headers=beta_headers,
+        json={"batch_size": 1, "seed": 204, "delivery": {"mode": "none"}},
+    ).status_code == 200
+
+    step_response = client.post("/api/simulate/step", headers=alpha_headers)
+    assert step_response.status_code == 200
+
+    alpha_status = client.get("/api/simulate/status", headers=alpha_headers).json()
+    beta_status = client.get("/api/simulate/status", headers=beta_headers).json()
+    assert alpha_status["stats"]["total_records"] == 1
+    assert beta_status["stats"]["total_records"] == 0
+    assert alpha_status["config"]["persist_path"] == "data/tenants/tenant-alpha/events.jsonl"
+    assert beta_status["config"]["persist_path"] == "data/tenants/tenant-beta/events.jsonl"
+    assert not alpha_path.exists()
+
+    alpha_events = client.get("/api/events", headers=alpha_headers).json()["events"]
+    beta_events = client.get("/api/events", headers=beta_headers).json()["events"]
+    assert len(alpha_events) == 1
+    assert beta_events == []
+
+    invalid_response = client.get("/api/health", headers={"X-RegEngine-Tenant": "../tenant"})
+    assert invalid_response.status_code == 400
 
 
 def test_scenario_save_load_restores_config_and_event_log(tmp_path):

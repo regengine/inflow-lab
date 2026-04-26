@@ -9,6 +9,7 @@ A mock-first FSMA 204 traceability simulator that emits **RegEngine-compatible i
 - [Quick start (local dev)](#quick-start-local-dev)
 - [Running tests](#running-tests)
 - [Delivery modes](#delivery-modes)
+- [Basic auth and tenant storage](#basic-auth-and-tenant-storage)
 - [Replay mode](#replay-mode)
 - [CSV import](#csv-import)
 - [Scenario presets](#scenario-presets)
@@ -42,6 +43,7 @@ Each event is persisted with `event_id`, `sha256_hash`, and `chain_hash` so the 
 
 ```text
 app/
+  auth.py                # Optional Basic Auth and tenant context resolution
   controller.py          # Simulator lifecycle (start/stop/step/reset)
   demo_fixtures.py       # Deterministic demo playback fixtures
   engine.py              # CTE generation and lot lineage logic
@@ -90,7 +92,7 @@ http://127.0.0.1:8000
 
 The dashboard lets you choose a scenario preset, save/load per-scenario demo states, load deterministic demo fixtures, start/stop/step/reset the simulator, replay the current persisted event log, import CSV seed lots or scheduled events, inspect recent events, trace lot lineage, and export mock FDA request CSV presets. API users can also derive scaffolded EPCIS 2.0 JSON-LD exports from the same stored records. It subscribes to live status/event snapshots with Server-Sent Events and falls back to refresh polling if the stream disconnects. Delivery mode defaults to **`mock`** so no credentials are required.
 
-Event records are stored as JSONL at `config.persist_path` (`data/events.jsonl` by default). Existing records at that path are loaded when the app starts or when a start/reset request points at a different path; reset clears the currently configured event log. Replay reads the JSONL log without appending, duplicating, or rewriting stored events.
+Event records are stored as JSONL at `config.persist_path` (`data/events.jsonl` by default for local unauthenticated use). Existing records at that path are loaded when the app starts or when a start/reset request points at a different path; reset clears the currently configured event log. Tenant-scoped requests store records under `data/tenants/{tenant_id}/events.jsonl` and ignore untrusted persist-path overrides. Replay reads the JSONL log without appending, duplicating, or rewriting stored events.
 
 ## Running tests
 
@@ -118,6 +120,19 @@ Sends real traffic to a RegEngine workspace. Configure from the dashboard or via
 Generates and persists events locally without delivering them anywhere. Useful for seeding fixtures.
 
 Every stored record tracks `delivery_status`, `destination_mode`, `delivery_attempts`, and last delivery timestamps. The dashboard delivery monitor summarizes posted, failed, generated-only, and retryable records. Failed records can be retried through the dashboard or `POST /api/delivery/retry` after switching to a working `mock` or `live` delivery configuration.
+
+## Basic auth and tenant storage
+
+Basic Auth is opt-in so local mock demos remain frictionless. Set both environment variables to require credentials for the dashboard and API:
+
+```bash
+export REGENGINE_BASIC_AUTH_USERNAME=demo
+export REGENGINE_BASIC_AUTH_PASSWORD=change-me
+```
+
+When Basic Auth is enabled, requests without valid credentials receive `401` with a `WWW-Authenticate` challenge. If no tenant header is supplied, the authenticated username becomes the tenant id.
+
+Use `X-RegEngine-Tenant` to select an explicit tenant scope. Tenant ids must be 1-64 characters and can contain only letters, numbers, dots, underscores, or hyphens. Tenant-scoped controllers keep separate simulator state, event logs, mock ingest responses, scenario saves, lineage, and exports under `data/tenants/{tenant_id}/`.
 
 ## Replay mode
 
@@ -251,6 +266,8 @@ The export returns an `EPCISDocument` with `ObjectEvent` records for harvesting,
 | `GET` | `/api/simulate/stream` | Server-Sent Events snapshots for live dashboard updates |
 | `POST` | `/api/import/csv` | Bulk import scheduled events or seed lots from CSV text |
 | `POST` | `/api/delivery/retry` | Retry failed stored deliveries with the current or supplied delivery config |
+
+All routes accept optional `X-RegEngine-Tenant` for tenant-scoped storage. If Basic Auth is enabled, include standard HTTP Basic credentials.
 
 ### Inspection
 
@@ -539,6 +556,8 @@ docker run --rm -p 8000:8000 regengine-inflow-lab
 | `uvicorn.out.log` | Server stdout (request logs, lifecycle messages) |
 | `uvicorn.err.log` | Server stderr (Python tracebacks, startup errors) |
 | `data/events.jsonl` | Persisted simulator events |
+| `data/tenants/{tenant_id}/events.jsonl` | Tenant-scoped simulator events |
+| `data/tenants/{tenant_id}/scenario_saves/` | Tenant-scoped saved scenario states |
 
 Common checks:
 

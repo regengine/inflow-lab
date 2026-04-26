@@ -28,7 +28,7 @@ This file is the standing backlog for unattended Codex runs.
 
 - [x] Add EPCIS 2.0 export scaffolding without breaking the current webhook contract.
 - [x] Add per-scenario save/load support.
-- [ ] Add basic auth and tenant-scoped storage boundaries.
+- [x] Add basic auth and tenant-scoped storage boundaries.
 
 ## Progress notes
 
