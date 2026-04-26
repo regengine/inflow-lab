@@ -222,6 +222,22 @@ python3 scripts/remote_smoke.py
 
 The harness keeps delivery in `mock` mode, uses the dedicated smoke tenant by default, and verifies health, Basic Auth, CORS, fixture load, lineage, FDA CSV, and EPCIS JSON-LD without printing the password.
 
+You can run the same check from GitHub Actions with the manual **Remote Smoke** workflow. Configure these repository secrets first:
+
+```text
+REGENGINE_REMOTE_USERNAME=demo
+REGENGINE_REMOTE_PASSWORD=<shared-demo-password>
+```
+
+Then run `.github/workflows/remote-smoke.yml` from the Actions tab. The workflow inputs are:
+
+| Input | Default | Purpose |
+|---|---|---|
+| `base_url` | `https://regengine-inflow-lab-production.up.railway.app` | Deployed shared-demo URL to validate |
+| `tenant` | `remote-smoke` | Tenant used for isolated smoke data |
+
+The workflow installs the repo dependencies and runs `python3 scripts/remote_smoke.py`. It does not require live RegEngine credentials and still loads the fixture with `delivery.mode=mock`.
+
 ## Profile Verification Checklist
 
 - `GET /api/health` returns the expected tenant and auth context.
@@ -231,6 +247,7 @@ The harness keeps delivery in `mock` mode, uses the dedicated smoke tenant by de
 - Dashboard stats match the chosen tenant/auth/storage profile.
 - `POST /api/demo-fixtures/fresh_cut_transformation/load` succeeds in `mock` mode.
 - `python3 scripts/remote_smoke.py` passes for the deployed shared-demo URL.
+- The manual GitHub **Remote Smoke** workflow passes with the same shared-demo URL and smoke tenant.
 - Lineage for `TLC-DEMO-FC-OUT-001` includes upstream harvest and packed lots.
 - FDA CSV and EPCIS exports are derivable from stored records.
 - No generated `data/` files or secrets are staged before committing.

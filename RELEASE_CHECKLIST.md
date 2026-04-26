@@ -33,6 +33,7 @@ Use this checklist before tagging a demo-ready build or handing the simulator to
 - [ ] EPCIS export includes a `TransformationEvent`.
 - [ ] Tenant-scoped requests keep separate event logs and scenario saves.
 - [ ] For shared-demo releases, `python3 scripts/remote_smoke.py` passes against the deployed HTTPS URL.
+- [ ] For shared-demo releases, the manual GitHub **Remote Smoke** workflow passes with repository secrets `REGENGINE_REMOTE_USERNAME` and `REGENGINE_REMOTE_PASSWORD`.
 
 ## Handoff Notes
 
