@@ -38,15 +38,22 @@ jobs:
           cache: pip
           cache-dependency-path: |
             requirements.txt
+            requirements-dev.txt
             pyproject.toml
 
       - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
-          pip install -r requirements.txt
+          pip install -r requirements-dev.txt
 
       - name: Run baseline tests
         run: pytest
+
+      - name: Validate Codex Autopilot secrets
+        env:
+          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+        run: |
+          test -n "$OPENAI_API_KEY" || { echo "OPENAI_API_KEY secret is required for Codex Autopilot"; exit 1; }
 
       - name: Run Codex
         id: run_codex
@@ -58,6 +65,12 @@ jobs:
           safety-strategy: drop-sudo
           sandbox: workspace-write
           codex-args: '["--full-auto"]'
+
+      - name: Explain Codex Action failure
+        if: failure() && steps.run_codex.outcome == 'failure'
+        run: |
+          echo "::error::Codex Action failed before producing an output file. Confirm OPENAI_API_KEY is valid, then inspect the uploaded Codex artifact and action logs."
+          exit 1
 
       - name: Run post-change tests
         run: pytest
@@ -107,9 +120,6 @@ jobs:
             - Prompt file: `.github/codex/prompts/autobuild.md`
             - Guidance files: `AGENTS.md` and `.agents/skills/regengine-api-contract/SKILL.md`
             - Transcript + patch: download the workflow artifact from this run
-          labels: |
-            codex
-            autopilot
           add-paths: |
             .github/**
             .agents/**
@@ -122,6 +132,8 @@ jobs:
             tests/**
             pyproject.toml
             requirements.txt
+            requirements-dev.txt
+            requirements-browser.txt
 
       - name: Enable auto-merge
         if: >-

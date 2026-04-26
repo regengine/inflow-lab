@@ -4,19 +4,9 @@ import random
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 from itertools import count
-from typing import Any, Iterable
 
 from .models import CTEType, RegEngineEvent
-
-
-SIMULATION_CLOCK_BACKDATE_DAYS = 30
-
-
-@dataclass(slots=True)
-class Location:
-    name: str
-    location_type: str
-    gln: str
+from .scenarios import Location, ProductSpec, ScenarioId, get_scenario
 
 
 @dataclass(slots=True)
@@ -52,53 +42,33 @@ class LegitFlowEngine:
     Each event aligns with the shape shown in RegEngine's current ingest docs.
     """
 
-    def __init__(self, seed: int | None = 204) -> None:
+    def __init__(
+        self,
+        seed: int | None = 204,
+        scenario: ScenarioId | str = ScenarioId.LEAFY_GREENS_SUPPLIER,
+    ) -> None:
         self._initial_seed = seed
-        self.reset(seed)
+        self._initial_scenario = ScenarioId(scenario)
+        self.reset(seed, scenario=scenario)
 
-    def reset(self, seed: int | None = None) -> None:
-        self.rng = random.Random(seed if seed is not None else self._initial_seed)
+    def reset(self, seed: int | None = None, scenario: ScenarioId | str | None = None) -> None:
+        # Deterministic simulator RNG, not security-sensitive.
+        self.rng = random.Random(seed if seed is not None else self._initial_seed)  # nosec B311
         self._lot_counter = count(1)
         self._ref_counter = count(1)
-        self._time_cursor = datetime.now(UTC) - timedelta(days=SIMULATION_CLOCK_BACKDATE_DAYS)
+        self._time_cursor = datetime.now(UTC) - timedelta(hours=12)
+        self.scenario = get_scenario(scenario or self._initial_scenario)
+        self.scenario_id = self.scenario.id
 
-        self.farms = [
-            Location("Valley Fresh Farms", "farm", "0850000001001"),
-            Location("Desert Bloom Farm", "farm", "0850000001002"),
-            Location("Riverbend Organics", "farm", "0850000001003"),
-        ]
-        self.coolers = [
-            Location("Salinas Cooling Hub", "cooler", "0850000002001"),
-            Location("Imperial Pre-Cool Facility", "cooler", "0850000002002"),
-        ]
-        self.packers = [
-            Location("FreshPack Central", "packer", "0850000003001"),
-            Location("GreenLeaf Packing House", "packer", "0850000003002"),
-        ]
-        self.processors = [
-            Location("ReadyFresh Processing Plant", "processor", "0850000004001"),
-            Location("DeliMix Plant", "processor", "0850000004002"),
-        ]
-        self.dcs = [
-            Location("Distribution Center #4", "dc", "0850000005001"),
-            Location("Distribution Center #7", "dc", "0850000005002"),
-        ]
-        self.retailers = [
-            Location("Retail Store #4521", "retail", "0850000006001"),
-            Location("Retail Store #3189", "retail", "0850000006002"),
-        ]
-        self.products = [
-            {"name": "Romaine Lettuce", "unit": "cases", "category": "leafy_greens"},
-            {"name": "Spinach", "unit": "cases", "category": "leafy_greens"},
-            {"name": "Cucumbers", "unit": "cases", "category": "produce"},
-            {"name": "Tomatoes", "unit": "cases", "category": "produce"},
-        ]
-        self.transformation_outputs = [
-            "Fresh Cut Salad Mix",
-            "Deli Salad Base",
-            "Leafy Greens Blend",
-        ]
-        self.carriers = ["SwiftChain Logistics", "ColdRoute Freight", "BlueLine Transport"]
+        self.farms = list(self.scenario.farms)
+        self.coolers = list(self.scenario.coolers)
+        self.packers = list(self.scenario.packers)
+        self.processors = list(self.scenario.processors)
+        self.dcs = list(self.scenario.dcs)
+        self.retailers = list(self.scenario.retailers)
+        self.products = list(self.scenario.products)
+        self.transformation_outputs = list(self.scenario.transformation_outputs)
+        self.carriers = list(self.scenario.carriers)
 
         self.harvested: list[Lot] = []
         self.cooled: list[Lot] = []
@@ -131,8 +101,9 @@ class LegitFlowEngine:
             return self._transform()
         raise RuntimeError(f"Unhandled action: {action}")
 
-    def snapshot(self) -> dict[str, int]:
+    def snapshot(self) -> dict[str, int | str]:
         return {
+            "scenario": self.scenario_id.value,
             "harvested": len(self.harvested),
             "cooled": len(self.cooled),
             "packed": len(self.packed),
@@ -145,26 +116,26 @@ class LegitFlowEngine:
 
     def _choose_action(self) -> str:
         weighted_actions: list[str] = []
-        if len(self.harvested) < 3:
-            weighted_actions.extend(["harvest"] * 5)
+        weights = self.scenario.action_weights
+        if len(self.harvested) < self.scenario.harvest_target:
+            weighted_actions.extend(["harvest"] * weights["harvest"])
         if self.harvested:
-            weighted_actions.extend(["cool"] * 2)
-            weighted_actions.extend(["initial_pack"] * 2)
+            weighted_actions.extend(["cool"] * weights["cool"])
         if self.cooled:
-            weighted_actions.extend(["initial_pack"] * 4)
+            weighted_actions.extend(["initial_pack"] * weights["initial_pack"])
         if self.packed or self.transformed or self.dc_inventory:
-            weighted_actions.extend(["ship"] * 4)
+            weighted_actions.extend(["ship"] * weights["ship"])
         if self.in_transit:
-            weighted_actions.extend(["receive"] * 5)
-        if len(self.processor_inventory) >= 2:
-            weighted_actions.extend(["transform"] * 3)
+            weighted_actions.extend(["receive"] * weights["receive"])
+        if len(self.processor_inventory) >= self.scenario.transform_min_lots:
+            weighted_actions.extend(["transform"] * weights["transform"])
         if not weighted_actions:
             weighted_actions.append("harvest")
         return self.rng.choice(weighted_actions)
 
     def _harvest(self) -> tuple[RegEngineEvent, list[str]]:
         farm = self.rng.choice(self.farms)
-        product = self.rng.choice(self.products)
+        product: ProductSpec = self.rng.choice(self.products)
         lot_code = self._make_lot_code(prefix="TLC")
         quantity = self._quantity(120, 640)
         timestamp = self._advance_time(15, 90)
@@ -172,9 +143,9 @@ class LegitFlowEngine:
 
         lot = Lot(
             lot_code=lot_code,
-            product_description=product["name"],
+            product_description=product.name,
             quantity=quantity,
-            unit_of_measure=product["unit"],
+            unit_of_measure=product.unit,
             current_location=farm.name,
             stage="harvested",
             origin_location=farm.name,
@@ -196,8 +167,7 @@ class LegitFlowEngine:
                 "harvest_date": timestamp.date().isoformat(),
                 "farm_location": farm.name,
                 "field_name": f"Field-{self.rng.randint(1, 18)}",
-                "immediate_subsequent_recipient": self.rng.choice(self.coolers + self.packers).name,
-                "reference_document": self._reference_document(lot.current_reference_type, reference_number),
+                "immediate_subsequent_recipient": self.rng.choice(self.coolers).name,
                 "reference_document_type": lot.current_reference_type,
                 "reference_document_number": reference_number,
                 "traceability_lot_code_source_reference": lot.tlc_source_reference,
@@ -236,8 +206,9 @@ class LegitFlowEngine:
         return event, [lot.lot_code]
 
     def _initial_pack(self) -> tuple[RegEngineEvent, list[str]]:
-        source_pool = self.cooled if self.cooled else self.harvested
-        source_lot = source_pool.pop(self.rng.randrange(len(source_pool)))
+        if not self.cooled:
+            raise RuntimeError("Initial packing requires a cooled source lot")
+        source_lot = self.cooled.pop(self.rng.randrange(len(self.cooled)))
         packer = self.rng.choice(self.packers)
         packed_lot_code = self._make_lot_code(prefix="TLC")
         packed_quantity = self._quantity(source_lot.quantity * 0.92, source_lot.quantity * 1.02)
@@ -297,7 +268,7 @@ class LegitFlowEngine:
         carrier = self.rng.choice(self.carriers)
 
         if stage_name == "packed":
-            if self.rng.random() < 0.45:
+            if self.rng.random() < self.scenario.packed_to_processor_probability:
                 destination = self.rng.choice(self.processors)
                 next_stage = "processor_inventory"
             else:
@@ -383,7 +354,7 @@ class LegitFlowEngine:
         return event, lot.parents or [lot.lot_code]
 
     def _transform(self) -> tuple[RegEngineEvent, list[str]]:
-        sample_size = min(len(self.processor_inventory), self.rng.choice([2, 2, 3]))
+        sample_size = min(len(self.processor_inventory), self.rng.choice(self.scenario.transform_input_choices))
         inputs = self.rng.sample(self.processor_inventory, k=sample_size)
         self.processor_inventory = [lot for lot in self.processor_inventory if lot not in inputs]
 

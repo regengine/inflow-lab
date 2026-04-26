@@ -7,5 +7,8 @@ __pycache__/
 htmlcov/
 data/*.jsonl
 data/*.csv
+data/scenario_saves/
+data/tenants/
 uvicorn.out.log
 uvicorn.err.log
+output/playwright/

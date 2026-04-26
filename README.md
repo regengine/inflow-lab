@@ -8,7 +8,18 @@ A mock-first FSMA 204 traceability simulator that emits **RegEngine-compatible i
 - [Project layout](#project-layout)
 - [Quick start (local dev)](#quick-start-local-dev)
 - [Running tests](#running-tests)
+- [Browser smoke](#browser-smoke)
+- [Release smoke regression](#release-smoke-regression)
 - [Delivery modes](#delivery-modes)
+- [Basic auth and tenant storage](#basic-auth-and-tenant-storage)
+- [Replay mode](#replay-mode)
+- [CSV import](#csv-import)
+- [Scenario presets](#scenario-presets)
+- [Demo fixtures](#demo-fixtures)
+- [FDA export presets](#fda-export-presets)
+- [EPCIS 2.0 export scaffolding](#epcis-20-export-scaffolding)
+- [Design-partner demo script](#design-partner-demo-script)
+- [Deployment profiles](#deployment-profiles)
 - [API reference](#api-reference)
 - [RegEngine payload contract](#regengine-payload-contract)
 - [Deployment](#deployment)
@@ -30,18 +41,25 @@ The generator walks lots through a realistic supply-chain lifecycle so the resul
 6. **Transformation** consumes input lots and emits a new output lot
 7. **Downstream shipping + receiving** moves transformed lots to DCs and retail
 
-Each event is persisted with `event_id`, `sha256_hash`, and `chain_hash` so the flow feels production-like, and you can trace lot lineage forward and backward through the dashboard or API.
+Each event is persisted with `event_id`, `sha256_hash`, and `chain_hash` so the flow feels production-like, and you can trace transitive lot lineage forward and backward through the dashboard or API.
 
 ## Project layout
 
 ```text
 app/
+  auth.py                # Optional Basic Auth and tenant context resolution
+  build_info.py          # Public non-secret build/deployment metadata for health checks
   controller.py          # Simulator lifecycle (start/stop/step/reset)
+  demo_fixtures.py       # Deterministic demo playback fixtures
   engine.py              # CTE generation and lot lineage logic
+  epcis_export.py        # EPCIS 2.0 JSON-LD export scaffolding
+  fda_export.py          # FDA-request CSV export presets and rendering
   main.py                # FastAPI app and route wiring
   mock_service.py        # Built-in mock RegEngine ingest endpoint
   models.py              # Pydantic models for config, events, payloads
   regengine_client.py    # HTTP client for live RegEngine delivery
+  scenario_saves.py      # Per-scenario saved config and event-log snapshots
+  scenarios.py           # Named scenario presets for product/location/flow mixes
   store.py               # Event persistence (JSONL)
   static/                # Dashboard (vanilla JS, HTML, CSS)
 .agents/skills/regengine-api-contract/
@@ -49,12 +67,27 @@ app/
   codex/prompts/autobuild.md
   workflows/ci.yml
   workflows/codex-autopilot.yml
+  workflows/remote-smoke.yml
+scripts/
+  smoke_regression.py    # End-to-end API smoke for demo-ready release checks
+  browser_smoke.py       # Headless Playwright dashboard smoke
+  remote_smoke.py        # HTTP smoke harness for deployed shared-demo instances
+  live_trial.py          # Gated one-batch live-ingest trial runner
 tests/
+.dockerignore
 AGENTS.md                # Repository instructions for Codex-style agents
 AUTOPILOT_TASKS.md       # Standing backlog for unattended runs
+DEPLOYMENT_PROFILES.md   # Local, shared-demo, and live-ingest run profiles
+DESIGN_PARTNER_DEMO_SCRIPT.md  # Design-partner walkthrough and reset script
+Dockerfile               # Container image for shared demo deployments
+docker-entrypoint.sh     # Chowns mounted data dir, then drops to app user
 PROMPT_FOR_CODEX.md      # Paste-ready Codex task prompt
+RELEASE_CHECKLIST.md     # Demo-ready release gate
 pyproject.toml
-requirements.txt
+railway.json             # Railway Docker build and healthcheck config
+requirements.txt         # Runtime dependencies used by Docker/shared demo
+requirements-dev.txt     # Local test, audit, and maintenance tooling
+requirements-browser.txt # Runtime + Playwright for dashboard smoke checks
 ```
 
 ## Quick start (local dev)
@@ -65,7 +98,7 @@ Requires **Python 3.11+**.
 # From the project root
 python3 -m venv .venv
 source .venv/bin/activate
-pip install -r requirements.txt
+pip install -r requirements-dev.txt
 
 # Run the dev server (auto-reload)
 uvicorn app.main:app --reload
@@ -77,15 +110,58 @@ Then open:
 http://127.0.0.1:8000
 ```
 
-The dashboard lets you start/stop/step/reset the simulator, inspect recent events, trace lot lineage, and export a mock FDA request CSV. Delivery mode defaults to **`mock`** so no credentials are required.
+The dashboard is organized as a guided operator console: setup, run, monitor delivery, trace lineage, and export evidence. It supports scenario presets, saved demo states, deterministic fixtures, start/stop/step/reset controls, replay, CSV imports, recent-event inspection, active tenant/auth/storage context, FDA CSV presets, and scaffolded EPCIS 2.0 JSON-LD exports. It subscribes to live status/event snapshots with Server-Sent Events and falls back to refresh polling if the stream disconnects. Delivery mode defaults to **`mock`** so no credentials are required.
+
+Event records are stored as JSONL at `config.persist_path` (`data/events.jsonl` by default for local unauthenticated use). Set `REGENGINE_DATA_DIR` to move the default event log, tenant logs, and scenario saves under another directory such as `/data` for a mounted deployment volume. Existing records at that path are loaded when the app starts or when a start/reset request points at a different path; reset clears the currently configured event log. Tenant-scoped requests store records under `{REGENGINE_DATA_DIR}/tenants/{tenant_id}/events.jsonl` and ignore untrusted persist-path overrides. Lineage, stats, retry lookup, replay, FDA CSV, and EPCIS exports read the persisted JSONL history so older records remain available after the in-memory recent-events window rolls forward. Replay reads the JSONL log without appending, duplicating, or rewriting stored events.
 
 ## Running tests
 
 ```bash
+pip install -r requirements-dev.txt
 pytest
 ```
 
 The suite covers payload shape, engine determinism, and the HTTP API contract.
+
+## Browser smoke
+
+Run the dashboard smoke after frontend or operator-flow changes:
+
+```bash
+pip install -r requirements-browser.txt
+python3 -m playwright install chromium
+python3 scripts/browser_smoke.py
+```
+
+The smoke starts a temporary local server with mock delivery, drives Chromium through the dashboard start/stop, reset, single-batch, fixture load, transformed-lot lineage lookup, and CSV warning display flows, then exits nonzero with a clear failure message if a browser assertion fails. It forces the dashboard delivery mode to `mock` before taking any action.
+
+Set `REGENGINE_BROWSER_BASE_URL` to run against an already-started local or remote instance instead of letting the script start one. For Basic Auth deployments, set `REGENGINE_BROWSER_USERNAME` and `REGENGINE_BROWSER_PASSWORD`; set `REGENGINE_BROWSER_TENANT` to send `X-RegEngine-Tenant` for an isolated smoke tenant. The script also accepts the equivalent `REGENGINE_REMOTE_*` variables used by `scripts/remote_smoke.py`.
+
+## Release smoke regression
+
+Run the release smoke harness before tagging or handing the simulator to a design partner:
+
+```bash
+python3 scripts/smoke_regression.py
+```
+
+The smoke harness uses FastAPI's in-process `TestClient` to exercise the operator-critical path: tenant-scoped fixture load, lineage lookup, FDA export, EPCIS export, scenario save/load, replay, and tenant isolation. If Basic Auth env vars are set, it sends matching Basic credentials automatically. Temporary smoke tenants are cleaned up after the run.
+
+For a deployed shared-demo instance, run the remote smoke harness against the public HTTPS URL:
+
+```bash
+export REGENGINE_REMOTE_BASE_URL=https://regengine-inflow-lab-production.up.railway.app
+export REGENGINE_REMOTE_USERNAME=demo
+export REGENGINE_REMOTE_PASSWORD='replace-with-shared-demo-password'
+export REGENGINE_REMOTE_TENANT=remote-smoke
+python3 scripts/remote_smoke.py
+```
+
+`scripts/remote_smoke.py` uses `httpx` with normal TLS verification to check `/api/healthz`, Basic Auth enforcement, credentialed CORS allow/block behavior, mock fixture loading, transformed-lot lineage, FDA CSV export, and EPCIS JSON-LD export. The tenant defaults to `remote-smoke`, fixture delivery stays in `mock` mode, and failure messages redact configured passwords and credential-like environment values. Set `REGENGINE_EXPECTED_BUILD_SHA` to fail fast when a deployed instance is not running the expected commit.
+
+GitHub also has manual and nightly **Remote Smoke** and **Remote Browser Smoke** workflows for deployed demo validation. Configure repository secrets `REGENGINE_REMOTE_USERNAME` and `REGENGINE_REMOTE_PASSWORD`, then run `.github/workflows/remote-smoke.yml` for API/export checks or `.github/workflows/remote-browser-smoke.yml` for authenticated dashboard checks with optional `base_url` and `tenant` inputs. Scheduled runs target the Railway shared-demo URL with dedicated nightly tenants and compare `/api/healthz` build metadata to the workflow commit.
+
+Use `RELEASE_CHECKLIST.md` as the full demo-ready gate. Use `DESIGN_PARTNER_DEMO_SCRIPT.md` for the call flow, expected talking points, fixture reset commands, and recovery steps.
 
 ## Delivery modes
 
@@ -101,8 +177,171 @@ Sends real traffic to a RegEngine workspace. Configure from the dashboard or via
 - `tenant_id`
 - Optional `endpoint` override (defaults to `https://www.regengine.co/api/v1/webhooks/ingest`)
 
+For controlled live workspace validation, use `scripts/live_trial.py`. It refuses to send live traffic unless `--confirm-live` is supplied, always performs a mock dry-run first, and sends exactly one live batch before stopping.
+
 ### `none`
 Generates and persists events locally without delivering them anywhere. Useful for seeding fixtures.
+
+Every stored record tracks `delivery_status`, `destination_mode`, `delivery_attempts`, last delivery timestamps, and non-secret `delivery_metadata` such as delivery mode, attempted event count, live endpoint host/path, HTTP status, and idempotency key. The dashboard delivery monitor summarizes posted, failed, generated-only, and retryable records. Failed records can be retried through the dashboard or `POST /api/delivery/retry` after switching to a working `mock` or `live` delivery configuration.
+
+## Basic auth and tenant storage
+
+Basic Auth is opt-in so local mock demos remain frictionless. Set both environment variables to require credentials for the dashboard and API:
+
+```bash
+export REGENGINE_BASIC_AUTH_USERNAME=demo
+export REGENGINE_BASIC_AUTH_PASSWORD=change-me
+```
+
+When Basic Auth is enabled, requests without valid credentials receive `401` with a `WWW-Authenticate` challenge. If no tenant header is supplied, the authenticated username becomes the tenant id.
+
+Use `X-RegEngine-Tenant` to select an explicit tenant scope. Tenant ids must be 1-64 characters and can contain only letters, numbers, dots, underscores, or hyphens. Tenant-scoped controllers keep separate simulator state, event logs, mock ingest responses, scenario saves, lineage, and exports under `data/tenants/{tenant_id}/`.
+
+`GET /api/health` and the dashboard stats area expose the active tenant id, whether Basic Auth is enabled, and whether storage is local default or tenant-scoped. Passwords, API keys, and other credentials are never returned; live delivery status preserves the active mode and endpoint while redacting the RegEngine API key and tenant id.
+
+Credentialed browser requests are limited to explicit CORS origins. By default the app allows the local dashboard origins `http://127.0.0.1:8000` and `http://localhost:8000`. For shared demos, set comma-separated HTTPS origins:
+
+```bash
+export REGENGINE_CORS_ORIGINS=https://demo.example.com,https://partner-demo.example.com
+```
+
+Wildcard CORS origins are rejected because Basic Auth and tenant-scoped requests may carry credentials. When Basic Auth is enabled, state-changing browser requests such as simulator start, step, reset, fixture load, import, replay, retry, and scenario save/load must present a trusted `Origin` or `Referer` from `REGENGINE_CORS_ORIGINS`; command-line and server-to-server calls without browser origin headers continue to work with valid Basic credentials.
+
+Protected tenant operations are available when Basic Auth is enabled:
+
+- `GET /api/operator/tenants` lists cached and on-disk tenant scopes, record counts, scenario-save counts, and storage paths.
+- `POST /api/operator/tenants/{tenant_id}/reset` stops that tenant's loop and clears its event log while preserving the tenant directory and scenario saves.
+- `DELETE /api/operator/tenants/{tenant_id}` stops that tenant's loop, evicts its cached controller, and deletes its tenant data directory.
+
+These endpoints reject unauthenticated requests and reject the default local tenant so the unprotected local demo surface stays simple.
+
+## Replay mode
+
+Replay mode reads previously persisted `StoredEventRecord` JSONL lines, rebuilds the RegEngine ingest payload as:
+
+```json
+{
+  "source": "codex-simulator",
+  "events": [
+    {
+      "cte_type": "receiving",
+      "traceability_lot_code": "TLC-20260421-000003",
+      "product_description": "Romaine Lettuce",
+      "quantity": 500,
+      "unit_of_measure": "cases",
+      "location_name": "Distribution Center #4",
+      "timestamp": "2026-02-05T08:30:00Z",
+      "kdes": {}
+    }
+  ]
+}
+```
+
+By default, `POST /api/simulate/replay` uses the current `config.persist_path`, `config.source`, and `config.delivery`. You can override the JSONL path, source, or delivery mode in the request body. Delivery still uses the same `mock`, `live`, and `none` branches as normal generation.
+
+Replay responses include `status`, `read`, `replayed`, `posted`, `failed`, `source`, `persist_path`, `delivery_mode`, `delivery_attempts`, and any delivery `response` or `error`. Replay does not create new stored records.
+
+## CSV import
+
+`POST /api/import/csv` accepts CSV text and imports either scheduled RegEngine-shaped events or seed lots. Valid rows are delivered through the selected delivery mode and persisted as `StoredEventRecord` JSONL entries. Invalid rows are skipped, with deterministic row-level errors in the response. Accepted rows are also checked against CTE-specific KDE expectations and can return warnings for missing lineage, document, location, or date context. The default dashboard/API delivery remains **`mock`** unless you explicitly submit a different `delivery` object.
+
+Request body:
+
+```json
+{
+  "import_type": "scheduled_events",
+  "csv_text": "cte_type,traceability_lot_code,...",
+  "source": "codex-simulator",
+  "delivery": {
+    "mode": "mock"
+  }
+}
+```
+
+For `scheduled_events`, each row must include the current RegEngine event fields:
+
+```text
+cte_type,traceability_lot_code,product_description,quantity,unit_of_measure,location_name,timestamp
+```
+
+Optional `kdes` may be a JSON object. Additional non-empty columns are imported as KDEs, so columns such as `source_traceability_lot_code`, `input_traceability_lot_codes`, `reference_document_type`, and `reference_document_number` preserve lineage and FDA-export context. `parent_lot_codes` is optional and can be a JSON array or a `|`, `;`, or comma-separated list.
+
+For `seed_lots`, each row must include:
+
+```text
+traceability_lot_code,product_description,quantity,unit_of_measure,location_name
+```
+
+Seed lots become valid `harvesting` events. Optional `timestamp`, `harvest_date`, `field_name`, `immediate_subsequent_recipient`, reference document columns, `kdes` JSON, and other KDE columns are preserved. If no timestamp is supplied, the import time is used.
+
+Import responses include `status`, `total`, `accepted`, `rejected`, `stored`, `posted`, `failed`, `delivery_attempts`, `lot_codes`, `errors[]`, and `warnings[]` with row number, field, and message. Warnings are advisory and do not change the RegEngine ingest payload shape.
+
+## Scenario presets
+
+Use `config.scenario` to pick a deterministic product/location/flow mix without changing the RegEngine ingest payload shape. Supported values:
+
+| Scenario | Value | Demo emphasis |
+|---|---|---|
+| Leafy greens supplier | `leafy_greens_supplier` | Farm-origin leafy greens through cooling, packout, and outbound cold chain |
+| Fresh-cut processor | `fresh_cut_processor` | Ingredient lots routed into processor inventory and transformed into fresh-cut outputs |
+| Retailer readiness demo | `retailer_readiness_demo` | Retail-ready cases moving quickly through DC receiving and store-level receipts |
+
+Scenario selection is available in the dashboard, in `SimulationConfig`, and via `GET /api/scenarios`. The default is `leafy_greens_supplier`, and delivery still defaults to **`mock`**.
+
+Per-scenario save/load stores one saved slot per scenario under `data/scenario_saves/`. A saved scenario includes the sanitized simulator config and the current stored event records, so operators can restore repeatable demo states after switching scenarios. Live API keys are never saved; live delivery settings are restored as mock delivery to preserve mock-first safety.
+
+## Demo fixtures
+
+Use `GET /api/demo-fixtures` to list deterministic demo playback fixtures. Each fixture contains fixed RegEngine-shaped events with stable timestamps, lot codes, reference documents, and parent-lot lineage. `POST /api/demo-fixtures/{fixture_id}/load` loads a fixture into the event store and optionally delivers it through `mock`, `live`, or `none` delivery.
+
+Supported fixture IDs:
+
+| Fixture | Value | Demo emphasis |
+|---|---|---|
+| Leafy greens trace | `leafy_greens_trace` | One leafy greens lot from harvest through DC receipt |
+| Fresh-cut transformation | `fresh_cut_transformation` | Two ingredient lots transformed into one fresh-cut output lot |
+| Retailer handoff | `retailer_handoff` | Retail-ready cases through DC and store receipts |
+
+The dashboard fixture loader resets the current event log before loading the selected fixture so demos start from a known state.
+
+## FDA export presets
+
+`GET /api/mock/regengine/export/fda-request` still returns the same 11-column FDA request CSV and remains backward compatible with optional `start_date` and `end_date` filters. Date filters must be valid inclusive `YYYY-MM-DD` dates, and `start_date` must not be later than `end_date`. It now also accepts:
+
+- `preset`: one of `all_records`, `lot_trace`, `shipment_handoff`, `receiving_log`, or `transformation_batches`
+- `traceability_lot_code`: optional for most presets, required for `lot_trace`
+
+If a lot code is supplied, the export is scoped to that lot's transitive lineage before applying the preset filter. `GET /api/mock/regengine/export/presets` returns the preset catalog used by the dashboard. The dashboard export panel builds CSV and EPCIS download links from the same lot and date filters.
+
+## EPCIS 2.0 export scaffolding
+
+`GET /api/mock/regengine/export/epcis` derives a scaffolded EPCIS 2.0 JSON-LD document from stored simulator records. This is intentionally additive: it does not change live RegEngine ingest payloads, the mock ingest route, or the FDA CSV export shape.
+
+Supported query parameters:
+
+- `start_date`: optional inclusive `YYYY-MM-DD`
+- `end_date`: optional inclusive `YYYY-MM-DD`
+- `traceability_lot_code`: optional lot code; when supplied, the export uses the same transitive lineage graph as `/api/lineage/{traceability_lot_code}`
+
+Invalid date formats, impossible dates, and inverted ranges return `400` so operators catch export filter mistakes before sharing files.
+
+The dashboard exposes a `Download EPCIS` control beside the FDA CSV export. It uses the same optional lot code and date filters as the CSV export panel, but does not apply FDA-only preset filters.
+
+The export returns an `EPCISDocument` with `ObjectEvent` records for harvesting, cooling, packing, shipping, and receiving CTEs, plus `TransformationEvent` records for transformation CTEs. RegEngine-specific fields are preserved under the `regengine:` JSON-LD namespace so KDEs, parent lot codes, document references, product descriptions, and original CTE types remain visible while the current webhook contract stays unchanged.
+
+## Design-partner demo script
+
+`DESIGN_PARTNER_DEMO_SCRIPT.md` contains a repeatable design-partner walkthrough with pre-demo verification, talking points, expected dashboard states, lot codes to inspect, FDA/EPCIS export checks, reset commands, and recovery notes. The default path uses the deterministic `fresh_cut_transformation` fixture and keeps delivery in mock mode.
+
+## Deployment profiles
+
+`DEPLOYMENT_PROFILES.md` defines three operator profiles:
+
+- Local demo: bind to `127.0.0.1`, no Basic Auth, default local storage, mock delivery.
+- Shared demo: Basic Auth enabled, tenant-scoped storage, mock delivery, and HTTPS/proxy guidance.
+- Live ingest trial: shared-demo protections plus an explicit one-batch live delivery workflow using the documented RegEngine endpoint.
+
+The service wrapper examples below can be used with any profile; keep the profile's bind address, auth, tenant, and delivery safeguards intact.
 
 ## API reference
 
@@ -110,12 +349,28 @@ Generates and persists events locally without delivering them anywhere. Useful f
 
 | Method | Path | Purpose |
 |---|---|---|
-| `GET` | `/api/health` | Liveness probe + current config snapshot |
+| `GET` | `/api/health` | Authenticated liveness probe, public build metadata, tenant/auth context, and current config snapshot |
+| `GET` | `/api/healthz` | Unauthenticated platform/container healthcheck with public build metadata |
+| `GET` | `/api/scenarios` | List available scenario presets |
+| `GET` | `/api/scenario-saves` | List saved per-scenario demo states |
+| `POST` | `/api/scenario-saves/{scenario_id}` | Save the current or supplied config and event log for a scenario |
+| `POST` | `/api/scenario-saves/{scenario_id}/load` | Restore a saved scenario config and event log |
+| `GET` | `/api/demo-fixtures` | List deterministic demo playback fixtures |
+| `POST` | `/api/demo-fixtures/{fixture_id}/load` | Load a deterministic fixture into the event store |
 | `GET` | `/api/simulate/status` | Running state, config, and aggregate stats |
+| `GET` | `/api/operator/tenants` | List protected tenant scopes and storage counts |
+| `POST` | `/api/operator/tenants/{tenant_id}/reset` | Reset one protected tenant event log |
+| `DELETE` | `/api/operator/tenants/{tenant_id}` | Delete one protected tenant data directory |
 | `POST` | `/api/simulate/start` | Start the loop (accepts a `config` body) |
 | `POST` | `/api/simulate/stop` | Stop the loop |
 | `POST` | `/api/simulate/step` | Emit one batch synchronously |
+| `POST` | `/api/simulate/replay` | Replay persisted JSONL events through the configured delivery mode |
 | `POST` | `/api/simulate/reset` | Clear state and persisted events |
+| `GET` | `/api/simulate/stream` | Server-Sent Events snapshots for live dashboard updates |
+| `POST` | `/api/import/csv` | Bulk import scheduled events or seed lots from CSV text |
+| `POST` | `/api/delivery/retry` | Retry failed stored deliveries with the current or supplied delivery config |
+
+All routes accept optional `X-RegEngine-Tenant` for tenant-scoped storage. If Basic Auth is enabled, include standard HTTP Basic credentials.
 
 ### Inspection
 
@@ -129,7 +384,9 @@ Generates and persists events locally without delivering them anywhere. Useful f
 | Method | Path | Purpose |
 |---|---|---|
 | `POST` | `/api/mock/regengine/ingest` | Accepts RegEngine-shaped payloads |
+| `GET` | `/api/mock/regengine/export/presets` | List FDA request export presets |
 | `GET` | `/api/mock/regengine/export/fda-request` | Mock 11-column FDA request CSV |
+| `GET` | `/api/mock/regengine/export/epcis` | Scaffolded EPCIS 2.0 JSON-LD export |
 
 ### Example: start the simulator in live mode
 
@@ -139,6 +396,7 @@ curl -X POST http://127.0.0.1:8000/api/simulate/start \
   -d '{
     "config": {
       "source": "codex-simulator",
+      "scenario": "fresh_cut_processor",
       "interval_seconds": 1.0,
       "batch_size": 3,
       "seed": 204,
@@ -153,6 +411,20 @@ curl -X POST http://127.0.0.1:8000/api/simulate/start \
   }'
 ```
 
+### Example: reset into a retailer readiness scenario
+
+```bash
+curl -X POST http://127.0.0.1:8000/api/simulate/reset \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "scenario": "retailer_readiness_demo",
+    "batch_size": 3,
+    "seed": 204,
+    "persist_path": "data/events.jsonl"
+  }'
+curl -X POST http://127.0.0.1:8000/api/simulate/step
+```
+
 ### Example: step once and inspect events
 
 ```bash
@@ -160,10 +432,84 @@ curl -X POST http://127.0.0.1:8000/api/simulate/step
 curl http://127.0.0.1:8000/api/events
 ```
 
+### Example: load a deterministic fresh-cut demo fixture
+
+```bash
+curl -X POST http://127.0.0.1:8000/api/demo-fixtures/fresh_cut_transformation/load \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "reset": true,
+    "delivery": {
+      "mode": "mock"
+    }
+  }'
+```
+
+### Example: save and reload a scenario state
+
+```bash
+curl -X POST http://127.0.0.1:8000/api/scenario-saves/fresh_cut_processor
+curl -X POST http://127.0.0.1:8000/api/scenario-saves/fresh_cut_processor/load
+```
+
+### Example: replay the current persisted log
+
+```bash
+curl -X POST http://127.0.0.1:8000/api/simulate/replay
+```
+
+### Example: replay another JSONL file without delivery
+
+```bash
+curl -X POST http://127.0.0.1:8000/api/simulate/replay \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "persist_path": "data/events.jsonl",
+    "source": "codex-simulator",
+    "delivery": {
+      "mode": "none"
+    }
+  }'
+```
+
+### Example: subscribe to live dashboard updates
+
+```bash
+curl -N http://127.0.0.1:8000/api/simulate/stream
+```
+
+Each SSE `snapshot` includes a monotonic `revision`, the same status payload returned by `/api/simulate/status`, and recent event records from `/api/events`. Use `limit` to control the number of recent events and `once=true` for a one-shot smoke check.
+
+### Example: retry failed deliveries in mock mode
+
+```bash
+curl -X POST http://127.0.0.1:8000/api/delivery/retry \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "delivery": {
+      "mode": "mock"
+    }
+  }'
+```
+
 ### Example: trace a lot
 
 ```bash
 curl http://127.0.0.1:8000/api/lineage/TLC-20260421-000003
+```
+
+The lineage response keeps the original `records[]` event timeline and adds `nodes[]` plus `edges[]` so transformed outputs can be displayed as a lot graph. `nodes[]` summarizes each related lot, and `edges[]` links source/input lot codes to downstream packed or transformed lots.
+
+### Example: export a lot-trace FDA request slice
+
+```bash
+curl "http://127.0.0.1:8000/api/mock/regengine/export/fda-request?preset=lot_trace&traceability_lot_code=TLC-20260421-000003"
+```
+
+### Example: export a lot-trace EPCIS scaffold
+
+```bash
+curl "http://127.0.0.1:8000/api/mock/regengine/export/epcis?traceability_lot_code=TLC-20260421-000003"
 ```
 
 ## RegEngine payload contract
@@ -196,7 +542,7 @@ The live delivery client targets the current RegEngine webhook shape:
 }
 ```
 
-The mock FDA export mirrors RegEngine's documented 11-column request export shape.
+The mock FDA export mirrors RegEngine's documented 11-column request export shape. The EPCIS 2.0 export is a separate derived JSON-LD scaffold and does not change this webhook contract.
 
 ## Deployment
 
@@ -287,32 +633,48 @@ journalctl -u regengine -f    # live logs
 
 ### Docker (optional)
 
-A minimal image is straightforward:
-
-```dockerfile
-FROM python:3.12-slim
-WORKDIR /app
-COPY requirements.txt ./
-RUN pip install --no-cache-dir -r requirements.txt
-COPY . .
-EXPOSE 8000
-CMD ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8000"]
-```
-
-Build and run:
+The repository ships with a production-oriented `Dockerfile`. The entrypoint prepares the mounted data directory, drops to a non-root app user for Uvicorn, stores default simulator data under `/data`, and includes a healthcheck for `/api/healthz`.
 
 ```bash
 docker build -t regengine-inflow-lab .
-docker run --rm -p 8000:8000 regengine-inflow-lab
+docker run --rm \
+  -p 8000:8000 \
+  -v "$PWD/data:/data" \
+  -e REGENGINE_BASIC_AUTH_USERNAME=demo \
+  -e REGENGINE_BASIC_AUTH_PASSWORD=change-me \
+  -e REGENGINE_CORS_ORIGINS=http://127.0.0.1:8000 \
+  regengine-inflow-lab
 ```
 
+`railway.json` uses the same Dockerfile and healthcheck for Railway deployments. Mount persistent storage at `/data` and keep `REGENGINE_DATA_DIR=/data`.
+
+Expose non-secret build metadata so stale shared-demo deployments are obvious from `/api/healthz` and remote smoke failures:
+
+```bash
+railway variable set --skip-deploys REGENGINE_BUILD_SHA="$(git rev-parse HEAD)" \
+  REGENGINE_BUILD_BRANCH="$(git branch --show-current)"
+railway up --ci -m "Deploy $(git rev-parse --short HEAD)"
+```
+
+The health responses always include `build.version`; `build.commit_sha`, `build.commit_sha_short`, `build.branch`, and `build.deployment_id` are populated from whitelisted environment variables when available, or from local `.git` metadata during local development.
+
 ## Logs and troubleshooting
+
+Every HTTP request emits an application log line like:
+
+```text
+request method=POST path=/api/demo-fixtures/fresh_cut_transformation/load status=200 duration_ms=42.10 tenant=remote-smoke delivery_mode=mock
+```
+
+The request log intentionally excludes headers, credentials, query strings, request bodies, response bodies, and export contents. Use it to correlate route failures, tenant scope, and the active delivery mode without exposing Basic Auth passwords, API keys, live tenant ids, or downloaded FDA/EPCIS data.
 
 | Location | What it contains |
 |---|---|
 | `uvicorn.out.log` | Server stdout (request logs, lifecycle messages) |
 | `uvicorn.err.log` | Server stderr (Python tracebacks, startup errors) |
 | `data/events.jsonl` | Persisted simulator events |
+| `data/tenants/{tenant_id}/events.jsonl` | Tenant-scoped simulator events |
+| `data/tenants/{tenant_id}/scenario_saves/` | Tenant-scoped saved scenario states |
 
 Common checks:
 
@@ -323,12 +685,27 @@ systemctl status regengine                    # Linux
 
 # Health probe
 curl http://127.0.0.1:8000/api/health
+curl http://127.0.0.1:8000/api/healthz
 
 # Tail logs (macOS)
 tail -f ~/regengine_codex_workspace/uvicorn.err.log
+
+# Railway logs
+railway logs --lines 100
+railway logs --http --status ">=400" --lines 50
 ```
 
-If the health check fails, the first place to look is `uvicorn.err.log` for a Python traceback.
+Common failure patterns:
+
+- Auth failures: request logs show `status=401` on `/api/...`; confirm `REGENGINE_BASIC_AUTH_USERNAME` and `REGENGINE_BASIC_AUTH_PASSWORD` are set as intended.
+- CORS failures: Railway HTTP logs may show successful `OPTIONS` but the browser blocks a follow-up request; confirm `REGENGINE_CORS_ORIGINS` is the exact HTTPS dashboard origin.
+- Volume/storage failures: `/api/health` should report tenant-scoped paths under `REGENGINE_DATA_DIR`; confirm Railway has a volume mounted at `/data` and `REGENGINE_DATA_DIR=/data`.
+- Stale deployment failures: `/api/healthz` should report the expected `build.commit_sha_short`; if it does not, redeploy current `main` and update `REGENGINE_BUILD_SHA`.
+- Live delivery failures: request logs identify the route and tenant while dashboard delivery stats show the sanitized delivery error; confirm endpoint, API key, and tenant id before retrying.
+- Local dependency conflicts: create a fresh `.venv` and install `requirements-dev.txt` before diagnosing app failures; global Python packages such as OpenTelemetry or Semgrep can drift independently of this repo.
+- Railway startup log noise: Uvicorn startup messages may appear with `level=error` in Railway logs. Treat them as noise unless there is a traceback, failed deployment, or HTTP 5xx.
+
+If the health check fails before request logs appear, the first place to look is `uvicorn.err.log` or `railway logs --deployment` for a Python traceback or startup error.
 
 ## Contributing
 

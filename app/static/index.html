@@ -8,84 +8,238 @@
   </head>
   <body>
     <main class="page">
-      <header class="hero">
+      <header class="app-header">
         <div>
-          <p class="eyebrow">Codex-ready simulator</p>
+          <p class="eyebrow">Mock-first FSMA 204 simulator</p>
           <h1>RegEngine Inflow Lab</h1>
-          <p class="lede">
-            Generate linked FSMA 204 Critical Tracking Events, post them to a mock or live
-            RegEngine-compatible ingest endpoint, and inspect lineage plus FDA-request exports.
-          </p>
         </div>
-        <div class="hero-actions">
+        <div class="header-actions">
           <a class="button secondary" href="/docs" target="_blank" rel="noreferrer">Open API docs</a>
           <a class="button secondary" href="/api/mock/regengine/export/fda-request" target="_blank" rel="noreferrer">Download mock FDA export</a>
         </div>
       </header>
 
-      <section class="panel controls">
-        <h2>Simulator controls</h2>
-        <form id="config-form" class="grid two-up">
-          <label>
-            Source
-            <input id="source" name="source" value="codex-simulator" />
-          </label>
-          <label>
-            Interval seconds
-            <input id="interval" name="interval" type="number" min="0" step="0.1" value="1.5" />
-          </label>
-          <label>
-            Batch size
-            <input id="batchSize" name="batchSize" type="number" min="1" max="100" value="3" />
-          </label>
-          <label>
-            Seed
-            <input id="seed" name="seed" type="number" value="204" />
-          </label>
-          <label>
-            Delivery mode
-            <select id="deliveryMode" name="deliveryMode">
-              <option value="mock" selected>Mock RegEngine</option>
-              <option value="live">Live RegEngine</option>
-              <option value="none">Generate only</option>
-            </select>
-          </label>
-          <label>
-            Live endpoint override
-            <input
-              id="endpoint"
-              name="endpoint"
-              value="https://www.regengine.co/api/v1/webhooks/ingest"
-              placeholder="https://www.regengine.co/api/v1/webhooks/ingest"
-            />
-          </label>
-          <label>
-            RegEngine API key
-            <input id="apiKey" name="apiKey" type="password" autocomplete="off" />
-          </label>
-          <label>
-            Tenant ID
-            <input id="tenantId" name="tenantId" autocomplete="off" />
-          </label>
-          <label class="checkbox-row live-confirmation" id="liveConfirmBlock" hidden>
-            <input id="liveConfirmed" name="liveConfirmed" type="checkbox" />
-            <span>I confirm this batch may post to live RegEngine.</span>
-          </label>
-        </form>
-        <div class="actions">
-          <button class="button" id="startBtn" type="button">Start loop</button>
-          <button class="button secondary" id="stopBtn" type="button">Stop</button>
-          <button class="button secondary" id="stepBtn" type="button">Single batch</button>
-          <button class="button danger" id="resetBtn" type="button">Reset state</button>
+      <section class="status-strip" aria-label="Current demo state">
+        <div>
+          <span>Next action</span>
+          <strong id="nextActionText">Load a fixture or run a batch</strong>
         </div>
-        <p class="note" id="statusMessage">Ready.</p>
+        <div>
+          <span>Tenant</span>
+          <strong id="tenantBadge">local-demo</strong>
+        </div>
+        <div>
+          <span>Delivery</span>
+          <strong id="deliveryModePill">mock</strong>
+        </div>
+        <div>
+          <span>Build</span>
+          <strong id="buildBadge">0.1.0</strong>
+        </div>
       </section>
 
-      <section class="grid stats-grid" id="statsGrid"></section>
+      <div class="console-layout">
+        <section class="panel setup-panel">
+          <div class="section-head">
+            <div>
+              <p class="section-kicker">1. Setup</p>
+              <h2>Demo setup</h2>
+            </div>
+            <span class="mode-alert" id="liveDeliveryWarning" hidden>Live delivery enabled</span>
+          </div>
 
-      <section class="panel">
+          <form id="config-form" class="setup-grid">
+            <label>
+              Scenario preset
+              <select id="scenario" name="scenario">
+                <option value="leafy_greens_supplier" selected>Leafy greens supplier</option>
+                <option value="fresh_cut_processor">Fresh-cut processor</option>
+                <option value="retailer_readiness_demo">Retailer readiness demo</option>
+              </select>
+            </label>
+            <label>
+              Fixture
+              <select id="demoFixture" name="demoFixture">
+                <option value="leafy_greens_trace" selected>Leafy greens trace</option>
+              </select>
+            </label>
+            <label>
+              Delivery mode
+              <select id="deliveryMode" name="deliveryMode">
+                <option value="mock" selected>Mock RegEngine</option>
+                <option value="live">Live RegEngine</option>
+                <option value="none">Generate only</option>
+              </select>
+            </label>
+            <label>
+              Source
+              <input id="source" name="source" value="codex-simulator" />
+            </label>
+          </form>
+
+          <p class="note" id="demoFixtureDescription">Harvest through cooling, packout, shipment, and DC receipt for one leafy greens lot.</p>
+
+          <div class="action-row primary-row">
+            <button class="button" id="loadFixtureBtn" type="button">Load fixture</button>
+            <button class="button secondary" id="stepBtn" type="button">Single batch</button>
+          </div>
+
+          <details class="advanced-panel" id="advancedConfig">
+            <summary>Advanced timing, credentials, and saved states</summary>
+            <div class="advanced-content">
+              <div class="grid two-up compact-fields">
+                <label>
+                  Interval seconds
+                  <input id="interval" name="interval" type="number" min="0" step="0.1" value="1.5" />
+                </label>
+                <label>
+                  Batch size
+                  <input id="batchSize" name="batchSize" type="number" min="1" max="100" value="3" />
+                </label>
+                <label>
+                  Seed
+                  <input id="seed" name="seed" type="number" value="204" />
+                </label>
+                <label>
+                  Tenant ID
+                  <input id="tenantId" name="tenantId" autocomplete="off" />
+                </label>
+                <label class="wide-field">
+                  Live endpoint override
+                  <input id="endpoint" name="endpoint" placeholder="https://www.regengine.co/api/v1/webhooks/ingest" />
+                </label>
+                <label class="wide-field">
+                  RegEngine API key
+                  <input id="apiKey" name="apiKey" type="password" autocomplete="off" />
+                </label>
+              </div>
+
+              <div class="split-row">
+                <label>
+                  Saved scenario
+                  <select id="scenarioSave" name="scenarioSave">
+                    <option value="">No saved scenarios</option>
+                  </select>
+                </label>
+                <div class="action-row">
+                  <button class="button secondary" id="saveScenarioBtn" type="button">Save scenario</button>
+                  <button class="button secondary" id="loadScenarioBtn" type="button">Load saved</button>
+                </div>
+              </div>
+              <p class="note" id="scenarioSaveDescription">No saved scenario selected.</p>
+            </div>
+          </details>
+        </section>
+
+        <aside class="panel run-panel">
+          <div class="section-head">
+            <div>
+              <p class="section-kicker">2. Run</p>
+              <h2>Simulator</h2>
+            </div>
+            <span class="status-pill" id="runStatePill">Stopped</span>
+          </div>
+          <p class="note status-message" id="statusMessage">Ready.</p>
+          <div class="action-row">
+            <button class="button" id="startBtn" type="button">Start loop</button>
+            <button class="button secondary" id="stopBtn" type="button">Stop</button>
+            <button class="button secondary" id="replayBtn" type="button">Replay current log</button>
+            <button class="button danger" id="resetBtn" type="button">Reset state</button>
+          </div>
+          <section class="stats-grid" id="statsGrid" aria-label="Simulator metrics"></section>
+        </aside>
+      </div>
+
+      <section class="panel delivery-monitor">
         <div class="section-head">
-          <h2>Recent events</h2>
+          <div>
+            <p class="section-kicker">3. Monitor</p>
+            <h2>Delivery monitor</h2>
+          </div>
+          <button class="button secondary" id="retryFailedBtn" type="button">Retry failed deliveries</button>
+        </div>
+        <div id="deliverySummary" class="delivery-summary"></div>
+      </section>
+
+      <div class="evidence-layout">
+        <section class="panel lineage-panel">
+          <div class="section-head">
+            <div>
+              <p class="section-kicker">4. Trace</p>
+              <h2>Lot lineage</h2>
+            </div>
+          </div>
+          <div class="inline-form">
+            <input id="lotLookup" placeholder="Traceability Lot Code" />
+            <button class="button secondary" id="lineageBtn" type="button">Trace lot</button>
+          </div>
+          <div id="lineageResults" class="lineage-results"></div>
+        </section>
+
+        <section class="panel evidence-panel">
+          <div class="section-head">
+            <div>
+              <p class="section-kicker">5. Export</p>
+              <h2>Evidence exports</h2>
+            </div>
+            <div class="section-actions">
+              <a class="button secondary" id="exportDownloadLink" href="/api/mock/regengine/export/fda-request" target="_blank" rel="noreferrer">Download CSV</a>
+              <a class="button secondary" id="epcisDownloadLink" href="/api/mock/regengine/export/epcis" target="_blank" rel="noreferrer">Download EPCIS</a>
+            </div>
+          </div>
+          <div class="grid two-up">
+            <label>
+              Export preset
+              <select id="exportPreset" name="exportPreset">
+                <option value="all_records" selected>All records</option>
+              </select>
+            </label>
+            <label>
+              Traceability Lot Code
+              <input id="exportLot" name="exportLot" placeholder="Optional unless preset requires one" />
+            </label>
+            <label>
+              Start date
+              <input id="exportStartDate" name="exportStartDate" type="date" />
+            </label>
+            <label>
+              End date
+              <input id="exportEndDate" name="exportEndDate" type="date" />
+            </label>
+          </div>
+          <p class="note" id="exportPresetDescription">Full FDA-request export for the selected date range. EPCIS uses the same lot and date filters.</p>
+
+          <div class="import-block">
+            <div class="section-head">
+              <h3>CSV import</h3>
+            </div>
+            <div class="grid two-up">
+              <label>
+                CSV type
+                <select id="csvImportType" name="csvImportType">
+                  <option value="scheduled_events" selected>Scheduled events</option>
+                  <option value="seed_lots">Seed lots</option>
+                </select>
+              </label>
+              <label>
+                CSV file
+                <input id="csvFile" name="csvFile" type="file" accept=".csv,text/csv" />
+              </label>
+            </div>
+            <div class="action-row">
+              <button class="button secondary" id="importCsvBtn" type="button">Import CSV</button>
+            </div>
+            <div id="importResults" class="import-results"></div>
+          </div>
+        </section>
+      </div>
+
+      <section class="panel events-panel">
+        <div class="section-head">
+          <div>
+            <p class="section-kicker">Event log</p>
+            <h2>Recent events</h2>
+          </div>
           <button class="button secondary" id="refreshBtn" type="button">Refresh</button>
         </div>
         <div class="table-wrap">
@@ -98,23 +252,14 @@
                 <th>Product</th>
                 <th>Location</th>
                 <th>Timestamp</th>
+                <th>Mode</th>
+                <th>Attempts</th>
                 <th>Status</th>
               </tr>
             </thead>
             <tbody id="eventsBody"></tbody>
           </table>
         </div>
-      </section>
-
-      <section class="panel">
-        <div class="section-head">
-          <h2>Lot lineage lookup</h2>
-        </div>
-        <div class="inline-form">
-          <input id="lotLookup" placeholder="Paste a Traceability Lot Code" />
-          <button class="button secondary" id="lineageBtn" type="button">Trace lot</button>
-        </div>
-        <div id="lineageResults" class="lineage-results"></div>
       </section>
     </main>
     <script src="/static/app.js" defer></script>

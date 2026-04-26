@@ -12,23 +12,38 @@ This file is the standing backlog for unattended Codex runs.
 
 ## Priority 1
 
-- [ ] Add server-sent events so the dashboard updates live without polling.
-- [ ] Add scenario presets for leafy greens supplier, fresh-cut processor, and retailer readiness demo.
-- [ ] Add replay mode for previously persisted JSONL events.
-- [ ] Add CSV bulk import for seed lots or scheduled events.
+- [x] Add server-sent events so the dashboard updates live without polling.
+- [x] Add scenario presets for leafy greens supplier, fresh-cut processor, and retailer readiness demo.
+- [x] Add replay mode for previously persisted JSONL events.
+- [x] Add CSV bulk import for seed lots or scheduled events.
 
 ## Priority 2
 
-- [ ] Add clearer lot-lineage views in the dashboard for transformed lots.
-- [ ] Add richer operator-visible delivery status and retry feedback.
-- [ ] Add export presets that mimic common FDA-request slices.
-- [ ] Add deterministic scenario fixtures for demo playback.
+- [x] Add clearer lot-lineage views in the dashboard for transformed lots.
+- [x] Add richer operator-visible delivery status and retry feedback.
+- [x] Add export presets that mimic common FDA-request slices.
+- [x] Add deterministic scenario fixtures for demo playback.
 
 ## Priority 3
 
-- [ ] Add EPCIS 2.0 export scaffolding without breaking the current webhook contract.
-- [ ] Add per-scenario save/load support.
-- [ ] Add basic auth and tenant-scoped storage boundaries.
+- [x] Add EPCIS 2.0 export scaffolding without breaking the current webhook contract.
+- [x] Add per-scenario save/load support.
+- [x] Add basic auth and tenant-scoped storage boundaries.
+
+## Priority 4
+
+- [x] Add release smoke regression harness and checklist.
+- [x] Add tenant/auth status and EPCIS export controls to the dashboard.
+- [x] Add a design-partner demo script with expected talking points and reset steps.
+- [x] Add deployment profile examples for local, shared demo, and live-ingest modes.
+
+## Priority 5
+
+- [x] Restrict credentialed CORS to configured browser origins for shared demo and live-ingest profiles.
+
+## Priority 6
+
+- [x] Add container/Railway deployment artifacts with persistent data-directory support.
 
 ## Progress notes
 

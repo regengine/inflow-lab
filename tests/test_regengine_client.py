@@ -1,17 +1,54 @@
+from __future__ import annotations
+
 import asyncio
 from datetime import UTC, datetime
+from typing import Any
 
-from app.models import CTEType, DeliveryConfig, DestinationMode, IngestPayload, RegEngineEvent, SimulationConfig
+from app.models import CTEType, IngestPayload, RegEngineEvent, SimulationConfig
 from app.regengine_client import DEFAULT_LIVE_INGEST_ENDPOINT, LiveRegEngineClient
 
 
-def _payload() -> IngestPayload:
+class FakeResponse:
+    status_code = 200
+
+    def raise_for_status(self) -> None:
+        return None
+
+    def json(self) -> dict[str, Any]:
+        return {"accepted": 1}
+
+
+class RecordingAsyncClient:
+    calls: list[dict[str, Any]] = []
+
+    def __init__(self, *, timeout: float) -> None:
+        self.timeout = timeout
+
+    async def __aenter__(self) -> "RecordingAsyncClient":
+        return self
+
+    async def __aexit__(self, exc_type: object, exc: object, tb: object) -> None:
+        return None
+
+    async def post(self, endpoint: str, *, headers: dict[str, str], json: dict[str, Any]) -> FakeResponse:
+        self.calls.append(
+            {
+                "endpoint": endpoint,
+                "headers": headers,
+                "json": json,
+                "timeout": self.timeout,
+            }
+        )
+        return FakeResponse()
+
+
+def make_payload() -> IngestPayload:
     return IngestPayload(
-        source="test-suite",
+        source="erp",
         events=[
             RegEngineEvent(
                 cte_type=CTEType.RECEIVING,
-                traceability_lot_code="TLC-TEST-000001",
+                traceability_lot_code="00012345678901-LOT-2026-001",
                 product_description="Romaine Lettuce",
                 quantity=500,
                 unit_of_measure="cases",
@@ -27,54 +64,83 @@ def _payload() -> IngestPayload:
     )
 
 
-def test_live_client_uses_documented_default_endpoint_and_headers(monkeypatch):
-    captured = {}
-
-    class FakeResponse:
-        def raise_for_status(self):
-            captured["raise_for_status_called"] = True
-
-        def json(self):
-            return {"accepted": 1, "events": []}
-
-    class FakeAsyncClient:
-        def __init__(self, *, timeout):
-            captured["timeout"] = timeout
-
-        async def __aenter__(self):
-            return self
-
-        async def __aexit__(self, exc_type, exc, tb):
-            return None
-
-        async def post(self, endpoint, *, headers, json):
-            captured["endpoint"] = endpoint
-            captured["headers"] = headers
-            captured["json"] = json
-            return FakeResponse()
-
-    monkeypatch.setattr("app.regengine_client.httpx.AsyncClient", FakeAsyncClient)
-    config = SimulationConfig(
-        delivery=DeliveryConfig(
-            mode=DestinationMode.LIVE,
-            api_key="regengine-api-key",
-            tenant_id="tenant-123",
-        )
+def make_live_config(endpoint: str | None = None) -> SimulationConfig:
+    return SimulationConfig(
+        delivery={
+            "mode": "live",
+            "endpoint": endpoint,
+            "api_key": "test-api-key",
+            "tenant_id": "test-tenant-id",
+        }
     )
 
-    result = asyncio.run(LiveRegEngineClient().ingest(_payload(), config))
 
-    assert result == {"accepted": 1, "events": []}
-    assert captured["endpoint"] == DEFAULT_LIVE_INGEST_ENDPOINT
-    assert captured["timeout"] == 20.0
-    assert captured["headers"] == {
-        "Content-Type": "application/json",
-        "X-RegEngine-API-Key": "regengine-api-key",
-        "X-Tenant-ID": "tenant-123",
-        "Idempotency-Key": captured["headers"]["Idempotency-Key"],
+def run_ingest(monkeypatch: Any, config: SimulationConfig) -> dict[str, Any]:
+    RecordingAsyncClient.calls = []
+    monkeypatch.setattr("app.regengine_client.httpx.AsyncClient", RecordingAsyncClient)
+
+    result = asyncio.run(LiveRegEngineClient().ingest(make_payload(), config))
+
+    assert result.response == {"accepted": 1}
+    assert result.metadata["delivery_mode"] == "live"
+    assert result.metadata["endpoint_host"]
+    assert result.metadata["endpoint_path"]
+    assert result.metadata["idempotency_key"]
+    assert result.metadata["status_code"] == 200
+    assert len(RecordingAsyncClient.calls) == 1
+    return RecordingAsyncClient.calls[0]
+
+
+def test_live_client_uses_documented_default_endpoint(monkeypatch: Any) -> None:
+    call = run_ingest(monkeypatch, make_live_config())
+
+    assert call["endpoint"] == DEFAULT_LIVE_INGEST_ENDPOINT
+    assert call["endpoint"] == "https://www.regengine.co/api/v1/webhooks/ingest"
+
+
+def test_live_client_uses_configured_endpoint_override(monkeypatch: Any) -> None:
+    override = "https://partner.example.test/regengine/ingest"
+
+    call = run_ingest(monkeypatch, make_live_config(endpoint=override))
+
+    assert call["endpoint"] == override
+
+
+def test_live_client_sends_required_headers_and_contract_payload(monkeypatch: Any) -> None:
+    call = run_ingest(monkeypatch, make_live_config())
+
+    assert call["headers"]["Content-Type"] == "application/json"
+    assert call["headers"]["X-RegEngine-API-Key"] == "test-api-key"
+    assert call["headers"]["X-Tenant-ID"] == "test-tenant-id"
+    assert call["headers"]["Idempotency-Key"]
+
+    payload = call["json"]
+    assert set(payload) == {"source", "events"}
+    assert payload["source"] == "erp"
+    assert len(payload["events"]) == 1
+
+    event = payload["events"][0]
+    assert set(event) == {
+        "cte_type",
+        "traceability_lot_code",
+        "product_description",
+        "quantity",
+        "unit_of_measure",
+        "location_name",
+        "timestamp",
+        "kdes",
     }
-    assert captured["headers"]["Idempotency-Key"]
-    assert captured["json"]["source"] == "test-suite"
-    assert captured["json"]["events"][0]["traceability_lot_code"] == "TLC-TEST-000001"
-    assert captured["json"]["events"][0]["timestamp"] == "2026-02-05T08:30:00Z"
-    assert captured["raise_for_status_called"] is True
+    assert event == {
+        "cte_type": "receiving",
+        "traceability_lot_code": "00012345678901-LOT-2026-001",
+        "product_description": "Romaine Lettuce",
+        "quantity": 500.0,
+        "unit_of_measure": "cases",
+        "location_name": "Distribution Center #4",
+        "timestamp": "2026-02-05T08:30:00Z",
+        "kdes": {
+            "receive_date": "2026-02-05",
+            "receiving_location": "Distribution Center #4",
+            "ship_from_location": "Valley Fresh Farms",
+        },
+    }

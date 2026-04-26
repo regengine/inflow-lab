@@ -1,66 +1,246 @@
 from __future__ import annotations
 
-import csv
-import io
+import asyncio
+import json
+import logging
+import os
+import re
+import shutil
+import time
 from contextlib import asynccontextmanager
-from datetime import UTC, datetime
+from datetime import UTC, date, datetime
 from pathlib import Path
+from threading import RLock
 from typing import Any
+from urllib.parse import urlparse
 
 from fastapi import Body, FastAPI, HTTPException, Query, Request
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse, JSONResponse, PlainTextResponse
+from fastapi.responses import FileResponse, JSONResponse, PlainTextResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 
+from .auth import DEFAULT_TENANT_ID, TenantContext, normalize_tenant_id, tenant_context_from_request
+from .build_info import APP_VERSION, current_build_info
 from .controller import SimulationController
+from .demo_fixtures import list_demo_fixture_summaries
 from .engine import LegitFlowEngine
+from .epcis_export import epcis_filename, render_epcis_document
+from .fda_export import (
+    FDA_EXPORT_PRESETS,
+    apply_fda_export_preset,
+    export_filename,
+    list_fda_export_preset_summaries,
+    render_fda_request_csv,
+)
 from .mock_service import MockRegEngineService
 from .models import (
+    CSVImportRequest,
+    CSVImportResponse,
+    DemoFixtureId,
+    DemoFixtureListResponse,
+    DemoFixtureLoadRequest,
+    DemoFixtureLoadResponse,
+    DemoFixtureSummary,
+    DeliveryRetryRequest,
+    DeliveryRetryResponse,
     EventListResponse,
+    FDAExportPreset,
+    FDAExportPresetListResponse,
+    FDAExportPresetSummary,
     IngestPayload,
     LineageResponse,
     MockIngestResponse,
+    ReplayRequest,
+    ReplayResponse,
     ResetResponse,
+    ScenarioLoadResponse,
+    ScenarioListResponse,
+    ScenarioSaveListResponse,
+    ScenarioSaveRequest,
+    ScenarioSaveResponse,
+    ScenarioSaveSummary,
+    ScenarioSummary,
     SimulationConfig,
     StartRequest,
     StatusResponse,
     StepResponse,
-    StepRequest,
+    TenantListResponse,
+    TenantOperationResponse,
+    TenantSummary,
 )
 from .regengine_client import LiveRegEngineClient
+from .scenario_saves import ScenarioSaveStore
+from .scenarios import ScenarioId, list_scenario_summaries
 from .store import EventStore
 
 
+DATA_ROOT = Path(os.getenv("REGENGINE_DATA_DIR", "data"))
+TENANT_DATA_ROOT = DATA_ROOT / "tenants"
+DEFAULT_CORS_ORIGINS = ("http://127.0.0.1:8000", "http://localhost:8000")
+UNSAFE_METHODS = {"POST", "PUT", "PATCH", "DELETE"}
+REQUEST_LOGGER = logging.getLogger("regengine.request")
+
 engine = LegitFlowEngine(seed=204)
-store = EventStore(persist_path="data/events.jsonl")
+store = EventStore(persist_path=str(DATA_ROOT / "events.jsonl"))
+scenario_saves = ScenarioSaveStore(save_dir=str(DATA_ROOT / "scenario_saves"))
 mock_service = MockRegEngineService()
 controller = SimulationController(
     engine=engine,
     store=store,
+    scenario_saves=scenario_saves,
     mock_service=mock_service,
     live_client=LiveRegEngineClient(),
 )
+_tenant_controllers: dict[str, SimulationController] = {DEFAULT_TENANT_ID: controller}
+_tenant_lock = RLock()
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     yield
-    await controller.shutdown()
+    for tenant_controller in set(_tenant_controllers.values()):
+        await tenant_controller.shutdown()
+
+
+def cors_origins_from_env() -> list[str]:
+    raw_origins = os.getenv("REGENGINE_CORS_ORIGINS")
+    if not raw_origins or not raw_origins.strip():
+        return list(DEFAULT_CORS_ORIGINS)
+
+    origins: list[str] = []
+    for raw_origin in raw_origins.split(","):
+        origin = _normalize_cors_origin(raw_origin)
+        if origin and origin not in origins:
+            origins.append(origin)
+    return origins or list(DEFAULT_CORS_ORIGINS)
+
+
+def _normalize_cors_origin(raw_origin: str) -> str | None:
+    origin = raw_origin.strip().rstrip("/")
+    if not origin:
+        return None
+    if origin == "*":
+        raise ValueError("REGENGINE_CORS_ORIGINS cannot contain '*' while credentialed requests are enabled")
+
+    parsed = urlparse(origin)
+    if (
+        parsed.scheme not in {"http", "https"}
+        or not parsed.netloc
+        or parsed.params
+        or parsed.query
+        or parsed.fragment
+        or parsed.path not in {"", "/"}
+    ):
+        raise ValueError(
+            "REGENGINE_CORS_ORIGINS entries must be comma-separated HTTP(S) origins such as "
+            "https://demo.example.com"
+        )
+    return f"{parsed.scheme}://{parsed.netloc}"
 
 
 app = FastAPI(
     title="RegEngine Inflow Lab",
     description="Mock-first FSMA 204 CTE data-flow simulator for RegEngine-compatible payloads.",
-    version="0.1.0",
+    version=APP_VERSION,
     lifespan=lifespan,
 )
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=cors_origins_from_env(),
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+
+@app.middleware("http")
+async def auth_and_tenant_middleware(request: Request, call_next):
+    started_at = time.perf_counter()
+    response = None
+
+    try:
+        if request.method == "OPTIONS" or request.url.path == "/api/healthz":
+            response = await call_next(request)
+            return response
+
+        context = tenant_context_from_request(request)
+        if isinstance(context, JSONResponse):
+            response = context
+            return response
+        request.state.tenant_context = context
+        unsafe_origin_response = _reject_untrusted_unsafe_origin(request, context)
+        if unsafe_origin_response is not None:
+            response = unsafe_origin_response
+            return response
+        response = await call_next(request)
+        return response
+    except Exception:
+        _log_request(request, status_code=500, started_at=started_at)
+        raise
+    finally:
+        if response is not None:
+            _log_request(request, status_code=response.status_code, started_at=started_at)
+
+
+def _log_request(request: Request, status_code: int, started_at: float) -> None:
+    duration_ms = (time.perf_counter() - started_at) * 1000
+    context = _tenant_context(request)
+    delivery_mode = _request_delivery_mode(request)
+    REQUEST_LOGGER.info(
+        "request method=%s path=%s status=%s duration_ms=%.2f tenant=%s delivery_mode=%s",
+        request.method,
+        request.url.path,
+        status_code,
+        duration_ms,
+        context.tenant_id,
+        delivery_mode,
+    )
+
+
+def _request_delivery_mode(request: Request) -> str:
+    if not hasattr(request.state, "tenant_context") and request.url.path != "/api/healthz":
+        return "unknown"
+    try:
+        return str(_active_controller(request).config.delivery.mode.value)
+    except Exception:
+        return "unknown"
+
+
+def _reject_untrusted_unsafe_origin(request: Request, context: TenantContext) -> JSONResponse | None:
+    if not context.auth_enabled or request.method.upper() not in UNSAFE_METHODS:
+        return None
+
+    request_origin = _browser_request_origin(request)
+    if request_origin is None:
+        return None
+
+    if request_origin in cors_origins_from_env():
+        return None
+
+    return JSONResponse(
+        status_code=403,
+        content={"detail": "State-changing requests require a trusted browser origin"},
+    )
+
+
+def _browser_request_origin(request: Request) -> str | None:
+    origin = request.headers.get("origin")
+    if origin:
+        return _origin_from_url(origin) or ""
+
+    referer = request.headers.get("referer")
+    if referer:
+        return _origin_from_url(referer) or ""
+
+    return None
+
+
+def _origin_from_url(raw_url: str) -> str | None:
+    parsed = urlparse(raw_url.strip())
+    if parsed.scheme not in {"http", "https"} or not parsed.netloc:
+        return None
+    return f"{parsed.scheme}://{parsed.netloc}"
+
 
 static_dir = Path(__file__).parent / "static"
 app.mount("/static", StaticFiles(directory=static_dir), name="static")
@@ -72,107 +252,516 @@ async def root() -> FileResponse:
 
 
 @app.get("/api/health")
-async def health() -> dict[str, Any]:
+async def health(request: Request) -> dict[str, Any]:
+    active_controller = _active_controller(request)
+    context = _tenant_context(request)
+    build = current_build_info().public_dict()
     return {
         "ok": True,
         "utc_time": datetime.now(UTC).isoformat(),
-        "status": controller.status(),
+        "build": build,
+        "tenant": context.tenant_id,
+        "auth": {
+            "enabled": context.auth_enabled,
+            "username": context.username,
+            "uses_default_storage": context.uses_default_storage,
+        },
+        "status": active_controller.status(),
+    }
+
+
+@app.get("/api/healthz")
+async def healthz() -> dict[str, Any]:
+    return {
+        "ok": True,
+        "utc_time": datetime.now(UTC).isoformat(),
+        "build": current_build_info().public_dict(),
     }
 
 
 @app.get("/api/simulate/status", response_model=StatusResponse)
-async def simulate_status() -> StatusResponse:
-    status = controller.status()
+async def simulate_status(request: Request) -> StatusResponse:
+    status = _active_controller(request).status()
     return StatusResponse.model_validate(status)
 
 
+@app.get("/api/operator/tenants", response_model=TenantListResponse)
+async def list_operator_tenants(request: Request) -> TenantListResponse:
+    _require_operator_auth(request)
+    return TenantListResponse(
+        tenants=[
+            TenantSummary.model_validate(_tenant_summary(tenant_id))
+            for tenant_id in _known_tenant_ids()
+        ]
+    )
+
+
+@app.post("/api/operator/tenants/{tenant_id}/reset", response_model=TenantOperationResponse)
+async def reset_operator_tenant(request: Request, tenant_id: str) -> TenantOperationResponse:
+    _require_operator_auth(request)
+    normalized_tenant = _operator_tenant_id(tenant_id)
+    tenant_controller = _tenant_controller_for_id(normalized_tenant)
+    await tenant_controller.reset()
+    return TenantOperationResponse(status="reset", tenant_id=normalized_tenant)
+
+
+@app.delete("/api/operator/tenants/{tenant_id}", response_model=TenantOperationResponse)
+async def delete_operator_tenant(request: Request, tenant_id: str) -> TenantOperationResponse:
+    _require_operator_auth(request)
+    normalized_tenant = _operator_tenant_id(tenant_id)
+    tenant_dir = _tenant_dir(normalized_tenant)
+    removed_data = tenant_dir.exists()
+
+    with _tenant_lock:
+        tenant_controller = _tenant_controllers.pop(normalized_tenant, None)
+    if tenant_controller is not None:
+        await tenant_controller.shutdown()
+
+    shutil.rmtree(tenant_dir, ignore_errors=True)
+    return TenantOperationResponse(
+        status="deleted",
+        tenant_id=normalized_tenant,
+        removed_cached_controller=tenant_controller is not None,
+        removed_data=removed_data,
+    )
+
+
+@app.get("/api/scenarios", response_model=ScenarioListResponse)
+async def list_scenarios() -> ScenarioListResponse:
+    return ScenarioListResponse(
+        scenarios=[ScenarioSummary.model_validate(summary) for summary in list_scenario_summaries()]
+    )
+
+
+@app.get("/api/scenario-saves", response_model=ScenarioSaveListResponse)
+async def list_saved_scenarios(request: Request) -> ScenarioSaveListResponse:
+    active_controller = _active_controller(request)
+    return ScenarioSaveListResponse(
+        saves=[
+            ScenarioSaveSummary.model_validate(summary)
+            for summary in active_controller.list_scenario_saves().saves
+        ]
+    )
+
+
+@app.post("/api/scenario-saves/{scenario_id}", response_model=ScenarioSaveResponse)
+async def save_scenario(
+    http_request: Request,
+    scenario_id: ScenarioId,
+    request: ScenarioSaveRequest | None = None,
+) -> ScenarioSaveResponse:
+    active_controller = _active_controller(http_request)
+    scoped_request = _scope_scenario_save_request(http_request, request)
+    return await active_controller.save_scenario(scenario_id, scoped_request)
+
+
+@app.post("/api/scenario-saves/{scenario_id}/load", response_model=ScenarioLoadResponse)
+async def load_saved_scenario(http_request: Request, scenario_id: ScenarioId) -> ScenarioLoadResponse:
+    try:
+        return await _active_controller(http_request).load_scenario_save(scenario_id)
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail="No saved scenario found") from exc
+
+
+@app.get("/api/demo-fixtures", response_model=DemoFixtureListResponse)
+async def list_demo_fixtures() -> DemoFixtureListResponse:
+    return DemoFixtureListResponse(
+        fixtures=[
+            DemoFixtureSummary.model_validate(summary)
+            for summary in list_demo_fixture_summaries()
+        ]
+    )
+
+
+@app.post("/api/demo-fixtures/{fixture_id}/load", response_model=DemoFixtureLoadResponse)
+async def load_demo_fixture(
+    http_request: Request,
+    fixture_id: DemoFixtureId,
+    request: DemoFixtureLoadRequest | None = None,
+) -> DemoFixtureLoadResponse:
+    return await _active_controller(http_request).load_demo_fixture(fixture_id, request)
+
+
+def sse_message(event_name: str, payload: dict[str, Any]) -> str:
+    data = json.dumps(payload, separators=(",", ":"))
+    return f"event: {event_name}\ndata: {data}\n\n"
+
+
+@app.get("/api/simulate/stream")
+async def simulate_stream(
+    request: Request,
+    limit: int = Query(default=100, ge=1, le=500),
+    once: bool = Query(default=False),
+) -> StreamingResponse:
+    active_controller = _active_controller(request)
+
+    async def event_generator():
+        snapshot = active_controller.snapshot(event_limit=limit)
+        last_revision = snapshot["revision"]
+        yield sse_message("snapshot", snapshot)
+        if once:
+            return
+
+        while True:
+            if await request.is_disconnected():
+                break
+            try:
+                last_revision = await active_controller.wait_for_revision(last_revision)
+            except asyncio.TimeoutError:
+                yield ": keep-alive\n\n"
+                continue
+
+            snapshot = active_controller.snapshot(event_limit=limit)
+            last_revision = snapshot["revision"]
+            yield sse_message("snapshot", snapshot)
+
+    return StreamingResponse(
+        event_generator(),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "X-Accel-Buffering": "no",
+        },
+    )
+
+
 @app.post("/api/simulate/start", response_model=StatusResponse)
-async def simulate_start(request: StartRequest) -> StatusResponse:
-    await controller.start(request.config)
-    return StatusResponse.model_validate(controller.status())
+async def simulate_start(http_request: Request, request: StartRequest) -> StatusResponse:
+    active_controller = _active_controller(http_request)
+    await active_controller.start(_scope_config(http_request, request.config))
+    return StatusResponse.model_validate(active_controller.status())
 
 
 @app.post("/api/simulate/stop", response_model=StatusResponse)
-async def simulate_stop() -> StatusResponse:
-    await controller.stop()
-    return StatusResponse.model_validate(controller.status())
+async def simulate_stop(request: Request) -> StatusResponse:
+    active_controller = _active_controller(request)
+    await active_controller.stop()
+    return StatusResponse.model_validate(active_controller.status())
 
 
 @app.post("/api/simulate/reset", response_model=ResetResponse)
-async def simulate_reset(config: SimulationConfig | None = None) -> ResetResponse:
-    await controller.reset(config)
+async def simulate_reset(request: Request, config: SimulationConfig | None = None) -> ResetResponse:
+    await _active_controller(request).reset(_scope_config(request, config) if config else None)
     return ResetResponse(status="reset")
 
 
 @app.post("/api/simulate/step", response_model=StepResponse)
 async def simulate_step(
-    request: StepRequest | None = Body(default=None),
+    request: Request,
     batch_size: int | None = Query(default=None, ge=1, le=100),
 ) -> StepResponse:
-    return await controller.step(batch_size=batch_size, config=request.config if request else None)
+    return await _active_controller(request).step(batch_size=batch_size)
+
+
+@app.post("/api/simulate/replay", response_model=ReplayResponse)
+async def simulate_replay(http_request: Request, request: ReplayRequest | None = None) -> ReplayResponse:
+    return await _active_controller(http_request).replay(_scope_replay_request(http_request, request))
+
+
+@app.post("/api/import/csv", response_model=CSVImportResponse)
+async def import_csv(http_request: Request, request: CSVImportRequest) -> CSVImportResponse:
+    return await _active_controller(http_request).import_csv(request)
+
+
+@app.post("/api/delivery/retry", response_model=DeliveryRetryResponse)
+async def retry_failed_delivery(
+    http_request: Request,
+    request: DeliveryRetryRequest | None = None,
+) -> DeliveryRetryResponse:
+    return await _active_controller(http_request).retry_failed_delivery(request)
 
 
 @app.get("/api/events", response_model=EventListResponse)
-async def list_events(limit: int = Query(default=100, ge=1, le=500)) -> EventListResponse:
-    return EventListResponse(events=store.recent(limit=limit))
+async def list_events(
+    request: Request,
+    limit: int = Query(default=100, ge=1, le=500),
+) -> EventListResponse:
+    return EventListResponse(events=_active_controller(request).store.recent(limit=limit))
 
 
 @app.get("/api/lineage/{traceability_lot_code}", response_model=LineageResponse)
-async def get_lineage(traceability_lot_code: str) -> LineageResponse:
-    records = store.lineage(traceability_lot_code)
+async def get_lineage(request: Request, traceability_lot_code: str) -> LineageResponse:
+    active_controller = _active_controller(request)
+    records = active_controller.store.lineage(traceability_lot_code)
     if not records:
         raise HTTPException(status_code=404, detail="No records found for that lot code")
-    return LineageResponse(traceability_lot_code=traceability_lot_code, records=records)
+    return LineageResponse(
+        traceability_lot_code=traceability_lot_code,
+        records=records,
+        nodes=active_controller.store.lineage_nodes(records),
+        edges=active_controller.store.lineage_edges(records),
+    )
 
 
 @app.post("/api/mock/regengine/ingest", response_model=MockIngestResponse)
-async def mock_regengine_ingest(payload: IngestPayload) -> MockIngestResponse:
-    return mock_service.ingest(payload)
+async def mock_regengine_ingest(request: Request, payload: IngestPayload) -> MockIngestResponse:
+    return _active_controller(request).mock_service.ingest(payload)
+
+
+@app.get("/api/mock/regengine/export/presets", response_model=FDAExportPresetListResponse)
+async def mock_fda_request_export_presets() -> FDAExportPresetListResponse:
+    return FDAExportPresetListResponse(
+        presets=[
+            FDAExportPresetSummary.model_validate(summary)
+            for summary in list_fda_export_preset_summaries()
+        ]
+    )
 
 
 @app.get("/api/mock/regengine/export/fda-request")
 async def mock_fda_request_export(
+    request: Request,
     start_date: str | None = Query(default=None, description="Inclusive YYYY-MM-DD"),
     end_date: str | None = Query(default=None, description="Inclusive YYYY-MM-DD"),
+    preset: FDAExportPreset = Query(default=FDAExportPreset.ALL_RECORDS),
+    traceability_lot_code: str | None = Query(default=None),
 ) -> PlainTextResponse:
-    columns = [
-        "Traceability Lot Code",
-        "Traceability Lot Code Description",
-        "Product Description",
-        "Quantity",
-        "Unit of Measure",
-        "Location Description",
-        "Location Identifier (GLN)",
-        "Date",
-        "Time",
-        "Reference Document Type",
-        "Reference Document Number",
-    ]
-    output = io.StringIO()
-    writer = csv.DictWriter(output, fieldnames=columns)
-    writer.writeheader()
-    for record in store.all_between(start_date=start_date, end_date=end_date):
-        event = record.event
-        writer.writerow(
-            {
-                "Traceability Lot Code": event.traceability_lot_code,
-                "Traceability Lot Code Description": event.cte_type.value,
-                "Product Description": event.product_description,
-                "Quantity": event.quantity,
-                "Unit of Measure": event.unit_of_measure,
-                "Location Description": event.location_name,
-                "Location Identifier (GLN)": engine.location_gln(event.location_name),
-                "Date": event.timestamp.date().isoformat(),
-                "Time": event.timestamp.time().isoformat(timespec="seconds"),
-                "Reference Document Type": event.kdes.get("reference_document_type", ""),
-                "Reference Document Number": event.kdes.get("reference_document_number", ""),
-            }
+    active_controller = _active_controller(request)
+    start_filter, end_filter = _parse_export_date_filters(start_date=start_date, end_date=end_date)
+    definition = FDA_EXPORT_PRESETS[preset]
+    if definition.requires_lot_code and not traceability_lot_code:
+        raise HTTPException(status_code=400, detail="traceability_lot_code is required for this export preset")
+
+    if traceability_lot_code:
+        records = active_controller.store.lineage(traceability_lot_code)
+        if not records:
+            raise HTTPException(status_code=404, detail="No records found for that lot code")
+        records = _filter_records_between(records, start_date=start_filter, end_date=end_filter)
+    else:
+        records = active_controller.store.all_between(
+            start_date=start_filter.isoformat() if start_filter else None,
+            end_date=end_filter.isoformat() if end_filter else None,
         )
+    records = apply_fda_export_preset(records, preset)
+    csv_text = render_fda_request_csv(records, location_gln=active_controller.engine.location_gln)
     return PlainTextResponse(
-        content=output.getvalue(),
+        content=csv_text,
         media_type="text/csv",
-        headers={"Content-Disposition": "attachment; filename=fda_request_export.csv"},
+        headers={"Content-Disposition": f"attachment; filename={export_filename(preset)}"},
     )
+
+
+@app.get("/api/mock/regengine/export/epcis")
+async def mock_epcis_export(
+    request: Request,
+    start_date: str | None = Query(default=None, description="Inclusive YYYY-MM-DD"),
+    end_date: str | None = Query(default=None, description="Inclusive YYYY-MM-DD"),
+    traceability_lot_code: str | None = Query(default=None),
+) -> JSONResponse:
+    active_controller = _active_controller(request)
+    start_filter, end_filter = _parse_export_date_filters(start_date=start_date, end_date=end_date)
+    if traceability_lot_code:
+        records = active_controller.store.lineage(traceability_lot_code)
+        if not records:
+            raise HTTPException(status_code=404, detail="No records found for that lot code")
+        records = _filter_records_between(records, start_date=start_filter, end_date=end_filter)
+    else:
+        records = active_controller.store.all_between(
+            start_date=start_filter.isoformat() if start_filter else None,
+            end_date=end_filter.isoformat() if end_filter else None,
+        )
+
+    document = render_epcis_document(
+        records,
+        source=active_controller.config.source,
+        location_gln=active_controller.engine.location_gln,
+    )
+    return JSONResponse(
+        content=document,
+        media_type="application/ld+json",
+        headers={"Content-Disposition": f"attachment; filename={epcis_filename()}"},
+    )
+
+
+def _filter_records_between(
+    records: list[Any],
+    start_date: date | None = None,
+    end_date: date | None = None,
+) -> list[Any]:
+    filtered = []
+    for record in records:
+        day = record.event.timestamp.date()
+        if start_date and day < start_date:
+            continue
+        if end_date and day > end_date:
+            continue
+        filtered.append(record)
+    return sorted(filtered, key=lambda record: record.event.timestamp)
+
+
+def _parse_export_date_filters(
+    start_date: str | None,
+    end_date: str | None,
+) -> tuple[date | None, date | None]:
+    start_filter = _parse_export_date("start_date", start_date)
+    end_filter = _parse_export_date("end_date", end_date)
+    if start_filter and end_filter and start_filter > end_filter:
+        raise HTTPException(status_code=400, detail="start_date must be before or equal to end_date")
+    return start_filter, end_filter
+
+
+def _parse_export_date(field_name: str, value: str | None) -> date | None:
+    if value is None:
+        return None
+    if not re.fullmatch(r"\d{4}-\d{2}-\d{2}", value):
+        raise HTTPException(status_code=400, detail=f"{field_name} must be YYYY-MM-DD")
+    try:
+        return date.fromisoformat(value)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=f"{field_name} must be a valid date") from exc
+
+
+def _tenant_context(request: Request) -> TenantContext:
+    return getattr(request.state, "tenant_context", TenantContext(tenant_id=DEFAULT_TENANT_ID))
+
+
+def _active_controller(request: Request) -> SimulationController:
+    context = _tenant_context(request)
+    if context.uses_default_storage:
+        return controller
+
+    return _tenant_controller_for_id(context.tenant_id)
+
+
+def _tenant_controller_for_id(tenant_id: str) -> SimulationController:
+    with _tenant_lock:
+        existing_controller = _tenant_controllers.get(tenant_id)
+        if existing_controller is not None:
+            return existing_controller
+
+        tenant_controller = _create_tenant_controller(tenant_id)
+        _tenant_controllers[tenant_id] = tenant_controller
+        return tenant_controller
+
+
+def _require_operator_auth(request: Request) -> None:
+    context = _tenant_context(request)
+    if not context.auth_enabled:
+        raise HTTPException(status_code=403, detail="Tenant operations require Basic Auth")
+
+
+def _operator_tenant_id(raw_tenant_id: str) -> str:
+    tenant_id = normalize_tenant_id(raw_tenant_id)
+    if tenant_id == DEFAULT_TENANT_ID:
+        raise HTTPException(status_code=400, detail="Default local tenant cannot be managed here")
+    return tenant_id
+
+
+def _known_tenant_ids() -> list[str]:
+    tenant_ids = set()
+    with _tenant_lock:
+        tenant_ids.update(
+            tenant_id for tenant_id in _tenant_controllers if tenant_id != DEFAULT_TENANT_ID
+        )
+
+    if TENANT_DATA_ROOT.exists():
+        for path in TENANT_DATA_ROOT.iterdir():
+            if path.is_dir():
+                try:
+                    tenant_ids.add(normalize_tenant_id(path.name))
+                except ValueError:
+                    continue
+    return sorted(tenant_ids)
+
+
+def _tenant_summary(tenant_id: str) -> dict[str, Any]:
+    tenant_dir = _tenant_dir(tenant_id)
+    persist_path = _tenant_events_path(tenant_id)
+    with _tenant_lock:
+        tenant_controller = _tenant_controllers.get(tenant_id)
+
+    if tenant_controller is not None:
+        stats = tenant_controller.store.stats()
+        running = tenant_controller.running
+        total_records = int(stats["total_records"])
+        persist_path_text = str(tenant_controller.store.persist_path)
+    else:
+        running = False
+        total_records = _count_jsonl_records(persist_path)
+        persist_path_text = str(persist_path)
+
+    return {
+        "tenant_id": tenant_id,
+        "cached": tenant_controller is not None,
+        "running": running,
+        "total_records": total_records,
+        "scenario_save_count": _count_scenario_saves(_tenant_saves_path(tenant_id)),
+        "persist_path": persist_path_text,
+        "data_path": str(tenant_dir),
+        "exists_on_disk": tenant_dir.exists(),
+    }
+
+
+def _count_jsonl_records(path: Path) -> int:
+    if not path.exists():
+        return 0
+    with path.open("r", encoding="utf-8") as handle:
+        return sum(1 for line in handle if line.strip())
+
+
+def _count_scenario_saves(path: Path) -> int:
+    if not path.exists():
+        return 0
+    return sum(1 for candidate in path.glob("*.json") if candidate.is_file())
+
+
+def _create_tenant_controller(tenant_id: str) -> SimulationController:
+    persist_path = _tenant_events_path(tenant_id)
+    tenant_engine = LegitFlowEngine(seed=204)
+    tenant_store = EventStore(persist_path=str(persist_path))
+    tenant_saves = ScenarioSaveStore(save_dir=str(_tenant_saves_path(tenant_id)))
+    return SimulationController(
+        engine=tenant_engine,
+        store=tenant_store,
+        scenario_saves=tenant_saves,
+        mock_service=MockRegEngineService(),
+        live_client=LiveRegEngineClient(),
+    )
+
+
+def _scope_config(request: Request, config: SimulationConfig) -> SimulationConfig:
+    context = _tenant_context(request)
+    if context.uses_default_storage:
+        return config
+    return config.model_copy(
+        update={"persist_path": str(_tenant_events_path(context.tenant_id))},
+        deep=True,
+    )
+
+
+def _scope_replay_request(request: Request, replay_request: ReplayRequest | None) -> ReplayRequest | None:
+    context = _tenant_context(request)
+    if context.uses_default_storage:
+        return replay_request
+    request_body = replay_request or ReplayRequest()
+    return request_body.model_copy(
+        update={"persist_path": str(_tenant_events_path(context.tenant_id))},
+        deep=True,
+    )
+
+
+def _scope_scenario_save_request(
+    request: Request,
+    save_request: ScenarioSaveRequest | None,
+) -> ScenarioSaveRequest | None:
+    if save_request is None or save_request.config is None:
+        return save_request
+    return save_request.model_copy(
+        update={"config": _scope_config(request, save_request.config)},
+        deep=True,
+    )
+
+
+def _tenant_dir(tenant_id: str) -> Path:
+    return TENANT_DATA_ROOT / tenant_id
+
+
+def _tenant_events_path(tenant_id: str) -> Path:
+    return _tenant_dir(tenant_id) / "events.jsonl"
+
+
+def _tenant_saves_path(tenant_id: str) -> Path:
+    return _tenant_dir(tenant_id) / "scenario_saves"
 
 
 @app.exception_handler(ValueError)

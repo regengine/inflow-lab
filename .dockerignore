@@ -1,0 +1,15 @@
+.git
+.github
+.venv
+__pycache__
+.pytest_cache
+*.py[cod]
+*.egg-info
+.coverage
+htmlcov
+data
+uvicorn.out.log
+uvicorn.err.log
+tests/__pycache__
+app/__pycache__
+scripts/__pycache__
