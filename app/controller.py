@@ -31,7 +31,7 @@ from .models import (
     StepResponse,
     StoredEventRecord,
 )
-from .regengine_client import LiveRegEngineClient
+from .regengine_client import LiveRegEngineClient, LiveRegEngineDeliveryError
 from .scenario_saves import ScenarioSaveStore
 from .scenarios import ScenarioId, get_scenario
 from .store import EventStore
@@ -47,6 +47,7 @@ class DeliveryOutcome:
     attempted_at: datetime | None = None
     completed_at: datetime | None = None
     error_message: str | None = None
+    metadata: dict[str, Any] | None = None
 
 
 class SimulationController:
@@ -143,6 +144,7 @@ class SimulationController:
                         if outcome.delivery_status == "posted"
                         else None,
                         delivery_response=event_response,
+                        delivery_metadata=outcome.metadata,
                         error=outcome.error_message,
                     )
                 )
@@ -252,6 +254,7 @@ class SimulationController:
                             if outcome.delivery_status == "posted"
                             else None,
                             delivery_response=event_response,
+                            delivery_metadata=outcome.metadata,
                             error=outcome.error_message,
                         )
                     )
@@ -334,6 +337,7 @@ class SimulationController:
                         if outcome.delivery_status == "posted"
                         else None,
                         delivery_response=event_response,
+                        delivery_metadata=outcome.metadata,
                         error=outcome.error_message,
                     )
                 )
@@ -490,6 +494,7 @@ class SimulationController:
                                     if outcome.delivery_status == "posted"
                                     else record.last_delivery_success_at,
                                     "delivery_response": event_response,
+                                    "delivery_metadata": outcome.metadata,
                                     "error": None
                                     if outcome.delivery_status == "posted"
                                     else outcome.error_message,
@@ -538,18 +543,32 @@ class SimulationController:
                     delivery_attempts=1,
                     attempted_at=attempted_at,
                     completed_at=datetime.now(UTC),
+                    metadata={
+                        "delivery_mode": "mock",
+                        "attempted_event_count": len(payload.events),
+                    },
                 )
             if config.delivery.mode == DestinationMode.LIVE:
-                response = await self.live_client.ingest(payload, config)
+                result = await self.live_client.ingest(payload, config)
                 return DeliveryOutcome(
-                    response=response,
+                    response=result.response,
                     delivery_status="posted",
                     posted=len(payload.events),
                     delivery_attempts=1,
                     attempted_at=attempted_at,
                     completed_at=datetime.now(UTC),
+                    metadata=result.metadata | {"attempted_event_count": len(payload.events)},
                 )
             return DeliveryOutcome()
+        except LiveRegEngineDeliveryError as exc:
+            return DeliveryOutcome(
+                delivery_status="failed",
+                failed=len(payload.events),
+                delivery_attempts=1,
+                attempted_at=attempted_at,
+                error_message=str(exc),
+                metadata=exc.metadata | {"attempted_event_count": len(payload.events)},
+            )
         except Exception as exc:  # pragma: no cover - exercised by live integration, not unit tests
             return DeliveryOutcome(
                 delivery_status="failed",
@@ -557,6 +576,10 @@ class SimulationController:
                 delivery_attempts=1,
                 attempted_at=attempted_at,
                 error_message=str(exc),
+                metadata={
+                    "delivery_mode": config.delivery.mode.value,
+                    "attempted_event_count": len(payload.events),
+                },
             )
 
     async def _run_loop(self) -> None:

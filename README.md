@@ -162,7 +162,7 @@ For controlled live workspace validation, use `scripts/live_trial.py`. It refuse
 ### `none`
 Generates and persists events locally without delivering them anywhere. Useful for seeding fixtures.
 
-Every stored record tracks `delivery_status`, `destination_mode`, `delivery_attempts`, and last delivery timestamps. The dashboard delivery monitor summarizes posted, failed, generated-only, and retryable records. Failed records can be retried through the dashboard or `POST /api/delivery/retry` after switching to a working `mock` or `live` delivery configuration.
+Every stored record tracks `delivery_status`, `destination_mode`, `delivery_attempts`, last delivery timestamps, and non-secret `delivery_metadata` such as delivery mode, attempted event count, live endpoint host/path, HTTP status, and idempotency key. The dashboard delivery monitor summarizes posted, failed, generated-only, and retryable records. Failed records can be retried through the dashboard or `POST /api/delivery/retry` after switching to a working `mock` or `live` delivery configuration.
 
 ## Basic auth and tenant storage
 

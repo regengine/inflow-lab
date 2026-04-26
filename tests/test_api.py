@@ -10,6 +10,7 @@ from fastapi.testclient import TestClient
 
 from app.main import app, controller, cors_origins_from_env, scenario_saves
 from app.models import SimulationConfig
+from app.regengine_client import LiveIngestResult
 from app.scenarios import ScenarioId, get_scenario
 
 
@@ -993,6 +994,62 @@ def test_failed_live_delivery_surfaces_retry_feedback_and_can_retry_to_mock(tmp_
     assert retried_record["delivery_attempts"] == 2
     assert retried_record["last_delivery_success_at"]
     assert retried_record["error"] is None
+
+
+def test_successful_live_delivery_records_sanitized_audit_metadata(monkeypatch, tmp_path):
+    class FakeLiveClient:
+        async def ingest(self, payload, config):  # noqa: ANN001
+            return LiveIngestResult(
+                response={
+                    "accepted": len(payload.events),
+                    "events": [
+                        {
+                            "traceability_lot_code": event.traceability_lot_code,
+                            "status": "accepted",
+                        }
+                        for event in payload.events
+                    ],
+                },
+                metadata={
+                    "delivery_mode": "live",
+                    "endpoint_host": "www.regengine.co",
+                    "endpoint_path": "/api/v1/webhooks/ingest",
+                    "idempotency_key": "idem-test-123",
+                    "status_code": 200,
+                },
+            )
+
+    monkeypatch.setattr(controller, "live_client", FakeLiveClient())
+    custom_path = tmp_path / "live-audit-events.jsonl"
+    reset_response = client.post(
+        "/api/simulate/reset",
+        json={
+            "batch_size": 1,
+            "seed": 204,
+            "persist_path": str(custom_path),
+            "delivery": {
+                "mode": "live",
+                "api_key": "live-api-secret",
+                "tenant_id": "live-tenant-secret",
+            },
+        },
+    )
+    assert reset_response.status_code == 200
+
+    step_response = client.post("/api/simulate/step")
+
+    assert step_response.status_code == 200
+    assert step_response.json()["delivery_status"] == "posted"
+    record = client.get("/api/events?limit=1").json()["events"][0]
+    assert record["delivery_metadata"] == {
+        "delivery_mode": "live",
+        "endpoint_host": "www.regengine.co",
+        "endpoint_path": "/api/v1/webhooks/ingest",
+        "idempotency_key": "idem-test-123",
+        "status_code": 200,
+        "attempted_event_count": 1,
+    }
+    assert_json_omits(record["delivery_metadata"], "live-api-secret", "live-tenant-secret")
 
 
 def test_delivery_retry_empty_when_no_failed_records():

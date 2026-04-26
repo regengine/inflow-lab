@@ -103,6 +103,7 @@ class StoredEventRecord(BaseModel):
     last_delivery_attempt_at: datetime | None = None
     last_delivery_success_at: datetime | None = None
     delivery_response: dict[str, Any] | None = None
+    delivery_metadata: dict[str, Any] | None = None
     error: str | None = None
     created_at: datetime = Field(default_factory=lambda: datetime.now(UTC))
 

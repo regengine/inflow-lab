@@ -9,6 +9,8 @@ from app.regengine_client import DEFAULT_LIVE_INGEST_ENDPOINT, LiveRegEngineClie
 
 
 class FakeResponse:
+    status_code = 200
+
     def raise_for_status(self) -> None:
         return None
 
@@ -79,7 +81,12 @@ def run_ingest(monkeypatch: Any, config: SimulationConfig) -> dict[str, Any]:
 
     result = asyncio.run(LiveRegEngineClient().ingest(make_payload(), config))
 
-    assert result == {"accepted": 1}
+    assert result.response == {"accepted": 1}
+    assert result.metadata["delivery_mode"] == "live"
+    assert result.metadata["endpoint_host"]
+    assert result.metadata["endpoint_path"]
+    assert result.metadata["idempotency_key"]
+    assert result.metadata["status_code"] == 200
     assert len(RecordingAsyncClient.calls) == 1
     return RecordingAsyncClient.calls[0]
 
@@ -105,6 +112,7 @@ def test_live_client_sends_required_headers_and_contract_payload(monkeypatch: An
     assert call["headers"]["Content-Type"] == "application/json"
     assert call["headers"]["X-RegEngine-API-Key"] == "test-api-key"
     assert call["headers"]["X-Tenant-ID"] == "test-tenant-id"
+    assert call["headers"]["Idempotency-Key"]
 
     payload = call["json"]
     assert set(payload) == {"source", "events"}
