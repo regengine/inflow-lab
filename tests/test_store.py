@@ -78,6 +78,80 @@ def test_store_updates_delivery_retry_metadata_on_disk(tmp_path):
     assert record.error == "temporary outage"
 
 
+def test_history_queries_use_persisted_records_beyond_memory_window(tmp_path):
+    persist_path = tmp_path / "events.jsonl"
+    store = EventStore(persist_path=str(persist_path), max_records=2)
+    records = [
+        make_record("TLC-HISTORY-HARVEST", CTEType.HARVESTING, 0),
+        make_record(
+            "TLC-HISTORY-PACKED",
+            CTEType.INITIAL_PACKING,
+            10,
+            parent_lot_codes=["TLC-HISTORY-HARVEST"],
+            kdes={"source_traceability_lot_code": "TLC-HISTORY-HARVEST"},
+        ),
+        make_record(
+            "TLC-HISTORY-TRANSFORMED",
+            CTEType.TRANSFORMATION,
+            20,
+            parent_lot_codes=["TLC-HISTORY-PACKED"],
+            kdes={"input_traceability_lot_codes": ["TLC-HISTORY-PACKED"]},
+        ),
+    ]
+    store.add_many(records)
+
+    assert [record.event.traceability_lot_code for record in store.recent()] == [
+        "TLC-HISTORY-TRANSFORMED",
+        "TLC-HISTORY-PACKED",
+    ]
+    assert store.stats()["total_records"] == 3
+    assert [record.event.traceability_lot_code for record in store.all_between()] == [
+        "TLC-HISTORY-HARVEST",
+        "TLC-HISTORY-PACKED",
+        "TLC-HISTORY-TRANSFORMED",
+    ]
+    assert [record.event.traceability_lot_code for record in store.lineage("TLC-HISTORY-TRANSFORMED")] == [
+        "TLC-HISTORY-HARVEST",
+        "TLC-HISTORY-PACKED",
+        "TLC-HISTORY-TRANSFORMED",
+    ]
+
+
+def test_failed_delivery_retry_lookup_and_update_use_full_persisted_history(tmp_path):
+    persist_path = tmp_path / "events.jsonl"
+    store = EventStore(persist_path=str(persist_path), max_records=1)
+    stored = store.add_many(
+        [
+            make_record("TLC-OLD-FAILED", CTEType.HARVESTING, 0).model_copy(
+                update={
+                    "delivery_status": "failed",
+                    "delivery_attempts": 1,
+                    "error": "temporary outage",
+                }
+            ),
+            make_record("TLC-NEW-GENERATED", CTEType.COOLING, 10),
+        ]
+    )
+
+    failed_records = store.failed_delivery_records()
+    assert [record.record_id for record in failed_records] == [stored[0].record_id]
+
+    retried = failed_records[0].model_copy(
+        update={"delivery_status": "posted", "delivery_attempts": 2, "error": None}
+    )
+    store.update_many([retried])
+
+    reloaded = EventStore(persist_path=str(persist_path), max_records=1)
+    records = reloaded.all_between()
+    assert [record.event.traceability_lot_code for record in records] == [
+        "TLC-OLD-FAILED",
+        "TLC-NEW-GENERATED",
+    ]
+    assert records[0].delivery_status == "posted"
+    assert records[0].delivery_attempts == 2
+    assert records[1].delivery_status == "generated"
+
+
 def test_lineage_for_transformed_output_includes_upstream_history_and_direct_query(tmp_path):
     store = EventStore(persist_path=str(tmp_path / "events.jsonl"))
     records = [

@@ -76,7 +76,7 @@ class EventStore:
             return []
 
         with self._lock:
-            current_records = list(self._records)
+            current_records = self._all_records()
             updated_records: list[StoredEventRecord] = []
             for record in current_records:
                 replacement = replacements.get(record.record_id)
@@ -120,8 +120,7 @@ class EventStore:
         limit: int = 50,
     ) -> list[StoredEventRecord]:
         record_id_filter = set(record_ids or [])
-        with self._lock:
-            records = sorted(self._records, key=lambda record: record.sequence_no)
+        records = self._all_records()
         failed_records = [
             record
             for record in records
@@ -131,8 +130,7 @@ class EventStore:
         return failed_records[:limit]
 
     def stats(self) -> dict[str, Any]:
-        with self._lock:
-            records = list(self._records)
+        records = self._all_records()
         cte_counter = Counter(record.event.cte_type.value for record in records)
         status_counter = Counter(record.delivery_status for record in records)
         destination_counter = Counter(record.destination_mode.value for record in records)
@@ -175,8 +173,7 @@ class EventStore:
         }
 
     def lineage(self, traceability_lot_code: str) -> list[StoredEventRecord]:
-        with self._lock:
-            records = list(self._records)
+        records = self._all_records()
         child_to_parents: dict[str, set[str]] = {}
         parent_to_children: dict[str, set[str]] = {}
         for record in records:
@@ -271,8 +268,7 @@ class EventStore:
         return parent_lot_codes
 
     def all_between(self, start_date: str | None = None, end_date: str | None = None) -> list[StoredEventRecord]:
-        with self._lock:
-            records = list(self._records)
+        records = self._all_records()
         if not start_date and not end_date:
             return sorted(records, key=lambda record: record.event.timestamp)
         filtered: list[StoredEventRecord] = []
@@ -284,3 +280,10 @@ class EventStore:
                 continue
             filtered.append(record)
         return sorted(filtered, key=lambda record: record.event.timestamp)
+
+    def _all_records(self) -> list[StoredEventRecord]:
+        records = self.read_persisted_records()
+        if records:
+            return sorted(records, key=lambda record: record.sequence_no)
+        with self._lock:
+            return sorted(self._records, key=lambda record: record.sequence_no)
