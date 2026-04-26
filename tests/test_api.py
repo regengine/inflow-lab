@@ -183,6 +183,49 @@ def test_basic_auth_is_optional_but_enforced_when_configured(monkeypatch):
     }
 
 
+def test_basic_auth_blocks_state_changes_from_untrusted_browser_origins(monkeypatch):
+    monkeypatch.setenv("REGENGINE_BASIC_AUTH_USERNAME", "demo-user")
+    monkeypatch.setenv("REGENGINE_BASIC_AUTH_PASSWORD", "demo-pass")
+    headers = basic_auth_header("demo-user", "demo-pass") | {
+        "X-RegEngine-Tenant": "origin-guard-test"
+    }
+    reset = client.post(
+        "/api/simulate/reset",
+        headers=headers,
+        json={"batch_size": 3, "seed": 204, "delivery": {"mode": "none"}},
+    )
+    assert reset.status_code == 200
+
+    blocked = client.post(
+        "/api/simulate/step",
+        headers=headers | {"Origin": "https://untrusted.example"},
+    )
+    assert blocked.status_code == 403
+    assert blocked.json()["detail"] == "State-changing requests require a trusted browser origin"
+
+    null_origin = client.post("/api/simulate/step", headers=headers | {"Origin": "null"})
+    assert null_origin.status_code == 403
+
+    blocked_referer = client.post(
+        "/api/simulate/step",
+        headers=headers | {"Referer": "https://untrusted.example/form"},
+    )
+    assert blocked_referer.status_code == 403
+
+    status = client.get("/api/simulate/status", headers=headers).json()
+    assert status["stats"]["total_records"] == 0
+
+    allowed_origin = client.post(
+        "/api/simulate/step",
+        headers=headers | {"Origin": "http://127.0.0.1:8000"},
+    )
+    assert allowed_origin.status_code == 200
+    assert allowed_origin.json()["generated"] == 3
+
+    script_style = client.post("/api/simulate/stop", headers=headers)
+    assert script_style.status_code == 200
+
+
 def test_request_logging_includes_ops_fields_without_auth_or_query_secrets(monkeypatch, caplog):
     monkeypatch.setenv("REGENGINE_BASIC_AUTH_USERNAME", "demo-user")
     monkeypatch.setenv("REGENGINE_BASIC_AUTH_PASSWORD", "demo-pass")

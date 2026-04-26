@@ -110,7 +110,7 @@ Shared-demo operating notes:
 - Keep delivery mode set to `mock` unless there is an explicit live-ingest trial.
 - Use a distinct tenant value per partner or workshop.
 - Rotate `REGENGINE_BASIC_AUTH_PASSWORD` between external demos.
-- Keep `REGENGINE_CORS_ORIGINS` limited to the HTTPS origins that should run the browser dashboard.
+- Keep `REGENGINE_CORS_ORIGINS` limited to the HTTPS origins that should run the browser dashboard; Basic Auth deployments reject state-changing browser requests from origins outside that list.
 - Mount persistent storage at `REGENGINE_DATA_DIR` so event logs and scenario saves survive restarts.
 - Back up or delete `data/tenants/{tenant_id}/` according to the partner's data-retention expectation.
 
@@ -272,6 +272,7 @@ Use these patterns when diagnosing a shared demo:
 
 - `status=401` on API routes usually means the Basic Auth username/password in the operator environment or GitHub secret is wrong.
 - Missing browser CORS headers usually means `REGENGINE_CORS_ORIGINS` does not exactly match the deployed HTTPS origin.
+- `status=403` on simulator actions with valid Basic Auth usually means the browser `Origin` or `Referer` is not in `REGENGINE_CORS_ORIGINS`.
 - Empty state after restart usually means the Railway volume is missing or `REGENGINE_DATA_DIR` is not `/data`.
 - Live delivery failures should be diagnosed from the dashboard delivery monitor and sanitized record status before retrying with corrected live endpoint, API key, and tenant id.
 

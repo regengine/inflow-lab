@@ -71,6 +71,7 @@ from .store import EventStore
 DATA_ROOT = Path(os.getenv("REGENGINE_DATA_DIR", "data"))
 TENANT_DATA_ROOT = DATA_ROOT / "tenants"
 DEFAULT_CORS_ORIGINS = ("http://127.0.0.1:8000", "http://localhost:8000")
+UNSAFE_METHODS = {"POST", "PUT", "PATCH", "DELETE"}
 REQUEST_LOGGER = logging.getLogger("regengine.request")
 
 engine = LegitFlowEngine(seed=204)
@@ -161,6 +162,10 @@ async def auth_and_tenant_middleware(request: Request, call_next):
             response = context
             return response
         request.state.tenant_context = context
+        unsafe_origin_response = _reject_untrusted_unsafe_origin(request, context)
+        if unsafe_origin_response is not None:
+            response = unsafe_origin_response
+            return response
         response = await call_next(request)
         return response
     except Exception:
@@ -193,6 +198,42 @@ def _request_delivery_mode(request: Request) -> str:
         return str(_active_controller(request).config.delivery.mode.value)
     except Exception:
         return "unknown"
+
+
+def _reject_untrusted_unsafe_origin(request: Request, context: TenantContext) -> JSONResponse | None:
+    if not context.auth_enabled or request.method.upper() not in UNSAFE_METHODS:
+        return None
+
+    request_origin = _browser_request_origin(request)
+    if request_origin is None:
+        return None
+
+    if request_origin in cors_origins_from_env():
+        return None
+
+    return JSONResponse(
+        status_code=403,
+        content={"detail": "State-changing requests require a trusted browser origin"},
+    )
+
+
+def _browser_request_origin(request: Request) -> str | None:
+    origin = request.headers.get("origin")
+    if origin:
+        return _origin_from_url(origin) or ""
+
+    referer = request.headers.get("referer")
+    if referer:
+        return _origin_from_url(referer) or ""
+
+    return None
+
+
+def _origin_from_url(raw_url: str) -> str | None:
+    parsed = urlparse(raw_url.strip())
+    if parsed.scheme not in {"http", "https"} or not parsed.netloc:
+        return None
+    return f"{parsed.scheme}://{parsed.netloc}"
 
 static_dir = Path(__file__).parent / "static"
 app.mount("/static", StaticFiles(directory=static_dir), name="static")

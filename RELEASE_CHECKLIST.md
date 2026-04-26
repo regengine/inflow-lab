@@ -25,6 +25,7 @@ Use this checklist before tagging a demo-ready build or handing the simulator to
 - [ ] `/api/healthz` remains available without credentials for container/platform healthchecks.
 - [ ] Basic Auth returns `401` without valid credentials when env vars are set.
 - [ ] Shared-demo or live-trial deployments set explicit `REGENGINE_CORS_ORIGINS` values instead of wildcard CORS.
+- [ ] Dashboard simulator actions do not return `403`; if they do, confirm the browser origin exactly matches `REGENGINE_CORS_ORIGINS`.
 - [ ] Shared-demo or live-trial deployments set `REGENGINE_DATA_DIR` to mounted persistent storage.
 - [ ] Demo fixture loading resets to a known event log.
 - [ ] Start, stop, single-step, and reset work from the dashboard.

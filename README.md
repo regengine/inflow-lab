@@ -185,7 +185,7 @@ Credentialed browser requests are limited to explicit CORS origins. By default t
 export REGENGINE_CORS_ORIGINS=https://demo.example.com,https://partner-demo.example.com
 ```
 
-Wildcard CORS origins are rejected because Basic Auth and tenant-scoped requests may carry credentials.
+Wildcard CORS origins are rejected because Basic Auth and tenant-scoped requests may carry credentials. When Basic Auth is enabled, state-changing browser requests such as simulator start, step, reset, fixture load, import, replay, retry, and scenario save/load must present a trusted `Origin` or `Referer` from `REGENGINE_CORS_ORIGINS`; command-line and server-to-server calls without browser origin headers continue to work with valid Basic credentials.
 
 ## Replay mode
 
