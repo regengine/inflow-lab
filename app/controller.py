@@ -35,7 +35,7 @@ from .models import (
 from .regengine_client import LiveRegEngineClient, LiveRegEngineDeliveryError
 from .scenario_saves import ScenarioSaveStore
 from .scenarios import ScenarioId, get_scenario
-from .store import EventStore
+from .store import EventStore, mask_secret_in_payload, mask_secret_in_string
 
 
 @dataclass(slots=True)
@@ -541,12 +541,13 @@ class SimulationController:
         if config.delivery.mode == DestinationMode.NONE:
             return DeliveryOutcome()
 
+        api_key = config.delivery.api_key
         attempted_at = datetime.now(UTC)
         try:
             if config.delivery.mode == DestinationMode.MOCK:
                 response = self.mock_service.ingest(payload).model_dump(mode="json")
                 return DeliveryOutcome(
-                    response=response,
+                    response=mask_secret_in_payload(response, api_key),
                     delivery_status="posted",
                     posted=len(payload.events),
                     delivery_attempts=1,
@@ -560,7 +561,7 @@ class SimulationController:
             if config.delivery.mode == DestinationMode.LIVE:
                 result = await self.live_client.ingest(payload, config)
                 return DeliveryOutcome(
-                    response=result.response,
+                    response=mask_secret_in_payload(result.response, api_key),
                     delivery_status="posted",
                     posted=len(payload.events),
                     delivery_attempts=1,
@@ -575,7 +576,7 @@ class SimulationController:
                 failed=len(payload.events),
                 delivery_attempts=1,
                 attempted_at=attempted_at,
-                error_message=str(exc),
+                error_message=mask_secret_in_string(str(exc), api_key),
                 metadata=exc.metadata | {"attempted_event_count": len(payload.events)},
             )
         except Exception as exc:  # pragma: no cover - exercised by live integration, not unit tests
@@ -584,7 +585,7 @@ class SimulationController:
                 failed=len(payload.events),
                 delivery_attempts=1,
                 attempted_at=attempted_at,
-                error_message=str(exc),
+                error_message=mask_secret_in_string(str(exc), api_key),
                 metadata={
                     "delivery_mode": config.delivery.mode.value,
                     "attempted_event_count": len(payload.events),

@@ -1181,6 +1181,101 @@ def test_successful_live_delivery_records_sanitized_audit_metadata(monkeypatch, 
     assert_json_omits(record["delivery_metadata"], "live-api-secret", "live-tenant-secret")
 
 
+def test_failed_live_delivery_masks_api_key_in_error_message(tmp_path):
+    api_key = "live-api-secret-leak"
+
+    class LeakyLiveClient:
+        async def ingest(self, payload, config):  # noqa: ANN001
+            raise LiveRegEngineDeliveryError(
+                f"upstream rejected request with key={api_key} for tenant",
+                {
+                    "delivery_mode": "live",
+                    "endpoint_host": "www.regengine.co",
+                    "endpoint_path": "/api/v1/webhooks/ingest",
+                    "idempotency_key": "idem-leak-1",
+                    "status_code": 401,
+                },
+            )
+
+    original_live_client = controller.live_client
+    controller.live_client = LeakyLiveClient()
+    try:
+        client.post(
+            "/api/simulate/reset",
+            json={
+                "batch_size": 1,
+                "seed": 204,
+                "persist_path": str(tmp_path / "leak-events.jsonl"),
+                "delivery": {
+                    "mode": "live",
+                    "api_key": api_key,
+                    "tenant_id": "live-tenant",
+                },
+            },
+        )
+        step_response = client.post("/api/simulate/step")
+    finally:
+        controller.live_client = original_live_client
+
+    assert step_response.status_code == 200
+    body = step_response.json()
+    assert body["delivery_status"] == "failed"
+    assert "***MASKED***" in body["error"]
+    assert api_key not in body["error"]
+
+    record = client.get("/api/events?limit=1").json()["events"][0]
+    assert_json_omits(record, api_key)
+
+
+def test_successful_live_delivery_masks_api_key_echoed_in_response(monkeypatch, tmp_path):
+    api_key = "live-api-secret-echo"
+
+    class EchoLiveClient:
+        async def ingest(self, payload, config):  # noqa: ANN001
+            return LiveIngestResult(
+                response={
+                    "accepted": len(payload.events),
+                    "events": [
+                        {
+                            "traceability_lot_code": event.traceability_lot_code,
+                            "status": "accepted",
+                        }
+                        for event in payload.events
+                    ],
+                    "echoed_api_key": api_key,
+                    "debug_message": f"received key {api_key}",
+                },
+                metadata={
+                    "delivery_mode": "live",
+                    "endpoint_host": "www.regengine.co",
+                    "endpoint_path": "/api/v1/webhooks/ingest",
+                    "idempotency_key": "idem-echo-1",
+                    "status_code": 200,
+                },
+            )
+
+    monkeypatch.setattr(controller, "live_client", EchoLiveClient())
+    client.post(
+        "/api/simulate/reset",
+        json={
+            "batch_size": 1,
+            "seed": 204,
+            "persist_path": str(tmp_path / "echo-events.jsonl"),
+            "delivery": {
+                "mode": "live",
+                "api_key": api_key,
+                "tenant_id": "live-tenant",
+            },
+        },
+    )
+    step_response = client.post("/api/simulate/step")
+
+    assert step_response.status_code == 200
+    assert step_response.json()["delivery_status"] == "posted"
+    record = client.get("/api/events?limit=1").json()["events"][0]
+    assert_json_omits(record, api_key)
+
+
 def test_delivery_retry_empty_when_no_failed_records():
     response = client.post("/api/delivery/retry")
 

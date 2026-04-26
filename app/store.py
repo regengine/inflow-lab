@@ -25,6 +25,29 @@ def _scrub_secrets(value: Any) -> Any:
     return value
 
 
+def mask_secret_in_string(message: str | None, secret: str | None) -> str | None:
+    if message is None or not secret:
+        return message
+    return message.replace(secret, MASKED_SECRET)
+
+
+def mask_secret_in_payload(value: Any, secret: str | None = None) -> Any:
+    if isinstance(value, dict):
+        masked: dict[str, Any] = {}
+        for key, item in value.items():
+            normalized_key = key.lower().replace("-", "_")
+            if normalized_key in SECRET_FIELD_NAMES:
+                masked[key] = MASKED_SECRET
+            else:
+                masked[key] = mask_secret_in_payload(item, secret)
+        return masked
+    if isinstance(value, list):
+        return [mask_secret_in_payload(item, secret) for item in value]
+    if isinstance(value, str) and secret and secret in value:
+        return value.replace(secret, MASKED_SECRET)
+    return value
+
+
 class EventStore:
     def __init__(self, persist_path: str = "data/events.jsonl", max_records: int = 5000) -> None:
         self.persist_path = Path(persist_path)
