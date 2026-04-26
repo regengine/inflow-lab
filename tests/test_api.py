@@ -21,6 +21,12 @@ def basic_auth_header(username: str, password: str) -> dict[str, str]:
     return {"Authorization": f"Basic {token}"}
 
 
+def assert_json_omits(payload: object, *needles: str) -> None:
+    dumped = json.dumps(payload, sort_keys=True)
+    for needle in needles:
+        assert needle not in dumped
+
+
 def setup_function() -> None:
     # reset shared app state between tests
     import asyncio
@@ -58,6 +64,47 @@ def test_sse_stream_emits_initial_snapshot():
     assert payload["revision"] == controller.revision
     assert payload["status"]["running"] is False
     assert payload["events"] == []
+
+
+def test_status_surfaces_redact_live_delivery_credentials(tmp_path):
+    api_key = "regengine-live-api-key-secret"
+    tenant_id = "regengine-live-tenant-secret"
+    reset_response = client.post(
+        "/api/simulate/reset",
+        json={
+            "batch_size": 1,
+            "seed": 204,
+            "persist_path": str(tmp_path / "live-status-events.jsonl"),
+            "delivery": {
+                "mode": "live",
+                "endpoint": "https://www.regengine.co/api/v1/webhooks/ingest",
+                "api_key": api_key,
+                "tenant_id": tenant_id,
+            },
+        },
+    )
+    assert reset_response.status_code == 200
+
+    status = client.get("/api/simulate/status").json()
+    health = client.get("/api/health").json()
+    stream_response = client.get("/api/simulate/stream?limit=5&once=true")
+    stream_data = next(
+        line.removeprefix("data: ")
+        for line in stream_response.text.splitlines()
+        if line.startswith("data: ")
+    )
+    snapshot = json.loads(stream_data)
+
+    for payload in (status, health, snapshot):
+        assert_json_omits(payload, api_key, tenant_id)
+
+    delivery = status["config"]["delivery"]
+    assert delivery["mode"] == "live"
+    assert delivery["endpoint"] == "https://www.regengine.co/api/v1/webhooks/ingest"
+    assert delivery["api_key"] is None
+    assert delivery["tenant_id"] is None
+    assert health["status"]["config"]["delivery"] == delivery
+    assert snapshot["status"]["config"]["delivery"] == delivery
 
 
 def test_scenario_catalog_endpoint_lists_supported_presets():

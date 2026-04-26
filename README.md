@@ -177,7 +177,7 @@ When Basic Auth is enabled, requests without valid credentials receive `401` wit
 
 Use `X-RegEngine-Tenant` to select an explicit tenant scope. Tenant ids must be 1-64 characters and can contain only letters, numbers, dots, underscores, or hyphens. Tenant-scoped controllers keep separate simulator state, event logs, mock ingest responses, scenario saves, lineage, and exports under `data/tenants/{tenant_id}/`.
 
-`GET /api/health` and the dashboard stats area expose the active tenant id, whether Basic Auth is enabled, and whether storage is local default or tenant-scoped. Passwords, API keys, and other credentials are never returned.
+`GET /api/health` and the dashboard stats area expose the active tenant id, whether Basic Auth is enabled, and whether storage is local default or tenant-scoped. Passwords, API keys, and other credentials are never returned; live delivery status preserves the active mode and endpoint while redacting the RegEngine API key and tenant id.
 
 Credentialed browser requests are limited to explicit CORS origins. By default the app allows the local dashboard origins `http://127.0.0.1:8000` and `http://localhost:8000`. For shared demos, set comma-separated HTTPS origins:
 

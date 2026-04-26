@@ -592,12 +592,18 @@ class SimulationController:
     def status(self) -> dict[str, Any]:
         return {
             "running": self.running,
-            "config": self.config.model_dump(mode="json"),
+            "config": self._sanitize_public_config(self.config).model_dump(mode="json"),
             "stats": {
                 **self.store.stats(),
                 "engine": self.engine.snapshot(),
             },
         }
+
+    def _sanitize_public_config(self, config: SimulationConfig) -> SimulationConfig:
+        delivery = config.delivery.model_copy(update={"api_key": None}, deep=True)
+        if delivery.mode == DestinationMode.LIVE:
+            delivery = delivery.model_copy(update={"tenant_id": None}, deep=True)
+        return config.model_copy(update={"delivery": delivery}, deep=True)
 
     def _sanitize_saved_config(self, config: SimulationConfig) -> SimulationConfig:
         delivery = config.delivery.model_copy(update={"api_key": None}, deep=True)
