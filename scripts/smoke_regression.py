@@ -36,7 +36,14 @@ def run_smoke(client: TestClient) -> None:
     main_headers = request_headers(TENANTS[0])
     other_headers = request_headers(TENANTS[1])
 
-    assert_status(client.get("/api/health", headers=main_headers), 200)
+    health = assert_json(client.get("/api/health", headers=main_headers), 200)
+    assert_equal(health["tenant"], TENANTS[0], "health tenant")
+    assert_equal(
+        health["auth"]["enabled"],
+        bool(os.getenv("REGENGINE_BASIC_AUTH_USERNAME") and os.getenv("REGENGINE_BASIC_AUTH_PASSWORD")),
+        "health auth enabled",
+    )
+    assert_equal(health["auth"]["uses_default_storage"], False, "health tenant storage scope")
     reset_response = client.post(
         "/api/simulate/reset",
         headers=main_headers,

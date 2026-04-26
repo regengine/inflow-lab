@@ -72,7 +72,15 @@ def test_scenario_catalog_endpoint_lists_supported_presets():
 
 
 def test_basic_auth_is_optional_but_enforced_when_configured(monkeypatch):
-    assert client.get("/api/health").status_code == 200
+    health_response = client.get("/api/health")
+    assert health_response.status_code == 200
+    health = health_response.json()
+    assert health["tenant"] == "local-demo"
+    assert health["auth"] == {
+        "enabled": False,
+        "username": None,
+        "uses_default_storage": True,
+    }
 
     monkeypatch.setenv("REGENGINE_BASIC_AUTH_USERNAME", "demo-user")
     monkeypatch.setenv("REGENGINE_BASIC_AUTH_PASSWORD", "demo-pass")
@@ -86,7 +94,13 @@ def test_basic_auth_is_optional_but_enforced_when_configured(monkeypatch):
 
     authorized = client.get("/api/health", headers=basic_auth_header("demo-user", "demo-pass"))
     assert authorized.status_code == 200
-    assert authorized.json()["tenant"] == "demo-user"
+    authorized_body = authorized.json()
+    assert authorized_body["tenant"] == "demo-user"
+    assert authorized_body["auth"] == {
+        "enabled": True,
+        "username": "demo-user",
+        "uses_default_storage": False,
+    }
 
 
 def test_tenant_header_scopes_event_storage_and_rejects_invalid_ids(tmp_path):

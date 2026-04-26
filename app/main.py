@@ -126,10 +126,16 @@ async def root() -> FileResponse:
 @app.get("/api/health")
 async def health(request: Request) -> dict[str, Any]:
     active_controller = _active_controller(request)
+    context = _tenant_context(request)
     return {
         "ok": True,
         "utc_time": datetime.now(UTC).isoformat(),
-        "tenant": _tenant_context(request).tenant_id,
+        "tenant": context.tenant_id,
+        "auth": {
+            "enabled": context.auth_enabled,
+            "username": context.username,
+            "uses_default_storage": context.uses_default_storage,
+        },
         "status": active_controller.status(),
     }
 

@@ -1,5 +1,6 @@
 const state = {
   status: null,
+  health: null,
   events: [],
   eventSource: null,
   fallbackTimer: null,
@@ -43,6 +44,7 @@ const ids = {
   exportStartDate: document.getElementById('exportStartDate'),
   exportEndDate: document.getElementById('exportEndDate'),
   exportDownloadLink: document.getElementById('exportDownloadLink'),
+  epcisDownloadLink: document.getElementById('epcisDownloadLink'),
   exportPresetDescription: document.getElementById('exportPresetDescription'),
   statusMessage: document.getElementById('statusMessage'),
   statsGrid: document.getElementById('statsGrid'),
@@ -221,30 +223,45 @@ async function loadExportPresets() {
 }
 
 function updateExportLink() {
-  const params = new URLSearchParams();
+  const csvParams = new URLSearchParams();
+  const epcisParams = new URLSearchParams();
   const preset = ids.exportPreset.value || 'all_records';
   const lotCode = ids.exportLot.value.trim();
   const startDate = ids.exportStartDate.value;
   const endDate = ids.exportEndDate.value;
-  params.set('preset', preset);
+  csvParams.set('preset', preset);
   if (lotCode) {
-    params.set('traceability_lot_code', lotCode);
+    csvParams.set('traceability_lot_code', lotCode);
+    epcisParams.set('traceability_lot_code', lotCode);
   }
   if (startDate) {
-    params.set('start_date', startDate);
+    csvParams.set('start_date', startDate);
+    epcisParams.set('start_date', startDate);
   }
   if (endDate) {
-    params.set('end_date', endDate);
+    csvParams.set('end_date', endDate);
+    epcisParams.set('end_date', endDate);
   }
-  ids.exportDownloadLink.href = `/api/mock/regengine/export/fda-request?${params.toString()}`;
-  ids.exportPresetDescription.textContent = state.exportPresetDescriptions[preset] || 'FDA-request CSV export.';
+  const epcisQuery = epcisParams.toString();
+  ids.exportDownloadLink.href = `/api/mock/regengine/export/fda-request?${csvParams.toString()}`;
+  ids.epcisDownloadLink.href = `/api/mock/regengine/export/epcis${epcisQuery ? `?${epcisQuery}` : ''}`;
+  const presetDescription = state.exportPresetDescriptions[preset] || 'FDA-request CSV export.';
+  ids.exportPresetDescription.textContent = `${presetDescription} EPCIS uses the same lot and date filters.`;
 }
 
 function renderStats(status) {
   const stats = status?.stats || {};
   const engine = stats.engine || {};
   const scenarioId = status?.config?.scenario || ids.scenario.value;
+  const health = state.health || {};
+  const auth = health.auth || {};
+  const tenant = health.tenant || 'local-demo';
+  const authState = auth.enabled ? 'Enabled' : 'Off';
+  const storageScope = auth.uses_default_storage === false ? 'Tenant' : 'Local';
   const cards = [
+    ['Tenant', tenant],
+    ['Auth', authState],
+    ['Storage scope', storageScope],
     ['Loop status', status?.running ? 'Running' : 'Stopped'],
     ['Scenario', scenarioLabel(scenarioId)],
     ['Total records', stats.total_records ?? 0],
@@ -259,8 +276,8 @@ function renderStats(status) {
     .map(
       ([label, value]) => `
         <article class="stat-card">
-          <span>${label}</span>
-          <strong>${value}</strong>
+          <span>${escapeHtml(label)}</span>
+          <strong>${escapeHtml(value)}</strong>
         </article>
       `,
     )
@@ -534,8 +551,9 @@ function renderImportResult(result) {
   `;
 }
 
-function renderSnapshot(status, events) {
+function renderSnapshot(status, events, health = state.health) {
   state.status = status;
+  state.health = health;
   state.events = events;
   renderStats(status);
   renderDeliverySummary(status);
@@ -546,8 +564,12 @@ function renderSnapshot(status, events) {
 }
 
 async function refresh() {
-  const [status, events] = await Promise.all([api('/api/simulate/status'), api('/api/events?limit=100')]);
-  renderSnapshot(status, events.events);
+  const [health, status, events] = await Promise.all([
+    api('/api/health'),
+    api('/api/simulate/status'),
+    api('/api/events?limit=100'),
+  ]);
+  renderSnapshot(status, events.events, health);
 }
 
 function stopFallbackPolling() {

@@ -94,7 +94,7 @@ Then open:
 http://127.0.0.1:8000
 ```
 
-The dashboard lets you choose a scenario preset, save/load per-scenario demo states, load deterministic demo fixtures, start/stop/step/reset the simulator, replay the current persisted event log, import CSV seed lots or scheduled events, inspect recent events, trace lot lineage, and export mock FDA request CSV presets. API users can also derive scaffolded EPCIS 2.0 JSON-LD exports from the same stored records. It subscribes to live status/event snapshots with Server-Sent Events and falls back to refresh polling if the stream disconnects. Delivery mode defaults to **`mock`** so no credentials are required.
+The dashboard lets you choose a scenario preset, save/load per-scenario demo states, load deterministic demo fixtures, start/stop/step/reset the simulator, replay the current persisted event log, import CSV seed lots or scheduled events, inspect recent events, trace lot lineage, see the active tenant/auth/storage context, and export mock FDA request CSV presets plus scaffolded EPCIS 2.0 JSON-LD exports. It subscribes to live status/event snapshots with Server-Sent Events and falls back to refresh polling if the stream disconnects. Delivery mode defaults to **`mock`** so no credentials are required.
 
 Event records are stored as JSONL at `config.persist_path` (`data/events.jsonl` by default for local unauthenticated use). Existing records at that path are loaded when the app starts or when a start/reset request points at a different path; reset clears the currently configured event log. Tenant-scoped requests store records under `data/tenants/{tenant_id}/events.jsonl` and ignore untrusted persist-path overrides. Replay reads the JSONL log without appending, duplicating, or rewriting stored events.
 
@@ -149,6 +149,8 @@ export REGENGINE_BASIC_AUTH_PASSWORD=change-me
 When Basic Auth is enabled, requests without valid credentials receive `401` with a `WWW-Authenticate` challenge. If no tenant header is supplied, the authenticated username becomes the tenant id.
 
 Use `X-RegEngine-Tenant` to select an explicit tenant scope. Tenant ids must be 1-64 characters and can contain only letters, numbers, dots, underscores, or hyphens. Tenant-scoped controllers keep separate simulator state, event logs, mock ingest responses, scenario saves, lineage, and exports under `data/tenants/{tenant_id}/`.
+
+`GET /api/health` and the dashboard stats area expose the active tenant id, whether Basic Auth is enabled, and whether storage is local default or tenant-scoped. Passwords, API keys, and other credentials are never returned.
 
 ## Replay mode
 
@@ -246,7 +248,7 @@ The dashboard fixture loader resets the current event log before loading the sel
 - `preset`: one of `all_records`, `lot_trace`, `shipment_handoff`, `receiving_log`, or `transformation_batches`
 - `traceability_lot_code`: optional for most presets, required for `lot_trace`
 
-If a lot code is supplied, the export is scoped to that lot's transitive lineage before applying the preset filter. `GET /api/mock/regengine/export/presets` returns the preset catalog used by the dashboard.
+If a lot code is supplied, the export is scoped to that lot's transitive lineage before applying the preset filter. `GET /api/mock/regengine/export/presets` returns the preset catalog used by the dashboard. The dashboard export panel builds CSV and EPCIS download links from the same lot and date filters.
 
 ## EPCIS 2.0 export scaffolding
 
@@ -258,6 +260,8 @@ Supported query parameters:
 - `end_date`: optional inclusive `YYYY-MM-DD`
 - `traceability_lot_code`: optional lot code; when supplied, the export uses the same transitive lineage graph as `/api/lineage/{traceability_lot_code}`
 
+The dashboard exposes a `Download EPCIS` control beside the FDA CSV export. It uses the same optional lot code and date filters as the CSV export panel, but does not apply FDA-only preset filters.
+
 The export returns an `EPCISDocument` with `ObjectEvent` records for harvesting, cooling, packing, shipping, and receiving CTEs, plus `TransformationEvent` records for transformation CTEs. RegEngine-specific fields are preserved under the `regengine:` JSON-LD namespace so KDEs, parent lot codes, document references, product descriptions, and original CTE types remain visible while the current webhook contract stays unchanged.
 
 ## API reference
@@ -266,7 +270,7 @@ The export returns an `EPCISDocument` with `ObjectEvent` records for harvesting,
 
 | Method | Path | Purpose |
 |---|---|---|
-| `GET` | `/api/health` | Liveness probe + current config snapshot |
+| `GET` | `/api/health` | Liveness probe, tenant/auth context, and current config snapshot |
 | `GET` | `/api/scenarios` | List available scenario presets |
 | `GET` | `/api/scenario-saves` | List saved per-scenario demo states |
 | `POST` | `/api/scenario-saves/{scenario_id}` | Save the current or supplied config and event log for a scenario |
