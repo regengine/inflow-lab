@@ -6,6 +6,7 @@ Use this checklist before tagging a demo-ready build or handing the simulator to
 
 - [ ] `pytest`
 - [ ] `python3 scripts/smoke_regression.py`
+- [ ] `python3 scripts/browser_smoke.py`
 - [ ] `node --check app/static/app.js`
 - [ ] `python3 -m compileall app scripts`
 - [ ] `git diff --check`

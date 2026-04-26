@@ -8,6 +8,7 @@ A mock-first FSMA 204 traceability simulator that emits **RegEngine-compatible i
 - [Project layout](#project-layout)
 - [Quick start (local dev)](#quick-start-local-dev)
 - [Running tests](#running-tests)
+- [Browser smoke](#browser-smoke)
 - [Release smoke regression](#release-smoke-regression)
 - [Delivery modes](#delivery-modes)
 - [Basic auth and tenant storage](#basic-auth-and-tenant-storage)
@@ -68,6 +69,7 @@ app/
   workflows/remote-smoke.yml
 scripts/
   smoke_regression.py    # End-to-end API smoke for demo-ready release checks
+  browser_smoke.py       # Headless Playwright dashboard smoke
   remote_smoke.py        # HTTP smoke harness for deployed shared-demo instances
   live_trial.py          # Gated one-batch live-ingest trial runner
 tests/
@@ -116,6 +118,18 @@ pytest
 ```
 
 The suite covers payload shape, engine determinism, and the HTTP API contract.
+
+## Browser smoke
+
+Run the dashboard smoke after frontend or operator-flow changes:
+
+```bash
+pip install -r requirements-browser.txt
+python3 -m playwright install chromium
+python3 scripts/browser_smoke.py
+```
+
+The smoke starts a temporary local server with mock delivery, drives Chromium through the dashboard start/stop, reset, single-batch, fixture load, transformed-lot lineage lookup, and CSV warning display flows, then exits nonzero with a clear failure message if a browser assertion fails. Set `REGENGINE_BROWSER_BASE_URL` to run against an already-started local instance instead of letting the script start one.
 
 ## Release smoke regression
 

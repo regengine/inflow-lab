@@ -11,3 +11,4 @@ data/scenario_saves/
 data/tenants/
 uvicorn.out.log
 uvicorn.err.log
+output/playwright/
