@@ -48,6 +48,7 @@ Each event is persisted with `event_id`, `sha256_hash`, and `chain_hash` so the 
 ```text
 app/
   auth.py                # Optional Basic Auth and tenant context resolution
+  build_info.py          # Public non-secret build/deployment metadata for health checks
   controller.py          # Simulator lifecycle (start/stop/step/reset)
   demo_fixtures.py       # Deterministic demo playback fixtures
   engine.py              # CTE generation and lot lineage logic
@@ -153,9 +154,9 @@ export REGENGINE_REMOTE_TENANT=remote-smoke
 python3 scripts/remote_smoke.py
 ```
 
-`scripts/remote_smoke.py` uses `httpx` with normal TLS verification to check `/api/healthz`, Basic Auth enforcement, credentialed CORS allow/block behavior, mock fixture loading, transformed-lot lineage, FDA CSV export, and EPCIS JSON-LD export. The tenant defaults to `remote-smoke`, fixture delivery stays in `mock` mode, and failure messages redact configured passwords and credential-like environment values.
+`scripts/remote_smoke.py` uses `httpx` with normal TLS verification to check `/api/healthz`, Basic Auth enforcement, credentialed CORS allow/block behavior, mock fixture loading, transformed-lot lineage, FDA CSV export, and EPCIS JSON-LD export. The tenant defaults to `remote-smoke`, fixture delivery stays in `mock` mode, and failure messages redact configured passwords and credential-like environment values. Set `REGENGINE_EXPECTED_BUILD_SHA` to fail fast when a deployed instance is not running the expected commit.
 
-GitHub also has manual and nightly **Remote Smoke** and **Remote Browser Smoke** workflows for deployed demo validation. Configure repository secrets `REGENGINE_REMOTE_USERNAME` and `REGENGINE_REMOTE_PASSWORD`, then run `.github/workflows/remote-smoke.yml` for API/export checks or `.github/workflows/remote-browser-smoke.yml` for authenticated dashboard checks with optional `base_url` and `tenant` inputs. Scheduled runs target the Railway shared-demo URL with dedicated nightly tenants.
+GitHub also has manual and nightly **Remote Smoke** and **Remote Browser Smoke** workflows for deployed demo validation. Configure repository secrets `REGENGINE_REMOTE_USERNAME` and `REGENGINE_REMOTE_PASSWORD`, then run `.github/workflows/remote-smoke.yml` for API/export checks or `.github/workflows/remote-browser-smoke.yml` for authenticated dashboard checks with optional `base_url` and `tenant` inputs. Scheduled runs target the Railway shared-demo URL with dedicated nightly tenants and compare `/api/healthz` build metadata to the workflow commit.
 
 Use `RELEASE_CHECKLIST.md` as the full demo-ready gate. Use `DESIGN_PARTNER_DEMO_SCRIPT.md` for the call flow, expected talking points, fixture reset commands, and recovery steps.
 
@@ -343,8 +344,8 @@ The service wrapper examples below can be used with any profile; keep the profil
 
 | Method | Path | Purpose |
 |---|---|---|
-| `GET` | `/api/health` | Authenticated liveness probe, tenant/auth context, and current config snapshot |
-| `GET` | `/api/healthz` | Unauthenticated platform/container healthcheck |
+| `GET` | `/api/health` | Authenticated liveness probe, public build metadata, tenant/auth context, and current config snapshot |
+| `GET` | `/api/healthz` | Unauthenticated platform/container healthcheck with public build metadata |
 | `GET` | `/api/scenarios` | List available scenario presets |
 | `GET` | `/api/scenario-saves` | List saved per-scenario demo states |
 | `POST` | `/api/scenario-saves/{scenario_id}` | Save the current or supplied config and event log for a scenario |
@@ -642,6 +643,16 @@ docker run --rm \
 
 `railway.json` uses the same Dockerfile and healthcheck for Railway deployments. Mount persistent storage at `/data` and keep `REGENGINE_DATA_DIR=/data`.
 
+Expose non-secret build metadata so stale shared-demo deployments are obvious from `/api/healthz` and remote smoke failures:
+
+```bash
+railway variable set --skip-deploys REGENGINE_BUILD_SHA="$(git rev-parse HEAD)" \
+  REGENGINE_BUILD_BRANCH="$(git branch --show-current)"
+railway up --ci -m "Deploy $(git rev-parse --short HEAD)"
+```
+
+The health responses always include `build.version`; `build.commit_sha`, `build.commit_sha_short`, `build.branch`, and `build.deployment_id` are populated from whitelisted environment variables when available, or from local `.git` metadata during local development.
+
 ## Logs and troubleshooting
 
 Every HTTP request emits an application log line like:
@@ -669,6 +680,7 @@ systemctl status regengine                    # Linux
 
 # Health probe
 curl http://127.0.0.1:8000/api/health
+curl http://127.0.0.1:8000/api/healthz
 
 # Tail logs (macOS)
 tail -f ~/regengine_codex_workspace/uvicorn.err.log
@@ -683,6 +695,7 @@ Common failure patterns:
 - Auth failures: request logs show `status=401` on `/api/...`; confirm `REGENGINE_BASIC_AUTH_USERNAME` and `REGENGINE_BASIC_AUTH_PASSWORD` are set as intended.
 - CORS failures: Railway HTTP logs may show successful `OPTIONS` but the browser blocks a follow-up request; confirm `REGENGINE_CORS_ORIGINS` is the exact HTTPS dashboard origin.
 - Volume/storage failures: `/api/health` should report tenant-scoped paths under `REGENGINE_DATA_DIR`; confirm Railway has a volume mounted at `/data` and `REGENGINE_DATA_DIR=/data`.
+- Stale deployment failures: `/api/healthz` should report the expected `build.commit_sha_short`; if it does not, redeploy current `main` and update `REGENGINE_BUILD_SHA`.
 - Live delivery failures: request logs identify the route and tenant while dashboard delivery stats show the sanitized delivery error; confirm endpoint, API key, and tenant id before retrying.
 
 If the health check fails before request logs appear, the first place to look is `uvicorn.err.log` or `railway logs --deployment` for a Python traceback or startup error.

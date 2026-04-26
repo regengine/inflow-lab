@@ -3,10 +3,17 @@ from __future__ import annotations
 import os
 import sys
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Any
 from urllib.parse import urlparse
 
 import httpx
+
+REPO_ROOT = Path(__file__).resolve().parents[1]
+if str(REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPO_ROOT))
+
+from app.build_info import APP_VERSION
 
 
 DEFAULT_TENANT = "remote-smoke"
@@ -26,6 +33,7 @@ class RemoteSmokeConfig:
     tenant: str = DEFAULT_TENANT
     cors_origin: str | None = None
     untrusted_origin: str = DEFAULT_UNTRUSTED_ORIGIN
+    expected_build_sha: str | None = None
     timeout_seconds: float = 30.0
 
     @property
@@ -57,7 +65,9 @@ def main() -> int:
         f"fixture_stored={summary['fixture_stored']}, "
         f"fixture_posted={summary['fixture_posted']}, "
         f"lineage_records={summary['lineage_records']}, "
-        f"epcis_events={summary['epcis_events']}"
+        f"epcis_events={summary['epcis_events']}, "
+        f"build_version={summary['build_version']}, "
+        f"build_commit={summary['build_commit'] or 'unknown'}"
     )
     return 0
 
@@ -89,6 +99,7 @@ def config_from_env(environ: dict[str, str] | None = None) -> RemoteSmokeConfig:
             environ.get("REGENGINE_REMOTE_UNTRUSTED_ORIGIN")
         )
         or DEFAULT_UNTRUSTED_ORIGIN,
+        expected_build_sha=environ.get("REGENGINE_EXPECTED_BUILD_SHA") or None,
     )
 
 
@@ -108,6 +119,13 @@ def run_remote_smoke(
     try:
         healthz = request_json(client, config, "GET", "/api/healthz", authenticated=False)
         assert_equal(healthz.get("ok"), True, "healthz ok")
+        build = assert_build_info(config, healthz.get("build"))
+        if config.expected_build_sha:
+            assert_build_sha(
+                actual=build.get("commit_sha"),
+                expected=config.expected_build_sha,
+                label="healthz build commit",
+            )
 
         unauthenticated_health = client.get("/api/health")
         assert_status(config, unauthenticated_health, 401, "Basic Auth enforcement")
@@ -223,6 +241,8 @@ def run_remote_smoke(
             "fixture_posted": fixture["posted"],
             "lineage_records": len(records),
             "epcis_events": len(epcis_events),
+            "build_version": build.get("version"),
+            "build_commit": build.get("commit_sha_short"),
         }
     finally:
         if owns_client:
@@ -338,6 +358,32 @@ def assert_equal(actual: Any, expected: Any, label: str) -> None:
 def assert_in(member: Any, container: Any, label: str) -> None:
     if member not in container:
         raise RemoteSmokeFailure(f"{label}: expected {member!r} to be present")
+
+
+def assert_build_info(config: RemoteSmokeConfig, build: Any) -> dict[str, Any]:
+    if not isinstance(build, dict):
+        raise RemoteSmokeFailure("healthz build: expected build metadata object")
+    assert_equal(build.get("version"), APP_VERSION, "healthz build version")
+    for field in ("commit_sha", "commit_sha_short", "branch", "deployment_id"):
+        value = build.get(field)
+        if value is not None and not isinstance(value, str):
+            raise RemoteSmokeFailure(f"healthz build {field}: expected string or null")
+    return build
+
+
+def assert_build_sha(actual: Any, expected: str, label: str) -> None:
+    if not isinstance(actual, str) or not actual:
+        raise RemoteSmokeFailure(f"{label}: expected deployed commit {expected[:12]}, got none")
+    if not _sha_prefix_match(actual, expected):
+        raise RemoteSmokeFailure(
+            f"{label}: expected deployed commit {expected[:12]}, got {actual[:12]}"
+        )
+
+
+def _sha_prefix_match(actual: str, expected: str) -> bool:
+    actual = actual.strip().lower()
+    expected = expected.strip().lower()
+    return actual.startswith(expected) or expected.startswith(actual)
 
 
 def normalize_base_url(value: str) -> str:

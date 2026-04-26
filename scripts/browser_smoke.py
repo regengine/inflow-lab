@@ -13,6 +13,12 @@ from typing import Iterator
 
 import httpx
 
+REPO_ROOT = Path(__file__).resolve().parents[1]
+if str(REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPO_ROOT))
+
+from app.build_info import APP_VERSION
+
 
 CSV_WITH_KDE_WARNINGS = """cte_type,traceability_lot_code,product_description,quantity,unit_of_measure,location_name,timestamp,kdes
 harvesting,TLC-BROWSER-WARN,Romaine Lettuce,10,cases,Valley Fresh Farms,2026-02-10T08:00:00Z,"{""harvest_date"":""2026-02-10""}"
@@ -26,6 +32,7 @@ class BrowserSmokeConfig:
     username: str | None
     password: str | None
     tenant: str | None
+    expected_build_sha: str | None
 
 
 def main() -> int:
@@ -50,6 +57,8 @@ def _load_config() -> BrowserSmokeConfig:
         username=username,
         password=password,
         tenant=_env_text("REGENGINE_BROWSER_TENANT") or _env_text("REGENGINE_REMOTE_TENANT"),
+        expected_build_sha=_env_text("REGENGINE_BROWSER_EXPECTED_BUILD_SHA")
+        or _env_text("REGENGINE_EXPECTED_BUILD_SHA"),
     )
 
 
@@ -101,6 +110,8 @@ def _run_dashboard_smoke(base_url: str, config: BrowserSmokeConfig) -> None:
             "Playwright is not installed. Run: python3 -m pip install -r requirements-browser.txt "
             "&& python3 -m playwright install chromium"
         ) from exc
+
+    _check_healthz_build(base_url, config.expected_build_sha)
 
     output_dir = Path("output/playwright")
     console_errors: list[str] = []
@@ -185,6 +196,35 @@ def _browser_context_options(config: BrowserSmokeConfig) -> dict[str, object]:
     if config.tenant:
         options["extra_http_headers"] = {"X-RegEngine-Tenant": config.tenant}
     return options
+
+
+def _check_healthz_build(base_url: str, expected_build_sha: str | None) -> None:
+    response = httpx.get(f"{base_url}/api/healthz", timeout=5.0)
+    response.raise_for_status()
+    payload = response.json()
+    build = payload.get("build")
+    if not isinstance(build, dict):
+        raise RuntimeError("/api/healthz did not include build metadata")
+    if build.get("version") != APP_VERSION:
+        raise RuntimeError(
+            f"/api/healthz build version mismatch: expected {APP_VERSION}, got {build.get('version')!r}"
+        )
+    if expected_build_sha:
+        actual = build.get("commit_sha")
+        if not isinstance(actual, str) or not actual:
+            raise RuntimeError(
+                f"/api/healthz build commit mismatch: expected {expected_build_sha[:12]}, got none"
+            )
+        if not _sha_prefix_match(actual, expected_build_sha):
+            raise RuntimeError(
+                f"/api/healthz build commit mismatch: expected {expected_build_sha[:12]}, got {actual[:12]}"
+            )
+
+
+def _sha_prefix_match(actual: str, expected: str) -> bool:
+    actual = actual.strip().lower()
+    expected = expected.strip().lower()
+    return actual.startswith(expected) or expected.startswith(actual)
 
 
 def _wait_for_healthz(base_url: str, process: subprocess.Popen[str]) -> None:

@@ -8,6 +8,7 @@ import logging
 import pytest
 from fastapi.testclient import TestClient
 
+from app.build_info import BRANCH_ENV_VARS, COMMIT_SHA_ENV_VARS, DEPLOYMENT_ID_ENV_VARS
 from app.main import app, controller, cors_origins_from_env, scenario_saves
 from app.models import SimulationConfig
 from app.regengine_client import LiveIngestResult
@@ -182,6 +183,35 @@ def test_basic_auth_is_optional_but_enforced_when_configured(monkeypatch):
         "username": "demo-user",
         "uses_default_storage": False,
     }
+
+
+def test_health_routes_include_build_metadata_from_whitelisted_env(monkeypatch):
+    for name in COMMIT_SHA_ENV_VARS + BRANCH_ENV_VARS + DEPLOYMENT_ID_ENV_VARS:
+        monkeypatch.delenv(name, raising=False)
+    monkeypatch.setenv("REGENGINE_APP_VERSION", "2.4.6")
+    monkeypatch.setenv("REGENGINE_BUILD_SHA", "abcdef1234567890")
+    monkeypatch.setenv("REGENGINE_BUILD_BRANCH", "codex/build-health-info")
+    monkeypatch.setenv("REGENGINE_DEPLOYMENT_ID", "deploy-123")
+    monkeypatch.setenv("REGENGINE_REMOTE_PASSWORD", "should-not-appear")
+
+    healthz = client.get("/api/healthz")
+    assert healthz.status_code == 200
+    healthz_build = healthz.json()["build"]
+    assert healthz_build == {
+        "version": "2.4.6",
+        "commit_sha": "abcdef1234567890",
+        "commit_sha_short": "abcdef1",
+        "commit_source": "REGENGINE_BUILD_SHA",
+        "branch": "codex/build-health-info",
+        "branch_source": "REGENGINE_BUILD_BRANCH",
+        "deployment_id": "deploy-123",
+        "deployment_source": "REGENGINE_DEPLOYMENT_ID",
+    }
+    assert "should-not-appear" not in json.dumps(healthz.json())
+
+    health = client.get("/api/health")
+    assert health.status_code == 200
+    assert health.json()["build"] == healthz_build
 
 
 def test_basic_auth_blocks_state_changes_from_untrusted_browser_origins(monkeypatch):

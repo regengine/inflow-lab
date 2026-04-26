@@ -227,9 +227,19 @@ REGENGINE_BASIC_AUTH_PASSWORD=<strong generated password>
 REGENGINE_DEFAULT_TENANT=demo-default
 REGENGINE_CORS_ORIGINS=https://<railway-domain>
 REGENGINE_DATA_DIR=/data
+REGENGINE_BUILD_SHA=<deployed git sha>
+REGENGINE_BUILD_BRANCH=main
 ```
 
 Attach a Railway volume at `/data` before using the service for partner demos. After a Railway domain is generated, update `REGENGINE_CORS_ORIGINS` to that exact HTTPS origin.
+
+When deploying from the CLI, update the non-secret build variables before `railway up` so health checks can identify stale deployments:
+
+```bash
+railway variable set --skip-deploys REGENGINE_BUILD_SHA="$(git rev-parse HEAD)" \
+  REGENGINE_BUILD_BRANCH="$(git branch --show-current)"
+railway up --ci -m "Deploy $(git rev-parse --short HEAD)"
+```
 
 Validate the deployed Railway demo with the remote smoke harness:
 
@@ -269,7 +279,7 @@ Then run `.github/workflows/remote-smoke.yml` or `.github/workflows/remote-brows
 | `base_url` | `https://regengine-inflow-lab-production.up.railway.app` | Deployed shared-demo URL to validate |
 | `tenant` | `remote-smoke` or `remote-browser-smoke` | Tenant used for isolated smoke data |
 
-The workflows install repo dependencies and run `python3 scripts/remote_smoke.py` or `python3 scripts/browser_smoke.py`. They do not require live RegEngine credentials and keep delivery in `mock` mode. Nightly scheduled runs target the Railway shared-demo URL with `remote-smoke-nightly` and `remote-browser-smoke-nightly` tenants.
+The workflows install repo dependencies and run `python3 scripts/remote_smoke.py` or `python3 scripts/browser_smoke.py`. They do not require live RegEngine credentials and keep delivery in `mock` mode. Nightly scheduled runs target the Railway shared-demo URL with `remote-smoke-nightly` and `remote-browser-smoke-nightly` tenants, and both remote workflows compare `/api/healthz` build metadata to the workflow commit.
 
 Railway log triage:
 
@@ -291,8 +301,9 @@ Use these patterns when diagnosing a shared demo:
 
 ## Profile Verification Checklist
 
-- `GET /api/health` returns the expected tenant and auth context.
-- `GET /api/healthz` returns `{"ok": true, ...}` without credentials for platform healthchecks.
+- `GET /api/health` returns the expected tenant, auth context, and build metadata.
+- `GET /api/healthz` returns `{"ok": true, "build": ...}` without credentials for platform healthchecks.
+- `build.commit_sha_short` matches the deployed git commit before manual or nightly remote smoke runs.
 - Browser requests from the intended HTTPS origin receive the `access-control-allow-origin` response header; untrusted origins do not.
 - `REGENGINE_DATA_DIR` points at mounted persistent storage in shared-demo and live-trial deployments.
 - Dashboard stats match the chosen tenant/auth/storage profile.

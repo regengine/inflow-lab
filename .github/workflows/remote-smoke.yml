@@ -60,4 +60,5 @@ jobs:
           REGENGINE_REMOTE_USERNAME: ${{ secrets.REGENGINE_REMOTE_USERNAME }}
           REGENGINE_REMOTE_PASSWORD: ${{ secrets.REGENGINE_REMOTE_PASSWORD }}
           REGENGINE_REMOTE_TENANT: ${{ github.event.inputs.tenant || 'remote-smoke-nightly' }}
+          REGENGINE_EXPECTED_BUILD_SHA: ${{ github.sha }}
         run: python3 scripts/remote_smoke.py

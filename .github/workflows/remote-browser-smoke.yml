@@ -62,4 +62,5 @@ jobs:
           REGENGINE_BROWSER_USERNAME: ${{ secrets.REGENGINE_REMOTE_USERNAME }}
           REGENGINE_BROWSER_PASSWORD: ${{ secrets.REGENGINE_REMOTE_PASSWORD }}
           REGENGINE_BROWSER_TENANT: ${{ github.event.inputs.tenant || 'remote-browser-smoke-nightly' }}
+          REGENGINE_BROWSER_EXPECTED_BUILD_SHA: ${{ github.sha }}
         run: python3 scripts/browser_smoke.py

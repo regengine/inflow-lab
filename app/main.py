@@ -19,6 +19,7 @@ from fastapi.responses import FileResponse, JSONResponse, PlainTextResponse, Str
 from fastapi.staticfiles import StaticFiles
 
 from .auth import DEFAULT_TENANT_ID, TenantContext, normalize_tenant_id, tenant_context_from_request
+from .build_info import APP_VERSION, current_build_info
 from .controller import SimulationController
 from .demo_fixtures import list_demo_fixture_summaries
 from .engine import LegitFlowEngine
@@ -139,7 +140,7 @@ def _normalize_cors_origin(raw_origin: str) -> str | None:
 app = FastAPI(
     title="RegEngine Inflow Lab",
     description="Mock-first FSMA 204 CTE data-flow simulator for RegEngine-compatible payloads.",
-    version="0.1.0",
+    version=APP_VERSION,
     lifespan=lifespan,
 )
 app.add_middleware(
@@ -253,9 +254,11 @@ async def root() -> FileResponse:
 async def health(request: Request) -> dict[str, Any]:
     active_controller = _active_controller(request)
     context = _tenant_context(request)
+    build = current_build_info().public_dict()
     return {
         "ok": True,
         "utc_time": datetime.now(UTC).isoformat(),
+        "build": build,
         "tenant": context.tenant_id,
         "auth": {
             "enabled": context.auth_enabled,
@@ -271,6 +274,7 @@ async def healthz() -> dict[str, Any]:
     return {
         "ok": True,
         "utc_time": datetime.now(UTC).isoformat(),
+        "build": current_build_info().public_dict(),
     }
 
 

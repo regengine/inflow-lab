@@ -3,6 +3,7 @@ from __future__ import annotations
 import httpx
 import pytest
 
+from app.build_info import APP_VERSION
 from scripts.remote_smoke import (
     DEFAULT_TENANT,
     FRESH_CUT_OUTPUT_LOT,
@@ -28,6 +29,17 @@ def test_config_from_env_requires_connection_and_auth_values():
     assert config.base_url == "https://demo.example.com"
     assert config.tenant == DEFAULT_TENANT
     assert config.allowed_origin == "https://demo.example.com"
+    assert config.expected_build_sha is None
+
+    expected_config = config_from_env(
+        {
+            "REGENGINE_REMOTE_BASE_URL": "https://demo.example.com/",
+            "REGENGINE_REMOTE_USERNAME": "demo",
+            "REGENGINE_REMOTE_PASSWORD": "secret-password",
+            "REGENGINE_EXPECTED_BUILD_SHA": "abcdef1234567890",
+        }
+    )
+    assert expected_config.expected_build_sha == "abcdef1234567890"
 
 
 def test_remote_smoke_success_uses_basic_auth_and_dedicated_tenant():
@@ -50,6 +62,8 @@ def test_remote_smoke_success_uses_basic_auth_and_dedicated_tenant():
         "fixture_posted": 13,
         "lineage_records": 3,
         "epcis_events": 1,
+        "build_version": APP_VERSION,
+        "build_commit": "abcdef1",
     }
 
     healthz = server.requests[0]
@@ -92,6 +106,23 @@ def test_remote_smoke_redacts_password_from_failure_messages():
     assert "[redacted]" in failure_message
 
 
+def test_remote_smoke_fails_when_expected_build_sha_does_not_match():
+    server = FakeRemoteServer()
+    config = RemoteSmokeConfig(
+        base_url="https://demo.example.com",
+        username="demo",
+        password="secret-password",
+        expected_build_sha="fedcba9876543210",
+    )
+
+    with httpx.Client(
+        base_url=config.base_url,
+        transport=httpx.MockTransport(server.handle),
+    ) as client:
+        with pytest.raises(RemoteSmokeFailure, match="healthz build commit"):
+            run_remote_smoke(config, client=client)
+
+
 class FakeRemoteServer:
     def __init__(self, *, fail_reset: bool = False) -> None:
         self.fail_reset = fail_reset
@@ -102,7 +133,17 @@ class FakeRemoteServer:
         self.requests.append(request)
         path = request.url.path
         if path == "/api/healthz":
-            return httpx.Response(200, json={"ok": True})
+            return httpx.Response(
+                200,
+                json={
+                    "ok": True,
+                    "build": {
+                        "version": APP_VERSION,
+                        "commit_sha": "abcdef1234567890",
+                        "commit_sha_short": "abcdef1",
+                    },
+                },
+            )
         if path == "/api/health":
             if "authorization" not in request.headers:
                 return httpx.Response(401, json={"detail": "Not authenticated"})
