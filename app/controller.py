@@ -281,6 +281,7 @@ class SimulationController:
                 delivery_attempts=outcome.delivery_attempts,
                 lot_codes=[event.traceability_lot_code for event in parsed.events],
                 errors=parsed.errors,
+                warnings=parsed.warnings,
                 response=outcome.response,
                 error=outcome.error_message,
             )

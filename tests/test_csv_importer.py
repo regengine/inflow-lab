@@ -51,3 +51,30 @@ transformation,TLC-OUT,Fresh Cut Salad Mix,50,cases,ReadyFresh Processing Plant,
     assert parsed.errors == []
     assert parsed.parent_lot_codes == [["TLC-IN-1", "TLC-IN-2"]]
     assert parsed.events[0].kdes["input_traceability_lot_codes"] == ["TLC-IN-1", "TLC-IN-2"]
+    assert {warning.field for warning in parsed.warnings} >= {
+        "transformation_date",
+        "transformation_location",
+        "reference_document_number",
+    }
+
+
+def test_parse_scheduled_event_warns_on_malformed_cte_kdes():
+    parsed = parse_csv_import(
+        CSVImportType.SCHEDULED_EVENTS,
+        """cte_type,traceability_lot_code,product_description,quantity,unit_of_measure,location_name,timestamp,kdes
+transformation,TLC-OUT,Fresh Cut Salad Mix,50,cases,ReadyFresh Processing Plant,2026-02-07T12:00:00Z,"{""input_traceability_lot_codes"":{""lot"":""TLC-IN-1""}}"
+""",
+    )
+
+    assert parsed.total == 1
+    assert parsed.errors == []
+    assert len(parsed.events) == 1
+    assert {
+        (warning.field, warning.message) for warning in parsed.warnings
+    } >= {
+        (
+            "input_traceability_lot_codes",
+            "Transformation input_traceability_lot_codes should be a non-empty list of lot codes",
+        ),
+        ("reference_document_number", "Missing expected transformation KDE: reference_document_number"),
+    }

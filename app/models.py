@@ -324,6 +324,12 @@ class CSVImportError(BaseModel):
     message: str
 
 
+class CSVImportWarning(BaseModel):
+    row: int
+    field: str | None = None
+    message: str
+
+
 class CSVImportResponse(BaseModel):
     status: Literal["accepted", "partial", "rejected", "delivery_failed"]
     import_type: CSVImportType
@@ -338,6 +344,7 @@ class CSVImportResponse(BaseModel):
     delivery_attempts: int = 0
     lot_codes: list[str]
     errors: list[CSVImportError] = Field(default_factory=list)
+    warnings: list[CSVImportWarning] = Field(default_factory=list)
     response: dict[str, Any] | None = None
     error: str | None = None
 

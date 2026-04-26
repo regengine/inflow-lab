@@ -223,7 +223,7 @@ Replay responses include `status`, `read`, `replayed`, `posted`, `failed`, `sour
 
 ## CSV import
 
-`POST /api/import/csv` accepts CSV text and imports either scheduled RegEngine-shaped events or seed lots. Valid rows are delivered through the selected delivery mode and persisted as `StoredEventRecord` JSONL entries. Invalid rows are skipped, with deterministic row-level errors in the response. The default dashboard/API delivery remains **`mock`** unless you explicitly submit a different `delivery` object.
+`POST /api/import/csv` accepts CSV text and imports either scheduled RegEngine-shaped events or seed lots. Valid rows are delivered through the selected delivery mode and persisted as `StoredEventRecord` JSONL entries. Invalid rows are skipped, with deterministic row-level errors in the response. Accepted rows are also checked against CTE-specific KDE expectations and can return warnings for missing lineage, document, location, or date context. The default dashboard/API delivery remains **`mock`** unless you explicitly submit a different `delivery` object.
 
 Request body:
 
@@ -254,7 +254,7 @@ traceability_lot_code,product_description,quantity,unit_of_measure,location_name
 
 Seed lots become valid `harvesting` events. Optional `timestamp`, `harvest_date`, `field_name`, `immediate_subsequent_recipient`, reference document columns, `kdes` JSON, and other KDE columns are preserved. If no timestamp is supplied, the import time is used.
 
-Import responses include `status`, `total`, `accepted`, `rejected`, `stored`, `posted`, `failed`, `delivery_attempts`, `lot_codes`, and `errors[]` with row number, field, and message.
+Import responses include `status`, `total`, `accepted`, `rejected`, `stored`, `posted`, `failed`, `delivery_attempts`, `lot_codes`, `errors[]`, and `warnings[]` with row number, field, and message. Warnings are advisory and do not change the RegEngine ingest payload shape.
 
 ## Scenario presets
 

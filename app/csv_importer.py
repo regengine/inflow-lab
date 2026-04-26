@@ -10,7 +10,8 @@ from typing import Any
 
 from pydantic import ValidationError
 
-from .models import CSVImportError, CSVImportType, CTEType, RegEngineEvent
+from .cte_rules import validate_event_kdes
+from .models import CSVImportError, CSVImportType, CSVImportWarning, CTEType, RegEngineEvent
 
 
 EVENT_REQUIRED_FIELDS = (
@@ -47,6 +48,7 @@ class ParsedCSVImport:
     events: list[RegEngineEvent]
     parent_lot_codes: list[list[str]]
     errors: list[CSVImportError]
+    warnings: list[CSVImportWarning]
 
 
 def parse_csv_import(
@@ -61,17 +63,19 @@ def parse_csv_import(
             events=[],
             parent_lot_codes=[],
             errors=[CSVImportError(row=0, field="csv_text", message="CSV content is empty")],
+            warnings=[],
         )
 
     reader = csv.DictReader(io.StringIO(csv_text.lstrip("\ufeff")), skipinitialspace=True)
     header_errors = _header_errors(reader.fieldnames)
     if header_errors:
-        return ParsedCSVImport(total=0, events=[], parent_lot_codes=[], errors=header_errors)
+        return ParsedCSVImport(total=0, events=[], parent_lot_codes=[], errors=header_errors, warnings=[])
 
     total = 0
     events: list[RegEngineEvent] = []
     parent_lot_codes: list[list[str]] = []
     errors: list[CSVImportError] = []
+    warnings: list[CSVImportWarning] = []
 
     for row_number, raw_row in enumerate(reader, start=2):
         row = _normalize_row(raw_row)
@@ -79,9 +83,9 @@ def parse_csv_import(
             continue
         total += 1
         if import_type == CSVImportType.SCHEDULED_EVENTS:
-            event, parents, row_errors = _parse_scheduled_event(row, row_number)
+            event, parents, row_errors, row_warnings = _parse_scheduled_event(row, row_number)
         else:
-            event, parents, row_errors = _parse_seed_lot(row, row_number, default_timestamp)
+            event, parents, row_errors, row_warnings = _parse_seed_lot(row, row_number, default_timestamp)
 
         if row_errors:
             errors.extend(row_errors)
@@ -89,20 +93,27 @@ def parse_csv_import(
         assert event is not None
         events.append(event)
         parent_lot_codes.append(parents)
+        warnings.extend(row_warnings)
 
     if total == 0 and not errors:
         errors.append(CSVImportError(row=0, field="csv_text", message="CSV contains no data rows"))
 
-    return ParsedCSVImport(total=total, events=events, parent_lot_codes=parent_lot_codes, errors=errors)
+    return ParsedCSVImport(
+        total=total,
+        events=events,
+        parent_lot_codes=parent_lot_codes,
+        errors=errors,
+        warnings=warnings,
+    )
 
 
 def _parse_scheduled_event(
     row: dict[str, str],
     row_number: int,
-) -> tuple[RegEngineEvent | None, list[str], list[CSVImportError]]:
+) -> tuple[RegEngineEvent | None, list[str], list[CSVImportError], list[CSVImportWarning]]:
     errors = _missing_required(row, row_number, EVENT_REQUIRED_FIELDS)
     if errors:
-        return None, [], errors
+        return None, [], errors, []
 
     quantity = _parse_quantity(row["quantity"], row_number, errors)
     timestamp = _parse_timestamp(row["timestamp"], row_number, "timestamp", errors)
@@ -110,7 +121,7 @@ def _parse_scheduled_event(
     kdes = _parse_kdes(row, row_number, errors)
 
     if errors:
-        return None, [], errors
+        return None, [], errors, []
 
     return _build_event(
         row=row,
@@ -127,10 +138,10 @@ def _parse_seed_lot(
     row: dict[str, str],
     row_number: int,
     default_timestamp: datetime,
-) -> tuple[RegEngineEvent | None, list[str], list[CSVImportError]]:
+) -> tuple[RegEngineEvent | None, list[str], list[CSVImportError], list[CSVImportWarning]]:
     errors = _missing_required(row, row_number, SEED_REQUIRED_FIELDS)
     if errors:
-        return None, [], errors
+        return None, [], errors, []
 
     quantity = _parse_quantity(row["quantity"], row_number, errors)
     timestamp = (
@@ -141,7 +152,7 @@ def _parse_seed_lot(
     kdes = _parse_kdes(row, row_number, errors)
 
     if errors:
-        return None, [], errors
+        return None, [], errors, []
 
     kdes.setdefault("harvest_date", timestamp.date().isoformat())
     kdes.setdefault("farm_location", row["location_name"])
@@ -172,10 +183,10 @@ def _build_event(
     timestamp: datetime | None,
     kdes: dict[str, Any],
     parent_lot_codes: list[str],
-) -> tuple[RegEngineEvent | None, list[str], list[CSVImportError]]:
+) -> tuple[RegEngineEvent | None, list[str], list[CSVImportError], list[CSVImportWarning]]:
     errors: list[CSVImportError] = []
     if cte_type is None or quantity is None or timestamp is None:
-        return None, [], errors
+        return None, [], errors, []
 
     try:
         event = RegEngineEvent(
@@ -195,9 +206,13 @@ def _build_event(
             errors.append(
                 CSVImportError(row=row_number, field=field, message=str(error.get("msg", "Invalid value")))
             )
-        return None, [], errors
+        return None, [], errors, []
 
-    return event, parent_lot_codes, []
+    warnings = [
+        CSVImportWarning(row=row_number, field=warning.field, message=warning.message)
+        for warning in validate_event_kdes(event)
+    ]
+    return event, parent_lot_codes, [], warnings
 
 
 def _header_errors(fieldnames: list[str] | None) -> list[CSVImportError]:

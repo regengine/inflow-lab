@@ -1130,6 +1130,11 @@ receiving,TLC-CSV-BAD,Romaine Lettuce,,cases,Distribution Center #4,2026-02-05T1
     assert body["errors"] == [
         {"row": 4, "field": "quantity", "message": "Missing required field: quantity"}
     ]
+    assert {warning["field"] for warning in body["warnings"]} >= {
+        "farm_location",
+        "reference_document_number",
+        "packing_location",
+    }
 
     events = client.get("/api/events?limit=10").json()["events"]
     assert len(events) == 2

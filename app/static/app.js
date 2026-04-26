@@ -535,10 +535,17 @@ function renderLineage(payload, traceabilityLotCode) {
 function renderImportResult(result) {
   const tone = result.status === 'accepted' ? 'success' : result.status === 'delivery_failed' ? 'error' : 'neutral';
   const errors = (result.errors || []).slice(0, 8);
+  const warnings = (result.warnings || []).slice(0, 8);
   const errorList = errors
     .map((error) => {
       const field = error.field ? ` ${escapeHtml(error.field)}:` : '';
       return `<li>Row ${escapeHtml(error.row)}${field} ${escapeHtml(error.message)}</li>`;
+    })
+    .join('');
+  const warningList = warnings
+    .map((warning) => {
+      const field = warning.field ? ` ${escapeHtml(warning.field)}:` : '';
+      return `<li>Row ${escapeHtml(warning.row)}${field} ${escapeHtml(warning.message)}</li>`;
     })
     .join('');
   ids.importResults.innerHTML = `
@@ -548,6 +555,7 @@ function renderImportResult(result) {
       ${result.error ? `<span>${escapeHtml(result.error)}</span>` : ''}
     </div>
     ${errorList ? `<ul>${errorList}</ul>` : ''}
+    ${warningList ? `<ul>${warningList}</ul>` : ''}
   `;
 }
 
@@ -795,6 +803,8 @@ async function importCsv() {
       setStatus(`Imported ${result.accepted} row(s), but delivery failed: ${result.error || 'delivery error'}`, 'error', 7000);
     } else if (result.rejected > 0) {
       setStatus(`Imported ${result.accepted} row(s); rejected ${result.rejected}.`, 'error', 7000);
+    } else if ((result.warnings || []).length > 0) {
+      setStatus(`Imported ${result.accepted} CSV row(s) with ${result.warnings.length} warning(s).`, 'success', 4500);
     } else {
       setStatus(`Imported ${result.accepted} CSV row(s).`, 'success', 3500);
     }
