@@ -67,6 +67,7 @@ app/
   workflows/codex-autopilot.yml
 scripts/
   smoke_regression.py    # End-to-end API smoke for demo-ready release checks
+  remote_smoke.py        # HTTP smoke harness for deployed shared-demo instances
 tests/
 .dockerignore
 AGENTS.md                # Repository instructions for Codex-style agents
@@ -123,6 +124,18 @@ python3 scripts/smoke_regression.py
 ```
 
 The smoke harness uses FastAPI's in-process `TestClient` to exercise the operator-critical path: tenant-scoped fixture load, lineage lookup, FDA export, EPCIS export, scenario save/load, replay, and tenant isolation. If Basic Auth env vars are set, it sends matching Basic credentials automatically. Temporary smoke tenants are cleaned up after the run.
+
+For a deployed shared-demo instance, run the remote smoke harness against the public HTTPS URL:
+
+```bash
+export REGENGINE_REMOTE_BASE_URL=https://regengine-inflow-lab-production.up.railway.app
+export REGENGINE_REMOTE_USERNAME=demo
+export REGENGINE_REMOTE_PASSWORD='replace-with-shared-demo-password'
+export REGENGINE_REMOTE_TENANT=remote-smoke
+python3 scripts/remote_smoke.py
+```
+
+`scripts/remote_smoke.py` uses `httpx` with normal TLS verification to check `/api/healthz`, Basic Auth enforcement, credentialed CORS allow/block behavior, mock fixture loading, transformed-lot lineage, FDA CSV export, and EPCIS JSON-LD export. The tenant defaults to `remote-smoke`, fixture delivery stays in `mock` mode, and failure messages redact configured passwords and credential-like environment values.
 
 Use `RELEASE_CHECKLIST.md` as the full demo-ready gate. Use `DESIGN_PARTNER_DEMO_SCRIPT.md` for the call flow, expected talking points, fixture reset commands, and recovery steps.
 

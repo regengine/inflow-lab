@@ -210,6 +210,18 @@ REGENGINE_DATA_DIR=/data
 
 Attach a Railway volume at `/data` before using the service for partner demos. After a Railway domain is generated, update `REGENGINE_CORS_ORIGINS` to that exact HTTPS origin.
 
+Validate the deployed Railway demo with the remote smoke harness:
+
+```bash
+export REGENGINE_REMOTE_BASE_URL=https://regengine-inflow-lab-production.up.railway.app
+export REGENGINE_REMOTE_USERNAME=demo
+export REGENGINE_REMOTE_PASSWORD='<shared-demo-password>'
+export REGENGINE_REMOTE_TENANT=remote-smoke
+python3 scripts/remote_smoke.py
+```
+
+The harness keeps delivery in `mock` mode, uses the dedicated smoke tenant by default, and verifies health, Basic Auth, CORS, fixture load, lineage, FDA CSV, and EPCIS JSON-LD without printing the password.
+
 ## Profile Verification Checklist
 
 - `GET /api/health` returns the expected tenant and auth context.
@@ -218,6 +230,7 @@ Attach a Railway volume at `/data` before using the service for partner demos. A
 - `REGENGINE_DATA_DIR` points at mounted persistent storage in shared-demo and live-trial deployments.
 - Dashboard stats match the chosen tenant/auth/storage profile.
 - `POST /api/demo-fixtures/fresh_cut_transformation/load` succeeds in `mock` mode.
+- `python3 scripts/remote_smoke.py` passes for the deployed shared-demo URL.
 - Lineage for `TLC-DEMO-FC-OUT-001` includes upstream harvest and packed lots.
 - FDA CSV and EPCIS exports are derivable from stored records.
 - No generated `data/` files or secrets are staged before committing.

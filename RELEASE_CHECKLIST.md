@@ -7,7 +7,7 @@ Use this checklist before tagging a demo-ready build or handing the simulator to
 - [ ] `pytest`
 - [ ] `python3 scripts/smoke_regression.py`
 - [ ] `node --check app/static/app.js`
-- [ ] `python3 -m compileall app`
+- [ ] `python3 -m compileall app scripts`
 - [ ] `git diff --check`
 
 ## Contract Checks
@@ -32,6 +32,7 @@ Use this checklist before tagging a demo-ready build or handing the simulator to
 - [ ] FDA lot-trace export includes `BATCH-DEMO-FC-001`.
 - [ ] EPCIS export includes a `TransformationEvent`.
 - [ ] Tenant-scoped requests keep separate event logs and scenario saves.
+- [ ] For shared-demo releases, `python3 scripts/remote_smoke.py` passes against the deployed HTTPS URL.
 
 ## Handoff Notes
 
