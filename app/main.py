@@ -2,7 +2,9 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 import os
+import time
 from contextlib import asynccontextmanager
 from datetime import UTC, datetime
 from pathlib import Path
@@ -69,6 +71,7 @@ from .store import EventStore
 DATA_ROOT = Path(os.getenv("REGENGINE_DATA_DIR", "data"))
 TENANT_DATA_ROOT = DATA_ROOT / "tenants"
 DEFAULT_CORS_ORIGINS = ("http://127.0.0.1:8000", "http://localhost:8000")
+REQUEST_LOGGER = logging.getLogger("regengine.request")
 
 engine = LegitFlowEngine(seed=204)
 store = EventStore(persist_path=str(DATA_ROOT / "events.jsonl"))
@@ -145,14 +148,51 @@ app.add_middleware(
 
 @app.middleware("http")
 async def auth_and_tenant_middleware(request: Request, call_next):
-    if request.method == "OPTIONS" or request.url.path == "/api/healthz":
-        return await call_next(request)
+    started_at = time.perf_counter()
+    response = None
 
-    context = tenant_context_from_request(request)
-    if isinstance(context, JSONResponse):
-        return context
-    request.state.tenant_context = context
-    return await call_next(request)
+    try:
+        if request.method == "OPTIONS" or request.url.path == "/api/healthz":
+            response = await call_next(request)
+            return response
+
+        context = tenant_context_from_request(request)
+        if isinstance(context, JSONResponse):
+            response = context
+            return response
+        request.state.tenant_context = context
+        response = await call_next(request)
+        return response
+    except Exception:
+        _log_request(request, status_code=500, started_at=started_at)
+        raise
+    finally:
+        if response is not None:
+            _log_request(request, status_code=response.status_code, started_at=started_at)
+
+
+def _log_request(request: Request, status_code: int, started_at: float) -> None:
+    duration_ms = (time.perf_counter() - started_at) * 1000
+    context = _tenant_context(request)
+    delivery_mode = _request_delivery_mode(request)
+    REQUEST_LOGGER.info(
+        "request method=%s path=%s status=%s duration_ms=%.2f tenant=%s delivery_mode=%s",
+        request.method,
+        request.url.path,
+        status_code,
+        duration_ms,
+        context.tenant_id,
+        delivery_mode,
+    )
+
+
+def _request_delivery_mode(request: Request) -> str:
+    if not hasattr(request.state, "tenant_context") and request.url.path != "/api/healthz":
+        return "unknown"
+    try:
+        return str(_active_controller(request).config.delivery.mode.value)
+    except Exception:
+        return "unknown"
 
 static_dir = Path(__file__).parent / "static"
 app.mount("/static", StaticFiles(directory=static_dir), name="static")

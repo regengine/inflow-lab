@@ -3,6 +3,7 @@ import base64
 import csv
 import io
 import json
+import logging
 
 import pytest
 from fastapi.testclient import TestClient
@@ -133,6 +134,64 @@ def test_basic_auth_is_optional_but_enforced_when_configured(monkeypatch):
         "username": "demo-user",
         "uses_default_storage": False,
     }
+
+
+def test_request_logging_includes_ops_fields_without_auth_or_query_secrets(monkeypatch, caplog):
+    monkeypatch.setenv("REGENGINE_BASIC_AUTH_USERNAME", "demo-user")
+    monkeypatch.setenv("REGENGINE_BASIC_AUTH_PASSWORD", "demo-pass")
+    caplog.set_level(logging.INFO, logger="regengine.request")
+
+    response = client.get(
+        "/api/health?api_key=query-secret",
+        headers={
+            **basic_auth_header("demo-user", "demo-pass"),
+            "X-RegEngine-Tenant": "ops-tenant",
+            "X-RegEngine-API-Key": "header-secret",
+        },
+    )
+
+    assert response.status_code == 200
+    messages = [
+        record.getMessage()
+        for record in caplog.records
+        if record.name == "regengine.request"
+    ]
+    assert any(
+        "method=GET" in message
+        and "path=/api/health" in message
+        and "status=200" in message
+        and "tenant=ops-tenant" in message
+        and "delivery_mode=mock" in message
+        for message in messages
+    )
+    log_text = "\n".join(messages)
+    assert "demo-pass" not in log_text
+    assert "query-secret" not in log_text
+    assert "header-secret" not in log_text
+    assert "Authorization" not in log_text
+    assert basic_auth_header("demo-user", "demo-pass")["Authorization"] not in log_text
+
+
+def test_request_logging_redacts_failed_basic_auth_attempts(monkeypatch, caplog):
+    monkeypatch.setenv("REGENGINE_BASIC_AUTH_USERNAME", "demo-user")
+    monkeypatch.setenv("REGENGINE_BASIC_AUTH_PASSWORD", "demo-pass")
+    caplog.set_level(logging.INFO, logger="regengine.request")
+
+    response = client.get(
+        "/api/health",
+        headers=basic_auth_header("demo-user", "wrong-password"),
+    )
+
+    assert response.status_code == 401
+    messages = [
+        record.getMessage()
+        for record in caplog.records
+        if record.name == "regengine.request"
+    ]
+    assert any("path=/api/health" in message and "status=401" in message for message in messages)
+    log_text = "\n".join(messages)
+    assert "wrong-password" not in log_text
+    assert basic_auth_header("demo-user", "wrong-password")["Authorization"] not in log_text
 
 
 def test_tenant_header_scopes_event_storage_and_rejects_invalid_ids(tmp_path):

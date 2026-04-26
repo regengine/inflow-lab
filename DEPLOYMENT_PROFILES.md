@@ -238,6 +238,23 @@ Then run `.github/workflows/remote-smoke.yml` from the Actions tab. The workflow
 
 The workflow installs the repo dependencies and runs `python3 scripts/remote_smoke.py`. It does not require live RegEngine credentials and still loads the fixture with `delivery.mode=mock`.
 
+Railway log triage:
+
+```bash
+railway logs --lines 100
+railway logs --http --status ">=400" --lines 50
+railway logs --http --path /api/health --lines 20
+```
+
+Application request logs include `method`, `path`, `status`, `duration_ms`, `tenant`, and `delivery_mode`. They do not include Authorization headers, API keys, query strings, request bodies, response bodies, FDA CSV contents, or EPCIS export contents.
+
+Use these patterns when diagnosing a shared demo:
+
+- `status=401` on API routes usually means the Basic Auth username/password in the operator environment or GitHub secret is wrong.
+- Missing browser CORS headers usually means `REGENGINE_CORS_ORIGINS` does not exactly match the deployed HTTPS origin.
+- Empty state after restart usually means the Railway volume is missing or `REGENGINE_DATA_DIR` is not `/data`.
+- Live delivery failures should be diagnosed from the dashboard delivery monitor and sanitized record status before retrying with corrected live endpoint, API key, and tenant id.
+
 ## Profile Verification Checklist
 
 - `GET /api/health` returns the expected tenant and auth context.

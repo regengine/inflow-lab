@@ -614,6 +614,14 @@ docker run --rm \
 
 ## Logs and troubleshooting
 
+Every HTTP request emits an application log line like:
+
+```text
+request method=POST path=/api/demo-fixtures/fresh_cut_transformation/load status=200 duration_ms=42.10 tenant=remote-smoke delivery_mode=mock
+```
+
+The request log intentionally excludes headers, credentials, query strings, request bodies, response bodies, and export contents. Use it to correlate route failures, tenant scope, and the active delivery mode without exposing Basic Auth passwords, API keys, live tenant ids, or downloaded FDA/EPCIS data.
+
 | Location | What it contains |
 |---|---|
 | `uvicorn.out.log` | Server stdout (request logs, lifecycle messages) |
@@ -634,9 +642,20 @@ curl http://127.0.0.1:8000/api/health
 
 # Tail logs (macOS)
 tail -f ~/regengine_codex_workspace/uvicorn.err.log
+
+# Railway logs
+railway logs --lines 100
+railway logs --http --status ">=400" --lines 50
 ```
 
-If the health check fails, the first place to look is `uvicorn.err.log` for a Python traceback.
+Common failure patterns:
+
+- Auth failures: request logs show `status=401` on `/api/...`; confirm `REGENGINE_BASIC_AUTH_USERNAME` and `REGENGINE_BASIC_AUTH_PASSWORD` are set as intended.
+- CORS failures: Railway HTTP logs may show successful `OPTIONS` but the browser blocks a follow-up request; confirm `REGENGINE_CORS_ORIGINS` is the exact HTTPS dashboard origin.
+- Volume/storage failures: `/api/health` should report tenant-scoped paths under `REGENGINE_DATA_DIR`; confirm Railway has a volume mounted at `/data` and `REGENGINE_DATA_DIR=/data`.
+- Live delivery failures: request logs identify the route and tenant while dashboard delivery stats show the sanitized delivery error; confirm endpoint, API key, and tenant id before retrying.
+
+If the health check fails before request logs appear, the first place to look is `uvicorn.err.log` or `railway logs --deployment` for a Python traceback or startup error.
 
 ## Contributing
 
