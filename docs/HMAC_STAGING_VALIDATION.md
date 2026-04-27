@@ -18,8 +18,7 @@ Run all checks before touching secrets.
 # Repo 1: Inflow Lab simulator must be on main with PR #43 merged.
 git -C ~/Documents/GitHub/regengine_codex_workspace checkout main
 git -C ~/Documents/GitHub/regengine_codex_workspace pull
-git -C ~/Documents/GitHub/regengine_codex_workspace rev-parse --short HEAD
-test "$(git -C ~/Documents/GitHub/regengine_codex_workspace rev-parse --short HEAD)" = "eefde6a"
+git -C ~/Documents/GitHub/regengine_codex_workspace merge-base --is-ancestor eefde6a HEAD && echo "PR #43 is in history"
 
 # Repo 2: RegEngine should be on main at current HEAD.
 git -C ~/Documents/GitHub/RegEngine checkout main
@@ -35,7 +34,7 @@ python3 -m pytest
 ```
 
 Expected pre-flight outcomes:
-- `regengine_codex_workspace` reports commit `eefde6a` on `main`.
+- `git merge-base --is-ancestor eefde6a HEAD` exits 0 and prints `PR #43 is in history`.
 - RegEngine repo is on `main` and at current HEAD.
 - `curl` to `/api/healthz` returns 2xx.
 - `python3 -m pytest` returns `87 passed`.
@@ -160,12 +159,50 @@ Validate RegEngine logs for signature verification (no skip/warning path):
 
 ```bash
 railway logs --service <regengine-ingestion-service> --environment staging | \
-  rg "webhook_signature_verified|webhook_signature_invalid|missing_webhook_signature|invalid_webhook_signature"
+  rg "webhook_signature_verified|webhook_signature_invalid|webhook_signature_missing|webhook_signature_unsupported_scheme|webhook_signature_mismatch"
 ```
 
 Success criterion for logs:
-- Verification event present (for implementations using `services/shared/webhook_security.py`, look for `webhook_signature_verified`).
-- No signature-failure lines for the same request.
+- Verification event present (`webhook_signature_verified`) and no signature-failure lines for the same request.
+- If your deployment does not emit positive-case verification logs, absence of `webhook_signature_*` warnings for the same request is acceptable evidence of pass.
+
+## 3.5 Negative Test (Mandatory)
+
+A success-only validation does not prove HMAC enforcement is active -
+it only proves a happy-path request was accepted. To confirm RegEngine
+is actually checking the signature, run a deliberately-wrong-secret
+trial and confirm it is rejected with 401.
+
+Run the negative test in a subshell so your real
+`REGENGINE_WEBHOOK_HMAC_SECRET` is not overwritten in your session:
+
+```bash
+( export REGENGINE_WEBHOOK_HMAC_SECRET='intentionally-wrong-secret-for-negative-test'
+  python3 scripts/live_trial.py --confirm-live; echo "exit_code=$?" )
+```
+
+Expected outcome:
+
+- Trial exits non-zero (`exit_code=1` or higher).
+- Output includes `live_failed=1` and `live_delivery_status=failed`.
+- Inspecting the latest stored event metadata shows the request was
+  signed (`delivery_metadata.signed: true`) but rejected by the
+  server with a 401 status code.
+
+If the negative test instead reports success, RegEngine is **not**
+enforcing signatures. Stop the validation. Verify
+`WEBHOOK_HMAC_SECRET` is set on RegEngine staging via the diagnostic
+in section 4.2.
+
+After the negative test passes, your shell still has the correct
+`REGENGINE_WEBHOOK_HMAC_SECRET` because the wrong value was scoped to
+the subshell. Confirm with:
+
+```bash
+python3 -c "import os,hashlib;s=os.getenv('REGENGINE_WEBHOOK_HMAC_SECRET','').encode();print(hashlib.sha256(s).hexdigest())"
+```
+
+The fingerprint should match what RegEngine staging has set.
 
 ## 4. Failure Mode Catalog
 
@@ -214,11 +251,9 @@ Diagnostics:
 ```bash
 railway run --service <regengine-ingestion-service> --environment staging -- \
   python -c "import os; print(bool(os.getenv('WEBHOOK_HMAC_SECRET')))"
-
-# Negative probe: intentionally wrong simulator secret should fail if enforcement is active.
-export REGENGINE_WEBHOOK_HMAC_SECRET='intentionally-wrong-secret'
-python3 scripts/live_trial.py --confirm-live; echo "exit_code=$?"
 ```
+
+If this prints `False`, the secret is not set on RegEngine. The negative test in Section 3.5 also catches this case directly.
 
 Fix:
 - Set `WEBHOOK_HMAC_SECRET` in Railway dashboard for RegEngine staging.
