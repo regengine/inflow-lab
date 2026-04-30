@@ -1,24 +1,25 @@
 :root {
   color-scheme: light;
-  --bg: #f5f6f0;
+  --bg: #f6f8f5;
   --surface: #ffffff;
-  --surface-muted: #f0f3ee;
-  --surface-strong: #263238;
-  --border: #d8ded4;
-  --border-strong: #b8c4b3;
-  --text: #1f2a2e;
-  --muted: #607074;
-  --accent: #007f73;
-  --accent-strong: #006158;
-  --accent-soft: #e3f5f1;
-  --info: #4763b4;
-  --warning: #9b6a00;
-  --warning-soft: #fff3d6;
+  --surface-muted: #f4f7f4;
+  --surface-strong: #020617;
+  --border: #dbe3dc;
+  --border-strong: #bcc9c0;
+  --text: #101820;
+  --muted: #52677a;
+  --accent: #059669;
+  --accent-strong: #047857;
+  --accent-soft: #dcfce7;
+  --info: #2563eb;
+  --warning: #b45309;
+  --warning-soft: #fffbeb;
   --danger: #c43b3b;
   --danger-soft: #fde7e7;
-  --success: #0b7a50;
-  --success-soft: #e1f4ea;
-  --shadow: 0 16px 40px rgba(31, 42, 46, 0.08);
+  --success: #047857;
+  --success-soft: #ecfdf5;
+  --shadow: 0 1px 2px rgba(15, 23, 42, 0.06);
+  --shadow-strong: 0 20px 70px rgba(15, 23, 42, 0.16);
 }
 
 * {
@@ -32,7 +33,9 @@
 body {
   margin: 0;
   font-family: Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
-  background: var(--bg);
+  background:
+    radial-gradient(circle at 12% -10%, rgba(5, 150, 105, 0.12), transparent 28rem),
+    linear-gradient(180deg, #f8faf7 0%, var(--bg) 38%, #f7faf7 100%);
   color: var(--text);
 }
 
@@ -60,27 +63,36 @@ summary:focus-visible {
 }
 
 .page {
-  width: min(1440px, 100%);
+  width: min(1480px, 100%);
   margin: 0 auto;
-  padding: 24px 20px 56px;
+  padding: 28px 24px 56px;
 }
 
 .app-header {
-  display: flex;
-  justify-content: space-between;
-  align-items: flex-end;
-  gap: 24px;
-  padding: 8px 0 18px;
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  align-items: end;
+  gap: 28px;
+  padding: 28px;
+  border: 1px solid rgba(6, 78, 59, 0.22);
+  border-radius: 18px 18px 0 0;
+  background: var(--surface-strong);
+  color: #ffffff;
+  box-shadow: var(--shadow-strong);
 }
 
 .eyebrow,
 .section-kicker {
   margin: 0 0 6px;
-  color: var(--accent);
+  color: var(--accent-strong);
   font-size: 0.78rem;
   font-weight: 700;
   letter-spacing: 0;
   text-transform: uppercase;
+}
+
+.app-header .eyebrow {
+  color: #a7f3d0;
 }
 
 h1,
@@ -91,7 +103,8 @@ h3 {
 }
 
 h1 {
-  font-size: 2rem;
+  font-size: clamp(2rem, 4vw, 3.2rem);
+  letter-spacing: 0;
 }
 
 h2 {
@@ -104,6 +117,14 @@ h3 {
 
 .note {
   color: var(--muted);
+}
+
+.hero-copy {
+  max-width: 760px;
+  margin: 12px 0 0;
+  color: #cbd5e1;
+  font-size: 1.02rem;
+  line-height: 1.55;
 }
 
 .header-actions,
@@ -131,7 +152,7 @@ h3 {
 }
 
 .panel {
-  padding: 20px;
+  padding: 22px;
   margin-bottom: 18px;
 }
 
@@ -140,12 +161,15 @@ h3 {
   grid-template-columns: 1.6fr repeat(3, minmax(150px, 1fr));
   gap: 1px;
   overflow: hidden;
-  margin-bottom: 18px;
+  margin-bottom: 20px;
+  border-top: 0;
+  border-radius: 0 0 18px 18px;
+  box-shadow: var(--shadow-strong);
 }
 
 .status-strip div {
   min-width: 0;
-  padding: 14px 16px;
+  padding: 16px 18px;
   background: var(--surface);
 }
 
@@ -171,19 +195,23 @@ h3 {
   overflow-wrap: anywhere;
 }
 
+.status-strip strong {
+  font-size: 1.02rem;
+}
+
 .console-layout,
 .evidence-layout {
   display: grid;
-  gap: 18px;
+  gap: 20px;
   align-items: start;
 }
 
 .console-layout {
-  grid-template-columns: minmax(0, 1.1fr) minmax(360px, 0.9fr);
+  grid-template-columns: minmax(0, 1fr) minmax(500px, 0.8fr);
 }
 
 .evidence-layout {
-  grid-template-columns: minmax(0, 1fr) minmax(360px, 0.9fr);
+  grid-template-columns: minmax(0, 0.95fr) minmax(420px, 1.05fr);
 }
 
 .setup-grid,
@@ -213,7 +241,7 @@ select {
   min-height: 42px;
   border-radius: 8px;
   border: 1px solid var(--border);
-  background: #fbfcfa;
+  background: #ffffff;
   color: var(--text);
   padding: 10px 12px;
 }
@@ -260,9 +288,15 @@ input::placeholder {
 }
 
 .button.secondary {
-  background: var(--surface-muted);
+  background: #ffffff;
   border-color: var(--border);
   color: var(--text);
+}
+
+.app-header .button.secondary {
+  background: rgba(255, 255, 255, 0.1);
+  border-color: rgba(255, 255, 255, 0.22);
+  color: #ffffff;
 }
 
 .button.danger {
@@ -370,6 +404,12 @@ input::placeholder {
 .lineage-lot,
 .lineage-card {
   padding: 14px;
+}
+
+.stat-card,
+.delivery-card,
+.delivery-details div {
+  background: #f8fafc;
 }
 
 .stat-card strong,
@@ -669,6 +709,10 @@ th {
   .action-row {
     align-items: stretch;
     flex-direction: column;
+  }
+
+  .app-header {
+    grid-template-columns: 1fr;
   }
 
   .setup-grid,
