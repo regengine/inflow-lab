@@ -18,6 +18,7 @@ A mock-first FSMA 204 traceability simulator that emits **RegEngine-compatible i
 - [Demo fixtures](#demo-fixtures)
 - [FDA export presets](#fda-export-presets)
 - [EPCIS 2.0 export scaffolding](#epcis-20-export-scaffolding)
+- [Full FSMA simulation](#full-fsma-simulation)
 - [Design-partner demo script](#design-partner-demo-script)
 - [Deployment profiles](#deployment-profiles)
 - [API reference](#api-reference)
@@ -162,6 +163,29 @@ python3 scripts/remote_smoke.py
 GitHub also has manual and nightly **Remote Smoke** and **Remote Browser Smoke** workflows for deployed demo validation. Configure repository secrets `REGENGINE_REMOTE_USERNAME` and `REGENGINE_REMOTE_PASSWORD`, then run `.github/workflows/remote-smoke.yml` for API/export checks or `.github/workflows/remote-browser-smoke.yml` for authenticated dashboard checks with optional `base_url` and `tenant` inputs. Scheduled runs target the Railway shared-demo URL with dedicated nightly tenants and compare `/api/healthz` build metadata to the workflow commit.
 
 Use `RELEASE_CHECKLIST.md` as the full demo-ready gate. Use `DESIGN_PARTNER_DEMO_SCRIPT.md` for the call flow, expected talking points, fixture reset commands, and recovery steps.
+
+## Full FSMA simulation
+
+Run the one-command golden path demo:
+
+```bash
+python3 run_full_fsma_simulation.py
+```
+
+The script uses the in-process FastAPI app and the deterministic fresh-cut transformation fixture. It prints:
+
+- events generated
+- mock ingestion accepted count
+- simulator KDE validation results
+- lot lineage count
+- FDA lot-trace CSV rows
+- EPCIS event count
+
+This is the shortest proof path for:
+
+```text
+simulate -> ingest -> validate -> trace -> export
+```
 
 ## Delivery modes
 
