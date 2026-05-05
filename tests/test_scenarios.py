@@ -1,7 +1,7 @@
 from collections import Counter
 
 from app.engine import LegitFlowEngine
-from app.models import CTEType
+from app.schemas.domain import CTEType
 from app.scenarios import ScenarioId, get_scenario, list_scenario_summaries
 
 

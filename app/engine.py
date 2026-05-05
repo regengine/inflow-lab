@@ -5,7 +5,7 @@ from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 from itertools import count
 
-from .models import CTEType, RegEngineEvent
+from .schemas.domain import CTEType, RegEngineEvent
 from .scenarios import Location, ProductSpec, ScenarioId, get_scenario
 
 

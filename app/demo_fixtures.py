@@ -3,7 +3,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from datetime import UTC, datetime
 
-from .models import CTEType, DemoFixtureId, RegEngineEvent
+from .schemas.domain import CTEType, DemoFixtureId, RegEngineEvent
 from .scenarios import ScenarioId
 
 

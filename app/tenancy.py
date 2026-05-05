@@ -11,9 +11,11 @@ from .auth import DEFAULT_TENANT_ID, TenantContext, normalize_tenant_id
 from .controller import SimulationController
 from .engine import LegitFlowEngine
 from .mock_service import MockRegEngineService
-from .models import ReplayRequest, ScenarioSaveRequest, SimulationConfig
 from .regengine_client import LiveRegEngineClient
 from .scenario_saves import ScenarioSaveStore
+from .schemas.ingestion import ReplayRequest
+from .schemas.scenarios import ScenarioSaveRequest
+from .schemas.simulation import SimulationConfig
 from .store import EventStore
 
 

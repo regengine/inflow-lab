@@ -1,6 +1,6 @@
 from datetime import UTC, datetime, timedelta
 
-from app.models import CTEType, DestinationMode, RegEngineEvent, StoredEventRecord
+from app.schemas.domain import CTEType, DestinationMode, RegEngineEvent, StoredEventRecord
 from app.store import EventStore
 
 

@@ -10,7 +10,7 @@ from fastapi.testclient import TestClient
 
 from app.build_info import BRANCH_ENV_VARS, COMMIT_SHA_ENV_VARS, DEPLOYMENT_ID_ENV_VARS
 from app.main import app, controller, cors_origins_from_env, scenario_saves
-from app.models import SimulationConfig
+from app.schemas.simulation import SimulationConfig
 from app.regengine_client import LiveIngestResult, LiveRegEngineDeliveryError
 from app.scenarios import ScenarioId, get_scenario
 

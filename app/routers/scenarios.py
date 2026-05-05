@@ -7,8 +7,8 @@ from ..auth import TenantContext
 from ..controller import SimulationController
 from ..demo_fixtures import list_demo_fixture_summaries
 from ..dependencies import get_active_controller, get_tenant_context
-from ..models import (
-    DemoFixtureId,
+from ..schemas.domain import DemoFixtureId
+from ..schemas.scenarios import (
     DemoFixtureListResponse,
     DemoFixtureLoadRequest,
     DemoFixtureLoadResponse,

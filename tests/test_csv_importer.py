@@ -1,7 +1,7 @@
 from datetime import UTC, datetime
 
 from app.csv_importer import parse_csv_import
-from app.models import CSVImportType
+from app.schemas.domain import CSVImportType
 
 
 def test_parse_seed_lot_uses_deterministic_default_timestamp():

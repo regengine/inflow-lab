@@ -5,7 +5,7 @@ import io
 from dataclasses import dataclass
 from typing import Callable, Iterable
 
-from .models import CTEType, FDAExportPreset, StoredEventRecord
+from .schemas.domain import CTEType, FDAExportPreset, StoredEventRecord
 
 
 FDA_EXPORT_COLUMNS = [

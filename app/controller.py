@@ -9,28 +9,30 @@ from .csv_importer import parse_csv_import
 from .demo_fixtures import get_demo_fixture
 from .engine import LegitFlowEngine
 from .mock_service import MockRegEngineService
-from .models import (
+from .schemas.domain import DemoFixtureId, DestinationMode, StoredEventRecord
+from .schemas.ingestion import (
     CSVImportRequest,
     CSVImportResponse,
-    DemoFixtureId,
-    DemoFixtureLoadRequest,
-    DemoFixtureLoadResponse,
-    DeliveryConfig,
     DeliveryRetryRequest,
     DeliveryRetryResponse,
-    DestinationMode,
     IngestPayload,
     ReplayRequest,
     ReplayResponse,
+)
+from .schemas.scenarios import (
+    DemoFixtureLoadRequest,
+    DemoFixtureLoadResponse,
     ScenarioLoadResponse,
     ScenarioSaveListResponse,
     ScenarioSaveRequest,
     ScenarioSaveResponse,
     ScenarioSaveSnapshot,
     ScenarioSaveSummary,
+)
+from .schemas.simulation import (
+    DeliveryConfig,
     SimulationConfig,
     StepResponse,
-    StoredEventRecord,
 )
 from .regengine_client import LiveRegEngineClient, LiveRegEngineDeliveryError
 from .scenario_saves import ScenarioSaveStore

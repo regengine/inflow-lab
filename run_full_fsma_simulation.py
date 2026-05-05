@@ -11,7 +11,7 @@ from fastapi.testclient import TestClient
 
 from app.cte_rules import validate_event_kdes
 from app.main import app
-from app.models import RegEngineEvent
+from app.schemas.domain import RegEngineEvent
 
 
 REPO_ROOT = Path(__file__).resolve().parent
