@@ -40,14 +40,19 @@ class LiveRegEngineDeliveryError(RuntimeError):
 
 
 class LiveRegEngineClient:
-    async def ingest(self, payload: IngestPayload, config: SimulationConfig) -> LiveIngestResult:
+    async def ingest(
+        self,
+        payload: IngestPayload,
+        config: SimulationConfig,
+        idempotency_key: str | None = None,
+    ) -> LiveIngestResult:
         endpoint = str(config.delivery.endpoint) if config.delivery.endpoint else DEFAULT_LIVE_INGEST_ENDPOINT
         api_key = config.delivery.api_key
         tenant_id = config.delivery.tenant_id
         if not api_key or not tenant_id:
             raise ValueError("Live delivery requires both api_key and tenant_id")
 
-        idempotency_key = uuid.uuid4().hex
+        idempotency_key = idempotency_key or uuid.uuid4().hex
         # Serialize the body exactly once so the bytes we sign are the same
         # bytes httpx puts on the wire. If we passed json=payload.model_dump()
         # to httpx, it would re-serialize and any whitespace/key-order drift

@@ -1045,7 +1045,7 @@ def test_reset_applies_configured_persist_path_for_next_step(tmp_path):
 
 def test_failed_live_delivery_surfaces_retry_feedback_and_can_retry_to_mock(tmp_path):
     class FailingLiveClient:
-        async def ingest(self, payload, config):  # noqa: ANN001
+        async def ingest(self, payload, config, idempotency_key=None):  # noqa: ANN001
             raise LiveRegEngineDeliveryError(
                 "temporary outage",
                 {
@@ -1125,9 +1125,80 @@ def test_failed_live_delivery_surfaces_retry_feedback_and_can_retry_to_mock(tmp_
     assert retried_record["error"] is None
 
 
+def test_live_delivery_retry_reuses_original_idempotency_key(monkeypatch, tmp_path):
+    class FlakyLiveClient:
+        def __init__(self) -> None:
+            self.idempotency_keys = []
+
+        async def ingest(self, payload, config, idempotency_key=None):  # noqa: ANN001
+            assert idempotency_key
+            self.idempotency_keys.append(idempotency_key)
+            metadata = {
+                "delivery_mode": "live",
+                "endpoint_host": "www.regengine.co",
+                "endpoint_path": "/api/v1/webhooks/ingest",
+                "idempotency_key": idempotency_key,
+                "status_code": 503 if len(self.idempotency_keys) == 1 else 200,
+            }
+            if len(self.idempotency_keys) == 1:
+                raise LiveRegEngineDeliveryError("connection dropped after upstream receive", metadata)
+            return LiveIngestResult(
+                response={
+                    "accepted": len(payload.events),
+                    "events": [
+                        {
+                            "traceability_lot_code": event.traceability_lot_code,
+                            "status": "accepted",
+                        }
+                        for event in payload.events
+                    ],
+                },
+                metadata=metadata,
+            )
+
+    flaky_client = FlakyLiveClient()
+    monkeypatch.setattr(controller, "live_client", flaky_client)
+    reset_response = client.post(
+        "/api/simulate/reset",
+        json={
+            "batch_size": 1,
+            "seed": 204,
+            "persist_path": str(tmp_path / "live-retry-events.jsonl"),
+            "delivery": {
+                "mode": "live",
+                "api_key": "live-api-secret",
+                "tenant_id": "live-tenant-secret",
+            },
+        },
+    )
+    assert reset_response.status_code == 200
+
+    step_response = client.post("/api/simulate/step")
+
+    assert step_response.status_code == 200
+    assert step_response.json()["delivery_status"] == "failed"
+    failed_record = client.get("/api/events?limit=1").json()["events"][0]
+    original_key = failed_record["delivery_metadata"]["idempotency_key"]
+    assert original_key == flaky_client.idempotency_keys[0]
+
+    retry_response = client.post("/api/delivery/retry")
+
+    assert retry_response.status_code == 200
+    retry_body = retry_response.json()
+    assert retry_body["status"] == "posted"
+    assert retry_body["posted"] == 1
+    assert retry_body["failed"] == 0
+    assert flaky_client.idempotency_keys == [original_key, original_key]
+
+    retried_record = client.get("/api/events?limit=1").json()["events"][0]
+    assert retried_record["delivery_status"] == "posted"
+    assert retried_record["delivery_attempts"] == 2
+    assert retried_record["delivery_metadata"]["idempotency_key"] == original_key
+
+
 def test_successful_live_delivery_records_sanitized_audit_metadata(monkeypatch, tmp_path):
     class FakeLiveClient:
-        async def ingest(self, payload, config):  # noqa: ANN001
+        async def ingest(self, payload, config, idempotency_key=None):  # noqa: ANN001
             return LiveIngestResult(
                 response={
                     "accepted": len(payload.events),
@@ -1185,7 +1256,7 @@ def test_failed_live_delivery_masks_api_key_in_error_message(tmp_path):
     api_key = "live-api-secret-leak"
 
     class LeakyLiveClient:
-        async def ingest(self, payload, config):  # noqa: ANN001
+        async def ingest(self, payload, config, idempotency_key=None):  # noqa: ANN001
             raise LiveRegEngineDeliveryError(
                 f"upstream rejected request with key={api_key} for tenant",
                 {
@@ -1231,7 +1302,7 @@ def test_successful_live_delivery_masks_api_key_echoed_in_response(monkeypatch, 
     api_key = "live-api-secret-echo"
 
     class EchoLiveClient:
-        async def ingest(self, payload, config):  # noqa: ANN001
+        async def ingest(self, payload, config, idempotency_key=None):  # noqa: ANN001
             return LiveIngestResult(
                 response={
                     "accepted": len(payload.events),

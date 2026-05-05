@@ -116,11 +116,13 @@ satisfies them as typed fields too, so the distinction is invisible.
 `Idempotency-Key` is required (`webhook_router_v2.py` line 933,
 `IdempotencyDependency(strict=True)`). The middleware caches 2xx
 responses for 24h, scoped per tenant. The simulator generates a fresh
-`uuid4().hex` per call.
+`uuid4().hex` for each new live delivery request and stores it in each record's
+`delivery_metadata`.
 
-**Known limitation:** if the simulator retries after a 5xx with a fresh
-UUID, RegEngine treats it as a new event. Keep the same idempotency
-key across retries of the same logical event.
+Live delivery retries reuse the stored `delivery_metadata.idempotency_key`
+when present and group failed records by `(source, idempotency_key)` so
+RegEngine can identify the retry and return the cached 2xx response.
+Records without prior idempotency metadata fall back to a fresh key.
 
 ## Mock export columns expected by this repo
 
