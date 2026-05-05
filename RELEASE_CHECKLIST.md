@@ -4,14 +4,14 @@ Use this checklist before tagging a demo-ready build or handing the simulator to
 
 ## Required Verification
 
-- [ ] `pytest`
-- [ ] `python3 scripts/smoke_regression.py`
-- [ ] `python3 scripts/browser_smoke.py`
+- [ ] `uv run pytest`
+- [ ] `uv run python scripts/smoke_regression.py`
+- [ ] `uv run --no-dev --group browser python scripts/browser_smoke.py`
 - [ ] `node --check app/static/app.js`
 - [ ] `python3 -m compileall app scripts`
-- [ ] `pip check`
-- [ ] `pip-audit -r requirements.txt`
-- [ ] `bandit -q -r app scripts`
+- [ ] `uv pip check`
+- [ ] `uv run pip-audit`
+- [ ] `uv run bandit -q -r app scripts`
 - [ ] `git diff --check`
 
 ## Contract Checks
@@ -39,11 +39,11 @@ Use this checklist before tagging a demo-ready build or handing the simulator to
 - [ ] EPCIS export includes a `TransformationEvent`.
 - [ ] Tenant-scoped requests keep separate event logs and scenario saves.
 - [ ] Protected tenant operations can list, reset, and delete a test tenant when Basic Auth is enabled.
-- [ ] For shared-demo releases, `python3 scripts/remote_smoke.py` passes against the deployed HTTPS URL.
+- [ ] For shared-demo releases, `uv run --no-dev python scripts/remote_smoke.py` passes against the deployed HTTPS URL.
 - [ ] For shared-demo releases, the manual GitHub **Remote Smoke** workflow passes with repository secrets `REGENGINE_REMOTE_USERNAME` and `REGENGINE_REMOTE_PASSWORD`.
 - [ ] For shared-demo releases, the manual GitHub **Remote Browser Smoke** workflow passes with repository secrets `REGENGINE_REMOTE_USERNAME` and `REGENGINE_REMOTE_PASSWORD`.
 - [ ] For shared-demo releases, nightly GitHub **Remote Smoke** and **Remote Browser Smoke** schedules are enabled after those repository secrets are configured and `REGENGINE_BUILD_SHA` is kept current on Railway.
-- [ ] For live-trial prep, `python3 scripts/live_trial.py --dry-run-only` passes before any confirmed live batch.
+- [ ] For live-trial prep, `uv run python scripts/live_trial.py --dry-run-only` passes before any confirmed live batch.
 
 ## Handoff Notes
 

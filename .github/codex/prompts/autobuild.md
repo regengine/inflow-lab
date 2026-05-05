@@ -6,11 +6,11 @@ Your job is to make one safe, compounding improvement to this repository without
 
 ## Operating sequence
 
-1. Run `pytest` first.
+1. Run `uv run pytest` first.
 2. If the baseline test suite fails, stop and explain the failure instead of changing code.
 3. Read `AUTOPILOT_TASKS.md` and choose the highest-priority unchecked task you can complete safely in a single run.
 4. Make the smallest coherent batch of changes needed for that task.
-5. Run `pytest` again after the edits.
+5. Run `uv run pytest` again after the edits.
 6. Update `AUTOPILOT_TASKS.md` to reflect what you completed, what remains, or what is blocked.
 7. Update `README.md` if setup steps, behavior, or endpoints changed.
 

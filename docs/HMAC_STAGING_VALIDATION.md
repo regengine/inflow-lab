@@ -30,14 +30,14 @@ curl -fsS "$REGEN_STAGING_BASE_URL/api/healthz" >/dev/null && echo "staging heal
 
 # Simulator local test baseline.
 cd ~/Documents/GitHub/regengine_codex_workspace
-python3 -m pytest
+uv run pytest
 ```
 
 Expected pre-flight outcomes:
 - `git merge-base --is-ancestor eefde6a HEAD` exits 0 and prints `PR #43 is in history`.
 - RegEngine repo is on `main` and at current HEAD.
 - `curl` to `/api/healthz` returns 2xx.
-- `python3 -m pytest` returns `87 passed`.
+- `uv run pytest` returns `87 passed`.
 
 Operational prerequisites (manual, no SQL shortcuts):
 - Staging tenant exists.

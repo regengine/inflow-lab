@@ -108,8 +108,8 @@ def _run_dashboard_smoke(base_url: str, config: BrowserSmokeConfig) -> None:
         from playwright.sync_api import expect, sync_playwright
     except ModuleNotFoundError as exc:
         raise RuntimeError(
-            "Playwright is not installed. Run: python3 -m pip install -r requirements-browser.txt "
-            "&& python3 -m playwright install chromium"
+            "Playwright is not installed. Run: uv sync --group browser "
+            "&& uv run playwright install chromium"
         ) from exc
 
     _check_healthz_build(base_url, config.expected_build_sha)

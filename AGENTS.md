@@ -34,7 +34,7 @@ The simulator must prioritize:
 
 - Before changing code, read `README.md` and `.agents/skills/regengine-api-contract/SKILL.md`.
 - In unattended GitHub Action runs, also read `AUTOPILOT_TASKS.md` and complete at most one priority theme per run.
-- After changing Python code, run `pytest`.
+- After changing Python code, run `uv run pytest`.
 - After changing frontend behavior, manually verify the dashboard still starts, steps, resets, and loads lineage.
 - Keep dependencies light. Avoid bringing in a frontend framework unless there is a clear win.
 - Prefer small, composable Python modules over one giant file.

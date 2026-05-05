@@ -11,8 +11,8 @@ Show that the simulator can produce realistic FSMA 204 CTE flow data, preserve l
 Run these checks before the call:
 
 ```bash
-pytest
-python3 scripts/smoke_regression.py
+uv run pytest
+uv run python scripts/smoke_regression.py
 node --check app/static/app.js
 python3 -m compileall app scripts
 git diff --check
@@ -21,7 +21,7 @@ git diff --check
 Start the local server:
 
 ```bash
-uvicorn app.main:app --reload
+uv run uvicorn app.main:app --reload
 ```
 
 Open `http://127.0.0.1:8000` and keep a terminal ready for quick API checks.
@@ -212,7 +212,7 @@ curl -fsS -u "$DEMO_USERNAME:$DEMO_PASSWORD" \
 Pre-call checklist:
 
 - Confirm the partner tenant name in `DEMO_TENANT`.
-- Run `python3 scripts/remote_smoke.py` or the GitHub **Remote Smoke** workflow.
+- Run `uv run --no-dev python scripts/remote_smoke.py` or the GitHub **Remote Smoke** workflow.
 - Reset the tenant and load the fresh-cut fixture in `mock` mode.
 - Confirm lineage for `TLC-DEMO-FC-OUT-001` includes upstream packed and harvest lots.
 - Confirm the FDA lot-trace export includes `BATCH-DEMO-FC-001`.
