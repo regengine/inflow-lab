@@ -6,7 +6,7 @@ This file is the standing backlog for unattended Codex runs.
 
 - Work from top to bottom.
 - Only take on one coherent theme per run.
-- Only check a box once the repository is still passing `pytest`.
+- Only check a box once the repository is still passing `uv run pytest`.
 - If a task is too large, complete the safest useful slice and add a note under **Progress notes**.
 - If you hit a blocker, do not improvise around the RegEngine payload contract. Record the blocker instead.
 

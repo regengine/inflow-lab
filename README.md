@@ -85,10 +85,8 @@ docker-entrypoint.sh     # Chowns mounted data dir, then drops to app user
 PROMPT_FOR_CODEX.md      # Paste-ready Codex task prompt
 RELEASE_CHECKLIST.md     # Demo-ready release gate
 pyproject.toml
+uv.lock                  # Locked dependency graph for uv installs
 railway.json             # Railway Docker build and healthcheck config
-requirements.txt         # Runtime dependencies used by Docker/shared demo
-requirements-dev.txt     # Local test, audit, and maintenance tooling
-requirements-browser.txt # Runtime + Playwright for dashboard smoke checks
 ```
 
 ## Quick start (local dev)
@@ -97,12 +95,11 @@ Requires **Python 3.11+**.
 
 ```bash
 # From the project root
-python3 -m venv .venv
-source .venv/bin/activate
-pip install -r requirements-dev.txt
+python3 -m pip install --upgrade uv
+uv sync --group dev
 
 # Run the dev server (auto-reload)
-uvicorn app.main:app --reload
+uv run uvicorn app.main:app --reload
 ```
 
 Then open:
@@ -118,8 +115,7 @@ Event records are stored as JSONL at `config.persist_path` (`data/events.jsonl` 
 ## Running tests
 
 ```bash
-pip install -r requirements-dev.txt
-pytest
+uv run pytest
 ```
 
 The suite covers payload shape, engine determinism, and the HTTP API contract.
@@ -129,9 +125,9 @@ The suite covers payload shape, engine determinism, and the HTTP API contract.
 Run the dashboard smoke after frontend or operator-flow changes:
 
 ```bash
-pip install -r requirements-browser.txt
-python3 -m playwright install chromium
-python3 scripts/browser_smoke.py
+uv sync --no-dev --group browser
+uv run --no-dev --group browser playwright install chromium
+uv run --no-dev --group browser python scripts/browser_smoke.py
 ```
 
 The smoke starts a temporary local server with mock delivery, drives Chromium through the dashboard start/stop, reset, single-batch, fixture load, transformed-lot lineage lookup, and CSV warning display flows, then exits nonzero with a clear failure message if a browser assertion fails. It forces the dashboard delivery mode to `mock` before taking any action.
@@ -143,7 +139,7 @@ Set `REGENGINE_BROWSER_BASE_URL` to run against an already-started local or remo
 Run the release smoke harness before tagging or handing the simulator to a design partner:
 
 ```bash
-python3 scripts/smoke_regression.py
+uv run python scripts/smoke_regression.py
 ```
 
 The smoke harness uses FastAPI's in-process `TestClient` to exercise the operator-critical path: tenant-scoped fixture load, lineage lookup, FDA export, EPCIS export, scenario save/load, replay, and tenant isolation. If Basic Auth env vars are set, it sends matching Basic credentials automatically. Temporary smoke tenants are cleaned up after the run.
@@ -155,7 +151,7 @@ export REGENGINE_REMOTE_BASE_URL=https://regengine-inflow-lab-production.up.rail
 export REGENGINE_REMOTE_USERNAME=demo
 export REGENGINE_REMOTE_PASSWORD='replace-with-shared-demo-password'
 export REGENGINE_REMOTE_TENANT=remote-smoke
-python3 scripts/remote_smoke.py
+uv run --no-dev python scripts/remote_smoke.py
 ```
 
 `scripts/remote_smoke.py` uses `httpx` with normal TLS verification to check `/api/healthz`, Basic Auth enforcement, credentialed CORS allow/block behavior, mock fixture loading, transformed-lot lineage, FDA CSV export, and EPCIS JSON-LD export. The tenant defaults to `remote-smoke`, fixture delivery stays in `mock` mode, and failure messages redact configured passwords and credential-like environment values. Set `REGENGINE_EXPECTED_BUILD_SHA` to fail fast when a deployed instance is not running the expected commit.
@@ -726,7 +722,7 @@ Common failure patterns:
 - Volume/storage failures: `/api/health` should report tenant-scoped paths under `REGENGINE_DATA_DIR`; confirm Railway has a volume mounted at `/data` and `REGENGINE_DATA_DIR=/data`.
 - Stale deployment failures: `/api/healthz` should report the expected `build.commit_sha_short`; if it does not, redeploy current `main` and update `REGENGINE_BUILD_SHA`.
 - Live delivery failures: request logs identify the route and tenant while dashboard delivery stats show the sanitized delivery error; confirm endpoint, API key, and tenant id before retrying.
-- Local dependency conflicts: create a fresh `.venv` and install `requirements-dev.txt` before diagnosing app failures; global Python packages such as OpenTelemetry or Semgrep can drift independently of this repo.
+- Local dependency conflicts: remove `.venv`, run `uv sync --group dev`, and retry before diagnosing app failures; global Python packages such as OpenTelemetry or Semgrep can drift independently of this repo.
 - Railway startup log noise: Uvicorn startup messages may appear with `level=error` in Railway logs. Treat them as noise unless there is a traceback, failed deployment, or HTTP 5xx.
 
 If the health check fails before request logs appear, the first place to look is `uvicorn.err.log` or `railway logs --deployment` for a Python traceback or startup error.
@@ -744,5 +740,5 @@ House rules in short:
 - Keep the live ingest payload compatible with the RegEngine contract.
 - Preserve **mock mode** as the default.
 - Maintain lot lineage across CTEs.
-- Run `pytest` after any Python change.
+- Run `uv run pytest` after any Python change.
 - Prefer small, composable modules and deterministic tests.

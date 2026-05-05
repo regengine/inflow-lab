@@ -13,11 +13,10 @@ This guide gives concrete run profiles for local development, shared design-part
 ## Common Prerequisites
 
 ```bash
-python3 -m venv .venv
-source .venv/bin/activate
-pip install -r requirements.txt
-pytest
-python3 scripts/smoke_regression.py
+python3 -m pip install --upgrade uv
+uv sync --group dev
+uv run pytest
+uv run python scripts/smoke_regression.py
 ```
 
 Before exposing any profile to another person, verify:
@@ -35,7 +34,7 @@ Use this profile for development and screen-share demos on one machine.
 unset REGENGINE_BASIC_AUTH_USERNAME
 unset REGENGINE_BASIC_AUTH_PASSWORD
 unset REGENGINE_DEFAULT_TENANT
-uvicorn app.main:app --host 127.0.0.1 --port 8000 --reload
+uv run uvicorn app.main:app --host 127.0.0.1 --port 8000 --reload
 ```
 
 Expected health context:
@@ -142,10 +141,10 @@ export REGENGINE_LIVE_API_KEY='<approved-live-key>'
 export REGENGINE_LIVE_TENANT_ID='<approved-live-tenant-id>'
 
 # Mock dry-run only. This sends no live RegEngine traffic.
-python3 scripts/live_trial.py --dry-run-only
+uv run python scripts/live_trial.py --dry-run-only
 
 # Live trial. This first performs the mock dry-run, then sends exactly one live batch.
-python3 scripts/live_trial.py --confirm-live
+uv run python scripts/live_trial.py --confirm-live
 ```
 
 The script refuses to run without either `--dry-run-only` or `--confirm-live`. It never prints the Basic Auth password, live API key, or live tenant id. Stop after the first live result and review the posted/failed status before any further volume.
@@ -248,7 +247,7 @@ export REGENGINE_REMOTE_BASE_URL=https://regengine-inflow-lab-production.up.rail
 export REGENGINE_REMOTE_USERNAME=demo
 export REGENGINE_REMOTE_PASSWORD='<shared-demo-password>'
 export REGENGINE_REMOTE_TENANT=remote-smoke
-python3 scripts/remote_smoke.py
+uv run --no-dev python scripts/remote_smoke.py
 ```
 
 The harness keeps delivery in `mock` mode, uses the dedicated smoke tenant by default, and verifies health, Basic Auth, CORS, fixture load, lineage, FDA CSV, and EPCIS JSON-LD without printing the password.
@@ -260,7 +259,7 @@ export REGENGINE_BROWSER_BASE_URL=https://regengine-inflow-lab-production.up.rai
 export REGENGINE_BROWSER_USERNAME=demo
 export REGENGINE_BROWSER_PASSWORD='<shared-demo-password>'
 export REGENGINE_BROWSER_TENANT=remote-browser-smoke
-python3 scripts/browser_smoke.py
+uv run --no-dev --group browser python scripts/browser_smoke.py
 ```
 
 The browser smoke forces dashboard delivery back to `mock`, uses the dedicated browser-smoke tenant, and verifies the real dashboard start/stop, reset, single-batch, fixture, lineage, and CSV warning flows without printing the password.
@@ -279,7 +278,7 @@ Then run `.github/workflows/remote-smoke.yml` or `.github/workflows/remote-brows
 | `base_url` | `https://regengine-inflow-lab-production.up.railway.app` | Deployed shared-demo URL to validate |
 | `tenant` | `remote-smoke` or `remote-browser-smoke` | Tenant used for isolated smoke data |
 
-The workflows install repo dependencies and run `python3 scripts/remote_smoke.py` or `python3 scripts/browser_smoke.py`. They do not require live RegEngine credentials and keep delivery in `mock` mode. Nightly scheduled runs target the Railway shared-demo URL with `remote-smoke-nightly` and `remote-browser-smoke-nightly` tenants, and both remote workflows compare `/api/healthz` build metadata to the workflow commit.
+The workflows install repo dependencies with `uv` and run `scripts/remote_smoke.py` or `scripts/browser_smoke.py` through `uv run`. They do not require live RegEngine credentials and keep delivery in `mock` mode. Nightly scheduled runs target the Railway shared-demo URL with `remote-smoke-nightly` and `remote-browser-smoke-nightly` tenants, and both remote workflows compare `/api/healthz` build metadata to the workflow commit.
 
 Railway log triage:
 
@@ -309,7 +308,7 @@ Use these patterns when diagnosing a shared demo:
 - `REGENGINE_DATA_DIR` points at mounted persistent storage in shared-demo and live-trial deployments.
 - Dashboard stats match the chosen tenant/auth/storage profile.
 - `POST /api/demo-fixtures/fresh_cut_transformation/load` succeeds in `mock` mode.
-- `python3 scripts/remote_smoke.py` passes for the deployed shared-demo URL.
+- `uv run --no-dev python scripts/remote_smoke.py` passes for the deployed shared-demo URL.
 - The manual GitHub **Remote Smoke** workflow passes with the same shared-demo URL and smoke tenant.
 - The manual GitHub **Remote Browser Smoke** workflow passes with the same shared-demo URL and browser-smoke tenant.
 - Nightly GitHub **Remote Smoke** and **Remote Browser Smoke** schedules are enabled after the shared-demo secrets are configured.
