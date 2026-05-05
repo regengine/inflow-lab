@@ -165,6 +165,24 @@ def test_live_client_sends_required_headers_and_contract_payload(monkeypatch: An
     }
 
 
+def test_live_client_uses_provided_idempotency_key(monkeypatch: Any) -> None:
+    idempotency_key = "retry-idem-123"
+    RecordingAsyncClient.calls = []
+    monkeypatch.setattr("app.regengine_client.httpx.AsyncClient", RecordingAsyncClient)
+
+    result = asyncio.run(
+        LiveRegEngineClient().ingest(
+            make_payload(),
+            make_live_config(),
+            idempotency_key=idempotency_key,
+        )
+    )
+
+    assert len(RecordingAsyncClient.calls) == 1
+    assert RecordingAsyncClient.calls[0]["headers"]["Idempotency-Key"] == idempotency_key
+    assert result.metadata["idempotency_key"] == idempotency_key
+
+
 # ---------------------------------------------------------------------------
 # Webhook HMAC signing — RegEngine #1243 contract alignment
 # ---------------------------------------------------------------------------

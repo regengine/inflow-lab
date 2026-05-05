@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import uuid
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from typing import Any
@@ -132,7 +133,11 @@ class SimulationController:
                 lineages.append(parent_lot_codes)
 
             payload = IngestPayload(source=self.config.source, events=events)
-            outcome = await self._deliver_payload(payload, self.config)
+            outcome = await self._deliver_payload(
+                payload,
+                self.config,
+                idempotency_key=uuid.uuid4().hex,
+            )
 
             stored_records: list[StoredEventRecord] = []
             response_events = (outcome.response or {}).get("events", []) if outcome.response else []
@@ -463,12 +468,17 @@ class SimulationController:
                 failed = 0
                 updated_records: list[StoredEventRecord] = []
                 responses: list[dict[str, Any]] = []
-                grouped_records: dict[str, list[StoredEventRecord]] = {}
+                grouped_records: dict[tuple[str, str | None], list[StoredEventRecord]] = {}
                 for record in candidates:
                     source = request.source or record.payload_source
-                    grouped_records.setdefault(source, []).append(record)
+                    idempotency_key = (
+                        _stored_idempotency_key(record)
+                        if delivery.mode == DestinationMode.LIVE
+                        else None
+                    )
+                    grouped_records.setdefault((source, idempotency_key), []).append(record)
 
-                for source, records in grouped_records.items():
+                for (source, idempotency_key), records in grouped_records.items():
                     retry_config = self.config.model_copy(
                         update={
                             "source": source,
@@ -477,7 +487,11 @@ class SimulationController:
                         deep=True,
                     )
                     payload = IngestPayload(source=source, events=[record.event for record in records])
-                    outcome = await self._deliver_payload(payload, retry_config)
+                    outcome = await self._deliver_payload(
+                        payload,
+                        retry_config,
+                        idempotency_key=idempotency_key,
+                    )
                     response_events = (outcome.response or {}).get("events", []) if outcome.response else []
                     responses.append(
                         {
@@ -539,12 +553,20 @@ class SimulationController:
         await self._publish_update()
         return result
 
-    async def _deliver_payload(self, payload: IngestPayload, config: SimulationConfig) -> DeliveryOutcome:
+    async def _deliver_payload(
+        self,
+        payload: IngestPayload,
+        config: SimulationConfig,
+        idempotency_key: str | None = None,
+    ) -> DeliveryOutcome:
         if config.delivery.mode == DestinationMode.NONE:
             return DeliveryOutcome()
 
         api_key = config.delivery.api_key
         attempted_at = datetime.now(UTC)
+        delivery_idempotency_key = idempotency_key
+        if config.delivery.mode == DestinationMode.LIVE and delivery_idempotency_key is None:
+            delivery_idempotency_key = uuid.uuid4().hex
         try:
             if config.delivery.mode == DestinationMode.MOCK:
                 response = self.mock_service.ingest(payload).model_dump(mode="json")
@@ -561,7 +583,11 @@ class SimulationController:
                     },
                 )
             if config.delivery.mode == DestinationMode.LIVE:
-                result = await self.live_client.ingest(payload, config)
+                result = await self.live_client.ingest(
+                    payload,
+                    config,
+                    idempotency_key=delivery_idempotency_key,
+                )
                 return DeliveryOutcome(
                     response=mask_secret_in_payload(result.response, api_key),
                     delivery_status="posted",
@@ -573,25 +599,31 @@ class SimulationController:
                 )
             return DeliveryOutcome()
         except LiveRegEngineDeliveryError as exc:
+            metadata = exc.metadata | {"attempted_event_count": len(payload.events)}
+            if delivery_idempotency_key and "idempotency_key" not in metadata:
+                metadata["idempotency_key"] = delivery_idempotency_key
             return DeliveryOutcome(
                 delivery_status="failed",
                 failed=len(payload.events),
                 delivery_attempts=1,
                 attempted_at=attempted_at,
                 error_message=mask_secret_in_string(str(exc), api_key),
-                metadata=exc.metadata | {"attempted_event_count": len(payload.events)},
+                metadata=metadata,
             )
         except Exception as exc:  # pragma: no cover - exercised by live integration, not unit tests
+            metadata = {
+                "delivery_mode": config.delivery.mode.value,
+                "attempted_event_count": len(payload.events),
+            }
+            if delivery_idempotency_key:
+                metadata["idempotency_key"] = delivery_idempotency_key
             return DeliveryOutcome(
                 delivery_status="failed",
                 failed=len(payload.events),
                 delivery_attempts=1,
                 attempted_at=attempted_at,
                 error_message=mask_secret_in_string(str(exc), api_key),
-                metadata={
-                    "delivery_mode": config.delivery.mode.value,
-                    "attempted_event_count": len(payload.events),
-                },
+                metadata=metadata,
             )
 
     async def _run_loop(self) -> None:
@@ -677,3 +709,11 @@ class SimulationController:
 def _validate_live_delivery(delivery: DeliveryConfig) -> None:
     if delivery.mode == DestinationMode.LIVE and (not delivery.api_key or not delivery.tenant_id):
         raise ValueError("Live delivery requires both api_key and tenant_id")
+
+
+def _stored_idempotency_key(record: StoredEventRecord) -> str | None:
+    metadata = record.delivery_metadata or {}
+    value = metadata.get("idempotency_key")
+    if isinstance(value, str) and value:
+        return value
+    return None
