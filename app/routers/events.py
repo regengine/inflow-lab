@@ -4,7 +4,7 @@ from fastapi import APIRouter, Depends, HTTPException, Query
 
 from ..controller import SimulationController
 from ..dependencies import get_active_controller
-from ..models import EventListResponse, LineageResponse
+from ..schemas.exports import EventListResponse, LineageResponse
 
 
 router = APIRouter(prefix="/api", tags=["Events"])

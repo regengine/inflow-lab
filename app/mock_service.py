@@ -6,7 +6,7 @@ from datetime import UTC, datetime
 from uuid import uuid4
 
 from .engine import LegitFlowEngine
-from .models import IngestPayload, IngestResponseEvent, MockIngestResponse
+from .schemas.ingestion import IngestPayload, IngestResponseEvent, MockIngestResponse
 
 
 class MockRegEngineService:

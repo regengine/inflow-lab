@@ -3,7 +3,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Any
 
-from .models import CTEType, RegEngineEvent
+from .schemas.domain import CTEType, RegEngineEvent
 
 
 @dataclass(frozen=True, slots=True)

@@ -1,7 +1,7 @@
 from datetime import UTC, datetime, timedelta
 
 from app.engine import LegitFlowEngine
-from app.models import CTEType
+from app.schemas.domain import CTEType
 
 
 def test_initial_packing_sources_previously_cooled_lots():

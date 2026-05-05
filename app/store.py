@@ -6,7 +6,7 @@ from pathlib import Path
 from threading import RLock
 from typing import Any, Iterable
 
-from .models import LineageEdge, LineageNode, StoredEventRecord
+from .schemas.domain import LineageEdge, LineageNode, StoredEventRecord
 
 
 # Sentinel that replaces secrets in scrubbed output. Not a credential.

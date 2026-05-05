@@ -11,7 +11,8 @@ from urllib.parse import urlparse
 
 import httpx
 
-from .models import IngestPayload, SimulationConfig
+from .schemas.ingestion import IngestPayload
+from .schemas.simulation import SimulationConfig
 
 
 DEFAULT_LIVE_INGEST_ENDPOINT = "https://www.regengine.co/api/v1/webhooks/ingest"

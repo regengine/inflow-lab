@@ -5,8 +5,10 @@ from pathlib import Path
 from threading import RLock
 from typing import Iterable
 
-from .models import ScenarioSaveSnapshot, SimulationConfig, StoredEventRecord
 from .scenarios import ScenarioId
+from .schemas.domain import StoredEventRecord
+from .schemas.scenarios import ScenarioSaveSnapshot
+from .schemas.simulation import SimulationConfig
 
 
 class ScenarioSaveStore:

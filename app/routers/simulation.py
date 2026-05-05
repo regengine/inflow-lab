@@ -11,7 +11,8 @@ from .. import tenancy
 from ..auth import TenantContext
 from ..controller import SimulationController
 from ..dependencies import get_active_controller, get_tenant_context
-from ..models import ReplayRequest, ReplayResponse, ResetResponse, SimulationConfig, StartRequest, StatusResponse, StepResponse
+from ..schemas.ingestion import ReplayRequest, ReplayResponse
+from ..schemas.simulation import ResetResponse, SimulationConfig, StartRequest, StatusResponse, StepResponse
 
 
 router = APIRouter(prefix="/api/simulate", tags=["Simulation"])

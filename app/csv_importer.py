@@ -11,7 +11,8 @@ from typing import Any
 from pydantic import ValidationError
 
 from .cte_rules import validate_event_kdes
-from .models import CSVImportError, CSVImportType, CSVImportWarning, CTEType, RegEngineEvent
+from .schemas.domain import CSVImportType, CTEType, RegEngineEvent
+from .schemas.ingestion import CSVImportError, CSVImportWarning
 
 
 EVENT_REQUIRED_FIELDS = (

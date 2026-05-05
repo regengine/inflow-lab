@@ -17,13 +17,9 @@ from ..fda_export import (
     list_fda_export_preset_summaries,
     render_fda_request_csv,
 )
-from ..models import (
-    FDAExportPreset,
-    FDAExportPresetListResponse,
-    FDAExportPresetSummary,
-    IngestPayload,
-    MockIngestResponse,
-)
+from ..schemas.domain import FDAExportPreset
+from ..schemas.exports import FDAExportPresetListResponse, FDAExportPresetSummary
+from ..schemas.ingestion import IngestPayload, MockIngestResponse
 
 
 router = APIRouter(prefix="/api/mock/regengine", tags=["Mock RegEngine"])
