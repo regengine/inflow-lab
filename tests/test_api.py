@@ -750,12 +750,12 @@ def test_fda_export_presets_filter_common_request_slices(tmp_path):
             "delivery": {"mode": "none"},
         },
     )
-    csv_text = """cte_type,traceability_lot_code,product_description,quantity,unit_of_measure,location_name,timestamp,source_traceability_lot_code,input_traceability_lot_codes,reference_document_type,reference_document_number
-harvesting,TLC-FDA-HARVEST,Romaine Lettuce,120,cases,Valley Fresh Farms,2026-02-05T08:00:00Z,,,Harvest Log,HAR-001
-initial_packing,TLC-FDA-PACKED,Romaine Lettuce,112,cases,Coastal Packhouse,2026-02-05T10:00:00Z,TLC-FDA-HARVEST,,Packout Record,PACK-001
-shipping,TLC-FDA-PACKED,Romaine Lettuce,112,cases,Coastal Packhouse,2026-02-05T12:00:00Z,,,Bill of Lading,BOL-001
-receiving,TLC-FDA-PACKED,Romaine Lettuce,112,cases,Distribution Center #4,2026-02-05T18:00:00Z,,,Bill of Lading,BOL-001
-transformation,TLC-FDA-OUT,Fresh Cut Salad Mix,95,cases,ReadyFresh Processing Plant,2026-02-06T09:00:00Z,,TLC-FDA-PACKED,Batch Record,BATCH-001
+    csv_text = """cte_type,traceability_lot_code,product_description,quantity,unit_of_measure,location_name,timestamp,source_traceability_lot_code,input_traceability_lot_codes,reference_document_type,reference_document
+harvesting,TLC-FDA-HARVEST,Romaine Lettuce,120,cases,Valley Fresh Farms,2026-02-05T08:00:00Z,,,Harvest Log,Harvest Log HAR-001
+initial_packing,TLC-FDA-PACKED,Romaine Lettuce,112,cases,Coastal Packhouse,2026-02-05T10:00:00Z,TLC-FDA-HARVEST,,Packout Record,Packout Record PACK-001
+shipping,TLC-FDA-PACKED,Romaine Lettuce,112,cases,Coastal Packhouse,2026-02-05T12:00:00Z,,,Bill of Lading,Bill of Lading BOL-001
+receiving,TLC-FDA-PACKED,Romaine Lettuce,112,cases,Distribution Center #4,2026-02-05T18:00:00Z,,,Bill of Lading,Bill of Lading BOL-001
+transformation,TLC-FDA-OUT,Fresh Cut Salad Mix,95,cases,ReadyFresh Processing Plant,2026-02-06T09:00:00Z,,TLC-FDA-PACKED,Batch Record,Batch Record BATCH-001
 """
     import_response = client.post(
         "/api/import/csv",
@@ -872,7 +872,7 @@ def test_epcis_export_scaffold_maps_lineage_to_jsonld_without_changing_ingest_co
     assert transformation_event["outputQuantityList"][0]["regengine:traceabilityLotCode"] == (
         "TLC-DEMO-FC-OUT-001"
     )
-    assert transformation_event["regengine:kdes"]["reference_document_number"] == "BATCH-DEMO-FC-001"
+    assert transformation_event["regengine:kdes"]["reference_document"] == "Batch Record BATCH-DEMO-FC-001"
 
     ingest_response = client.post(
         "/api/mock/regengine/ingest",
@@ -1458,7 +1458,7 @@ def test_csv_import_scheduled_events_stores_valid_rows_and_reports_errors(tmp_pa
     )
     csv_text = """cte_type,traceability_lot_code,product_description,quantity,unit_of_measure,location_name,timestamp,source_traceability_lot_code,kdes
 harvesting,TLC-CSV-HARVEST,Romaine Lettuce,120,cases,Valley Fresh Farms,2026-02-05T08:00:00Z,,"{""harvest_date"":""2026-02-05""}"
-initial_packing,TLC-CSV-PACKED,Romaine Lettuce,112,cases,Coastal Packhouse,2026-02-05T10:00:00Z,TLC-CSV-HARVEST,"{""pack_date"":""2026-02-05""}"
+initial_packing,TLC-CSV-PACKED,Romaine Lettuce,112,cases,Coastal Packhouse,2026-02-05T10:00:00Z,TLC-CSV-HARVEST,"{""packing_date"":""2026-02-05""}"
 receiving,TLC-CSV-BAD,Romaine Lettuce,,cases,Distribution Center #4,2026-02-05T12:00:00Z,,
 """
 
@@ -1483,9 +1483,8 @@ receiving,TLC-CSV-BAD,Romaine Lettuce,,cases,Distribution Center #4,2026-02-05T1
         {"row": 4, "field": "quantity", "message": "Missing required field: quantity"}
     ]
     assert {warning["field"] for warning in body["warnings"]} >= {
-        "farm_location",
-        "reference_document_number",
-        "packing_location",
+        "reference_document",
+        "harvester_business_name",
     }
 
     events = client.get("/api/events?limit=10").json()["events"]
@@ -1562,9 +1561,9 @@ TLC-SEED-001,Spinach,80,cases,Valley Fresh Farms,2026-02-06T09:15:00Z,Field-9,Ce
     assert event["cte_type"] == "harvesting"
     assert event["traceability_lot_code"] == "TLC-SEED-001"
     assert event["kdes"]["harvest_date"] == "2026-02-06"
-    assert event["kdes"]["farm_location"] == "Valley Fresh Farms"
+    assert event["location_name"] == "Valley Fresh Farms"
     assert event["kdes"]["field_name"] == "Field-9"
-    assert event["kdes"]["reference_document_number"] == "CSV-TLC-SEED-001"
+    assert event["kdes"]["reference_document"] == "Seed Lot Import CSV-TLC-SEED-001"
 
 
 def test_reset_applies_scenario_config_and_keeps_mock_delivery_default(tmp_path):

@@ -165,13 +165,11 @@ class LegitFlowEngine:
             timestamp=timestamp,
             kdes={
                 "harvest_date": timestamp.date().isoformat(),
-                "farm_location": farm.name,
                 "field_name": f"Field-{self.rng.randint(1, 18)}",
                 "immediate_subsequent_recipient": self.rng.choice(self.coolers).name,
                 "reference_document": self._reference_document(lot.current_reference_type, reference_number),
                 "reference_document_type": lot.current_reference_type,
-                "reference_document_number": reference_number,
-                "traceability_lot_code_source_reference": lot.tlc_source_reference,
+                "tlc_source_reference": lot.tlc_source_reference,
             },
         )
         return event, []
@@ -196,12 +194,10 @@ class LegitFlowEngine:
             timestamp=timestamp,
             kdes={
                 "cooling_date": timestamp.date().isoformat(),
-                "cooling_location": cooler.name,
                 "harvest_location": lot.origin_location,
                 "reference_document": self._reference_document(lot.current_reference_type, lot.current_reference_number),
                 "reference_document_type": lot.current_reference_type,
-                "reference_document_number": lot.current_reference_number,
-                "traceability_lot_code_source_reference": lot.tlc_source_reference,
+                "tlc_source_reference": lot.tlc_source_reference,
             },
         )
         return event, [lot.lot_code]
@@ -241,15 +237,14 @@ class LegitFlowEngine:
             timestamp=timestamp,
             kdes={
                 "packing_date": timestamp.date().isoformat(),
-                "pack_date": timestamp.date().isoformat(),
-                "packing_location": packer.name,
+                # Internal lineage pointer used by store/EPCIS to wire the
+                # packed lot back to its cooled source. Not part of
+                # RegEngine REQUIRED_KDES; kept for in-process linkage.
                 "source_traceability_lot_code": source_lot.lot_code,
-                "farm_location": source_lot.origin_location,
                 "reference_document": self._reference_document(packed_lot.current_reference_type, reference_number),
                 "reference_document_type": packed_lot.current_reference_type,
-                "reference_document_number": reference_number,
                 "harvester_business_name": source_lot.origin_location,
-                "traceability_lot_code_source_reference": packed_lot.tlc_source_reference,
+                "tlc_source_reference": packed_lot.tlc_source_reference,
             },
         )
         return event, [source_lot.lot_code]
@@ -307,9 +302,7 @@ class LegitFlowEngine:
                 "carrier": carrier,
                 "reference_document": self._reference_document(shipment.reference_type, shipment.reference_number),
                 "reference_document_type": shipment.reference_type,
-                "reference_document_number": shipment.reference_number,
                 "tlc_source_reference": lot.tlc_source_reference,
-                "traceability_lot_code_source_reference": lot.tlc_source_reference,
             },
         )
         return event, lot.parents or [lot.lot_code]
@@ -347,9 +340,7 @@ class LegitFlowEngine:
                 "immediate_previous_source": shipment.from_location,
                 "reference_document": self._reference_document(shipment.reference_type, shipment.reference_number),
                 "reference_document_type": shipment.reference_type,
-                "reference_document_number": shipment.reference_number,
                 "tlc_source_reference": lot.tlc_source_reference,
-                "traceability_lot_code_source_reference": lot.tlc_source_reference,
             },
         )
         return event, lot.parents or [lot.lot_code]
@@ -392,15 +383,12 @@ class LegitFlowEngine:
             timestamp=timestamp,
             kdes={
                 "transformation_date": timestamp.date().isoformat(),
-                "transformation_location": processor.name,
-                "location_name": processor.name,
                 "input_traceability_lot_codes": [lot.lot_code for lot in inputs],
                 "input_products": [lot.product_description for lot in inputs],
                 "reference_document": self._reference_document(output_lot.current_reference_type, output_lot.current_reference_number),
                 "reference_document_type": output_lot.current_reference_type,
-                "reference_document_number": output_lot.current_reference_number,
                 "yield_ratio": round(output_qty / total_input_qty, 3) if total_input_qty else 0,
-                "traceability_lot_code_source_reference": output_lot.tlc_source_reference,
+                "tlc_source_reference": output_lot.tlc_source_reference,
             },
         )
         return event, [lot.lot_code for lot in inputs]

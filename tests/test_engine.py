@@ -83,22 +83,129 @@ def test_engine_emits_regengine_canonical_kdes_for_lab_contract():
 
     harvesting = seen[CTEType.HARVESTING]
     assert "reference_document_type" in harvesting.kdes
-    assert "reference_document_number" in harvesting.kdes
-    # Required for RegEngine ingest contract — webhook_router_v2 KDE
-    # validator looks for the combined `reference_document` field on
-    # harvesting events, not just the split type/number fields.
+    # Canonical RegEngine ingest contract uses the unified
+    # `reference_document` field, not a split type/number pair.
     assert harvesting.kdes["reference_document"]
 
     initial_packing = seen[CTEType.INITIAL_PACKING]
     assert initial_packing.kdes["packing_date"]
-    assert initial_packing.kdes["pack_date"]
     assert initial_packing.kdes["reference_document"]
     assert initial_packing.kdes["harvester_business_name"]
 
     shipping = seen[CTEType.SHIPPING]
     assert shipping.kdes["reference_document"]
     assert shipping.kdes["tlc_source_reference"]
-    assert shipping.kdes["traceability_lot_code_source_reference"]
+
+
+# Hardcoded copy of RegEngine's REQUIRED_KDES_BY_CTE
+# (services/ingestion/app/webhook_models.py). Pinned here intentionally
+# — DO NOT replace with an import from RegEngine. Drift between this
+# constant and the engine's emitted KDEs should fail CI loudly so we
+# catch wire-compat regressions before they reach a tenant.
+REGENGINE_REQUIRED_KDES: dict[CTEType, tuple[str, ...]] = {
+    CTEType.HARVESTING: (
+        "traceability_lot_code",
+        "product_description",
+        "quantity",
+        "unit_of_measure",
+        "harvest_date",
+        "location_name",
+        "reference_document",
+    ),
+    CTEType.COOLING: (
+        "traceability_lot_code",
+        "product_description",
+        "quantity",
+        "unit_of_measure",
+        "cooling_date",
+        "location_name",
+        "reference_document",
+    ),
+    CTEType.INITIAL_PACKING: (
+        "traceability_lot_code",
+        "product_description",
+        "quantity",
+        "unit_of_measure",
+        "packing_date",
+        "location_name",
+        "reference_document",
+        "harvester_business_name",
+    ),
+    CTEType.SHIPPING: (
+        "traceability_lot_code",
+        "product_description",
+        "quantity",
+        "unit_of_measure",
+        "ship_date",
+        "ship_from_location",
+        "ship_to_location",
+        "reference_document",
+        "tlc_source_reference",
+    ),
+    CTEType.RECEIVING: (
+        "traceability_lot_code",
+        "product_description",
+        "quantity",
+        "unit_of_measure",
+        "receive_date",
+        "receiving_location",
+        "immediate_previous_source",
+        "reference_document",
+        "tlc_source_reference",
+    ),
+    CTEType.TRANSFORMATION: (
+        "traceability_lot_code",
+        "product_description",
+        "quantity",
+        "unit_of_measure",
+        "transformation_date",
+        "location_name",
+        "reference_document",
+    ),
+}
+
+
+def test_emitted_events_satisfy_regengine_required_kdes():
+    """Every event the engine emits must satisfy RegEngine's contract.
+
+    The RegEngine validator merges top-level IngestEvent fields with the
+    kdes dict before checking required keys, so we replicate that merge
+    here.
+    """
+    engine = LegitFlowEngine(seed=204)
+    seen_ctes: set[CTEType] = set()
+
+    for _ in range(400):
+        event, _ = engine.next_event()
+        required = REGENGINE_REQUIRED_KDES.get(event.cte_type)
+        if required is None:
+            continue
+        seen_ctes.add(event.cte_type)
+        available = {
+            "traceability_lot_code": event.traceability_lot_code,
+            "product_description": event.product_description,
+            "quantity": event.quantity,
+            "unit_of_measure": event.unit_of_measure,
+            "location_name": event.location_name,
+            **event.kdes,
+        }
+        missing = [field for field in required if not _has_kde_value(available.get(field))]
+        assert not missing, (
+            f"{event.cte_type.value} event missing required KDEs {missing}; "
+            f"available keys: {sorted(available.keys())}"
+        )
+
+    assert seen_ctes == set(REGENGINE_REQUIRED_KDES.keys())
+
+
+def _has_kde_value(value) -> bool:
+    if value is None:
+        return False
+    if isinstance(value, str):
+        return bool(value.strip())
+    if isinstance(value, list):
+        return bool(value)
+    return True
 
 
 def test_engine_clock_stays_inside_live_webhook_window_for_demo_loop():
