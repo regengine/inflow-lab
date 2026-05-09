@@ -198,6 +198,56 @@ def test_emitted_events_satisfy_regengine_required_kdes():
     assert seen_ctes == set(REGENGINE_REQUIRED_KDES.keys())
 
 
+def test_emitted_events_carry_location_gln_for_known_locations():
+    """Every event for a known scenario location must emit location_gln.
+
+    The simulator's locations all have GLNs configured in scenarios.py,
+    so every event the engine produces should carry a non-None
+    location_gln populated from engine.location_gln(name).
+    """
+    engine = LegitFlowEngine(seed=204)
+    seen_ctes: set[CTEType] = set()
+
+    for _ in range(200):
+        event, _ = engine.next_event()
+        seen_ctes.add(event.cte_type)
+        # location_name should always resolve in the scenario index, so
+        # location_gln must be populated and match the engine lookup.
+        assert event.location_gln is not None
+        assert event.location_gln == engine.location_gln(event.location_name)
+
+    # We exercised every CTE type the engine actively emits.
+    assert {
+        CTEType.HARVESTING,
+        CTEType.COOLING,
+        CTEType.INITIAL_PACKING,
+        CTEType.SHIPPING,
+        CTEType.RECEIVING,
+        CTEType.TRANSFORMATION,
+    } <= seen_ctes
+
+
+def test_location_gln_or_none_returns_none_for_unknown_location():
+    engine = LegitFlowEngine(seed=204)
+    assert engine._location_gln_or_none("Unknown Place") is None
+
+
+def test_regengine_event_back_compat_loads_old_jsonl_without_location_gln():
+    """Old persisted events lack location_gln; field is Optional so they
+    must still deserialize cleanly with location_gln=None.
+    """
+    from app.schemas.domain import RegEngineEvent
+
+    legacy_payload = (
+        '{"cte_type":"harvesting","traceability_lot_code":"TLC-1",'
+        '"product_description":"Romaine","quantity":100.0,'
+        '"unit_of_measure":"cases","location_name":"Valley Fresh Farms",'
+        '"timestamp":"2026-01-01T00:00:00Z","kdes":{}}'
+    )
+    event = RegEngineEvent.model_validate_json(legacy_payload)
+    assert event.location_gln is None
+
+
 def _has_kde_value(value) -> bool:
     if value is None:
         return False
