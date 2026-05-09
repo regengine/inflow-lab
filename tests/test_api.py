@@ -1498,6 +1498,7 @@ receiving,TLC-CSV-BAD,Romaine Lettuce,,cases,Distribution Center #4,2026-02-05T1
         "quantity",
         "unit_of_measure",
         "location_name",
+        "location_gln",
         "timestamp",
         "kdes",
     }

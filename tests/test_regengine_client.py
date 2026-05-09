@@ -146,6 +146,7 @@ def test_live_client_sends_required_headers_and_contract_payload(monkeypatch: An
         "quantity",
         "unit_of_measure",
         "location_name",
+        "location_gln",
         "timestamp",
         "kdes",
     }
@@ -156,6 +157,7 @@ def test_live_client_sends_required_headers_and_contract_payload(monkeypatch: An
         "quantity": 500.0,
         "unit_of_measure": "cases",
         "location_name": "Distribution Center #4",
+        "location_gln": None,
         "timestamp": "2026-02-05T08:30:00Z",
         "kdes": {
             "receive_date": "2026-02-05",

@@ -57,6 +57,11 @@ class RegEngineEvent(BaseModel):
     quantity: float
     unit_of_measure: str
     location_name: str
+    # Optional GS1 GLN for the emitting location. RegEngine's IngestEvent
+    # accepts this as a top-level field with mod-10 validation. Existing
+    # JSONL stores predate this field; Pydantic's Optional default keeps
+    # them backward-compatible on read.
+    location_gln: str | None = None
     timestamp: datetime
     kdes: dict[str, Any] = Field(default_factory=dict)
 

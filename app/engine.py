@@ -162,6 +162,7 @@ class LegitFlowEngine:
             quantity=lot.quantity,
             unit_of_measure=lot.unit_of_measure,
             location_name=farm.name,
+            location_gln=self._location_gln_or_none(farm.name),
             timestamp=timestamp,
             kdes={
                 "harvest_date": timestamp.date().isoformat(),
@@ -191,6 +192,7 @@ class LegitFlowEngine:
             quantity=lot.quantity,
             unit_of_measure=lot.unit_of_measure,
             location_name=cooler.name,
+            location_gln=self._location_gln_or_none(cooler.name),
             timestamp=timestamp,
             kdes={
                 "cooling_date": timestamp.date().isoformat(),
@@ -234,6 +236,7 @@ class LegitFlowEngine:
             quantity=packed_lot.quantity,
             unit_of_measure=packed_lot.unit_of_measure,
             location_name=packer.name,
+            location_gln=self._location_gln_or_none(packer.name),
             timestamp=timestamp,
             kdes={
                 "packing_date": timestamp.date().isoformat(),
@@ -294,6 +297,7 @@ class LegitFlowEngine:
             quantity=lot.quantity,
             unit_of_measure=lot.unit_of_measure,
             location_name=shipment.from_location,
+            location_gln=self._location_gln_or_none(shipment.from_location),
             timestamp=timestamp,
             kdes={
                 "ship_date": timestamp.date().isoformat(),
@@ -332,6 +336,7 @@ class LegitFlowEngine:
             quantity=lot.quantity,
             unit_of_measure=lot.unit_of_measure,
             location_name=shipment.to_location,
+            location_gln=self._location_gln_or_none(shipment.to_location),
             timestamp=timestamp,
             kdes={
                 "receive_date": timestamp.date().isoformat(),
@@ -380,6 +385,7 @@ class LegitFlowEngine:
             quantity=output_lot.quantity,
             unit_of_measure=output_lot.unit_of_measure,
             location_name=processor.name,
+            location_gln=self._location_gln_or_none(processor.name),
             timestamp=timestamp,
             kdes={
                 "transformation_date": timestamp.date().isoformat(),
@@ -396,6 +402,16 @@ class LegitFlowEngine:
     def location_gln(self, location_name: str) -> str:
         location = self.location_index.get(location_name)
         return location.gln if location else ""
+
+    def _location_gln_or_none(self, location_name: str) -> str | None:
+        """Same as location_gln() but returns None for unknown/empty.
+
+        RegEngine's IngestEvent validator treats empty strings as missing
+        and rejects them; emit None instead so the optional field stays
+        truly optional on the wire.
+        """
+        gln = self.location_gln(location_name)
+        return gln or None
 
     def _make_lot_code(self, prefix: str) -> str:
         return f"{prefix}-{self._time_cursor.strftime('%Y%m%d')}-{next(self._lot_counter):06d}"

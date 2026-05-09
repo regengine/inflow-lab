@@ -106,6 +106,7 @@ def validate_event_kdes(event: RegEngineEvent) -> list[CTEValidationWarning]:
     # event.kdes so a required key satisfied at top level isn't flagged.
     available: dict[str, Any] = {
         "location_name": event.location_name,
+        "location_gln": event.location_gln,
         "traceability_lot_code": event.traceability_lot_code,
         "product_description": event.product_description,
         "quantity": event.quantity,
