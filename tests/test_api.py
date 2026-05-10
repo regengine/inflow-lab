@@ -128,6 +128,7 @@ def test_scenario_catalog_endpoint_lists_supported_presets():
     ]
     assert all(scenario["label"] for scenario in scenarios)
     assert {scenario["industry_type"] for scenario in scenarios} >= {"produce", "seafood", "dairy"}
+    assert {scenario["operation_type"] for scenario in scenarios} >= {"supplier", "processor", "retailer", "first_receiver"}
 
 
 def test_status_includes_backend_audit_summary():

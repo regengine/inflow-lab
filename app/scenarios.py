@@ -47,6 +47,7 @@ class ScenarioPreset:
     carriers: tuple[str, ...]
     action_weights: Mapping[str, int]
     industry_type: str
+    operation_type: str
     reference_format: str
     source_cte_type: CTEType = CTEType.HARVESTING
     requires_cooling: bool = True
@@ -110,6 +111,7 @@ SCENARIO_PRESETS: dict[ScenarioId, ScenarioPreset] = {
             "transform": 4,
         },
         industry_type="produce",
+        operation_type="supplier",
         reference_format="GS1",
         harvest_target=3,
         packed_to_processor_probability=0.45,
@@ -165,6 +167,7 @@ SCENARIO_PRESETS: dict[ScenarioId, ScenarioPreset] = {
             "transform": 8,
         },
         industry_type="produce",
+        operation_type="processor",
         reference_format="GS1",
         harvest_target=4,
         packed_to_processor_probability=0.85,
@@ -221,6 +224,7 @@ SCENARIO_PRESETS: dict[ScenarioId, ScenarioPreset] = {
             "transform": 2,
         },
         industry_type="produce",
+        operation_type="retailer",
         reference_format="GS1",
         harvest_target=3,
         packed_to_processor_probability=0.1,
@@ -271,6 +275,7 @@ SCENARIO_PRESETS: dict[ScenarioId, ScenarioPreset] = {
             "transform": 6,
         },
         industry_type="seafood",
+        operation_type="first_receiver",
         reference_format="GS1",
         source_cte_type=CTEType.FIRST_LAND_BASED_RECEIVING,
         requires_cooling=False,
@@ -323,6 +328,7 @@ SCENARIO_PRESETS: dict[ScenarioId, ScenarioPreset] = {
             "transform": 7,
         },
         industry_type="dairy",
+        operation_type="processor",
         reference_format="GS1",
         requires_cooling=False,
         harvest_target=4,
@@ -344,6 +350,7 @@ def list_scenario_summaries() -> list[dict[str, str | bool]]:
             "label": preset.label,
             "description": preset.description,
             "industry_type": preset.industry_type,
+            "operation_type": preset.operation_type,
             "reference_format": preset.reference_format,
             "requires_cooling": preset.requires_cooling,
         }
