@@ -19,7 +19,8 @@ TLC-SEED-DEFAULT,Romaine Hearts,42,cases,Valley Fresh Farms
     event = parsed.events[0]
     assert event.timestamp == datetime(2026, 2, 7, 11, 30, tzinfo=UTC)
     assert event.kdes["harvest_date"] == "2026-02-07"
-    assert event.kdes["reference_document"] == "Seed Lot Import CSV-TLC-SEED-DEFAULT"
+    assert event.kdes["reference_document_number"] == "CSV-TLC-SEED-DEFAULT"
+    assert event.kdes["tlc_source_reference"] == "CSV-SEED-TLC-SEED-DEFAULT"
 
 
 def test_parse_scheduled_event_reports_invalid_cte_timestamp_and_kdes():
@@ -54,6 +55,7 @@ transformation,TLC-OUT,Fresh Cut Salad Mix,50,cases,ReadyFresh Processing Plant,
     assert {warning.field for warning in parsed.warnings} >= {
         "transformation_date",
         "reference_document",
+        "reference_document_type",
     }
 
 

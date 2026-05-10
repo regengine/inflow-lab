@@ -152,10 +152,11 @@ def _transformation_batch_number(record: StoredEventRecord) -> str | None:
         return batch_number
 
     reference_type = record.event.kdes.get("reference_document_type")
-    reference_number = _reference_document_number(record.event.kdes)
+    reference_number = record.event.kdes.get("reference_document_number")
     if (
         isinstance(reference_type, str)
         and "batch" in reference_type.lower()
+        and isinstance(reference_number, str)
         and reference_number
     ):
         return reference_number
@@ -202,8 +203,10 @@ def _input_lot_codes(record: StoredEventRecord) -> list[str]:
 
 def _biz_transactions(record: StoredEventRecord) -> list[dict[str, str]]:
     reference_type = record.event.kdes.get("reference_document_type")
-    reference_number = _reference_document_number(record.event.kdes)
-    if not isinstance(reference_type, str) or not reference_type or not reference_number:
+    reference_number = record.event.kdes.get("reference_document_number")
+    if not isinstance(reference_type, str) or not isinstance(reference_number, str):
+        return []
+    if not reference_type or not reference_number:
         return []
 
     return [
@@ -214,25 +217,6 @@ def _biz_transactions(record: StoredEventRecord) -> list[dict[str, str]]:
             "regengine:documentNumber": reference_number,
         }
     ]
-
-
-def _reference_document_number(kdes: dict[str, Any]) -> str:
-    """Derive a structured document number for EPCIS bizTransaction URNs.
-
-    The canonical RegEngine contract uses a unified ``reference_document``
-    string formatted ``"<type> <number>"``. EPCIS needs the number alone
-    (or a stable token) for the bizTransaction URN, so we strip the
-    leading type token when present.
-    """
-    document = kdes.get("reference_document")
-    if not isinstance(document, str) or not document:
-        return ""
-    document_type = kdes.get("reference_document_type")
-    if isinstance(document_type, str) and document_type and document.startswith(document_type):
-        remainder = document[len(document_type):].lstrip()
-        if remainder:
-            return remainder
-    return document
 
 
 def _lot_identifier(lot_code: str) -> str:

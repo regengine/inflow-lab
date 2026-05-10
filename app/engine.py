@@ -319,6 +319,7 @@ class LegitFlowEngine:
                 "reference_document_number": shipment.reference_number,
                 "sscc": shipment.reference_number if self.scenario.reference_format == "GS1" else None,
                 "tlc_source_reference": lot.tlc_source_reference,
+                "traceability_lot_code_source_reference": lot.tlc_source_reference,
             },
         )
         return event, lot.parents or [lot.lot_code]
@@ -360,6 +361,7 @@ class LegitFlowEngine:
                 "reference_document_number": shipment.reference_number,
                 "sscc": shipment.reference_number if self.scenario.reference_format == "GS1" else None,
                 "tlc_source_reference": lot.tlc_source_reference,
+                "traceability_lot_code_source_reference": lot.tlc_source_reference,
             },
         )
         return event, lot.parents or [lot.lot_code]
@@ -451,12 +453,6 @@ class LegitFlowEngine:
         return location.gln if location else ""
 
     def _location_gln_or_none(self, location_name: str) -> str | None:
-        """Same as location_gln() but returns None for unknown/empty.
-
-        RegEngine's IngestEvent validator treats empty strings as missing
-        and rejects them; emit None instead so the optional field stays
-        truly optional on the wire.
-        """
         gln = self.location_gln(location_name)
         return gln or None
 

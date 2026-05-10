@@ -15,6 +15,7 @@ class ScenarioSummary(BaseModel):
     label: str
     description: str
     industry_type: str
+    operation_type: str
     reference_format: str
     requires_cooling: bool
 

@@ -2,6 +2,7 @@ const state = {
   status: null,
   health: null,
   events: [],
+  allScenarios: [],
   scenarioCatalog: {},
   eventSource: null,
   fallbackTimer: null,
@@ -17,6 +18,13 @@ const state = {
     leafy_greens_trace: 'Harvest through cooling, packout, shipment, and DC receipt for one leafy greens lot.',
   },
   scenarioSaves: [],
+  operationTypeLabels: {
+    all: 'All operations',
+    supplier: 'Supplier',
+    processor: 'Processor',
+    retailer: 'Retail / distribution',
+    first_receiver: 'First receiver',
+  },
   exportPresetDescriptions: {
     all_records: 'Full FDA-request export for the selected date range.',
   },
@@ -26,6 +34,7 @@ const DEFAULT_LIVE_INGEST_ENDPOINT = 'https://www.regengine.co/api/v1/webhooks/i
 
 const ids = {
   source: document.getElementById('source'),
+  operationType: document.getElementById('operationType'),
   scenario: document.getElementById('scenario'),
   interval: document.getElementById('interval'),
   batchSize: document.getElementById('batchSize'),
@@ -44,6 +53,7 @@ const ids = {
   demoFixture: document.getElementById('demoFixture'),
   demoFixtureDescription: document.getElementById('demoFixtureDescription'),
   loadFixtureBtn: document.getElementById('loadFixtureBtn'),
+  operationTypeDescription: document.getElementById('operationTypeDescription'),
   exportPreset: document.getElementById('exportPreset'),
   exportLot: document.getElementById('exportLot'),
   exportStartDate: document.getElementById('exportStartDate'),
@@ -116,18 +126,66 @@ function scenarioLabel(scenarioId) {
   return state.scenarioLabels[scenarioId] || scenarioId || 'Unknown';
 }
 
-function renderScenarioOptions(scenarios) {
-  const selected = ids.scenario.value || 'leafy_greens_supplier';
+function operationTypeLabel(operationType) {
+  return state.operationTypeLabels[operationType] || operationType || 'Unknown';
+}
+
+function scenariosForOperation(operationType = ids.operationType.value || 'all') {
+  if (operationType === 'all') {
+    return state.allScenarios;
+  }
+  return state.allScenarios.filter((scenario) => scenario.operation_type === operationType);
+}
+
+function renderOperationTypeOptions(scenarios, preferredOperationType = ids.operationType.value || 'all') {
+  const operationTypes = ['all', ...new Set(scenarios.map((scenario) => scenario.operation_type))];
+  ids.operationType.innerHTML = operationTypes
+    .map(
+      (operationType) => `
+        <option value="${escapeHtml(operationType)}">${escapeHtml(operationTypeLabel(operationType))}</option>
+      `,
+    )
+    .join('');
+  ids.operationType.value = operationTypes.includes(preferredOperationType) ? preferredOperationType : 'all';
+  updateOperationTypeDescription();
+}
+
+function updateOperationTypeDescription() {
+  const operationType = ids.operationType.value || 'all';
+  if (operationType === 'all') {
+    ids.operationTypeDescription.textContent =
+      'Choose the type of operation you run to narrow the scenario presets to matching flows.';
+    return;
+  }
+  const visibleCount = scenariosForOperation(operationType).length;
+  ids.operationTypeDescription.textContent =
+    `${operationTypeLabel(operationType)} view: showing ${visibleCount} matching scenario${visibleCount === 1 ? '' : 's'} you can start from.`;
+}
+
+function renderScenarioOptions(
+  scenarios,
+  preferredScenarioId = ids.scenario.value || 'leafy_greens_supplier',
+  preferredOperationType = null,
+) {
+  state.allScenarios = scenarios;
   state.scenarioCatalog = Object.fromEntries(scenarios.map((scenario) => [scenario.id, scenario]));
   state.scenarioLabels = Object.fromEntries(scenarios.map((scenario) => [scenario.id, scenario.label]));
-  ids.scenario.innerHTML = scenarios
+  const selectedScenario = state.scenarioCatalog[preferredScenarioId] || null;
+  renderOperationTypeOptions(
+    scenarios,
+    preferredOperationType || selectedScenario?.operation_type || ids.operationType.value || 'all',
+  );
+  const filteredScenarios = scenariosForOperation();
+  ids.scenario.innerHTML = filteredScenarios
     .map(
       (scenario) => `
         <option value="${escapeHtml(scenario.id)}">${escapeHtml(scenario.label)}</option>
       `,
     )
     .join('');
-  ids.scenario.value = state.scenarioLabels[selected] ? selected : scenarios[0]?.id || 'leafy_greens_supplier';
+  ids.scenario.value = filteredScenarios.some((scenario) => scenario.id === preferredScenarioId)
+    ? preferredScenarioId
+    : filteredScenarios[0]?.id || scenarios[0]?.id || 'leafy_greens_supplier';
   renderReadinessBanner(activeScenarioSummary(), state.events, state.status);
   renderScenarioWorkbench(state.status, state.events);
   renderRecordSpotlight(state.events);
@@ -143,7 +201,13 @@ function applyConfigToForm(config) {
     return;
   }
   ids.source.value = config.source || 'codex-simulator';
-  ids.scenario.value = config.scenario || 'leafy_greens_supplier';
+  const scenarioId = config.scenario || 'leafy_greens_supplier';
+  const scenario = state.scenarioCatalog[scenarioId];
+  renderScenarioOptions(
+    state.allScenarios.length ? state.allScenarios : Object.values(state.scenarioCatalog),
+    scenarioId,
+    scenario?.operation_type || null,
+  );
   ids.interval.value = config.interval_seconds ?? 1.5;
   ids.batchSize.value = config.batch_size ?? 3;
   ids.seed.value = config.seed ?? '';
@@ -399,6 +463,7 @@ function renderScenarioWorkbench(status = state.status, events = state.events) {
   const warningCount = readiness.missing;
   const transformCount = (events || []).filter((record) => record.event.cte_type === 'transformation').length;
   const cards = [
+    ['Operation', operationTypeLabel(summary.operation_type)],
     ['Industry', summary.industry_type],
     ['Reference format', summary.reference_format],
     ['Source CTE', sourceCte],
@@ -1195,6 +1260,9 @@ ids.exportLot.addEventListener('input', updateExportLink);
 ids.exportStartDate.addEventListener('change', updateExportLink);
 ids.exportEndDate.addEventListener('change', updateExportLink);
 ids.deliveryMode.addEventListener('change', () => updateShellStatus());
+ids.operationType.addEventListener('change', () => {
+  renderScenarioOptions(state.allScenarios, ids.scenario.value, ids.operationType.value);
+});
 ids.scenario.addEventListener('change', () => {
   renderReadinessBanner(activeScenarioSummary(), state.events, state.status);
   renderScenarioWorkbench(state.status, state.events);

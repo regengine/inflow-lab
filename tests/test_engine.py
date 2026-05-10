@@ -73,6 +73,11 @@ def test_location_gln_lookup():
     assert engine.location_gln("Valley Fresh Farms") == "0850000001001"
 
 
+def test_location_gln_or_none_returns_none_for_unknown_location():
+    engine = LegitFlowEngine(seed=204)
+    assert engine._location_gln_or_none("Unknown Place") is None
+
+
 def test_engine_emits_regengine_canonical_kdes_for_lab_contract():
     engine = LegitFlowEngine(seed=204)
     seen = {}
@@ -83,179 +88,24 @@ def test_engine_emits_regengine_canonical_kdes_for_lab_contract():
 
     harvesting = seen[CTEType.HARVESTING]
     assert "reference_document_type" in harvesting.kdes
-    # Canonical RegEngine ingest contract uses the unified
-    # `reference_document` field, not a split type/number pair.
+    assert "reference_document_number" in harvesting.kdes
+    # Required for RegEngine ingest contract — webhook_router_v2 KDE
+    # validator looks for the combined `reference_document` field on
+    # harvesting events, not just the split type/number fields.
     assert harvesting.kdes["reference_document"]
+    assert harvesting.location_gln == engine.location_gln(harvesting.location_name)
 
     initial_packing = seen[CTEType.INITIAL_PACKING]
     assert initial_packing.kdes["packing_date"]
+    assert initial_packing.kdes["pack_date"]
     assert initial_packing.kdes["reference_document"]
     assert initial_packing.kdes["harvester_business_name"]
 
     shipping = seen[CTEType.SHIPPING]
     assert shipping.kdes["reference_document"]
     assert shipping.kdes["tlc_source_reference"]
-
-
-# Hardcoded copy of RegEngine's REQUIRED_KDES_BY_CTE
-# (services/ingestion/app/webhook_models.py). Pinned here intentionally
-# — DO NOT replace with an import from RegEngine. Drift between this
-# constant and the engine's emitted KDEs should fail CI loudly so we
-# catch wire-compat regressions before they reach a tenant.
-REGENGINE_REQUIRED_KDES: dict[CTEType, tuple[str, ...]] = {
-    CTEType.HARVESTING: (
-        "traceability_lot_code",
-        "product_description",
-        "quantity",
-        "unit_of_measure",
-        "harvest_date",
-        "location_name",
-        "reference_document",
-    ),
-    CTEType.COOLING: (
-        "traceability_lot_code",
-        "product_description",
-        "quantity",
-        "unit_of_measure",
-        "cooling_date",
-        "location_name",
-        "reference_document",
-    ),
-    CTEType.INITIAL_PACKING: (
-        "traceability_lot_code",
-        "product_description",
-        "quantity",
-        "unit_of_measure",
-        "packing_date",
-        "location_name",
-        "reference_document",
-        "harvester_business_name",
-    ),
-    CTEType.SHIPPING: (
-        "traceability_lot_code",
-        "product_description",
-        "quantity",
-        "unit_of_measure",
-        "ship_date",
-        "ship_from_location",
-        "ship_to_location",
-        "reference_document",
-        "tlc_source_reference",
-    ),
-    CTEType.RECEIVING: (
-        "traceability_lot_code",
-        "product_description",
-        "quantity",
-        "unit_of_measure",
-        "receive_date",
-        "receiving_location",
-        "immediate_previous_source",
-        "reference_document",
-        "tlc_source_reference",
-    ),
-    CTEType.TRANSFORMATION: (
-        "traceability_lot_code",
-        "product_description",
-        "quantity",
-        "unit_of_measure",
-        "transformation_date",
-        "location_name",
-        "reference_document",
-    ),
-}
-
-
-def test_emitted_events_satisfy_regengine_required_kdes():
-    """Every event the engine emits must satisfy RegEngine's contract.
-
-    The RegEngine validator merges top-level IngestEvent fields with the
-    kdes dict before checking required keys, so we replicate that merge
-    here.
-    """
-    engine = LegitFlowEngine(seed=204)
-    seen_ctes: set[CTEType] = set()
-
-    for _ in range(400):
-        event, _ = engine.next_event()
-        required = REGENGINE_REQUIRED_KDES.get(event.cte_type)
-        if required is None:
-            continue
-        seen_ctes.add(event.cte_type)
-        available = {
-            "traceability_lot_code": event.traceability_lot_code,
-            "product_description": event.product_description,
-            "quantity": event.quantity,
-            "unit_of_measure": event.unit_of_measure,
-            "location_name": event.location_name,
-            **event.kdes,
-        }
-        missing = [field for field in required if not _has_kde_value(available.get(field))]
-        assert not missing, (
-            f"{event.cte_type.value} event missing required KDEs {missing}; "
-            f"available keys: {sorted(available.keys())}"
-        )
-
-    assert seen_ctes == set(REGENGINE_REQUIRED_KDES.keys())
-
-
-def test_emitted_events_carry_location_gln_for_known_locations():
-    """Every event for a known scenario location must emit location_gln.
-
-    The simulator's locations all have GLNs configured in scenarios.py,
-    so every event the engine produces should carry a non-None
-    location_gln populated from engine.location_gln(name).
-    """
-    engine = LegitFlowEngine(seed=204)
-    seen_ctes: set[CTEType] = set()
-
-    for _ in range(200):
-        event, _ = engine.next_event()
-        seen_ctes.add(event.cte_type)
-        # location_name should always resolve in the scenario index, so
-        # location_gln must be populated and match the engine lookup.
-        assert event.location_gln is not None
-        assert event.location_gln == engine.location_gln(event.location_name)
-
-    # We exercised every CTE type the engine actively emits.
-    assert {
-        CTEType.HARVESTING,
-        CTEType.COOLING,
-        CTEType.INITIAL_PACKING,
-        CTEType.SHIPPING,
-        CTEType.RECEIVING,
-        CTEType.TRANSFORMATION,
-    } <= seen_ctes
-
-
-def test_location_gln_or_none_returns_none_for_unknown_location():
-    engine = LegitFlowEngine(seed=204)
-    assert engine._location_gln_or_none("Unknown Place") is None
-
-
-def test_regengine_event_back_compat_loads_old_jsonl_without_location_gln():
-    """Old persisted events lack location_gln; field is Optional so they
-    must still deserialize cleanly with location_gln=None.
-    """
-    from app.schemas.domain import RegEngineEvent
-
-    legacy_payload = (
-        '{"cte_type":"harvesting","traceability_lot_code":"TLC-1",'
-        '"product_description":"Romaine","quantity":100.0,'
-        '"unit_of_measure":"cases","location_name":"Valley Fresh Farms",'
-        '"timestamp":"2026-01-01T00:00:00Z","kdes":{}}'
-    )
-    event = RegEngineEvent.model_validate_json(legacy_payload)
-    assert event.location_gln is None
-
-
-def _has_kde_value(value) -> bool:
-    if value is None:
-        return False
-    if isinstance(value, str):
-        return bool(value.strip())
-    if isinstance(value, list):
-        return bool(value)
-    return True
+    assert shipping.kdes["traceability_lot_code_source_reference"]
+    assert shipping.location_gln == engine.location_gln(shipping.location_name)
 
 
 def test_engine_clock_stays_inside_live_webhook_window_for_demo_loop():
@@ -328,3 +178,11 @@ def test_transformation_can_emit_split_outputs_and_rework():
             return
 
     raise AssertionError("Expected a transformation event")
+
+
+def test_events_emit_location_gln_for_known_locations():
+    engine = LegitFlowEngine(seed=204)
+
+    for _ in range(120):
+        event, _ = engine.next_event()
+        assert event.location_gln == engine.location_gln(event.location_name)

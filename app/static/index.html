@@ -120,6 +120,12 @@
                 <input id="tenantId" name="tenantId" autocomplete="off" placeholder="local-demo" />
               </label>
               <label>
+                Operation type
+                <select id="operationType" name="operationType">
+                  <option value="all" selected>All operations</option>
+                </select>
+              </label>
+              <label>
                 Scenario preset
                 <select id="scenario" name="scenario">
                   <option value="leafy_greens_supplier" selected>Leafy greens supplier</option>
@@ -148,6 +154,7 @@
                 <input id="source" name="source" value="codex-simulator" />
               </label>
             </form>
+            <p class="note" id="operationTypeDescription">Choose the type of operation you run to narrow the scenario presets to matching flows.</p>
             <p class="note" id="demoFixtureDescription">Harvest through cooling, packout, shipment, and DC receipt for one leafy greens lot.</p>
           </section>
 

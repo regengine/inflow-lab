@@ -34,6 +34,7 @@ def test_scenario_catalog_lists_required_presets():
     assert all(summary["label"] for summary in summaries)
     assert all(summary["description"] for summary in summaries)
     assert {summary["industry_type"] for summary in summaries} >= {"produce", "seafood", "dairy"}
+    assert {summary["operation_type"] for summary in summaries} >= {"supplier", "processor", "retailer", "first_receiver"}
     assert all(summary["reference_format"] for summary in summaries)
 
 

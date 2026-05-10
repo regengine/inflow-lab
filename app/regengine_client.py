@@ -16,6 +16,7 @@ from .schemas.simulation import SimulationConfig
 
 
 DEFAULT_LIVE_INGEST_ENDPOINT = "https://www.regengine.co/api/v1/webhooks/ingest"
+DEFAULT_LIVE_TIMEOUT_SECONDS = 30.0
 
 # Env var used to share an HMAC secret with the RegEngine ingest service.
 # When set, every live ingest request is signed with HMAC-SHA256 over the
@@ -80,7 +81,7 @@ class LiveRegEngineClient:
         if signature_header is not None:
             headers["X-Webhook-Signature"] = signature_header
         try:
-            async with httpx.AsyncClient(timeout=20.0) as client:
+            async with httpx.AsyncClient(timeout=_live_timeout_seconds()) as client:
                 response = await client.post(endpoint, headers=headers, content=body_bytes)
         except httpx.HTTPError as exc:
             raise LiveRegEngineDeliveryError(str(exc), metadata) from exc
@@ -107,6 +108,17 @@ def _build_signature_header(body_bytes: bytes) -> str | None:
         return None
     digest = hmac.new(secret.encode("utf-8"), body_bytes, hashlib.sha256).hexdigest()
     return f"sha256={digest}"
+
+
+def _live_timeout_seconds() -> float:
+    raw = os.getenv("REGENGINE_LIVE_TIMEOUT_SECONDS", "").strip()
+    if not raw:
+        return DEFAULT_LIVE_TIMEOUT_SECONDS
+    try:
+        timeout = float(raw)
+    except ValueError:
+        return DEFAULT_LIVE_TIMEOUT_SECONDS
+    return timeout if timeout > 0 else DEFAULT_LIVE_TIMEOUT_SECONDS
 
 
 def _delivery_metadata(
