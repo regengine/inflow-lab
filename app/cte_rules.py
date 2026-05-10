@@ -12,64 +12,114 @@ class CTEValidationWarning:
     message: str
 
 
+# Mirrors RegEngine's REQUIRED_KDES_BY_CTE
+# (services/ingestion/app/webhook_models.py). Top-level IngestEvent fields
+# (location_name, traceability_lot_code, product_description, quantity,
+# unit_of_measure) are merged with the kdes dict before checking, matching
+# how the RegEngine validator resolves required keys.
 REQUIRED_KDES: dict[CTEType, tuple[str, ...]] = {
     CTEType.HARVESTING: (
+        "traceability_lot_code",
+        "product_description",
+        "quantity",
+        "unit_of_measure",
         "harvest_date",
-        "farm_location",
-        "reference_document_number",
+        "location_name",
+        "reference_document",
     ),
     CTEType.COOLING: (
+        "traceability_lot_code",
+        "product_description",
+        "quantity",
+        "unit_of_measure",
         "cooling_date",
-        "cooling_location",
-        "reference_document_number",
+        "location_name",
+        "reference_document",
     ),
     CTEType.INITIAL_PACKING: (
-        "pack_date",
-        "packing_location",
-        "source_traceability_lot_code",
-        "reference_document_number",
+        "traceability_lot_code",
+        "product_description",
+        "quantity",
+        "unit_of_measure",
+        "packing_date",
+        "location_name",
+        "reference_document",
+        "harvester_business_name",
     ),
     CTEType.FIRST_LAND_BASED_RECEIVING: (
+        "traceability_lot_code",
+        "product_description",
+        "quantity",
+        "unit_of_measure",
         "landing_date",
+        "receiving_location",
         "first_land_based_receiver",
         "vessel_identifier",
+        "reference_document",
         "reference_document_number",
     ),
     CTEType.SHIPPING: (
+        "traceability_lot_code",
+        "product_description",
+        "quantity",
+        "unit_of_measure",
         "ship_date",
         "ship_from_location",
         "ship_to_location",
-        "reference_document_number",
+        "reference_document",
+        "tlc_source_reference",
     ),
     CTEType.RECEIVING: (
+        "traceability_lot_code",
+        "product_description",
+        "quantity",
+        "unit_of_measure",
         "receive_date",
         "receiving_location",
-        "ship_from_location",
-        "reference_document_number",
+        "immediate_previous_source",
+        "reference_document",
+        "tlc_source_reference",
     ),
     CTEType.TRANSFORMATION: (
+        "traceability_lot_code",
+        "product_description",
+        "quantity",
+        "unit_of_measure",
         "transformation_date",
-        "transformation_location",
-        "input_traceability_lot_codes",
-        "reference_document_number",
+        "location_name",
+        "reference_document",
     ),
 }
 
 RECOMMENDED_KDES: dict[CTEType, tuple[str, ...]] = {
-    CTEType.HARVESTING: ("field_name", "traceability_lot_code_source_reference"),
-    CTEType.COOLING: ("harvest_location", "traceability_lot_code_source_reference"),
-    CTEType.INITIAL_PACKING: ("farm_location", "traceability_lot_code_source_reference"),
-    CTEType.FIRST_LAND_BASED_RECEIVING: ("vessel_name", "water_temperature_c"),
+    CTEType.HARVESTING: ("field_name", "tlc_source_reference"),
+    CTEType.COOLING: ("harvest_location", "tlc_source_reference"),
+    CTEType.INITIAL_PACKING: ("farm_location", "tlc_source_reference"),
+    CTEType.FIRST_LAND_BASED_RECEIVING: ("vessel_name", "water_temperature_c", "tlc_source_reference"),
     CTEType.SHIPPING: ("carrier", "reference_document_type"),
-    CTEType.RECEIVING: ("reference_document_type", "traceability_lot_code_source_reference"),
-    CTEType.TRANSFORMATION: ("input_products", "reference_document_type"),
+    CTEType.RECEIVING: ("reference_document_type",),
+    CTEType.TRANSFORMATION: ("input_traceability_lot_codes", "input_products", "reference_document_type"),
 }
 
 
 def validate_event_kdes(event: RegEngineEvent) -> list[CTEValidationWarning]:
     warnings: list[CTEValidationWarning] = []
-    for field in REQUIRED_KDES[event.cte_type]:
-        if not _has_value(event.kdes.get(field)):
+
+    # Match RegEngine's validator: merge top-level IngestEvent fields with
+    # event.kdes so a required key satisfied at top level isn't flagged.
+    available: dict[str, Any] = {
+        "location_name": event.location_name,
+        "location_gln": event.location_gln,
+        "traceability_lot_code": event.traceability_lot_code,
+        "product_description": event.product_description,
+        "quantity": event.quantity,
+        "unit_of_measure": event.unit_of_measure,
+        **event.kdes,
+    }
+
+    required = REQUIRED_KDES.get(event.cte_type, ())
+    for field in required:
+        if not _has_value(available.get(field)):
             warnings.append(
                 CTEValidationWarning(
                     field=field,
@@ -77,8 +127,8 @@ def validate_event_kdes(event: RegEngineEvent) -> list[CTEValidationWarning]:
                 )
             )
 
-    for field in RECOMMENDED_KDES[event.cte_type]:
-        if not _has_value(event.kdes.get(field)):
+    for field in RECOMMENDED_KDES.get(event.cte_type, ()):
+        if not _has_value(available.get(field)):
             warnings.append(
                 CTEValidationWarning(
                     field=field,

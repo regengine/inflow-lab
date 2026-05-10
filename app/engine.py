@@ -185,6 +185,7 @@ class LegitFlowEngine:
             quantity=lot.quantity,
             unit_of_measure=lot.unit_of_measure,
             location_name=source_location.name,
+            location_gln=self._location_gln_or_none(source_location.name),
             timestamp=timestamp,
             kdes=lot.source_details,
         )
@@ -207,16 +208,9 @@ class LegitFlowEngine:
             quantity=lot.quantity,
             unit_of_measure=lot.unit_of_measure,
             location_name=cooler.name,
+            location_gln=self._location_gln_or_none(cooler.name),
             timestamp=timestamp,
-            kdes={
-                "cooling_date": timestamp.date().isoformat(),
-                "cooling_location": cooler.name,
-                "harvest_location": lot.origin_location,
-                "reference_document": self._reference_document(lot.current_reference_type, lot.current_reference_number),
-                "reference_document_type": lot.current_reference_type,
-                "reference_document_number": lot.current_reference_number,
-                "traceability_lot_code_source_reference": lot.tlc_source_reference,
-            },
+            kdes=self.adapter.cooling_kdes(engine=self, lot=lot, cooler=cooler, timestamp=timestamp),
         )
         return event, [lot.lot_code]
 
@@ -256,6 +250,7 @@ class LegitFlowEngine:
             quantity=packed_lot.quantity,
             unit_of_measure=packed_lot.unit_of_measure,
             location_name=packer.name,
+            location_gln=self._location_gln_or_none(packer.name),
             timestamp=timestamp,
             kdes=self.adapter.packing_kdes(
                 engine=self,
@@ -312,6 +307,7 @@ class LegitFlowEngine:
             quantity=lot.quantity,
             unit_of_measure=lot.unit_of_measure,
             location_name=shipment.from_location,
+            location_gln=self._location_gln_or_none(shipment.from_location),
             timestamp=timestamp,
             kdes={
                 "ship_date": timestamp.date().isoformat(),
@@ -323,7 +319,6 @@ class LegitFlowEngine:
                 "reference_document_number": shipment.reference_number,
                 "sscc": shipment.reference_number if self.scenario.reference_format == "GS1" else None,
                 "tlc_source_reference": lot.tlc_source_reference,
-                "traceability_lot_code_source_reference": lot.tlc_source_reference,
             },
         )
         return event, lot.parents or [lot.lot_code]
@@ -353,6 +348,7 @@ class LegitFlowEngine:
             quantity=lot.quantity,
             unit_of_measure=lot.unit_of_measure,
             location_name=shipment.to_location,
+            location_gln=self._location_gln_or_none(shipment.to_location),
             timestamp=timestamp,
             kdes={
                 "receive_date": timestamp.date().isoformat(),
@@ -364,7 +360,6 @@ class LegitFlowEngine:
                 "reference_document_number": shipment.reference_number,
                 "sscc": shipment.reference_number if self.scenario.reference_format == "GS1" else None,
                 "tlc_source_reference": lot.tlc_source_reference,
-                "traceability_lot_code_source_reference": lot.tlc_source_reference,
             },
         )
         return event, lot.parents or [lot.lot_code]
@@ -434,6 +429,7 @@ class LegitFlowEngine:
             quantity=outputs[0].quantity,
             unit_of_measure=outputs[0].unit_of_measure,
             location_name=processor.name,
+            location_gln=self._location_gln_or_none(processor.name),
             timestamp=timestamp,
             kdes=self.adapter.transformation_kdes(
                 engine=self,
@@ -453,6 +449,16 @@ class LegitFlowEngine:
     def location_gln(self, location_name: str) -> str:
         location = self.location_index.get(location_name)
         return location.gln if location else ""
+
+    def _location_gln_or_none(self, location_name: str) -> str | None:
+        """Same as location_gln() but returns None for unknown/empty.
+
+        RegEngine's IngestEvent validator treats empty strings as missing
+        and rejects them; emit None instead so the optional field stays
+        truly optional on the wire.
+        """
+        gln = self.location_gln(location_name)
+        return gln or None
 
     def _make_lot_code(self, prefix: str) -> str:
         if self.scenario.reference_format == "GS1":

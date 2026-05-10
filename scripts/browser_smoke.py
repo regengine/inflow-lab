@@ -171,7 +171,7 @@ def _run_dashboard_smoke(base_url: str, config: BrowserSmokeConfig) -> None:
             page.locator("#csvFile").set_input_files(str(csv_path))
             page.locator("#importCsvBtn").click()
             expect(page.locator("#statusMessage")).to_contain_text("warning")
-            expect(page.locator("#importResults")).to_contain_text("Missing expected harvesting KDE: farm_location")
+            expect(page.locator("#importResults")).to_contain_text("Missing expected harvesting KDE: reference_document")
 
             browser.close()
     except Exception:
