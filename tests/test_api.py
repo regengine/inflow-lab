@@ -1527,8 +1527,9 @@ receiving,TLC-CSV-BAD,Romaine Lettuce,,cases,Distribution Center #4,2026-02-05T1
     ]
     assert {warning["field"] for warning in body["warnings"]} >= {
         "farm_location",
-        "reference_document_number",
-        "packing_location",
+        "reference_document",
+        "packing_date",
+        "tlc_source_reference",
     }
 
     events = client.get("/api/events?limit=10").json()["events"]
@@ -1542,6 +1543,7 @@ receiving,TLC-CSV-BAD,Romaine Lettuce,,cases,Distribution Center #4,2026-02-05T1
         "quantity",
         "unit_of_measure",
         "location_name",
+        "location_gln",
         "timestamp",
         "kdes",
     }
@@ -1608,6 +1610,7 @@ TLC-SEED-001,Spinach,80,cases,Valley Fresh Farms,2026-02-06T09:15:00Z,Field-9,Ce
     assert event["kdes"]["farm_location"] == "Valley Fresh Farms"
     assert event["kdes"]["field_name"] == "Field-9"
     assert event["kdes"]["reference_document_number"] == "CSV-TLC-SEED-001"
+    assert event["kdes"]["tlc_source_reference"] == "CSV-SEED-TLC-SEED-001"
 
 
 def test_reset_applies_scenario_config_and_keeps_mock_delivery_default(tmp_path):

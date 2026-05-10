@@ -73,6 +73,11 @@ def test_location_gln_lookup():
     assert engine.location_gln("Valley Fresh Farms") == "0850000001001"
 
 
+def test_location_gln_or_none_returns_none_for_unknown_location():
+    engine = LegitFlowEngine(seed=204)
+    assert engine._location_gln_or_none("Unknown Place") is None
+
+
 def test_engine_emits_regengine_canonical_kdes_for_lab_contract():
     engine = LegitFlowEngine(seed=204)
     seen = {}
@@ -88,6 +93,7 @@ def test_engine_emits_regengine_canonical_kdes_for_lab_contract():
     # validator looks for the combined `reference_document` field on
     # harvesting events, not just the split type/number fields.
     assert harvesting.kdes["reference_document"]
+    assert harvesting.location_gln == engine.location_gln(harvesting.location_name)
 
     initial_packing = seen[CTEType.INITIAL_PACKING]
     assert initial_packing.kdes["packing_date"]
@@ -99,6 +105,7 @@ def test_engine_emits_regengine_canonical_kdes_for_lab_contract():
     assert shipping.kdes["reference_document"]
     assert shipping.kdes["tlc_source_reference"]
     assert shipping.kdes["traceability_lot_code_source_reference"]
+    assert shipping.location_gln == engine.location_gln(shipping.location_name)
 
 
 def test_engine_clock_stays_inside_live_webhook_window_for_demo_loop():
@@ -171,3 +178,11 @@ def test_transformation_can_emit_split_outputs_and_rework():
             return
 
     raise AssertionError("Expected a transformation event")
+
+
+def test_events_emit_location_gln_for_known_locations():
+    engine = LegitFlowEngine(seed=204)
+
+    for _ in range(120):
+        event, _ = engine.next_event()
+        assert event.location_gln == engine.location_gln(event.location_name)

@@ -39,6 +39,7 @@ class IndustryAdapter:
             ),
             "reference_document_type": lot.current_reference_type,
             "reference_document_number": lot.current_reference_number,
+            "tlc_source_reference": lot.tlc_source_reference,
             "traceability_lot_code_source_reference": lot.tlc_source_reference,
         }
 
@@ -60,6 +61,7 @@ class IndustryAdapter:
             ),
             "reference_document_type": lot.current_reference_type,
             "reference_document_number": lot.current_reference_number,
+            "tlc_source_reference": lot.tlc_source_reference,
             "traceability_lot_code_source_reference": lot.tlc_source_reference,
         }
 
@@ -85,6 +87,7 @@ class IndustryAdapter:
             "reference_document_type": packed_lot.current_reference_type,
             "reference_document_number": packed_lot.current_reference_number,
             "harvester_business_name": source_lot.origin_location,
+            "tlc_source_reference": packed_lot.tlc_source_reference,
             "traceability_lot_code_source_reference": packed_lot.tlc_source_reference,
         }
 
@@ -116,6 +119,7 @@ class IndustryAdapter:
             "commingled_input_lot_count": len(inputs),
             "rework_traceability_lot_codes": [lot.lot_code for lot in rework_lots],
             "batch_number": reference_number,
+            "tlc_source_reference": outputs[0].tlc_source_reference,
             "traceability_lot_code_source_reference": outputs[0].tlc_source_reference,
         }
 
@@ -180,6 +184,7 @@ class SeafoodAdapter(IndustryAdapter):
         )
         return {
             "landing_date": timestamp.date().isoformat(),
+            "receiving_location": location.name,
             "first_land_based_receiver": location.name,
             "vessel_identifier": vessel_id,
             "vessel_name": vessel_name,
@@ -194,6 +199,7 @@ class SeafoodAdapter(IndustryAdapter):
             ),
             "reference_document_type": lot.current_reference_type,
             "reference_document_number": lot.current_reference_number,
+            "tlc_source_reference": lot.tlc_source_reference,
             "traceability_lot_code_source_reference": lot.tlc_source_reference,
         }
 

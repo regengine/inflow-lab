@@ -167,6 +167,7 @@ def _parse_seed_lot(
         kdes.setdefault("immediate_subsequent_recipient", row["immediate_subsequent_recipient"])
     kdes.setdefault("reference_document_type", "Seed Lot Import")
     kdes.setdefault("reference_document_number", f"CSV-{row['traceability_lot_code']}")
+    kdes.setdefault("tlc_source_reference", f"CSV-SEED-{row['traceability_lot_code']}")
     kdes.setdefault("traceability_lot_code_source_reference", f"CSV-SEED-{row['traceability_lot_code']}")
 
     return _build_event(

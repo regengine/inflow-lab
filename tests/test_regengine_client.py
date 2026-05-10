@@ -125,6 +125,14 @@ def test_live_client_uses_configured_endpoint_override(monkeypatch: Any) -> None
     assert call["endpoint"] == override
 
 
+def test_live_client_timeout_is_operator_configurable(monkeypatch: Any) -> None:
+    monkeypatch.setenv("REGENGINE_LIVE_TIMEOUT_SECONDS", "60")
+
+    call = run_ingest(monkeypatch, make_live_config())
+
+    assert call["timeout"] == 60.0
+
+
 def test_live_client_sends_required_headers_and_contract_payload(monkeypatch: Any) -> None:
     call = run_ingest(monkeypatch, make_live_config())
 
@@ -146,6 +154,7 @@ def test_live_client_sends_required_headers_and_contract_payload(monkeypatch: An
         "quantity",
         "unit_of_measure",
         "location_name",
+        "location_gln",
         "timestamp",
         "kdes",
     }
@@ -156,6 +165,7 @@ def test_live_client_sends_required_headers_and_contract_payload(monkeypatch: An
         "quantity": 500.0,
         "unit_of_measure": "cases",
         "location_name": "Distribution Center #4",
+        "location_gln": None,
         "timestamp": "2026-02-05T08:30:00Z",
         "kdes": {
             "receive_date": "2026-02-05",

@@ -57,6 +57,7 @@ class RegEngineEvent(BaseModel):
     quantity: float
     unit_of_measure: str
     location_name: str
+    location_gln: str | None = None
     timestamp: datetime
     kdes: dict[str, Any] = Field(default_factory=dict)
 

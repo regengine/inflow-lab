@@ -20,6 +20,7 @@ TLC-SEED-DEFAULT,Romaine Hearts,42,cases,Valley Fresh Farms
     assert event.timestamp == datetime(2026, 2, 7, 11, 30, tzinfo=UTC)
     assert event.kdes["harvest_date"] == "2026-02-07"
     assert event.kdes["reference_document_number"] == "CSV-TLC-SEED-DEFAULT"
+    assert event.kdes["tlc_source_reference"] == "CSV-SEED-TLC-SEED-DEFAULT"
 
 
 def test_parse_scheduled_event_reports_invalid_cte_timestamp_and_kdes():
@@ -53,8 +54,8 @@ transformation,TLC-OUT,Fresh Cut Salad Mix,50,cases,ReadyFresh Processing Plant,
     assert parsed.events[0].kdes["input_traceability_lot_codes"] == ["TLC-IN-1", "TLC-IN-2"]
     assert {warning.field for warning in parsed.warnings} >= {
         "transformation_date",
-        "transformation_location",
-        "reference_document_number",
+        "reference_document",
+        "reference_document_type",
     }
 
 
@@ -76,5 +77,5 @@ transformation,TLC-OUT,Fresh Cut Salad Mix,50,cases,ReadyFresh Processing Plant,
             "input_traceability_lot_codes",
             "Transformation input_traceability_lot_codes should be a non-empty list of lot codes",
         ),
-        ("reference_document_number", "Missing expected transformation KDE: reference_document_number"),
+        ("reference_document", "Missing expected transformation KDE: reference_document"),
     }
