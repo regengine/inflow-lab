@@ -1,12 +1,18 @@
 from __future__ import annotations
 
 import random
+import os
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 from itertools import count
+from typing import Any
 
+from .industry_adapters import get_industry_adapter
 from .schemas.domain import CTEType, RegEngineEvent
 from .scenarios import Location, ProductSpec, ScenarioId, get_scenario
+
+
+DEFAULT_MAX_FUTURE_HOURS = 20
 
 
 @dataclass(slots=True)
@@ -22,6 +28,10 @@ class Lot:
     current_reference_type: str | None = None
     current_reference_number: str | None = None
     tlc_source_reference: str | None = None
+    packaging_level: str = "bulk"
+    packaging_hierarchy: tuple[str, ...] = ()
+    continuous_flow: bool = False
+    source_details: dict[str, Any] = field(default_factory=dict)
 
 
 @dataclass(slots=True)
@@ -59,6 +69,7 @@ class LegitFlowEngine:
         self._time_cursor = datetime.now(UTC) - timedelta(hours=12)
         self.scenario = get_scenario(scenario or self._initial_scenario)
         self.scenario_id = self.scenario.id
+        self.adapter = get_industry_adapter(self.scenario.industry_type)
 
         self.farms = list(self.scenario.farms)
         self.coolers = list(self.scenario.coolers)
@@ -119,9 +130,9 @@ class LegitFlowEngine:
         weights = self.scenario.action_weights
         if len(self.harvested) < self.scenario.harvest_target:
             weighted_actions.extend(["harvest"] * weights["harvest"])
-        if self.harvested:
+        if self.scenario.requires_cooling and self.harvested:
             weighted_actions.extend(["cool"] * weights["cool"])
-        if self.cooled:
+        if self._packing_source_pool():
             weighted_actions.extend(["initial_pack"] * weights["initial_pack"])
         if self.packed or self.transformed or self.dc_inventory:
             weighted_actions.extend(["ship"] * weights["ship"])
@@ -134,45 +145,48 @@ class LegitFlowEngine:
         return self.rng.choice(weighted_actions)
 
     def _harvest(self) -> tuple[RegEngineEvent, list[str]]:
-        farm = self.rng.choice(self.farms)
+        source_location = self.adapter.source_location(self)
         product: ProductSpec = self.rng.choice(self.products)
         lot_code = self._make_lot_code(prefix="TLC")
-        quantity = self._quantity(120, 640)
+        quantity_low, quantity_high = self.adapter.source_quantity_range(product)
+        quantity = self._quantity(quantity_low, quantity_high)
         timestamp = self._advance_time(15, 90)
-        reference_number = self._reference("HAR")
+        reference_prefix = "LAND" if self.scenario.source_cte_type == CTEType.FIRST_LAND_BASED_RECEIVING else "HAR"
+        reference_number = self._reference(reference_prefix)
+        next_location = self._default_next_location()
 
         lot = Lot(
             lot_code=lot_code,
             product_description=product.name,
             quantity=quantity,
             unit_of_measure=product.unit,
-            current_location=farm.name,
+            current_location=source_location.name,
             stage="harvested",
-            origin_location=farm.name,
-            current_reference_type="Harvest Log",
+            origin_location=source_location.name,
+            current_reference_type=self.adapter.source_reference_type,
             current_reference_number=reference_number,
             tlc_source_reference=self._reference("SRC"),
+            continuous_flow=self.scenario.industry_type == "dairy",
+        )
+        lot.source_details = self.adapter.source_kdes(
+            engine=self,
+            lot=lot,
+            location=source_location,
+            product=product,
+            timestamp=timestamp,
+            next_location=next_location,
         )
         self.harvested.append(lot)
 
         event = RegEngineEvent(
-            cte_type=CTEType.HARVESTING,
+            cte_type=self.scenario.source_cte_type,
             traceability_lot_code=lot.lot_code,
             product_description=lot.product_description,
             quantity=lot.quantity,
             unit_of_measure=lot.unit_of_measure,
-            location_name=farm.name,
+            location_name=source_location.name,
             timestamp=timestamp,
-            kdes={
-                "harvest_date": timestamp.date().isoformat(),
-                "farm_location": farm.name,
-                "field_name": f"Field-{self.rng.randint(1, 18)}",
-                "immediate_subsequent_recipient": self.rng.choice(self.coolers).name,
-                "reference_document": self._reference_document(lot.current_reference_type, reference_number),
-                "reference_document_type": lot.current_reference_type,
-                "reference_document_number": reference_number,
-                "traceability_lot_code_source_reference": lot.tlc_source_reference,
-            },
+            kdes=lot.source_details,
         )
         return event, []
 
@@ -207,9 +221,10 @@ class LegitFlowEngine:
         return event, [lot.lot_code]
 
     def _initial_pack(self) -> tuple[RegEngineEvent, list[str]]:
-        if not self.cooled:
-            raise RuntimeError("Initial packing requires a cooled source lot")
-        source_lot = self.cooled.pop(self.rng.randrange(len(self.cooled)))
+        source_pool = self._packing_source_pool()
+        if not source_pool:
+            raise RuntimeError("Initial packing requires a source lot")
+        source_lot = source_pool.pop(self.rng.randrange(len(source_pool)))
         packer = self.rng.choice(self.packers)
         packed_lot_code = self._make_lot_code(prefix="TLC")
         packed_quantity = self._quantity(source_lot.quantity * 0.92, source_lot.quantity * 1.02)
@@ -228,6 +243,9 @@ class LegitFlowEngine:
             current_reference_type="Packout Record",
             current_reference_number=reference_number,
             tlc_source_reference=self._reference("SRC"),
+            packaging_level="master_case" if self.scenario.industry_type in {"produce", "seafood"} else "tote",
+            packaging_hierarchy=tuple(self._default_packaging_hierarchy()),
+            continuous_flow=source_lot.continuous_flow,
         )
         self.packed.append(packed_lot)
 
@@ -239,18 +257,13 @@ class LegitFlowEngine:
             unit_of_measure=packed_lot.unit_of_measure,
             location_name=packer.name,
             timestamp=timestamp,
-            kdes={
-                "packing_date": timestamp.date().isoformat(),
-                "pack_date": timestamp.date().isoformat(),
-                "packing_location": packer.name,
-                "source_traceability_lot_code": source_lot.lot_code,
-                "farm_location": source_lot.origin_location,
-                "reference_document": self._reference_document(packed_lot.current_reference_type, reference_number),
-                "reference_document_type": packed_lot.current_reference_type,
-                "reference_document_number": reference_number,
-                "harvester_business_name": source_lot.origin_location,
-                "traceability_lot_code_source_reference": packed_lot.tlc_source_reference,
-            },
+            kdes=self.adapter.packing_kdes(
+                engine=self,
+                source_lot=source_lot,
+                packed_lot=packed_lot,
+                packer=packer,
+                timestamp=timestamp,
+            ),
         )
         return event, [source_lot.lot_code]
 
@@ -308,6 +321,7 @@ class LegitFlowEngine:
                 "reference_document": self._reference_document(shipment.reference_type, shipment.reference_number),
                 "reference_document_type": shipment.reference_type,
                 "reference_document_number": shipment.reference_number,
+                "sscc": shipment.reference_number if self.scenario.reference_format == "GS1" else None,
                 "tlc_source_reference": lot.tlc_source_reference,
                 "traceability_lot_code_source_reference": lot.tlc_source_reference,
             },
@@ -348,6 +362,7 @@ class LegitFlowEngine:
                 "reference_document": self._reference_document(shipment.reference_type, shipment.reference_number),
                 "reference_document_type": shipment.reference_type,
                 "reference_document_number": shipment.reference_number,
+                "sscc": shipment.reference_number if self.scenario.reference_format == "GS1" else None,
                 "tlc_source_reference": lot.tlc_source_reference,
                 "traceability_lot_code_source_reference": lot.tlc_source_reference,
             },
@@ -362,46 +377,76 @@ class LegitFlowEngine:
         processor = self.rng.choice(self.processors)
         output_description = self.rng.choice(self.transformation_outputs)
         total_input_qty = sum(lot.quantity for lot in inputs)
-        output_qty = self._quantity(total_input_qty * 0.78, total_input_qty * 0.91)
+        gross_output_qty = self._quantity(total_input_qty * 0.78, total_input_qty * 0.91)
         timestamp = self._advance_time(35, 150)
         reference_number = self._reference("BATCH")
-        output_lot_code = self._make_lot_code(prefix="TLC")
+        output_count = self._transform_output_count()
+        rework_qty = 0.0
+        rework_lots: list[Lot] = []
+        if self._should_create_rework(inputs):
+            rework_qty = round(gross_output_qty * self.rng.uniform(0.06, 0.14), 2)
+        sellable_qty = max(gross_output_qty - rework_qty, 1.0)
+        output_quantities = self._split_quantity(sellable_qty, output_count)
 
-        output_lot = Lot(
-            lot_code=output_lot_code,
-            product_description=output_description,
-            quantity=output_qty,
-            unit_of_measure="cases",
-            current_location=processor.name,
-            stage="transformed",
-            parents=[lot.lot_code for lot in inputs],
-            origin_location=processor.name,
-            current_reference_type="Batch Record",
-            current_reference_number=reference_number,
-            tlc_source_reference=self._reference("SRC"),
-        )
-        self.transformed.append(output_lot)
+        outputs: list[Lot] = []
+        for index, output_qty in enumerate(output_quantities, start=1):
+            lot_code = self._make_lot_code(prefix="TLC")
+            output_lot = Lot(
+                lot_code=lot_code,
+                product_description=output_description if output_count == 1 else f"{output_description} #{index}",
+                quantity=output_qty,
+                unit_of_measure=self._transform_output_unit(inputs),
+                current_location=processor.name,
+                stage="transformed",
+                parents=[lot.lot_code for lot in inputs],
+                origin_location=processor.name,
+                current_reference_type="Batch Record",
+                current_reference_number=reference_number,
+                tlc_source_reference=self._reference("SRC"),
+                packaging_level="finished_good",
+                packaging_hierarchy=tuple(self._default_packaging_hierarchy()),
+            )
+            outputs.append(output_lot)
+            self.transformed.append(output_lot)
+
+        if rework_qty > 0:
+            rework_lot = Lot(
+                lot_code=self._make_lot_code(prefix="TLC"),
+                product_description=f"Rework of {output_description}",
+                quantity=rework_qty,
+                unit_of_measure=self._transform_output_unit(inputs),
+                current_location=processor.name,
+                stage="processor_inventory",
+                parents=[outputs[0].lot_code],
+                origin_location=processor.name,
+                current_reference_type="Rework Hold Tag",
+                current_reference_number=self._reference("REWORK"),
+                tlc_source_reference=self._reference("SRC"),
+                packaging_level="rework",
+            )
+            rework_lots.append(rework_lot)
+            self.processor_inventory.append(rework_lot)
 
         event = RegEngineEvent(
             cte_type=CTEType.TRANSFORMATION,
-            traceability_lot_code=output_lot.lot_code,
-            product_description=output_lot.product_description,
-            quantity=output_lot.quantity,
-            unit_of_measure=output_lot.unit_of_measure,
+            traceability_lot_code=outputs[0].lot_code,
+            product_description=outputs[0].product_description,
+            quantity=outputs[0].quantity,
+            unit_of_measure=outputs[0].unit_of_measure,
             location_name=processor.name,
             timestamp=timestamp,
-            kdes={
-                "transformation_date": timestamp.date().isoformat(),
-                "transformation_location": processor.name,
-                "location_name": processor.name,
-                "input_traceability_lot_codes": [lot.lot_code for lot in inputs],
-                "input_products": [lot.product_description for lot in inputs],
-                "reference_document": self._reference_document(output_lot.current_reference_type, output_lot.current_reference_number),
-                "reference_document_type": output_lot.current_reference_type,
-                "reference_document_number": output_lot.current_reference_number,
-                "yield_ratio": round(output_qty / total_input_qty, 3) if total_input_qty else 0,
-                "traceability_lot_code_source_reference": output_lot.tlc_source_reference,
-            },
+            kdes=self.adapter.transformation_kdes(
+                engine=self,
+                inputs=inputs,
+                outputs=outputs,
+                rework_lots=rework_lots,
+                processor=processor,
+                timestamp=timestamp,
+                reference_type=outputs[0].current_reference_type or "Batch Record",
+                reference_number=reference_number,
+                total_input_qty=total_input_qty,
+                total_output_qty=gross_output_qty,
+            ),
         )
         return event, [lot.lot_code for lot in inputs]
 
@@ -410,19 +455,110 @@ class LegitFlowEngine:
         return location.gln if location else ""
 
     def _make_lot_code(self, prefix: str) -> str:
+        if self.scenario.reference_format == "GS1":
+            return self._make_sgtin()
         return f"{prefix}-{self._time_cursor.strftime('%Y%m%d')}-{next(self._lot_counter):06d}"
 
     def _reference(self, prefix: str) -> str:
+        if self.scenario.reference_format == "GS1" and prefix in {"BOL", "LAND"}:
+            return self._make_sscc()
         return f"{prefix}-{self._time_cursor.strftime('%Y%m%d')}-{next(self._ref_counter):05d}"
 
     def _reference_document(self, reference_type: str | None, reference_number: str | None) -> str:
         if reference_type and reference_number:
+            if self.scenario.reference_format == "GS1":
+                if reference_type in {"Bill of Lading", "Landing Receipt"}:
+                    return f"GS1-128 (00){reference_number}"
+                if "Batch" in reference_type:
+                    return f"GS1-128 (10){reference_number}"
+                return f"GS1 {reference_type} {reference_number}"
             return f"{reference_type} {reference_number}"
         return reference_number or reference_type or ""
 
     def _advance_time(self, min_minutes: int, max_minutes: int) -> datetime:
         self._time_cursor += timedelta(minutes=self.rng.randint(min_minutes, max_minutes))
+        live_window_ceiling = datetime.now(UTC) + timedelta(hours=_max_future_hours())
+        if self._time_cursor > live_window_ceiling:
+            self._time_cursor = live_window_ceiling
         return self._time_cursor
 
     def _quantity(self, low: float, high: float) -> float:
         return round(self.rng.uniform(float(low), float(high)), 2)
+
+    def _packing_source_pool(self) -> list[Lot]:
+        if self.scenario.requires_cooling:
+            return self.cooled
+        return self.harvested
+
+    def _default_next_location(self) -> str:
+        if self.scenario.requires_cooling and self.coolers:
+            return self.rng.choice(self.coolers).name
+        if self.packers:
+            return self.rng.choice(self.packers).name
+        if self.processors:
+            return self.rng.choice(self.processors).name
+        return ""
+
+    def _default_packaging_hierarchy(self) -> list[str]:
+        if self.scenario.industry_type == "seafood":
+            return ["harvest_tote", "fillet_bag", "master_case"]
+        if self.scenario.industry_type == "dairy":
+            return ["farm_silo", "processing_vat", "tote", "pallet"]
+        return ["bulk_bin", "individual_clamshell", "master_case"]
+
+    def _transform_output_count(self) -> int:
+        if self.scenario.industry_type in {"produce", "seafood"}:
+            return self.rng.choice((1, 2, 3))
+        return self.rng.choice((1, 2))
+
+    def _transform_output_unit(self, inputs: list[Lot]) -> str:
+        if self.scenario.industry_type == "produce":
+            return "cases"
+        return inputs[0].unit_of_measure if inputs else "cases"
+
+    def _should_create_rework(self, inputs: list[Lot]) -> bool:
+        return len(inputs) > 1 and self.rng.random() < 0.45
+
+    def _split_quantity(self, total: float, count_: int) -> list[float]:
+        if count_ <= 1:
+            return [round(total, 2)]
+        weights = [self.rng.uniform(0.8, 1.4) for _ in range(count_)]
+        weight_total = sum(weights) or 1.0
+        values = [round(total * weight / weight_total, 2) for weight in weights]
+        delta = round(total - sum(values), 2)
+        values[0] = round(values[0] + delta, 2)
+        return values
+
+    def _make_sgtin(self) -> str:
+        serial = next(self._lot_counter)
+        company_prefix = "8500000"
+        item_reference = f"{10000 + (serial % 89999):05d}"
+        serial_component = f"{self._time_cursor.strftime('%y%m%d')}{serial:06d}"
+        return f"urn:epc:id:sgtin:{company_prefix}.{item_reference}.{serial_component}"
+
+    def _make_sscc(self) -> str:
+        company_prefix = "8500000"
+        serial = next(self._ref_counter)
+        base = f"0{company_prefix}{self._time_cursor.strftime('%j')}{serial:07d}"[:17]
+        return f"{base}{self._gs1_check_digit(base)}"
+
+    def _gs1_check_digit(self, digits: str) -> int:
+        total = 0
+        for index, digit in enumerate(reversed(digits), start=1):
+            total += int(digit) * (3 if index % 2 else 1)
+        return (10 - (total % 10)) % 10
+
+    def _gps_coordinate(self) -> str:
+        lat = round(self.rng.uniform(32.0, 39.5), 4)
+        lon = round(self.rng.uniform(-122.5, -114.0), 4)
+        return f"{lat},{lon}"
+
+    def _plu_code(self) -> str:
+        return f"{self.rng.randint(3000, 4999)}"
+
+
+def _max_future_hours() -> int:
+    try:
+        return int(os.getenv("REGENGINE_SIM_MAX_FUTURE_HOURS", str(DEFAULT_MAX_FUTURE_HOURS)))
+    except ValueError:
+        return DEFAULT_MAX_FUTURE_HOURS

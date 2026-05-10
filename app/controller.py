@@ -6,6 +6,7 @@ from dataclasses import dataclass
 from datetime import UTC, datetime
 from typing import Any
 
+from .audit import summarize_scenario_audit
 from .csv_importer import parse_csv_import
 from .demo_fixtures import get_demo_fixture
 from .engine import LegitFlowEngine
@@ -658,11 +659,14 @@ class SimulationController:
         }
 
     def status(self) -> dict[str, Any]:
+        records = self.store.all_between()
+        scenario = get_scenario(self.config.scenario)
         return {
             "running": self.running,
             "config": self._sanitize_public_config(self.config).model_dump(mode="json"),
             "stats": {
                 **self.store.stats(),
+                "audit": summarize_scenario_audit(records, scenario),
                 "engine": self.engine.snapshot(),
             },
         }

@@ -123,8 +123,51 @@ def test_scenario_catalog_endpoint_lists_supported_presets():
         "leafy_greens_supplier",
         "fresh_cut_processor",
         "retailer_readiness_demo",
+        "seafood_first_receiver",
+        "dairy_continuous_flow",
     ]
     assert all(scenario["label"] for scenario in scenarios)
+    assert {scenario["industry_type"] for scenario in scenarios} >= {"produce", "seafood", "dairy"}
+
+
+def test_status_includes_backend_audit_summary():
+    client.post(
+        "/api/simulate/reset",
+        json={
+            "scenario": "leafy_greens_supplier",
+            "batch_size": 1,
+            "seed": 204,
+        },
+    )
+    client.post("/api/simulate/step")
+
+    status = client.get("/api/simulate/status").json()
+    audit = status["stats"]["audit"]
+
+    assert audit["industry_type"] == "produce"
+    assert audit["reference_format"] == "GS1"
+    assert isinstance(audit["score"], int)
+    assert audit["total"] >= 1
+    assert isinstance(audit["checks"], list)
+
+
+def test_status_audit_tracks_seafood_readiness_shape():
+    client.post(
+        "/api/simulate/reset",
+        json={
+            "scenario": "seafood_first_receiver",
+            "batch_size": 1,
+            "seed": 204,
+        },
+    )
+    client.post("/api/simulate/step")
+
+    status = client.get("/api/simulate/status").json()
+    audit = status["stats"]["audit"]
+
+    assert audit["industry_type"] == "seafood"
+    assert audit["requires_cooling"] is False
+    assert any(check["label"] == "Vessel-linked receiving" for check in audit["checks"])
 
 
 def test_cors_defaults_allow_local_origins_and_block_unknown_origins():

@@ -28,9 +28,13 @@ def test_scenario_catalog_lists_required_presets():
         "leafy_greens_supplier",
         "fresh_cut_processor",
         "retailer_readiness_demo",
+        "seafood_first_receiver",
+        "dairy_continuous_flow",
     ]
     assert all(summary["label"] for summary in summaries)
     assert all(summary["description"] for summary in summaries)
+    assert {summary["industry_type"] for summary in summaries} >= {"produce", "seafood", "dairy"}
+    assert all(summary["reference_format"] for summary in summaries)
 
 
 def test_scenario_generation_is_deterministic_for_seed():
@@ -47,6 +51,7 @@ def test_scenario_presets_produce_distinct_product_and_flow_mixes():
     leafy_products = {product.name for product in get_scenario(ScenarioId.LEAFY_GREENS_SUPPLIER).products}
     retailer_products = {product.name for product in get_scenario(ScenarioId.RETAILER_READINESS_DEMO).products}
     fresh_cut_outputs = set(get_scenario(ScenarioId.FRESH_CUT_PROCESSOR).transformation_outputs)
+    seafood_products = {product.name for product in get_scenario(ScenarioId.SEAFOOD_FIRST_RECEIVER).products}
 
     leafy_harvests = {
         event.product_description
@@ -61,6 +66,17 @@ def test_scenario_presets_produce_distinct_product_and_flow_mixes():
     fresh_cut_products = {event.product_description for event in events_by_scenario[ScenarioId.FRESH_CUT_PROCESSOR]}
     fresh_cut_counts = Counter(event.cte_type for event in events_by_scenario[ScenarioId.FRESH_CUT_PROCESSOR])
     retailer_locations = {event.location_name for event in events_by_scenario[ScenarioId.RETAILER_READINESS_DEMO]}
+    seafood_ctes = {event.cte_type for event in events_by_scenario[ScenarioId.SEAFOOD_FIRST_RECEIVER]}
+    seafood_seen_products = {
+        event.product_description
+        for event in events_by_scenario[ScenarioId.SEAFOOD_FIRST_RECEIVER]
+        if event.cte_type == CTEType.FIRST_LAND_BASED_RECEIVING
+    }
+    dairy_harvest_units = {
+        event.unit_of_measure
+        for event in events_by_scenario[ScenarioId.DAIRY_CONTINUOUS_FLOW]
+        if event.cte_type == CTEType.HARVESTING
+    }
 
     assert leafy_harvests <= leafy_products
     assert retailer_harvests <= retailer_products
@@ -68,3 +84,6 @@ def test_scenario_presets_produce_distinct_product_and_flow_mixes():
     assert fresh_cut_products & fresh_cut_outputs
     assert fresh_cut_counts[CTEType.TRANSFORMATION] > 0
     assert {"Retail DC West", "Retail Store #4521"} <= retailer_locations
+    assert CTEType.FIRST_LAND_BASED_RECEIVING in seafood_ctes
+    assert seafood_seen_products <= seafood_products
+    assert dairy_harvest_units == {"gallons"}

@@ -29,6 +29,12 @@ REQUIRED_KDES: dict[CTEType, tuple[str, ...]] = {
         "source_traceability_lot_code",
         "reference_document_number",
     ),
+    CTEType.FIRST_LAND_BASED_RECEIVING: (
+        "landing_date",
+        "first_land_based_receiver",
+        "vessel_identifier",
+        "reference_document_number",
+    ),
     CTEType.SHIPPING: (
         "ship_date",
         "ship_from_location",
@@ -53,6 +59,7 @@ RECOMMENDED_KDES: dict[CTEType, tuple[str, ...]] = {
     CTEType.HARVESTING: ("field_name", "traceability_lot_code_source_reference"),
     CTEType.COOLING: ("harvest_location", "traceability_lot_code_source_reference"),
     CTEType.INITIAL_PACKING: ("farm_location", "traceability_lot_code_source_reference"),
+    CTEType.FIRST_LAND_BASED_RECEIVING: ("vessel_name", "water_temperature_c"),
     CTEType.SHIPPING: ("carrier", "reference_document_type"),
     CTEType.RECEIVING: ("reference_document_type", "traceability_lot_code_source_reference"),
     CTEType.TRANSFORMATION: ("input_products", "reference_document_type"),

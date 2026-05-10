@@ -106,5 +106,68 @@ def test_engine_clock_stays_inside_live_webhook_window_for_demo_loop():
     timestamps = [engine.next_event()[0].timestamp for _ in range(300)]
     now = datetime.now(UTC)
 
-    assert max(timestamps) <= now + timedelta(days=30)
+    assert max(timestamps) <= now + timedelta(hours=20, seconds=1)
     assert min(timestamps) >= now - timedelta(days=90)
+
+
+def test_seafood_scenario_emits_first_land_based_receiving_kdes():
+    engine = LegitFlowEngine(seed=204, scenario="seafood_first_receiver")
+
+    for _ in range(60):
+        event, _ = engine.next_event()
+        if event.cte_type == CTEType.FIRST_LAND_BASED_RECEIVING:
+            assert event.kdes["landing_date"]
+            assert event.kdes["vessel_identifier"]
+            assert event.kdes["first_land_based_receiver"] == event.location_name
+            assert event.kdes["reference_document"].startswith("GS1-128 (00)")
+            return
+
+    raise AssertionError("Expected a first land-based receiving event")
+
+
+def test_shipping_and_receiving_share_same_gs1_reference_document():
+    engine = LegitFlowEngine(seed=204, scenario="seafood_first_receiver")
+    shipping_document = None
+    shipping_number = None
+
+    for _ in range(120):
+        event, _ = engine.next_event()
+        if event.cte_type == CTEType.SHIPPING:
+            shipping_document = event.kdes["reference_document"]
+            shipping_number = event.kdes["reference_document_number"]
+        elif event.cte_type == CTEType.RECEIVING and shipping_document:
+            assert event.kdes["reference_document"] == shipping_document
+            assert event.kdes["reference_document_number"] == shipping_number
+            assert event.kdes["sscc"] == shipping_number
+            return
+
+    raise AssertionError("Expected linked shipping and receiving events")
+
+
+def test_dairy_scenario_supports_continuous_flow_without_cooling_step():
+    engine = LegitFlowEngine(seed=204, scenario="dairy_continuous_flow")
+
+    for _ in range(80):
+        event, _ = engine.next_event()
+        assert event.cte_type != CTEType.COOLING
+        if event.cte_type == CTEType.INITIAL_PACKING:
+            assert event.kdes["flow_type"] == "continuous"
+            assert "silo_identifier" in event.kdes
+            return
+
+    raise AssertionError("Expected a dairy initial packing event")
+
+
+def test_transformation_can_emit_split_outputs_and_rework():
+    engine = LegitFlowEngine(seed=204, scenario="fresh_cut_processor")
+
+    for _ in range(180):
+        event, _ = engine.next_event()
+        if event.cte_type == CTEType.TRANSFORMATION:
+            assert len(event.kdes["input_traceability_lot_codes"]) >= 2
+            assert event.kdes["output_traceability_lot_codes"]
+            assert event.kdes["commingled_input_lot_count"] >= 2
+            assert "lineage_pattern" in event.kdes
+            return
+
+    raise AssertionError("Expected a transformation event")
