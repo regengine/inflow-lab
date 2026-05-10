@@ -117,7 +117,7 @@ def render_fda_request_csv(
                 "Date": event.timestamp.date().isoformat(),
                 "Time": event.timestamp.time().isoformat(timespec="seconds"),
                 "Reference Document Type": event.kdes.get("reference_document_type", ""),
-                "Reference Document Number": _reference_document_number(event.kdes),
+                "Reference Document Number": event.kdes.get("reference_document_number", ""),
             }
         )
     return output.getvalue()
@@ -125,21 +125,3 @@ def render_fda_request_csv(
 
 def export_filename(preset_id: FDAExportPreset) -> str:
     return f"fda_request_{preset_id.value}.csv"
-
-
-def _reference_document_number(kdes: dict) -> str:
-    """Derive the Reference Document Number for FDA's CSV column.
-
-    RegEngine's canonical contract uses a single ``reference_document`` string
-    formatted ``"<type> <number>"``. The FDA template wants the number split
-    out. We strip the leading ``reference_document_type`` token if present.
-    """
-    document = kdes.get("reference_document")
-    if not isinstance(document, str) or not document:
-        return ""
-    document_type = kdes.get("reference_document_type")
-    if isinstance(document_type, str) and document_type and document.startswith(document_type):
-        remainder = document[len(document_type):].lstrip()
-        if remainder:
-            return remainder
-    return document

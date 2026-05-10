@@ -120,11 +120,19 @@
                 <input id="tenantId" name="tenantId" autocomplete="off" placeholder="local-demo" />
               </label>
               <label>
+                Operation type
+                <select id="operationType" name="operationType">
+                  <option value="all" selected>All operations</option>
+                </select>
+              </label>
+              <label>
                 Scenario preset
                 <select id="scenario" name="scenario">
                   <option value="leafy_greens_supplier" selected>Leafy greens supplier</option>
                   <option value="fresh_cut_processor">Fresh-cut processor</option>
                   <option value="retailer_readiness_demo">Retailer readiness demo</option>
+                  <option value="seafood_first_receiver">Seafood first receiver</option>
+                  <option value="dairy_continuous_flow">Dairy continuous flow</option>
                 </select>
               </label>
               <label>
@@ -146,6 +154,7 @@
                 <input id="source" name="source" value="codex-simulator" />
               </label>
             </form>
+            <p class="note" id="operationTypeDescription">Choose the type of operation you run to narrow the scenario presets to matching flows.</p>
             <p class="note" id="demoFixtureDescription">Harvest through cooling, packout, shipment, and DC receipt for one leafy greens lot.</p>
           </section>
 
@@ -211,12 +220,34 @@
 
         <section class="center-stack">
           <div class="tab-strip" aria-label="Workspace sections">
-            <span>Lots</span>
+            <span>Audit view</span>
+            <span>Scenario lens</span>
+            <span>Record spotlight</span>
             <span>Lineage</span>
             <span>Exports</span>
             <span>Event log</span>
-            <span>Diagnostics</span>
           </div>
+
+          <section class="panel scenario-panel">
+            <div class="section-head">
+              <div>
+                <p class="section-kicker">Scenario intelligence</p>
+                <h2>Industry audit lens</h2>
+              </div>
+            </div>
+            <div id="readinessBanner" class="readiness-banner"></div>
+            <div id="scenarioWorkbench" class="scenario-workbench"></div>
+          </section>
+
+          <section class="panel spotlight-panel">
+            <div class="section-head">
+              <div>
+                <p class="section-kicker">Active record review</p>
+                <h2>Record spotlight</h2>
+              </div>
+            </div>
+            <div id="recordSpotlight" class="record-spotlight"></div>
+          </section>
 
           <section class="panel lineage-panel">
             <div class="section-head">

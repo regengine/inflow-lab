@@ -2,6 +2,8 @@ const state = {
   status: null,
   health: null,
   events: [],
+  allScenarios: [],
+  scenarioCatalog: {},
   eventSource: null,
   fallbackTimer: null,
   statusHoldUntil: 0,
@@ -9,11 +11,20 @@ const state = {
     leafy_greens_supplier: 'Leafy greens supplier',
     fresh_cut_processor: 'Fresh-cut processor',
     retailer_readiness_demo: 'Retailer readiness demo',
+    seafood_first_receiver: 'Seafood first receiver',
+    dairy_continuous_flow: 'Dairy continuous flow',
   },
   demoFixtureDescriptions: {
     leafy_greens_trace: 'Harvest through cooling, packout, shipment, and DC receipt for one leafy greens lot.',
   },
   scenarioSaves: [],
+  operationTypeLabels: {
+    all: 'All operations',
+    supplier: 'Supplier',
+    processor: 'Processor',
+    retailer: 'Retail / distribution',
+    first_receiver: 'First receiver',
+  },
   exportPresetDescriptions: {
     all_records: 'Full FDA-request export for the selected date range.',
   },
@@ -23,6 +34,7 @@ const DEFAULT_LIVE_INGEST_ENDPOINT = 'https://www.regengine.co/api/v1/webhooks/i
 
 const ids = {
   source: document.getElementById('source'),
+  operationType: document.getElementById('operationType'),
   scenario: document.getElementById('scenario'),
   interval: document.getElementById('interval'),
   batchSize: document.getElementById('batchSize'),
@@ -41,6 +53,7 @@ const ids = {
   demoFixture: document.getElementById('demoFixture'),
   demoFixtureDescription: document.getElementById('demoFixtureDescription'),
   loadFixtureBtn: document.getElementById('loadFixtureBtn'),
+  operationTypeDescription: document.getElementById('operationTypeDescription'),
   exportPreset: document.getElementById('exportPreset'),
   exportLot: document.getElementById('exportLot'),
   exportStartDate: document.getElementById('exportStartDate'),
@@ -61,6 +74,9 @@ const ids = {
   eventsBody: document.getElementById('eventsBody'),
   lotLookup: document.getElementById('lotLookup'),
   lineageResults: document.getElementById('lineageResults'),
+  readinessBanner: document.getElementById('readinessBanner'),
+  scenarioWorkbench: document.getElementById('scenarioWorkbench'),
+  recordSpotlight: document.getElementById('recordSpotlight'),
 };
 
 function setStatus(message, tone = 'neutral', holdMs = 0) {
@@ -110,17 +126,69 @@ function scenarioLabel(scenarioId) {
   return state.scenarioLabels[scenarioId] || scenarioId || 'Unknown';
 }
 
-function renderScenarioOptions(scenarios) {
-  const selected = ids.scenario.value || 'leafy_greens_supplier';
+function operationTypeLabel(operationType) {
+  return state.operationTypeLabels[operationType] || operationType || 'Unknown';
+}
+
+function scenariosForOperation(operationType = ids.operationType.value || 'all') {
+  if (operationType === 'all') {
+    return state.allScenarios;
+  }
+  return state.allScenarios.filter((scenario) => scenario.operation_type === operationType);
+}
+
+function renderOperationTypeOptions(scenarios, preferredOperationType = ids.operationType.value || 'all') {
+  const operationTypes = ['all', ...new Set(scenarios.map((scenario) => scenario.operation_type))];
+  ids.operationType.innerHTML = operationTypes
+    .map(
+      (operationType) => `
+        <option value="${escapeHtml(operationType)}">${escapeHtml(operationTypeLabel(operationType))}</option>
+      `,
+    )
+    .join('');
+  ids.operationType.value = operationTypes.includes(preferredOperationType) ? preferredOperationType : 'all';
+  updateOperationTypeDescription();
+}
+
+function updateOperationTypeDescription() {
+  const operationType = ids.operationType.value || 'all';
+  if (operationType === 'all') {
+    ids.operationTypeDescription.textContent =
+      'Choose the type of operation you run to narrow the scenario presets to matching flows.';
+    return;
+  }
+  const visibleCount = scenariosForOperation(operationType).length;
+  ids.operationTypeDescription.textContent =
+    `${operationTypeLabel(operationType)} view: showing ${visibleCount} matching scenario${visibleCount === 1 ? '' : 's'} you can start from.`;
+}
+
+function renderScenarioOptions(
+  scenarios,
+  preferredScenarioId = ids.scenario.value || 'leafy_greens_supplier',
+  preferredOperationType = null,
+) {
+  state.allScenarios = scenarios;
+  state.scenarioCatalog = Object.fromEntries(scenarios.map((scenario) => [scenario.id, scenario]));
   state.scenarioLabels = Object.fromEntries(scenarios.map((scenario) => [scenario.id, scenario.label]));
-  ids.scenario.innerHTML = scenarios
+  const selectedScenario = state.scenarioCatalog[preferredScenarioId] || null;
+  renderOperationTypeOptions(
+    scenarios,
+    preferredOperationType || selectedScenario?.operation_type || ids.operationType.value || 'all',
+  );
+  const filteredScenarios = scenariosForOperation();
+  ids.scenario.innerHTML = filteredScenarios
     .map(
       (scenario) => `
         <option value="${escapeHtml(scenario.id)}">${escapeHtml(scenario.label)}</option>
       `,
     )
     .join('');
-  ids.scenario.value = state.scenarioLabels[selected] ? selected : scenarios[0]?.id || 'leafy_greens_supplier';
+  ids.scenario.value = filteredScenarios.some((scenario) => scenario.id === preferredScenarioId)
+    ? preferredScenarioId
+    : filteredScenarios[0]?.id || scenarios[0]?.id || 'leafy_greens_supplier';
+  renderReadinessBanner(activeScenarioSummary(), state.events, state.status);
+  renderScenarioWorkbench(state.status, state.events);
+  renderRecordSpotlight(state.events);
 }
 
 async function loadScenarios() {
@@ -133,7 +201,13 @@ function applyConfigToForm(config) {
     return;
   }
   ids.source.value = config.source || 'codex-simulator';
-  ids.scenario.value = config.scenario || 'leafy_greens_supplier';
+  const scenarioId = config.scenario || 'leafy_greens_supplier';
+  const scenario = state.scenarioCatalog[scenarioId];
+  renderScenarioOptions(
+    state.allScenarios.length ? state.allScenarios : Object.values(state.scenarioCatalog),
+    scenarioId,
+    scenario?.operation_type || null,
+  );
   ids.interval.value = config.interval_seconds ?? 1.5;
   ids.batchSize.value = config.batch_size ?? 3;
   ids.seed.value = config.seed ?? '';
@@ -291,6 +365,167 @@ function updateShellStatus(status = state.status, events = state.events, health 
   ids.nextActionText.textContent = nextAction(status, events || [], deliveryMode);
 }
 
+function activeScenarioSummary() {
+  return state.scenarioCatalog[ids.scenario.value] || null;
+}
+
+function backendAudit(status = state.status, summary = activeScenarioSummary()) {
+  const audit = status?.stats?.audit || null;
+  const statusScenario = status?.config?.scenario;
+  if (!audit || !summary || !statusScenario || statusScenario !== summary.id) {
+    return null;
+  }
+  return audit;
+}
+
+function sourceCteForScenario(summary) {
+  if (summary?.industry_type === 'seafood') {
+    return 'First land-based receiving';
+  }
+  return 'Harvesting';
+}
+
+function scenarioNarrative(summary) {
+  if (!summary) {
+    return 'Choose a scenario to see which audit signals and reference rules the lab should surface.';
+  }
+  if (summary.industry_type === 'seafood') {
+    return 'This flow should prove vessel-linked first receipt, dockside handoff, and GS1-linked shipping continuity.';
+  }
+  if (summary.industry_type === 'dairy') {
+    return 'This flow should prove continuous movement through silos and vats without forcing produce-style cooling records.';
+  }
+  return 'This flow should prove field-level origin, packout packaging changes, and downstream traceability through transformation and shipment.';
+}
+
+function pendingAuditModel(summary) {
+  return {
+    checks: [],
+    score: 0,
+    tone: 'watch',
+    label: 'Awaiting simulator audit',
+    passed: 0,
+    total: 0,
+    missing: 0,
+    detail: summary
+      ? `${summary.label} needs a simulator status refresh before audit scoring can be shown.`
+      : 'Run the simulator to load backend audit scoring.',
+  };
+}
+
+function renderReadinessBanner(summary, events, status = state.status) {
+  if (!summary) {
+    ids.readinessBanner.innerHTML = '<p class="note">Readiness scoring will appear once scenario metadata loads.</p>';
+    return;
+  }
+  const readiness = backendAudit(status, summary) || pendingAuditModel(summary);
+  ids.readinessBanner.innerHTML = `
+    <div class="readiness-banner-shell" data-tone="${readiness.tone}">
+      <div class="readiness-score">
+        <span>Readiness</span>
+        <strong>${escapeHtml(readiness.score)}</strong>
+        <small>/100</small>
+      </div>
+      <div class="readiness-copy">
+        <h3>${escapeHtml(readiness.label)}</h3>
+        <p>${escapeHtml(readiness.detail || `${summary.label} is currently showing ${readiness.passed} of ${readiness.total} expected audit signals.`)}</p>
+      </div>
+      <div class="readiness-meta">
+        <span>${escapeHtml(summary.reference_format)} references</span>
+        <span>${escapeHtml(summary.requires_cooling ? 'Cooling required' : 'Continuous or direct flow')}</span>
+        <span>${escapeHtml(readiness.total ? `${readiness.missing} gap(s) still visible` : 'Backend audit pending')}</span>
+      </div>
+    </div>
+  `;
+}
+
+function recordWarnings(record, summary, status = state.status) {
+  const audit = backendAudit(status, summary);
+  const warningPayload = audit?.warnings_by_record?.[record.record_id];
+  if (Array.isArray(warningPayload) && warningPayload.length) {
+    return warningPayload
+      .map((warning) => warning.message)
+      .filter((message) => typeof message === 'string' && message);
+  }
+  return [];
+}
+
+function renderScenarioWorkbench(status = state.status, events = state.events) {
+  const summary = activeScenarioSummary();
+  if (!summary) {
+    ids.scenarioWorkbench.innerHTML = '<p class="note">Scenario metadata will appear here once presets load.</p>';
+    return;
+  }
+  const readiness = backendAudit(status, summary) || pendingAuditModel(summary);
+  const checks = readiness.checks;
+  const sourceCte = sourceCteForScenario(summary);
+  const eventCount = (events || []).length;
+  const warningCount = readiness.missing;
+  const transformCount = (events || []).filter((record) => record.event.cte_type === 'transformation').length;
+  const cards = [
+    ['Operation', operationTypeLabel(summary.operation_type)],
+    ['Industry', summary.industry_type],
+    ['Reference format', summary.reference_format],
+    ['Source CTE', sourceCte],
+    ['Cooling model', summary.requires_cooling ? 'Required' : 'Bypassed'],
+    ['Loaded records', eventCount],
+    ['Transform runs', transformCount],
+  ];
+
+  ids.scenarioWorkbench.innerHTML = `
+    <div class="scenario-hero">
+      <div class="scenario-hero-copy">
+        <span class="pill">${escapeHtml(summary.industry_type)}</span>
+        <h3>${escapeHtml(summary.label)}</h3>
+        <p>${escapeHtml(summary.description)}</p>
+        <p class="note">${escapeHtml(scenarioNarrative(summary))}</p>
+      </div>
+      <div class="scenario-alert${warningCount ? ' has-warning' : ''}">
+        <span>Audit readiness</span>
+        <strong>${warningCount ? `${warningCount} signal(s) still missing` : 'Signals visible'}</strong>
+        <small>${escapeHtml(summary.reference_format)} references, ${escapeHtml(sourceCte)} source flow</small>
+      </div>
+    </div>
+    <div class="scenario-signal-grid">
+      ${cards
+        .map(
+          ([label, value]) => `
+            <article class="scenario-signal-card">
+              <span>${escapeHtml(label)}</span>
+              <strong>${escapeHtml(value)}</strong>
+            </article>
+          `,
+        )
+        .join('')}
+    </div>
+    <div class="audit-checklist">
+      ${
+        checks.length
+          ? checks
+              .map(
+                (item) => `
+                  <article class="audit-check${item.ok ? ' is-pass' : ' is-watch'}">
+                    <header>
+                      <strong>${escapeHtml(item.label)}</strong>
+                      <span>${item.ok ? 'Visible' : 'Not yet seen'}</span>
+                    </header>
+                    <p>${escapeHtml(item.detail)}</p>
+                  </article>
+                `,
+              )
+              .join('')
+          : `<article class="audit-check is-watch">
+              <header>
+                <strong>Backend audit pending</strong>
+                <span>Refresh needed</span>
+              </header>
+              <p>${escapeHtml(readiness.detail)}</p>
+            </article>`
+      }
+    </div>
+  `;
+}
+
 function renderStats(status) {
   const stats = status?.stats || {};
   const engine = stats.engine || {};
@@ -382,6 +617,104 @@ function renderDeliverySummary(status) {
   `;
 }
 
+function pickSpotlightRecord(events) {
+  if (!events.length) {
+    return null;
+  }
+  return (
+    events.find((record) => record.event.cte_type === 'transformation') ||
+    events.find((record) => record.event.cte_type === 'shipping') ||
+    events[0]
+  );
+}
+
+function spotlightFields(event) {
+  const preferredKeys = [
+    'reference_document',
+    'reference_document_number',
+    'vessel_identifier',
+    'vessel_name',
+    'landing_date',
+    'field_gps_coordinates',
+    'plu_code',
+    'flow_type',
+    'silo_identifier',
+    'vat_identifier',
+    'packaging_hierarchy',
+    'packaging_conversion',
+    'input_traceability_lot_codes',
+    'output_traceability_lot_codes',
+    'rework_traceability_lot_codes',
+    'yield_ratio',
+    'sscc',
+  ];
+  const entries = [];
+  for (const key of preferredKeys) {
+    if (Object.prototype.hasOwnProperty.call(event.kdes || {}, key)) {
+      entries.push([key, event.kdes[key]]);
+    }
+  }
+  if (!entries.length) {
+    return Object.entries(event.kdes || {}).slice(0, 8);
+  }
+  return entries.slice(0, 8);
+}
+
+function renderRecordSpotlight(events) {
+  const record = pickSpotlightRecord(events || []);
+  if (!record) {
+    ids.recordSpotlight.innerHTML = '<p class="note">Run the pipeline or load a fixture to inspect an audit-style record spotlight.</p>';
+    return;
+  }
+  const event = record.event;
+  const keyFacts = [
+    ['CTE', cteLabel(event.cte_type)],
+    ['Lot', event.traceability_lot_code],
+    ['Quantity', `${event.quantity} ${event.unit_of_measure}`],
+    ['Location', event.location_name],
+    ['Posted status', record.delivery_status],
+  ];
+  const fields = spotlightFields(event);
+  ids.recordSpotlight.innerHTML = `
+    <div class="spotlight-hero">
+      <div>
+        <span class="pill">${escapeHtml(cteLabel(event.cte_type))}</span>
+        <h3>${escapeHtml(event.product_description)}</h3>
+        <p class="note">Sequence ${escapeHtml(record.sequence_no)} at ${formatDateTime(event.timestamp)}</p>
+      </div>
+      <button class="button secondary" type="button" data-spotlight-lot="${escapeHtml(event.traceability_lot_code)}">Trace this lot</button>
+    </div>
+    <div class="spotlight-facts">
+      ${keyFacts
+        .map(
+          ([label, value]) => `
+            <article class="spotlight-fact">
+              <span>${escapeHtml(label)}</span>
+              <strong>${escapeHtml(value)}</strong>
+            </article>
+          `,
+        )
+        .join('')}
+    </div>
+    <div class="spotlight-kdes">
+      ${fields
+        .map(
+          ([key, value]) => `
+            <article class="spotlight-kde">
+              <span>${escapeHtml(key)}</span>
+              <strong>${escapeHtml(formatKdeValue(value))}</strong>
+            </article>
+          `,
+        )
+        .join('')}
+    </div>
+  `;
+  ids.recordSpotlight.querySelector('[data-spotlight-lot]')?.addEventListener('click', async (eventNode) => {
+    ids.lotLookup.value = eventNode.currentTarget.dataset.spotlightLot;
+    await lookupLineage();
+  });
+}
+
 function escapeHtml(text) {
   return String(text)
     .replaceAll('&', '&amp;')
@@ -410,6 +743,7 @@ function formatKdeValue(value) {
 }
 
 function renderEvents(events) {
+  const summary = activeScenarioSummary();
   if (!events.length) {
     ids.eventsBody.innerHTML = `
       <tr>
@@ -421,8 +755,9 @@ function renderEvents(events) {
   ids.eventsBody.innerHTML = events
     .map((record) => {
       const event = record.event;
+      const warnings = recordWarnings(record, summary);
       return `
-        <tr>
+        <tr class="${warnings.length ? 'has-audit-warning' : ''}">
           <td>${record.sequence_no}</td>
           <td><span class="pill">${escapeHtml(event.cte_type)}</span></td>
           <td><button class="link-button" data-lot="${escapeHtml(event.traceability_lot_code)}">${escapeHtml(event.traceability_lot_code)}</button></td>
@@ -430,7 +765,10 @@ function renderEvents(events) {
           <td>${escapeHtml(event.location_name)}</td>
           <td>${escapeHtml(new Date(event.timestamp).toLocaleString())}</td>
           <td>${escapeHtml(record.destination_mode)}</td>
-          <td>${escapeHtml(record.delivery_attempts || 0)}</td>
+          <td>
+            ${escapeHtml(record.delivery_attempts || 0)}
+            ${warnings.length ? `<small class="status-warning">${escapeHtml(warnings[0])}</small>` : ''}
+          </td>
           <td>
             <span class="status-pill" data-tone="${deliveryTone(record.delivery_status)}">${escapeHtml(record.delivery_status)}</span>
             ${record.error ? `<small class="status-error">${escapeHtml(record.error)}</small>` : ''}
@@ -450,6 +788,7 @@ function renderEvents(events) {
 
 function renderLineage(payload, traceabilityLotCode) {
   const records = payload.records || [];
+  const scenarioSummary = activeScenarioSummary();
   if (!records.length) {
     ids.lineageResults.innerHTML = `<p class="note">No lineage found for ${escapeHtml(traceabilityLotCode)}.</p>`;
     return;
@@ -467,7 +806,7 @@ function renderLineage(payload, traceabilityLotCode) {
     ['Transformations', transformations],
   ];
 
-  const summary = queriedNode
+  const lineageSummary = queriedNode
     ? `
       <div class="lineage-focus">
         <span>Focused lot</span>
@@ -528,12 +867,13 @@ function renderLineage(payload, traceabilityLotCode) {
   const timelineMarkup = records
     .map((record) => {
       const event = record.event;
+      const warnings = recordWarnings(record, scenarioSummary);
       const kdes = Object.entries(event.kdes || {})
         .slice(0, 6)
         .map(([key, value]) => `<li><strong>${escapeHtml(key)}:</strong> ${escapeHtml(formatKdeValue(value))}</li>`)
         .join('');
       return `
-        <article class="lineage-card">
+        <article class="lineage-card${warnings.length ? ' has-audit-warning' : ''}">
           <header>
             <h3>${escapeHtml(cteLabel(event.cte_type))}</h3>
             <span>${formatDateTime(event.timestamp)}</span>
@@ -541,6 +881,7 @@ function renderLineage(payload, traceabilityLotCode) {
           <p><strong>Lot:</strong> ${escapeHtml(event.traceability_lot_code)}</p>
           <p><strong>Product:</strong> ${escapeHtml(event.product_description)}</p>
           <p><strong>Location:</strong> ${escapeHtml(event.location_name)}</p>
+          ${warnings.length ? `<p class="lineage-warning">${escapeHtml(warnings.join(' • '))}</p>` : ''}
           <ul>${kdes}</ul>
         </article>
       `;
@@ -549,7 +890,7 @@ function renderLineage(payload, traceabilityLotCode) {
 
   ids.lineageResults.innerHTML = `
     <div class="lineage-overview">
-      ${summary}
+      ${lineageSummary}
       <div class="lineage-stats">${statMarkup}</div>
       <p class="note">${escapeHtml(locations.size)} location(s) represented in this lineage trace.</p>
     </div>
@@ -604,8 +945,11 @@ function renderSnapshot(status, events, health = state.health) {
   state.health = health;
   state.events = events;
   updateShellStatus(status, events, health);
+  renderReadinessBanner(activeScenarioSummary(), events, status);
   renderStats(status);
   renderDeliverySummary(status);
+  renderScenarioWorkbench(status, events);
+  renderRecordSpotlight(events);
   renderEvents(events);
   if (Date.now() >= state.statusHoldUntil) {
     setStatus(status.running ? 'Simulator loop is running.' : 'Simulator loop is stopped.');
@@ -916,6 +1260,15 @@ ids.exportLot.addEventListener('input', updateExportLink);
 ids.exportStartDate.addEventListener('change', updateExportLink);
 ids.exportEndDate.addEventListener('change', updateExportLink);
 ids.deliveryMode.addEventListener('change', () => updateShellStatus());
+ids.operationType.addEventListener('change', () => {
+  renderScenarioOptions(state.allScenarios, ids.scenario.value, ids.operationType.value);
+});
+ids.scenario.addEventListener('change', () => {
+  renderReadinessBanner(activeScenarioSummary(), state.events, state.status);
+  renderScenarioWorkbench(state.status, state.events);
+  renderRecordSpotlight(state.events);
+  renderEvents(state.events);
+});
 
 loadScenarios().catch((error) => {
   setStatus(error.message, 'error', 5000);

@@ -14,6 +14,10 @@ class ScenarioSummary(BaseModel):
     id: ScenarioId
     label: str
     description: str
+    industry_type: str
+    operation_type: str
+    reference_format: str
+    requires_cooling: bool
 
 
 class ScenarioListResponse(BaseModel):

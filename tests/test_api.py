@@ -123,8 +123,52 @@ def test_scenario_catalog_endpoint_lists_supported_presets():
         "leafy_greens_supplier",
         "fresh_cut_processor",
         "retailer_readiness_demo",
+        "seafood_first_receiver",
+        "dairy_continuous_flow",
     ]
     assert all(scenario["label"] for scenario in scenarios)
+    assert {scenario["industry_type"] for scenario in scenarios} >= {"produce", "seafood", "dairy"}
+    assert {scenario["operation_type"] for scenario in scenarios} >= {"supplier", "processor", "retailer", "first_receiver"}
+
+
+def test_status_includes_backend_audit_summary():
+    client.post(
+        "/api/simulate/reset",
+        json={
+            "scenario": "leafy_greens_supplier",
+            "batch_size": 1,
+            "seed": 204,
+        },
+    )
+    client.post("/api/simulate/step")
+
+    status = client.get("/api/simulate/status").json()
+    audit = status["stats"]["audit"]
+
+    assert audit["industry_type"] == "produce"
+    assert audit["reference_format"] == "GS1"
+    assert isinstance(audit["score"], int)
+    assert audit["total"] >= 1
+    assert isinstance(audit["checks"], list)
+
+
+def test_status_audit_tracks_seafood_readiness_shape():
+    client.post(
+        "/api/simulate/reset",
+        json={
+            "scenario": "seafood_first_receiver",
+            "batch_size": 1,
+            "seed": 204,
+        },
+    )
+    client.post("/api/simulate/step")
+
+    status = client.get("/api/simulate/status").json()
+    audit = status["stats"]["audit"]
+
+    assert audit["industry_type"] == "seafood"
+    assert audit["requires_cooling"] is False
+    assert any(check["label"] == "Vessel-linked receiving" for check in audit["checks"])
 
 
 def test_cors_defaults_allow_local_origins_and_block_unknown_origins():
@@ -750,12 +794,12 @@ def test_fda_export_presets_filter_common_request_slices(tmp_path):
             "delivery": {"mode": "none"},
         },
     )
-    csv_text = """cte_type,traceability_lot_code,product_description,quantity,unit_of_measure,location_name,timestamp,source_traceability_lot_code,input_traceability_lot_codes,reference_document_type,reference_document
-harvesting,TLC-FDA-HARVEST,Romaine Lettuce,120,cases,Valley Fresh Farms,2026-02-05T08:00:00Z,,,Harvest Log,Harvest Log HAR-001
-initial_packing,TLC-FDA-PACKED,Romaine Lettuce,112,cases,Coastal Packhouse,2026-02-05T10:00:00Z,TLC-FDA-HARVEST,,Packout Record,Packout Record PACK-001
-shipping,TLC-FDA-PACKED,Romaine Lettuce,112,cases,Coastal Packhouse,2026-02-05T12:00:00Z,,,Bill of Lading,Bill of Lading BOL-001
-receiving,TLC-FDA-PACKED,Romaine Lettuce,112,cases,Distribution Center #4,2026-02-05T18:00:00Z,,,Bill of Lading,Bill of Lading BOL-001
-transformation,TLC-FDA-OUT,Fresh Cut Salad Mix,95,cases,ReadyFresh Processing Plant,2026-02-06T09:00:00Z,,TLC-FDA-PACKED,Batch Record,Batch Record BATCH-001
+    csv_text = """cte_type,traceability_lot_code,product_description,quantity,unit_of_measure,location_name,timestamp,source_traceability_lot_code,input_traceability_lot_codes,reference_document_type,reference_document_number
+harvesting,TLC-FDA-HARVEST,Romaine Lettuce,120,cases,Valley Fresh Farms,2026-02-05T08:00:00Z,,,Harvest Log,HAR-001
+initial_packing,TLC-FDA-PACKED,Romaine Lettuce,112,cases,Coastal Packhouse,2026-02-05T10:00:00Z,TLC-FDA-HARVEST,,Packout Record,PACK-001
+shipping,TLC-FDA-PACKED,Romaine Lettuce,112,cases,Coastal Packhouse,2026-02-05T12:00:00Z,,,Bill of Lading,BOL-001
+receiving,TLC-FDA-PACKED,Romaine Lettuce,112,cases,Distribution Center #4,2026-02-05T18:00:00Z,,,Bill of Lading,BOL-001
+transformation,TLC-FDA-OUT,Fresh Cut Salad Mix,95,cases,ReadyFresh Processing Plant,2026-02-06T09:00:00Z,,TLC-FDA-PACKED,Batch Record,BATCH-001
 """
     import_response = client.post(
         "/api/import/csv",
@@ -872,7 +916,7 @@ def test_epcis_export_scaffold_maps_lineage_to_jsonld_without_changing_ingest_co
     assert transformation_event["outputQuantityList"][0]["regengine:traceabilityLotCode"] == (
         "TLC-DEMO-FC-OUT-001"
     )
-    assert transformation_event["regengine:kdes"]["reference_document"] == "Batch Record BATCH-DEMO-FC-001"
+    assert transformation_event["regengine:kdes"]["reference_document_number"] == "BATCH-DEMO-FC-001"
 
     ingest_response = client.post(
         "/api/mock/regengine/ingest",
@@ -1458,7 +1502,7 @@ def test_csv_import_scheduled_events_stores_valid_rows_and_reports_errors(tmp_pa
     )
     csv_text = """cte_type,traceability_lot_code,product_description,quantity,unit_of_measure,location_name,timestamp,source_traceability_lot_code,kdes
 harvesting,TLC-CSV-HARVEST,Romaine Lettuce,120,cases,Valley Fresh Farms,2026-02-05T08:00:00Z,,"{""harvest_date"":""2026-02-05""}"
-initial_packing,TLC-CSV-PACKED,Romaine Lettuce,112,cases,Coastal Packhouse,2026-02-05T10:00:00Z,TLC-CSV-HARVEST,"{""packing_date"":""2026-02-05""}"
+initial_packing,TLC-CSV-PACKED,Romaine Lettuce,112,cases,Coastal Packhouse,2026-02-05T10:00:00Z,TLC-CSV-HARVEST,"{""pack_date"":""2026-02-05""}"
 receiving,TLC-CSV-BAD,Romaine Lettuce,,cases,Distribution Center #4,2026-02-05T12:00:00Z,,
 """
 
@@ -1483,8 +1527,10 @@ receiving,TLC-CSV-BAD,Romaine Lettuce,,cases,Distribution Center #4,2026-02-05T1
         {"row": 4, "field": "quantity", "message": "Missing required field: quantity"}
     ]
     assert {warning["field"] for warning in body["warnings"]} >= {
+        "farm_location",
         "reference_document",
-        "harvester_business_name",
+        "packing_date",
+        "tlc_source_reference",
     }
 
     events = client.get("/api/events?limit=10").json()["events"]
@@ -1562,9 +1608,10 @@ TLC-SEED-001,Spinach,80,cases,Valley Fresh Farms,2026-02-06T09:15:00Z,Field-9,Ce
     assert event["cte_type"] == "harvesting"
     assert event["traceability_lot_code"] == "TLC-SEED-001"
     assert event["kdes"]["harvest_date"] == "2026-02-06"
-    assert event["location_name"] == "Valley Fresh Farms"
+    assert event["kdes"]["farm_location"] == "Valley Fresh Farms"
     assert event["kdes"]["field_name"] == "Field-9"
-    assert event["kdes"]["reference_document"] == "Seed Lot Import CSV-TLC-SEED-001"
+    assert event["kdes"]["reference_document_number"] == "CSV-TLC-SEED-001"
+    assert event["kdes"]["tlc_source_reference"] == "CSV-SEED-TLC-SEED-001"
 
 
 def test_reset_applies_scenario_config_and_keeps_mock_delivery_default(tmp_path):

@@ -125,6 +125,14 @@ def test_live_client_uses_configured_endpoint_override(monkeypatch: Any) -> None
     assert call["endpoint"] == override
 
 
+def test_live_client_timeout_is_operator_configurable(monkeypatch: Any) -> None:
+    monkeypatch.setenv("REGENGINE_LIVE_TIMEOUT_SECONDS", "60")
+
+    call = run_ingest(monkeypatch, make_live_config())
+
+    assert call["timeout"] == 60.0
+
+
 def test_live_client_sends_required_headers_and_contract_payload(monkeypatch: Any) -> None:
     call = run_ingest(monkeypatch, make_live_config())
 
