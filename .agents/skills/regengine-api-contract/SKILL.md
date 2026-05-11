@@ -12,53 +12,28 @@ description: Use this skill when working on RegEngine ingest payloads, FSMA 204 
 - you are changing ingest payload fields, simulator outputs, or lineage behavior
 - you are adding a new delivery target or export path
 
-## Core contract
+## Contract source of truth
 
-Live delivery targets the documented RegEngine ingest webhook:
+Before changing any live-ingest behavior, read
+`references/contract.md`. That file is the local mirror of the RegEngine
+webhook contract and covers:
 
-- endpoint: `https://www.regengine.co/api/v1/webhooks/ingest`
-- required headers:
-  - `X-RegEngine-API-Key`
-  - `X-Tenant-ID`
-  - `Content-Type: application/json`
+- live ingest endpoint and required headers
+- tenant resolution and `X-Tenant-ID`
+- required `Idempotency-Key` behavior
+- optional HMAC signing with `X-Webhook-Signature`
+- accepted CTE types, including `first_land_based_receiving`
+- strict RegEngine KDE requirements by CTE
 
-Expected top-level payload:
-
-```json
-{
-  "source": "erp",
-  "events": [
-    {
-      "cte_type": "receiving",
-      "traceability_lot_code": "00012345678901-LOT-2026-001",
-      "product_description": "Romaine Lettuce",
-      "quantity": 500,
-      "unit_of_measure": "cases",
-      "location_name": "Distribution Center #4",
-      "timestamp": "2026-02-05T08:30:00Z",
-      "kdes": {
-        "receive_date": "2026-02-05",
-        "receiving_location": "Distribution Center #4",
-        "ship_from_location": "Valley Fresh Farms"
-      }
-    }
-  ]
-}
-```
-
-## Supported CTEs in this repo
-
-- `harvesting`
-- `cooling`
-- `initial_packing`
-- `shipping`
-- `receiving`
-- `transformation`
+Do not duplicate the detailed contract shape here. Keeping one detailed
+reference avoids stale skill guidance when RegEngine's webhook handler changes.
 
 ## Guardrails
 
-- Never break the public ingest shape without updating the mock service, tests, README, and frontend.
-- If you add new KDEs, keep them additive and preserve existing keys.
+- Never break the public ingest shape without updating the mock service, tests,
+  README, frontend, and `references/contract.md`.
+- If you add new KDEs, keep them additive and preserve existing keys unless the
+  RegEngine contract reference explicitly changes.
 - When extending the engine, maintain valid lineage between upstream and downstream lots.
 - Prefer mock-first development. Live delivery should stay opt-in.
 

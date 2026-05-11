@@ -14,7 +14,7 @@ def test_validate_event_kdes_uses_top_level_contract_fields():
         quantity=42.0,
         unit_of_measure="cases",
         location_name="Valley Fresh Farms",
-        location_gln="0850000001001",
+        location_gln="0850000010017",
         timestamp=datetime(2026, 5, 9, 12, 0, tzinfo=UTC),
         kdes={
             "harvest_date": "2026-05-09",
@@ -69,7 +69,7 @@ def test_dairy_audit_uses_shared_rules_for_checks_and_warnings():
             quantity=1000.0,
             unit_of_measure="gallons",
             location_name="Creamline Vat Hall",
-            location_gln="0850000003201",
+            location_gln="0850000032012",
             timestamp=datetime(2026, 5, 9, 12, 0, tzinfo=UTC),
             kdes={
                 "packing_date": "2026-05-09",

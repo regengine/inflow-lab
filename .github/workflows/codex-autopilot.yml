@@ -2,12 +2,6 @@ name: Codex Autopilot
 
 on:
   workflow_dispatch:
-    inputs:
-      auto_merge:
-        description: Enable auto-merge for the generated PR after checks pass.
-        required: false
-        type: boolean
-        default: false
   schedule:
     - cron: '17 14 * * 1-5'
 
@@ -123,6 +117,8 @@ jobs:
             - Prompt file: `.github/codex/prompts/autobuild.md`
             - Guidance files: `AGENTS.md` and `.agents/skills/regengine-api-contract/SKILL.md`
             - Transcript + patch: download the workflow artifact from this run
+            - Merge policy: this workflow only opens or updates a PR. A human review
+              and required status checks must land the change.
           add-paths: |
             .github/**
             .agents/**
@@ -135,11 +131,3 @@ jobs:
             tests/**
             pyproject.toml
             uv.lock
-
-      - name: Enable auto-merge
-        if: >-
-          steps.cpr.outputs.pull-request-number != '' &&
-          (github.event.inputs.auto_merge == 'true' || vars.CODEX_AUTO_MERGE == 'true')
-        run: gh pr merge --squash --auto "${{ steps.cpr.outputs.pull-request-url }}"
-        env:
-          GH_TOKEN: ${{ secrets.CODEX_PR_TOKEN || github.token }}
