@@ -1,6 +1,7 @@
 from datetime import UTC, datetime, timedelta
 
 from app.engine import LegitFlowEngine
+from app.scenarios import SCENARIO_PRESETS
 from app.schemas.domain import CTEType
 
 
@@ -70,7 +71,20 @@ def test_engine_emits_all_supported_ctes_and_lineage():
 
 def test_location_gln_lookup():
     engine = LegitFlowEngine(seed=204)
-    assert engine.location_gln("Valley Fresh Farms") == "0850000001001"
+    assert_valid_gln(engine.location_gln("Valley Fresh Farms"))
+
+
+def test_all_scenario_locations_use_valid_gs1_glns():
+    for scenario in SCENARIO_PRESETS.values():
+        for location in [
+            *scenario.farms,
+            *scenario.coolers,
+            *scenario.packers,
+            *scenario.processors,
+            *scenario.dcs,
+            *scenario.retailers,
+        ]:
+            assert_valid_gln(location.gln)
 
 
 def test_location_gln_or_none_returns_none_for_unknown_location():
@@ -186,3 +200,16 @@ def test_events_emit_location_gln_for_known_locations():
     for _ in range(120):
         event, _ = engine.next_event()
         assert event.location_gln == engine.location_gln(event.location_name)
+        assert_valid_gln(event.location_gln)
+
+
+def assert_valid_gln(gln: str | None) -> None:
+    assert gln is not None
+    assert len(gln) == 13
+    assert gln.isdigit()
+    total = sum(
+        int(digit) * (1 if index % 2 else 3)
+        for index, digit in enumerate(reversed(gln[:-1]))
+    )
+    expected = str((10 - (total % 10)) % 10)
+    assert gln[-1] == expected

@@ -60,35 +60,45 @@ class ScenarioPreset:
         return min(self.transform_input_choices)
 
 
+def _gln(location_id: int) -> str:
+    body = f"0850000{location_id:05d}"
+    total = sum(
+        int(digit) * (1 if index % 2 else 3)
+        for index, digit in enumerate(reversed(body))
+    )
+    check_digit = (10 - (total % 10)) % 10
+    return f"{body}{check_digit}"
+
+
 SCENARIO_PRESETS: dict[ScenarioId, ScenarioPreset] = {
     ScenarioId.LEAFY_GREENS_SUPPLIER: ScenarioPreset(
         id=ScenarioId.LEAFY_GREENS_SUPPLIER,
         label="Leafy greens supplier",
         description="Farm-origin leafy greens flowing through cooling, packout, and outbound cold-chain shipments.",
         farms=(
-            Location("Valley Fresh Farms", "farm", "0850000001001", {"gps": "36.6777,-121.6555"}),
-            Location("Desert Bloom Farm", "farm", "0850000001002", {"gps": "32.8473,-115.5671"}),
-            Location("Riverbend Organics", "farm", "0850000001003", {"gps": "38.3149,-121.9018"}),
+            Location("Valley Fresh Farms", "farm", _gln(1001), {"gps": "36.6777,-121.6555"}),
+            Location("Desert Bloom Farm", "farm", _gln(1002), {"gps": "32.8473,-115.5671"}),
+            Location("Riverbend Organics", "farm", _gln(1003), {"gps": "38.3149,-121.9018"}),
         ),
         coolers=(
-            Location("Salinas Cooling Hub", "cooler", "0850000002001"),
-            Location("Imperial Pre-Cool Facility", "cooler", "0850000002002"),
+            Location("Salinas Cooling Hub", "cooler", _gln(2001)),
+            Location("Imperial Pre-Cool Facility", "cooler", _gln(2002)),
         ),
         packers=(
-            Location("FreshPack Central", "packer", "0850000003001"),
-            Location("GreenLeaf Packing House", "packer", "0850000003002"),
+            Location("FreshPack Central", "packer", _gln(3001)),
+            Location("GreenLeaf Packing House", "packer", _gln(3002)),
         ),
         processors=(
-            Location("ReadyFresh Processing Plant", "processor", "0850000004001"),
-            Location("DeliMix Plant", "processor", "0850000004002"),
+            Location("ReadyFresh Processing Plant", "processor", _gln(4001)),
+            Location("DeliMix Plant", "processor", _gln(4002)),
         ),
         dcs=(
-            Location("Distribution Center #4", "dc", "0850000005001"),
-            Location("Distribution Center #7", "dc", "0850000005002"),
+            Location("Distribution Center #4", "dc", _gln(5001)),
+            Location("Distribution Center #7", "dc", _gln(5002)),
         ),
         retailers=(
-            Location("Retail Store #4521", "retail", "0850000006001"),
-            Location("Retail Store #3189", "retail", "0850000006002"),
+            Location("Retail Store #4521", "retail", _gln(6001)),
+            Location("Retail Store #3189", "retail", _gln(6002)),
         ),
         products=(
             ProductSpec("Romaine Lettuce", "cases", "leafy_greens", {"plu": "4640"}),
@@ -121,29 +131,29 @@ SCENARIO_PRESETS: dict[ScenarioId, ScenarioPreset] = {
         label="Fresh-cut processor",
         description="Ingredient lots routed into processor inventory, transformed into fresh-cut outputs, then shipped onward.",
         farms=(
-            Location("Valley Fresh Farms", "farm", "0850000001001", {"gps": "36.6777,-121.6555"}),
-            Location("Coastal Leaf Farm", "farm", "0850000001011", {"gps": "36.6039,-121.8947"}),
-            Location("Desert Bloom Farm", "farm", "0850000001002", {"gps": "32.8473,-115.5671"}),
+            Location("Valley Fresh Farms", "farm", _gln(1001), {"gps": "36.6777,-121.6555"}),
+            Location("Coastal Leaf Farm", "farm", _gln(1011), {"gps": "36.6039,-121.8947"}),
+            Location("Desert Bloom Farm", "farm", _gln(1002), {"gps": "32.8473,-115.5671"}),
         ),
         coolers=(
-            Location("Salinas Cooling Hub", "cooler", "0850000002001"),
-            Location("Coastal Cold Chain", "cooler", "0850000002011"),
+            Location("Salinas Cooling Hub", "cooler", _gln(2001)),
+            Location("Coastal Cold Chain", "cooler", _gln(2011)),
         ),
         packers=(
-            Location("Processor Intake Packout", "packer", "0850000003011"),
-            Location("GreenLeaf Packing House", "packer", "0850000003002"),
+            Location("Processor Intake Packout", "packer", _gln(3011)),
+            Location("GreenLeaf Packing House", "packer", _gln(3002)),
         ),
         processors=(
-            Location("ReadyFresh Processing Plant", "processor", "0850000004001"),
-            Location("Urban Greens Fresh-Cut", "processor", "0850000004011"),
+            Location("ReadyFresh Processing Plant", "processor", _gln(4001)),
+            Location("Urban Greens Fresh-Cut", "processor", _gln(4011)),
         ),
         dcs=(
-            Location("Foodservice DC #12", "dc", "0850000005011"),
-            Location("Regional Cold DC #3", "dc", "0850000005012"),
+            Location("Foodservice DC #12", "dc", _gln(5011)),
+            Location("Regional Cold DC #3", "dc", _gln(5012)),
         ),
         retailers=(
-            Location("Cafe Commissary #88", "retail", "0850000006011"),
-            Location("Retail Store #4521", "retail", "0850000006001"),
+            Location("Cafe Commissary #88", "retail", _gln(6011)),
+            Location("Retail Store #4521", "retail", _gln(6001)),
         ),
         products=(
             ProductSpec("Romaine Lettuce", "cases", "leafy_greens", {"plu": "4640"}),
@@ -178,30 +188,30 @@ SCENARIO_PRESETS: dict[ScenarioId, ScenarioPreset] = {
         label="Retailer readiness demo",
         description="Retail-ready produce flows quickly through DC receiving and store-level downstream receipts.",
         farms=(
-            Location("SunCoast Produce Ranch", "farm", "0850000001021", {"gps": "34.1231,-119.1802"}),
-            Location("Valley Fresh Farms", "farm", "0850000001001", {"gps": "36.6777,-121.6555"}),
-            Location("Riverbend Organics", "farm", "0850000001003", {"gps": "38.3149,-121.9018"}),
+            Location("SunCoast Produce Ranch", "farm", _gln(1021), {"gps": "34.1231,-119.1802"}),
+            Location("Valley Fresh Farms", "farm", _gln(1001), {"gps": "36.6777,-121.6555"}),
+            Location("Riverbend Organics", "farm", _gln(1003), {"gps": "38.3149,-121.9018"}),
         ),
         coolers=(
-            Location("Retail Cold Dock West", "cooler", "0850000002021"),
-            Location("Salinas Cooling Hub", "cooler", "0850000002001"),
+            Location("Retail Cold Dock West", "cooler", _gln(2021)),
+            Location("Salinas Cooling Hub", "cooler", _gln(2001)),
         ),
         packers=(
-            Location("Retail Ready Packout", "packer", "0850000003021"),
-            Location("FreshPack Central", "packer", "0850000003001"),
+            Location("Retail Ready Packout", "packer", _gln(3021)),
+            Location("FreshPack Central", "packer", _gln(3001)),
         ),
         processors=(
-            Location("ReadyFresh Processing Plant", "processor", "0850000004001"),
-            Location("Meal Kit Prep Center", "processor", "0850000004021"),
+            Location("ReadyFresh Processing Plant", "processor", _gln(4001)),
+            Location("Meal Kit Prep Center", "processor", _gln(4021)),
         ),
         dcs=(
-            Location("Retail DC West", "dc", "0850000005021"),
-            Location("Retail DC East", "dc", "0850000005022"),
+            Location("Retail DC West", "dc", _gln(5021)),
+            Location("Retail DC East", "dc", _gln(5022)),
         ),
         retailers=(
-            Location("Retail Store #4521", "retail", "0850000006001"),
-            Location("Retail Store #3189", "retail", "0850000006002"),
-            Location("Urban Market #22", "retail", "0850000006021"),
+            Location("Retail Store #4521", "retail", _gln(6001)),
+            Location("Retail Store #3189", "retail", _gln(6002)),
+            Location("Urban Market #22", "retail", _gln(6021)),
         ),
         products=(
             ProductSpec("Romaine Hearts Retail Pack", "cases", "retail_ready", {"plu": "3097"}),
@@ -236,24 +246,24 @@ SCENARIO_PRESETS: dict[ScenarioId, ScenarioPreset] = {
         description="Wild-caught seafood landed at the dock, first land-based received, portioned, and shipped with vessel-linked records.",
         farms=(),
         coolers=(
-            Location("Kodiak First Receiver Dock", "first_receiver", "0850000002101", {"harbor": "Kodiak"}),
-            Location("Monterey Harbor Seafood Dock", "first_receiver", "0850000002102", {"harbor": "Monterey"}),
+            Location("Kodiak First Receiver Dock", "first_receiver", _gln(2101), {"harbor": "Kodiak"}),
+            Location("Monterey Harbor Seafood Dock", "first_receiver", _gln(2102), {"harbor": "Monterey"}),
         ),
         packers=(
-            Location("North Pacific Seafood Packhouse", "packer", "0850000003101"),
-            Location("Harbor Portioning Line", "packer", "0850000003102"),
+            Location("North Pacific Seafood Packhouse", "packer", _gln(3101)),
+            Location("Harbor Portioning Line", "packer", _gln(3102)),
         ),
         processors=(
-            Location("ColdWave Fillet Plant", "processor", "0850000004101"),
-            Location("Pacific Smokehouse", "processor", "0850000004102"),
+            Location("ColdWave Fillet Plant", "processor", _gln(4101)),
+            Location("Pacific Smokehouse", "processor", _gln(4102)),
         ),
         dcs=(
-            Location("Seafood DC West", "dc", "0850000005101"),
-            Location("Seafood Export Consolidation Hub", "dc", "0850000005102"),
+            Location("Seafood DC West", "dc", _gln(5101)),
+            Location("Seafood Export Consolidation Hub", "dc", _gln(5102)),
         ),
         retailers=(
-            Location("Harbor Market Seafood Counter", "retail", "0850000006101"),
-            Location("Chef Supply Seafood Depot", "retail", "0850000006102"),
+            Location("Harbor Market Seafood Counter", "retail", _gln(6101)),
+            Location("Chef Supply Seafood Depot", "retail", _gln(6102)),
         ),
         products=(
             ProductSpec("Sockeye Salmon", "totes", "seafood", {"species_code": "SAL-SOC"}),
@@ -288,25 +298,25 @@ SCENARIO_PRESETS: dict[ScenarioId, ScenarioPreset] = {
         label="Dairy continuous flow",
         description="Raw milk flows from farm silos into processing vats, is blended in continuous runs, and ships as production-ready dairy inventory.",
         farms=(
-            Location("North Valley Dairy", "farm", "0850000001101", {"gps": "37.4322,-120.7605"}),
-            Location("Sierra Crest Creamery", "farm", "0850000001102", {"gps": "36.9811,-119.7094"}),
+            Location("North Valley Dairy", "farm", _gln(1101), {"gps": "37.4322,-120.7605"}),
+            Location("Sierra Crest Creamery", "farm", _gln(1102), {"gps": "36.9811,-119.7094"}),
         ),
         coolers=(),
         packers=(
-            Location("Creamery Fill Hall", "packer", "0850000003201"),
-            Location("Cultured Dairy Packaging", "packer", "0850000003202"),
+            Location("Creamery Fill Hall", "packer", _gln(3201)),
+            Location("Cultured Dairy Packaging", "packer", _gln(3202)),
         ),
         processors=(
-            Location("Central Pasteurization Plant", "processor", "0850000004201"),
-            Location("Aged Cheese Vat Room", "processor", "0850000004202"),
+            Location("Central Pasteurization Plant", "processor", _gln(4201)),
+            Location("Aged Cheese Vat Room", "processor", _gln(4202)),
         ),
         dcs=(
-            Location("Dairy Cold Storage North", "dc", "0850000005201"),
-            Location("Foodservice Dairy DC", "dc", "0850000005202"),
+            Location("Dairy Cold Storage North", "dc", _gln(5201)),
+            Location("Foodservice Dairy DC", "dc", _gln(5202)),
         ),
         retailers=(
-            Location("Regional Grocery Dairy Depot", "retail", "0850000006201"),
-            Location("Ingredient Buyer Warehouse", "retail", "0850000006202"),
+            Location("Regional Grocery Dairy Depot", "retail", _gln(6201)),
+            Location("Ingredient Buyer Warehouse", "retail", _gln(6202)),
         ),
         products=(
             ProductSpec("Raw Whole Milk", "gallons", "dairy", {"fat_test": "3.7"}),
