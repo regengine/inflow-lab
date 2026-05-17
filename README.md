@@ -74,6 +74,7 @@ scripts/
   browser_smoke.py       # Headless Playwright dashboard smoke
   remote_smoke.py        # HTTP smoke harness for deployed shared-demo instances
   live_trial.py          # Gated one-batch live-ingest trial runner
+  pressure_trial.py      # Gated staged live-ingest pressure runner
 tests/
 .dockerignore
 AGENTS.md                # Repository instructions for Codex-style agents
@@ -198,6 +199,8 @@ Sends real traffic to a RegEngine workspace. Configure from the dashboard or via
 - Optional `endpoint` override (defaults to `https://www.regengine.co/api/v1/webhooks/ingest`)
 
 For controlled live workspace validation, use `scripts/live_trial.py`. It refuses to send live traffic unless `--confirm-live` is supplied, always performs a mock dry-run first, and sends exactly one live batch before stopping.
+
+For controlled live pressure ramps, use `scripts/pressure_trial.py`. It also refuses to send live traffic unless `--confirm-live` is supplied, always performs a mock dry-run first, then runs staged batches in `<requests>x<batch_size>` form such as `3x1,3x10,3x25`. Use `--workers` to fan out across tenant-scoped simulator controllers, `--max-failures`, `--max-p95-ms`, and `--max-error-rate` to stop unhealthy ramps, `--timeout-seconds` to keep the harness from giving up before larger live batches finish, and `--report-json output/pressure/run.json` to save a machine-readable run summary. Set `REGENGINE_LIVE_TIMEOUT_SECONDS` on the Inflow Lab service when downstream RegEngine batches can legitimately take longer than the default observer window. Render the report as a terminal track with `python3 scripts/pressure_gravitram.py output/pressure/run.json` to spot slow or failed batches quickly. See `docs/PRESSURE_TEST_PRD.md` for the pressure-test product requirements and rollout plan.
 
 ### `none`
 Generates and persists events locally without delivering them anywhere. Useful for seeding fixtures.

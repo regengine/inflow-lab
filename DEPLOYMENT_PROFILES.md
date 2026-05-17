@@ -145,6 +145,28 @@ uv run python scripts/live_trial.py --dry-run-only
 
 # Live trial. This first performs the mock dry-run, then sends exactly one live batch.
 uv run python scripts/live_trial.py --confirm-live
+
+# Staged pressure ramp. This first performs the mock dry-run, then sends
+# 2 single-event batches, 3 ten-event batches, and 3 twenty-five-event batches.
+uv run python scripts/pressure_trial.py \
+  --confirm-live \
+  --stages 2x1,3x10,3x25 \
+  --workers 1 \
+  --max-failures 0 \
+  --max-error-rate 0 \
+  --report-json output/pressure/live-trial-ramp.json
+
+# Parallel tenant fanout. Use only after the one-worker ramp is healthy.
+uv run python scripts/pressure_trial.py \
+  --confirm-live \
+  --stages 3x10,5x25,5x50 \
+  --workers 2 \
+  --max-failures 0 \
+  --max-error-rate 0 \
+  --timeout-seconds 120 \
+  --report-json output/pressure/live-trial-workers.json
+
+python3 scripts/pressure_gravitram.py output/pressure/live-trial-workers.json
 ```
 
 The script refuses to run without either `--dry-run-only` or `--confirm-live`. It never prints the Basic Auth password, live API key, or live tenant id. Stop after the first live result and review the posted/failed status before any further volume.
@@ -207,6 +229,9 @@ Live-trial safeguards:
 - Use `POST /api/delivery/retry` only after correcting the delivery config.
 - Keep the live-trial dashboard origin explicit in `REGENGINE_CORS_ORIGINS`; do not use wildcard CORS with Basic Auth.
 - Do not commit API keys, tenant ids, partner names, downloaded exports, or event logs from live trials.
+- Prefer `scripts/pressure_trial.py` for staged ramps because it reports per-stage posted/failed counts, p50/p95/max latency, events per second, and optional JSON artifacts while keeping the same explicit live-confirmation gate.
+- For large live batches, set `REGENGINE_LIVE_TIMEOUT_SECONDS=60` or higher on the Inflow Lab service and pass `--timeout-seconds 120` or higher to the pressure harness so observer timeouts do not masquerade as RegEngine delivery failures.
+- Increase only one pressure dimension at a time: stage size, then worker count, then latency gates.
 
 ## Service Wrappers
 
