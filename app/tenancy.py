@@ -118,8 +118,30 @@ def tenant_summary(tenant_id: str) -> dict[str, Any]:
     }
 
 
+def _ensure_persist_path_within_root(persist_path: str) -> str:
+    """Reject a caller-supplied persist_path that escapes the data root.
+
+    In default (no-auth) local mode the caller's persist_path is used verbatim
+    by the EventStore for both reads and writes. Without this guard a request
+    could traverse to or target an arbitrary filesystem location
+    (``../../etc/cron.d/x`` or an absolute ``/etc/passwd``), giving arbitrary
+    file read/write as the service user. Tenant-scoped requests never reach
+    here with a caller path — those branches override persist_path with the
+    tenant's own events file.
+
+    Raises ValueError (mapped to HTTP 400 by ``handle_value_error``) on escape.
+    The message deliberately omits the offending path to avoid reflecting it.
+    """
+    candidate = Path(persist_path).resolve()
+    root = DATA_ROOT.resolve()
+    if candidate != root and root not in candidate.parents:
+        raise ValueError("persist_path must stay within the permitted data directory")
+    return persist_path
+
+
 def scope_config(context: TenantContext, config: SimulationConfig) -> SimulationConfig:
     if context.uses_default_storage:
+        _ensure_persist_path_within_root(config.persist_path)
         return config
     return config.model_copy(
         update={"persist_path": str(tenant_events_path(context.tenant_id))},
@@ -132,6 +154,8 @@ def scope_replay_request(
     replay_request: ReplayRequest | None,
 ) -> ReplayRequest | None:
     if context.uses_default_storage:
+        if replay_request is not None and replay_request.persist_path is not None:
+            _ensure_persist_path_within_root(replay_request.persist_path)
         return replay_request
     request_body = replay_request or ReplayRequest()
     return request_body.model_copy(
