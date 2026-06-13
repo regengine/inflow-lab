@@ -7,8 +7,6 @@ REGENGINE_DATA_DIR is an absolute volume path (broke the browser smoke).
 
 from __future__ import annotations
 
-from pathlib import Path
-
 import pytest
 
 from app import tenancy
