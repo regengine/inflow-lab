@@ -131,12 +131,25 @@ def _ensure_persist_path_within_root(persist_path: str) -> str:
 
     Raises ValueError (mapped to HTTP 400 by ``handle_value_error``) on escape.
     The message deliberately omits the offending path to avoid reflecting it.
+
+    Note on relative paths: the UI submits the relative default
+    ``data/events.jsonl``, while in deployments ``REGENGINE_DATA_DIR`` is often
+    an *absolute* volume path. A strict within-DATA_ROOT check would then
+    wrongly reject that legitimate default. A relative path with no ``..``
+    escape can only target the app's own working tree (never an arbitrary
+    filesystem location), so we also accept relative paths confined to the
+    current working directory. Absolute paths must still be within DATA_ROOT.
     """
-    candidate = Path(persist_path).resolve()
+    candidate = Path(persist_path)
+    resolved = candidate.resolve()
     root = DATA_ROOT.resolve()
-    if candidate != root and root not in candidate.parents:
-        raise ValueError("persist_path must stay within the permitted data directory")
-    return persist_path
+    if resolved == root or root in resolved.parents:
+        return persist_path
+    if not candidate.is_absolute():
+        cwd = Path.cwd().resolve()
+        if resolved == cwd or cwd in resolved.parents:
+            return persist_path
+    raise ValueError("persist_path must stay within the permitted data directory")
 
 
 def scope_config(context: TenantContext, config: SimulationConfig) -> SimulationConfig:
