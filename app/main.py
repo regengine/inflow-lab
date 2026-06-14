@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import logging
 from contextlib import asynccontextmanager
 from pathlib import Path
 
@@ -9,6 +10,7 @@ from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
 
 from . import tenancy
+from .auth import basic_auth_config_from_env
 from .auth_middleware import auth_and_tenant_middleware
 from .build_info import APP_VERSION
 from .cors import cors_origins_from_env
@@ -19,9 +21,18 @@ from .tenancy import controller, scenario_saves
 
 static_dir = Path(__file__).parent / "static"
 
+logger = logging.getLogger("inflow_lab")
+
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    if not basic_auth_config_from_env().enabled:
+        logger.warning(
+            "inflow-lab is starting WITHOUT authentication (REGENGINE_BASIC_AUTH_USERNAME/"
+            "PASSWORD unset). This is a non-production demo simulator — do not expose it on a "
+            "public network or enter real/customer data. Set Basic Auth env vars, or keep it "
+            "bound to localhost. See REPO_PURPOSE.md."
+        )
     yield
     await tenancy.shutdown_tenant_controllers()
 

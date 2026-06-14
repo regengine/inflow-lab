@@ -6,6 +6,9 @@ on:
       - main
       - 'codex/**'
   pull_request:
+  schedule:
+    - cron: '0 7 * * 1'
+  workflow_dispatch:
 
 permissions:
   contents: read

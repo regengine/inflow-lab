@@ -2,6 +2,8 @@
 
 A mock-first FSMA 204 traceability simulator that emits **RegEngine-compatible ingest payloads** into a realistic supply-chain lifecycle. Ships with a FastAPI backend, a lightweight dashboard, and a built-in mock RegEngine endpoint for safe local testing.
 
+> **Non-production sandbox.** Inflow Lab is a demo, onboarding, and integration-validation tool for RegEngine — not a product, not a source of compliance record, and not built for public exposure. All data is synthetic. Without Basic Auth it serves a single shared `local-demo` tenant; keep it on localhost or behind auth, and never enter real data. See [REPO_PURPOSE.md](REPO_PURPOSE.md).
+
 ## Table of contents
 
 - [What it does](#what-it-does)
