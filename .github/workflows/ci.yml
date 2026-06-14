@@ -43,7 +43,12 @@ jobs:
       - name: Check dependency health
         run: |
           uv pip check
-          uv run --frozen --group dev pip-audit
+          # PYSEC-2026-196 is an advisory against the GitHub runner's bundled
+          # pip (26.1.1; fixed in 26.1.2) — a build tool, not a project
+          # dependency. It fails pip-audit's ambient-env scan and is unrelated
+          # to this repo. Ignore it so the gate reflects project deps only;
+          # remove once the runner image ships pip >= 26.1.2.
+          uv run --frozen --group dev pip-audit --ignore-vuln PYSEC-2026-196
           uv run --frozen --group dev bandit -q -r app scripts
 
   browser-smoke:

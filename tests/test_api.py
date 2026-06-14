@@ -73,7 +73,7 @@ def test_sse_stream_emits_initial_snapshot():
     assert payload["events"] == []
 
 
-def test_status_surfaces_redact_live_delivery_credentials(tmp_path):
+def test_status_surfaces_redact_live_delivery_credentials():
     api_key = "regengine-live-api-key-secret"
     tenant_id = "regengine-live-tenant-secret"
     reset_response = client.post(
@@ -81,7 +81,6 @@ def test_status_surfaces_redact_live_delivery_credentials(tmp_path):
         json={
             "batch_size": 1,
             "seed": 204,
-            "persist_path": str(tmp_path / "live-status-events.jsonl"),
             "delivery": {
                 "mode": "live",
                 "endpoint": "https://www.regengine.co/api/v1/webhooks/ingest",
@@ -404,6 +403,31 @@ def test_tenant_header_scopes_event_storage_and_rejects_invalid_ids(tmp_path):
 
     invalid_response = client.get("/api/health", headers={"X-RegEngine-Tenant": "../tenant"})
     assert invalid_response.status_code == 400
+
+
+@pytest.mark.parametrize(
+    "escape_path",
+    [
+        "/etc/passwd",
+        "../../etc/cron.d/inflow",
+        "data/../../../tmp/escape.jsonl",
+    ],
+)
+def test_default_mode_rejects_persist_path_outside_data_root(escape_path):
+    # In default (no-auth) local mode the caller's persist_path is used
+    # verbatim by the EventStore; a path escaping the data root must be
+    # rejected (would otherwise be arbitrary file read/write).
+    start_response = client.post(
+        "/api/simulate/start",
+        json={"config": {"batch_size": 1, "seed": 204, "persist_path": escape_path}},
+    )
+    assert start_response.status_code == 400
+
+    replay_response = client.post(
+        "/api/simulate/replay",
+        json={"persist_path": escape_path},
+    )
+    assert replay_response.status_code == 400
 
 
 def test_default_data_root_is_used_for_local_and_tenant_paths():
