@@ -24,6 +24,10 @@ const state = {
     processor: 'Processor',
     retailer: 'Retail / distribution',
     first_receiver: 'First receiver',
+    copacker: 'Co-packer / contract manufacturer',
+    distributor: 'Distributor / wholesaler',
+    foodservice: 'Foodservice',
+    egg_producer: 'Egg producer',
   },
   exportPresetDescriptions: {
     all_records: 'Full FDA-request export for the selected date range.',
