@@ -13,6 +13,8 @@ Inflow Lab plays the role of **a RegEngine customer's own software**: a fictiona
 - [Browser smoke](#browser-smoke)
 - [Release smoke regression](#release-smoke-regression)
 - [Delivery modes](#delivery-modes)
+- [RegEngine integration settings](#regengine-integration-settings)
+- [Customer journey harness](#customer-journey-harness)
 - [Basic auth and tenant storage](#basic-auth-and-tenant-storage)
 - [Replay mode](#replay-mode)
 - [CSV import](#csv-import)
@@ -34,37 +36,47 @@ Inflow Lab plays the role of **a RegEngine customer's own software**: a fictiona
 
 ## What it does
 
-The generator walks lots through a realistic supply-chain lifecycle so the resulting trace feels legitimate rather than random:
+Inflow Lab reproduces the full experience a RegEngine customer has in the wild, playing the customer's side of the integration:
 
-1. **Harvesting** originates at farms
-2. **Cooling** moves harvested lots through cooler facilities
-3. **Initial packing** creates downstream packed lots
-4. **Shipping** creates a believable destination and reference document
-5. **Receiving** corresponds to an actual prior shipment
-6. **Transformation** consumes input lots and emits a new output lot
-7. **Downstream shipping + receiving** moves transformed lots to DCs and retail
+- **A factory persona.** The console presents as Meridian Fresh Foods' own production software — line setup, line control, a shift log, traceability views — with RegEngine demoted to an *Integrations* settings panel the way a real customer configures a third-party service (endpoint, API key, tenant, test connection).
+- **A realistic event generator.** Lots walk through a believable supply-chain lifecycle so the resulting trace feels legitimate rather than random:
+  1. **Harvesting** originates at farms
+  2. **Cooling** moves harvested lots through cooler facilities
+  3. **Initial packing** creates downstream packed lots
+  4. **Shipping** creates a believable destination and reference document
+  5. **Receiving** corresponds to an actual prior shipment
+  6. **Transformation** consumes input lots and emits a new output lot
+  7. **Downstream shipping + receiving** moves transformed lots to DCs and retail
+- **Real integration mechanics.** Live delivery sends exactly what an integrator sends — `X-RegEngine-API-Key`, `X-Tenant-ID`, a required `Idempotency-Key`, optional HMAC body signing — and surfaces RegEngine's real per-event accept/reject responses. The built-in stand-in mirrors the live webhook's validation, so a payload that would fail in production fails here too.
+- **Real friction, on purpose.** Missing-KDE rejections, bad-key 401s, lapsed-billing 402s, and rate-limit 429s can all be rehearsed, with recovery guidance and idempotent retries that never double-ingest.
 
-Each event is persisted with `event_id`, `sha256_hash`, and `chain_hash` so the flow feels production-like, and you can trace transitive lot lineage forward and backward through the dashboard or API.
+Each accepted event is persisted with `event_id`, `sha256_hash`, and `chain_hash` so the flow feels production-like, and you can trace transitive lot lineage forward and backward through the console or API.
 
 ## Project layout
 
 ```text
 app/
+  audit.py               # Scenario audit scoring for the console's readiness lens
   auth.py                # Optional Basic Auth and tenant context resolution
+  auth_middleware.py     # Auth + tenant middleware, trusted-origin checks, request logging
   build_info.py          # Public non-secret build/deployment metadata for health checks
-  controller.py          # Simulator lifecycle (start/stop/step/reset)
-  demo_fixtures.py       # Deterministic demo playback fixtures
+  controller.py          # Simulator lifecycle (start/stop/step/reset) and delivery fan-out
+  csv_importer.py        # CSV parsing for scheduled events and seed lots
+  cte_rules.py           # Required/recommended KDEs per CTE (pinned to RegEngine's contract)
+  demo_fixtures.py       # Deterministic demo playback fixtures (RegEngine-canonical KDEs)
   engine.py              # CTE generation and lot lineage logic
   epcis_export.py        # EPCIS 2.0 JSON-LD export scaffolding
   fda_export.py          # FDA-request CSV export presets and rendering
+  industry_adapters.py   # Industry-specific event shaping (produce, seafood, dairy)
   main.py                # FastAPI app and route wiring
-  mock_service.py        # Built-in mock RegEngine ingest endpoint
-  models.py              # Pydantic models for config, events, payloads
-  regengine_client.py    # HTTP client for live RegEngine delivery
+  mock_service.py        # RegEngine stand-in mirroring the live webhook's validation
+  regengine_client.py    # HTTP client for live delivery + connection-check probe
+  routers/               # API routers (simulation, integration, events, exports, ...)
   scenario_saves.py      # Per-scenario saved config and event-log snapshots
   scenarios.py           # Named scenario presets for product/location/flow mixes
+  schemas/               # Pydantic models (domain, simulation, ingestion, integration, ...)
   store.py               # Event persistence (JSONL)
-  static/                # Dashboard (vanilla JS, HTML, CSS)
+  static/                # Operator console (vanilla JS, HTML, CSS)
 .agents/skills/regengine-api-contract/
 .github/
   codex/prompts/autobuild.md
@@ -76,6 +88,7 @@ scripts/
   browser_smoke.py       # Headless Playwright dashboard smoke
   remote_smoke.py        # HTTP smoke harness for deployed shared-demo instances
   live_trial.py          # Gated one-batch live-ingest trial runner
+  customer_journey.py    # End-to-end customer journey against a real RegEngine stack
 tests/
 .dockerignore
 AGENTS.md                # Repository instructions for Codex-style agents
@@ -110,7 +123,7 @@ Then open:
 http://127.0.0.1:8000
 ```
 
-The dashboard is organized as a guided operator console: setup, run, monitor delivery, trace lineage, and export evidence. It supports scenario presets, saved demo states, deterministic fixtures, start/stop/step/reset controls, replay, CSV imports, recent-event inspection, active tenant/auth/storage context, FDA CSV presets, and scaffolded EPCIS 2.0 JSON-LD exports. It subscribes to live status/event snapshots with Server-Sent Events and falls back to refresh polling if the stream disconnects. Delivery mode defaults to **`mock`** so no credentials are required.
+The console presents as Meridian Fresh Foods' plant-operations software: line setup (operation type, line profile, data sets), line control (start/pause/step/clear with live metrics), a **RegEngine connection** integrations panel (endpoint, API key, tenant, test-connection verdicts, failure-mode rehearsal toggles), a shift log with per-event delivery status, lot tracing, an audit-readiness lens, CSV import, and FDA CSV / EPCIS 2.0 JSON-LD evidence exports. The delivery monitor explains how to recover from each failure class (bad key, lapsed billing, rate limit, missing KDEs). It subscribes to live status/event snapshots with Server-Sent Events and falls back to refresh polling if the stream disconnects. Delivery defaults to **`mock`** (the built-in RegEngine stand-in) so no credentials are required.
 
 Event records are stored as JSONL at `config.persist_path` (`data/events.jsonl` by default for local unauthenticated use). Set `REGENGINE_DATA_DIR` to move the default event log, tenant logs, and scenario saves under another directory such as `/data` for a mounted deployment volume. Existing records at that path are loaded when the app starts or when a start/reset request points at a different path; reset clears the currently configured event log. Tenant-scoped requests store records under `{REGENGINE_DATA_DIR}/tenants/{tenant_id}/events.jsonl` and ignore untrusted persist-path overrides. Lineage, stats, retry lookup, replay, FDA CSV, and EPCIS exports read the persisted JSONL history so older records remain available after the in-memory recent-events window rolls forward. Replay reads the JSONL log without appending, duplicating, or rewriting stored events.
 
@@ -120,7 +133,7 @@ Event records are stored as JSONL at `config.persist_path` (`data/events.jsonl` 
 uv run pytest
 ```
 
-The suite covers payload shape, engine determinism, and the HTTP API contract.
+The suite covers payload shape, engine determinism, the HTTP API contract, the integration-settings endpoints, mock rejection/friction/idempotency behavior, and a contract-pin test that locks `app/cte_rules.py`'s required KDEs to RegEngine's live webhook table (`webhook_models.REQUIRED_KDES_BY_CTE`) so validator drift fails CI instead of failing a customer.
 
 ## Browser smoke
 
@@ -132,7 +145,7 @@ uv run --no-dev --group browser playwright install chromium
 uv run --no-dev --group browser python scripts/browser_smoke.py
 ```
 
-The smoke starts a temporary local server with mock delivery, drives Chromium through the dashboard start/stop, reset, single-batch, fixture load, transformed-lot lineage lookup, and CSV warning display flows, then exits nonzero with a clear failure message if a browser assertion fails. It forces the dashboard delivery mode to `mock` before taking any action.
+The smoke starts a temporary local server with mock delivery, drives Chromium through the console start/pause, clear, single-batch, connection-test, line-data load, transformed-lot lineage lookup, and CSV warning display flows, then exits nonzero with a clear failure message if a browser assertion fails. It forces the delivery mode to `mock` before taking any action. Set `REGENGINE_BROWSER_EXECUTABLE` to point at a pre-installed Chromium instead of downloading one (useful in sandboxed CI environments).
 
 Set `REGENGINE_BROWSER_BASE_URL` to run against an already-started local or remote instance instead of letting the script start one. For Basic Auth deployments, set `REGENGINE_BROWSER_USERNAME` and `REGENGINE_BROWSER_PASSWORD`; set `REGENGINE_BROWSER_TENANT` to send `X-RegEngine-Tenant` for an isolated smoke tenant. The script also accepts the equivalent `REGENGINE_REMOTE_*` variables used by `scripts/remote_smoke.py`.
 
@@ -427,11 +440,19 @@ All routes accept optional `X-RegEngine-Tenant` for tenant-scoped storage. If Ba
 | `GET` | `/api/events` | List persisted events |
 | `GET` | `/api/lineage/{traceability_lot_code}` | Full lineage graph for a lot |
 
+### RegEngine integration
+
+| Method | Path | Purpose |
+|---|---|---|
+| `GET` | `/api/integration/status` | Sanitized connection state (mode, endpoint host, key/tenant configured, HMAC, friction) |
+| `POST` | `/api/integration/configure` | Partial update of mode/endpoint/api_key/tenant_id/mock_friction |
+| `POST` | `/api/integration/test` | Probe RegEngine with configured or supplied credentials; returns an actionable verdict |
+
 ### Mock RegEngine
 
 | Method | Path | Purpose |
 |---|---|---|
-| `POST` | `/api/mock/regengine/ingest` | Accepts RegEngine-shaped payloads |
+| `POST` | `/api/mock/regengine/ingest` | RegEngine-shaped ingest mirroring the live webhook's validation (per-event accept/reject) |
 | `GET` | `/api/mock/regengine/export/presets` | List FDA request export presets |
 | `GET` | `/api/mock/regengine/export/fda-request` | Mock 11-column FDA request CSV |
 | `GET` | `/api/mock/regengine/export/epcis` | Scaffolded EPCIS 2.0 JSON-LD export |
@@ -565,8 +586,8 @@ curl "http://127.0.0.1:8000/api/mock/regengine/export/epcis?traceability_lot_cod
 The live delivery client targets the current RegEngine webhook shape:
 
 - **Endpoint:** `https://www.regengine.co/api/v1/webhooks/ingest`
-- **Headers:** `X-RegEngine-API-Key`, `X-Tenant-ID`, `Content-Type: application/json`
-- **Payload:**
+- **Headers:** `X-RegEngine-API-Key`, `X-Tenant-ID`, `Idempotency-Key` (required by RegEngine; generated per batch and reused on retry), `Content-Type: application/json`, and `X-Webhook-Signature: sha256=<hex>` when `REGENGINE_WEBHOOK_HMAC_SECRET` is set (HMAC-SHA256 over the exact request body bytes)
+- **Payload** (note the canonical KDEs — RegEngine's validator uses strict string lookup, so split fields like `reference_document_type`/`_number` do **not** satisfy `reference_document`):
 
 ```json
 {
@@ -583,14 +604,17 @@ The live delivery client targets the current RegEngine webhook shape:
       "kdes": {
         "receive_date": "2026-02-05",
         "receiving_location": "Distribution Center #4",
-        "ship_from_location": "Valley Fresh Farms"
+        "ship_from_location": "Valley Fresh Farms",
+        "immediate_previous_source": "Valley Fresh Farms",
+        "reference_document": "Bill of Lading BOL-2026-001",
+        "tlc_source_reference": "SRC-2026-001"
       }
     }
   ]
 }
 ```
 
-The mock FDA export mirrors RegEngine's documented 11-column request export shape. The EPCIS 2.0 export is a separate derived JSON-LD scaffold and does not change this webhook contract.
+Required KDEs per CTE are mirrored in `app/cte_rules.py` and pinned to RegEngine's `REQUIRED_KDES_BY_CTE` by `tests/test_regengine_contract_pin.py`; the detailed contract reference lives in `.agents/skills/regengine-api-contract/references/contract.md`. The mock FDA export mirrors RegEngine's documented 11-column request export shape. The EPCIS 2.0 export is a separate derived JSON-LD scaffold and does not change this webhook contract.
 
 ## Deployment
 
