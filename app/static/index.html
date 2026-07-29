@@ -3,39 +3,40 @@
   <head>
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-    <title>RegEngine Inflow Lab</title>
+    <title>Meridian Fresh Ops — Plant Operations Console</title>
     <link rel="icon" href="data:," />
-    <link rel="stylesheet" href="/static/styles.css?v=2" />
+    <link rel="stylesheet" href="/static/styles.css?v=3" />
   </head>
   <body>
     <main class="page">
       <div role="note" style="margin:0 0 1rem;padding:10px 14px;border:1px solid #d9a300;border-radius:8px;background:#fff8e1;color:#5a4500;font-size:14px;line-height:1.5;">
-        <strong>Non-production demo.</strong> This is a mock FSMA 204 simulator — all data is synthetic. Do not enter real or customer data, and do not expose this instance on a public network.
+        <strong>Sandbox environment.</strong> Meridian Fresh Foods is a fictional company and all data here is synthetic — this console simulates the software a RegEngine customer runs. Do not enter real or customer data, and do not expose this instance on a public network.
       </div>
       <header class="app-header">
         <div class="hero-main">
-          <p class="eyebrow">Mock-first FSMA 204 simulator</p>
-          <h1>RegEngine Inflow Lab</h1>
+          <p class="eyebrow">Meridian Fresh Foods</p>
+          <h1>Plant Operations Console</h1>
           <p class="hero-copy">
-            Configure an inflow source, run a mock delivery, trace lot lineage, and package export-ready evidence.
+            Run the production line, record traceability events as product moves, and keep the plant's
+            FSMA&nbsp;204 records flowing to compliance.
           </p>
           <div class="hero-actions">
-            <button class="button" id="loadFixtureBtn" type="button">Load demo scenario</button>
-            <button class="button secondary" id="stepBtn" type="button">Run pipeline</button>
+            <button class="button" id="loadFixtureBtn" type="button">Load today's line data</button>
+            <button class="button secondary" id="stepBtn" type="button">Record next batch</button>
             <button class="button secondary" id="lineageBtn" type="button">Trace latest lot</button>
             <a class="button secondary" id="exportDownloadLink" href="/api/mock/regengine/export/fda-request" target="_blank" rel="noreferrer">
-              Prepare FDA package
+              Compliance export
             </a>
           </div>
         </div>
         <div class="hero-side" aria-label="Current environment">
           <div>
-            <span>Tenant</span>
+            <span>Site</span>
             <strong id="tenantBadge">local-demo</strong>
           </div>
           <div>
-            <span>Delivery</span>
-            <strong id="deliveryModePill">mock</strong>
+            <span>RegEngine</span>
+            <strong id="deliveryModePill">sandbox</strong>
           </div>
           <div>
             <span>Build</span>
@@ -44,62 +45,62 @@
         </div>
       </header>
 
-      <section class="status-strip" aria-label="Pipeline summary">
+      <section class="status-strip" aria-label="Shift summary">
         <div class="status-card">
           <span>Next action</span>
-          <strong id="nextActionText">Load a fixture or run a batch</strong>
+          <strong id="nextActionText">Load line data or record a batch</strong>
         </div>
         <div class="status-card">
           <span>Records</span>
-          <strong>5 CTE types</strong>
+          <strong>7 CTE types</strong>
         </div>
         <div class="status-card">
-          <span>Delivery</span>
-          <strong>Mock adapter</strong>
+          <span>Compliance link</span>
+          <strong>RegEngine ingest</strong>
         </div>
         <div class="status-card">
           <span>Evidence</span>
-          <strong>CSV + EPCIS</strong>
+          <strong>FDA CSV + EPCIS</strong>
         </div>
       </section>
 
-      <section class="workflow-rail" aria-label="Inflow pipeline stages">
+      <section class="workflow-rail" aria-label="Plant flow stages">
         <article>
-          <span>Demo data</span>
-          <strong>Leafy greens supplier</strong>
-          <small>Scenario fixture</small>
+          <span>Harvest intake</span>
+          <strong>Field lots arrive</strong>
+          <small>Origin records</small>
         </article>
         <article>
-          <span>Generate</span>
-          <strong>Harvest to receipt</strong>
-          <small>CTE records</small>
+          <span>Cooling</span>
+          <strong>Cold chain start</strong>
+          <small>Cooler receipts</small>
         </article>
         <article>
-          <span>Deliver</span>
-          <strong>Local simulation</strong>
-          <small>Mock posted</small>
+          <span>Packing</span>
+          <strong>Packout lines</strong>
+          <small>New lot codes</small>
         </article>
         <article>
-          <span>Validate</span>
-          <strong>FSMA KDE checks</strong>
-          <small>Warnings visible</small>
+          <span>Ship &amp; receive</span>
+          <strong>Dock movements</strong>
+          <small>BOL references</small>
         </article>
         <article>
-          <span>Trace</span>
-          <strong>Lot lineage</strong>
-          <small>Chain review</small>
+          <span>Processing</span>
+          <strong>Transformation</strong>
+          <small>Batch records</small>
         </article>
         <article>
-          <span>Export</span>
-          <strong>FDA + EPCIS</strong>
-          <small>Evidence package</small>
+          <span>Compliance</span>
+          <strong>RegEngine evidence</strong>
+          <small>Audit-ready</small>
         </article>
       </section>
 
       <section class="workspace-heading">
         <div>
-          <p class="section-kicker">Operational workspace</p>
-          <h2>Review generated records, trace lots, and prepare evidence exports from the active demo scenario.</h2>
+          <p class="section-kicker">Shift workspace</p>
+          <h2>Watch the line, trace lots through the plant, and keep compliance records current.</h2>
         </div>
         <div class="quick-trace">
           <input id="lotLookup" placeholder="Traceability Lot Code" />
@@ -112,16 +113,12 @@
           <section class="panel compact-panel">
             <div class="section-head">
               <div>
-                <p class="section-kicker">Scenario setup</p>
-                <h2>Inflow source</h2>
+                <p class="section-kicker">Line setup</p>
+                <h2>Production line</h2>
               </div>
-              <span class="mode-alert" id="liveDeliveryWarning" hidden>Live delivery enabled</span>
+              <span class="mode-alert" id="liveDeliveryWarning" hidden>Connected to RegEngine (live)</span>
             </div>
             <form id="config-form" class="setup-grid">
-              <label>
-                Tenant
-                <input id="tenantId" name="tenantId" autocomplete="off" placeholder="local-demo" />
-              </label>
               <label>
                 Operation type
                 <select id="operationType" name="operationType">
@@ -129,7 +126,7 @@
                 </select>
               </label>
               <label>
-                Scenario preset
+                Line profile
                 <select id="scenario" name="scenario">
                   <option value="leafy_greens_supplier" selected>Leafy greens supplier</option>
                   <option value="fresh_cut_processor">Fresh-cut processor</option>
@@ -139,48 +136,87 @@
                 </select>
               </label>
               <label>
-                Fixture
+                Line data set
                 <select id="demoFixture" name="demoFixture">
                   <option value="leafy_greens_trace" selected>Leafy greens trace</option>
                 </select>
               </label>
-              <label>
-                Delivery mode
-                <select id="deliveryMode" name="deliveryMode">
-                  <option value="mock" selected>Mock RegEngine</option>
-                  <option value="live">Live RegEngine</option>
-                  <option value="none">Generate only</option>
-                </select>
-              </label>
               <label class="wide-field">
-                Source
-                <input id="source" name="source" value="codex-simulator" />
+                Source system label
+                <input id="source" name="source" value="meridian-ops" />
               </label>
             </form>
-            <p class="note" id="operationTypeDescription">Choose the type of operation you run to narrow the scenario presets to matching flows.</p>
+            <p class="note" id="operationTypeDescription">Choose the type of operation this plant runs to narrow the line profiles to matching flows.</p>
             <p class="note" id="demoFixtureDescription">Harvest through cooling, packout, shipment, and DC receipt for one leafy greens lot.</p>
           </section>
 
           <section class="panel compact-panel run-panel">
             <div class="section-head">
               <div>
-                <p class="section-kicker">Run command center</p>
-                <h2>Simulator</h2>
+                <p class="section-kicker">Line control</p>
+                <h2>Production feed</h2>
               </div>
-              <span class="status-pill" id="runStatePill">Stopped</span>
+              <span class="status-pill" id="runStatePill">Idle</span>
             </div>
             <p class="note status-message" id="statusMessage">Ready.</p>
             <div class="action-row">
-              <button class="button" id="startBtn" type="button">Start loop</button>
-              <button class="button secondary" id="stopBtn" type="button">Stop</button>
-              <button class="button secondary" id="replayBtn" type="button">Replay log</button>
-              <button class="button danger" id="resetBtn" type="button">Reset state</button>
+              <button class="button" id="startBtn" type="button">Start line</button>
+              <button class="button secondary" id="stopBtn" type="button">Pause line</button>
+              <button class="button secondary" id="replayBtn" type="button">Replay shift log</button>
+              <button class="button danger" id="resetBtn" type="button">Clear shift</button>
             </div>
-            <div class="stats-grid" id="statsGrid" aria-label="Simulator metrics"></div>
+            <div class="stats-grid" id="statsGrid" aria-label="Line metrics"></div>
+          </section>
+
+          <section class="panel compact-panel integration-panel">
+            <div class="section-head">
+              <div>
+                <p class="section-kicker">Integrations</p>
+                <h2>RegEngine connection</h2>
+              </div>
+              <span class="status-pill" id="connectionPill">Sandbox</span>
+            </div>
+            <div id="connectionChips" class="connection-chips"></div>
+            <div class="grid compact-fields">
+              <label>
+                Delivery
+                <select id="deliveryMode" name="deliveryMode">
+                  <option value="mock" selected>Sandbox (built-in stand-in)</option>
+                  <option value="live">Connected (live RegEngine)</option>
+                  <option value="none">Off (record locally only)</option>
+                </select>
+              </label>
+              <label class="wide-field">
+                Ingest endpoint
+                <input id="endpoint" name="endpoint" placeholder="https://www.regengine.co/api/v1/webhooks/ingest" />
+              </label>
+              <label class="wide-field">
+                API key
+                <input id="apiKey" name="apiKey" type="password" autocomplete="off" placeholder="rge_live_…" />
+              </label>
+              <label class="wide-field">
+                Tenant ID
+                <input id="tenantId" name="tenantId" autocomplete="off" placeholder="RegEngine workspace tenant UUID" />
+              </label>
+            </div>
+            <div class="action-row">
+              <button class="button secondary" id="testConnectionBtn" type="button">Test connection</button>
+              <button class="button secondary" id="saveIntegrationBtn" type="button">Save settings</button>
+            </div>
+            <div id="connectionResult" class="connection-result"></div>
+            <details class="friction-details">
+              <summary>Rehearse failure modes (sandbox only)</summary>
+              <div class="friction-row">
+                <label><input type="checkbox" id="frictionInvalidKey" value="invalid_key" /> Invalid API key (401)</label>
+                <label><input type="checkbox" id="frictionSubscription" value="subscription_inactive" /> Subscription lapsed (402)</label>
+                <label><input type="checkbox" id="frictionRateLimit" value="rate_limit" /> Rate limited (429)</label>
+              </div>
+              <p class="note">These inject the same failures a live integration hits, so operators can practice diagnosing and retrying before going live.</p>
+            </details>
           </section>
 
           <details class="panel advanced-panel" id="advancedConfig">
-            <summary>Advanced timing, credentials, and saved states</summary>
+            <summary>Advanced timing and saved line states</summary>
             <div class="advanced-content">
               <div class="grid two-up compact-fields">
                 <label>
@@ -195,28 +231,20 @@
                   Seed
                   <input id="seed" name="seed" type="number" value="204" />
                 </label>
-                <label class="wide-field">
-                  Live endpoint override
-                  <input id="endpoint" name="endpoint" placeholder="https://www.regengine.co/api/v1/webhooks/ingest" />
-                </label>
-                <label class="wide-field">
-                  RegEngine API key
-                  <input id="apiKey" name="apiKey" type="password" autocomplete="off" />
-                </label>
               </div>
               <div class="split-row">
                 <label>
-                  Saved scenario
+                  Saved line state
                   <select id="scenarioSave" name="scenarioSave">
-                    <option value="">No saved scenarios</option>
+                    <option value="">No saved line states</option>
                   </select>
                 </label>
                 <div class="action-row">
-                  <button class="button secondary" id="saveScenarioBtn" type="button">Save scenario</button>
+                  <button class="button secondary" id="saveScenarioBtn" type="button">Save state</button>
                   <button class="button secondary" id="loadScenarioBtn" type="button">Load saved</button>
                 </div>
               </div>
-              <p class="note" id="scenarioSaveDescription">No saved scenario selected.</p>
+              <p class="note" id="scenarioSaveDescription">No saved line state selected.</p>
             </div>
           </details>
         </aside>
@@ -224,7 +252,7 @@
         <section class="center-stack">
           <div class="tab-strip" aria-label="Workspace sections">
             <span>Audit view</span>
-            <span>Scenario lens</span>
+            <span>Line lens</span>
             <span>Record spotlight</span>
             <span>Lineage</span>
             <span>Exports</span>
@@ -234,8 +262,8 @@
           <section class="panel scenario-panel">
             <div class="section-head">
               <div>
-                <p class="section-kicker">Scenario intelligence</p>
-                <h2>Industry audit lens</h2>
+                <p class="section-kicker">Compliance intelligence</p>
+                <h2>Audit readiness</h2>
               </div>
             </div>
             <div id="readinessBanner" class="readiness-banner"></div>
@@ -265,7 +293,7 @@
           <section class="panel events-panel">
             <div class="section-head">
               <div>
-                <p class="section-kicker">Event log</p>
+                <p class="section-kicker">Shift log</p>
                 <h2>Recent events</h2>
               </div>
               <button class="button secondary" id="refreshBtn" type="button">Refresh</button>
@@ -295,8 +323,8 @@
           <section class="panel delivery-monitor">
             <div class="section-head">
               <div>
-                <p class="section-kicker">Delivery monitor</p>
-                <h2>Mock adapter</h2>
+                <p class="section-kicker">RegEngine delivery</p>
+                <h2>Ingest monitor</h2>
               </div>
               <button class="button secondary" id="retryFailedBtn" type="button">Retry failed</button>
             </div>
@@ -337,8 +365,8 @@
           <section class="panel import-block">
             <div class="section-head">
               <div>
-                <p class="section-kicker">CSV import</p>
-                <h2>Stage records</h2>
+                <p class="section-kicker">Data import</p>
+                <h2>Bring in plant records</h2>
               </div>
             </div>
             <div class="grid export-grid">
@@ -362,11 +390,11 @@
 
           <nav class="resource-links" aria-label="Resources">
             <a href="/docs" target="_blank" rel="noreferrer">Open API docs</a>
-            <a href="/api/mock/regengine/export/fda-request" target="_blank" rel="noreferrer">Download mock FDA export</a>
+            <a href="/api/mock/regengine/export/fda-request" target="_blank" rel="noreferrer">Download FDA export</a>
           </nav>
         </aside>
       </div>
     </main>
-    <script src="/static/app.js?v=2" defer></script>
+    <script src="/static/app.js?v=3" defer></script>
   </body>
 </html>

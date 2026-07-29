@@ -425,8 +425,9 @@ input::placeholder {
 }
 
 .run-panel {
-  position: sticky;
-  top: 16px;
+  /* Not sticky: the integration panel sits below it in the left column and
+     a sticky run panel slides over it on scroll, intercepting clicks. */
+  position: static;
 }
 
 .status-message {
@@ -1166,4 +1167,89 @@ tbody tr.has-audit-warning {
     border: 1px solid var(--border);
     border-radius: 8px;
   }
+}
+
+/* RegEngine integration panel (customer-style settings page) */
+.integration-panel .connection-chips {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  margin: 0 0 10px;
+}
+
+.connection-chip {
+  display: inline-flex;
+  align-items: baseline;
+  gap: 6px;
+  padding: 4px 10px;
+  border: 1px solid var(--border);
+  border-radius: 999px;
+  font-size: 12px;
+  background: var(--surface, #fff);
+}
+
+.connection-chip span {
+  color: var(--muted, #667085);
+}
+
+.connection-chip strong {
+  font-weight: 600;
+}
+
+.connection-result {
+  margin-top: 10px;
+}
+
+.connection-verdict {
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 10px 12px;
+  font-size: 13px;
+  line-height: 1.5;
+}
+
+.connection-verdict strong {
+  text-transform: capitalize;
+}
+
+.connection-verdict p {
+  margin: 4px 0 0;
+}
+
+.connection-verdict[data-tone="success"] {
+  border-color: #12805c;
+  background: #ecfdf3;
+}
+
+.connection-verdict[data-tone="error"] {
+  border-color: #b42318;
+  background: #fef3f2;
+}
+
+.friction-details {
+  margin-top: 12px;
+  font-size: 13px;
+}
+
+.friction-details summary {
+  cursor: pointer;
+  color: var(--muted, #667085);
+}
+
+.friction-row {
+  display: grid;
+  gap: 6px;
+  margin: 10px 0 4px;
+}
+
+.friction-row label {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-size: 13px;
+}
+
+.friction-row input[type="checkbox"] {
+  width: auto;
+  margin: 0;
 }

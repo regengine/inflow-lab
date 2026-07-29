@@ -66,6 +66,8 @@ REQUIRED_KDES: dict[CTEType, tuple[str, ...]] = {
         "reference_document",
         "harvester_business_name",
     ),
+    # Matches RegEngine webhook_models.REQUIRED_KDES_BY_CTE exactly
+    # (§1.1325(c)(7)); vessel/receiver detail is recommended, not required.
     CTEType.FIRST_LAND_BASED_RECEIVING: (
         "traceability_lot_code",
         "product_description",
@@ -73,10 +75,7 @@ REQUIRED_KDES: dict[CTEType, tuple[str, ...]] = {
         "unit_of_measure",
         "landing_date",
         "receiving_location",
-        "first_land_based_receiver",
-        "vessel_identifier",
         "reference_document",
-        "reference_document_number",
     ),
     CTEType.SHIPPING: (
         "traceability_lot_code",
@@ -115,7 +114,14 @@ RECOMMENDED_KDES: dict[CTEType, tuple[str, ...]] = {
     CTEType.HARVESTING: ("field_name", "tlc_source_reference"),
     CTEType.COOLING: ("harvest_location", "tlc_source_reference"),
     CTEType.INITIAL_PACKING: ("farm_location", "tlc_source_reference"),
-    CTEType.FIRST_LAND_BASED_RECEIVING: ("vessel_name", "water_temperature_c", "tlc_source_reference"),
+    CTEType.FIRST_LAND_BASED_RECEIVING: (
+        "first_land_based_receiver",
+        "vessel_identifier",
+        "vessel_name",
+        "water_temperature_c",
+        "reference_document_number",
+        "tlc_source_reference",
+    ),
     CTEType.SHIPPING: ("carrier", "reference_document_type"),
     CTEType.RECEIVING: ("reference_document_type",),
     CTEType.TRANSFORMATION: ("input_traceability_lot_codes", "input_products", "reference_document_type"),

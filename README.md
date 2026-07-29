@@ -1,8 +1,8 @@
 # RegEngine Inflow Lab
 
-A mock-first FSMA 204 traceability simulator that emits **RegEngine-compatible ingest payloads** into a realistic supply-chain lifecycle. Ships with a FastAPI backend, a lightweight dashboard, and a built-in mock RegEngine endpoint for safe local testing.
+Inflow Lab plays the role of **a RegEngine customer's own software**: a fictional factory's production system ("Meridian Fresh Foods — Plant Operations Console") that generates FSMA 204 CTE events through a realistic supply-chain lifecycle and delivers them to RegEngine exactly the way a real integrator does — API key, tenant header, idempotency keys, optional HMAC signing, and real per-event accept/reject responses. Ships with a FastAPI backend, the operator console, a built-in RegEngine stand-in that mirrors the live webhook's validation, and an end-to-end customer-journey harness.
 
-> **Non-production sandbox.** Inflow Lab is a demo, onboarding, and integration-validation tool for RegEngine — not a product, not a source of compliance record, and not built for public exposure. All data is synthetic. Without Basic Auth it serves a single shared `local-demo` tenant; keep it on localhost or behind auth, and never enter real data. See [REPO_PURPOSE.md](REPO_PURPOSE.md).
+> **Non-production sandbox.** Inflow Lab is a demo, onboarding, and integration-validation tool for RegEngine — not a product, not a source of compliance record, and not built for public exposure. Meridian Fresh Foods is fictional and all data is synthetic. Without Basic Auth it serves a single shared `local-demo` tenant; keep it on localhost or behind auth, and never enter real data. See [REPO_PURPOSE.md](REPO_PURPOSE.md).
 
 ## Table of contents
 
@@ -190,7 +190,9 @@ simulate -> ingest -> validate -> trace -> export
 The simulator supports three delivery modes, configured via the `delivery.mode` field:
 
 ### `mock` (default)
-No credentials required. Events are accepted by the built-in mock ingest service and returned with a synthetic `event_id`, `sha256_hash`, and `chain_hash`. Safe for demos and design-partner testing.
+No credentials required. Events go to the built-in RegEngine stand-in, which **mirrors the live webhook's validation** rather than accepting everything: strict per-CTE KDE checks (exact key lookup, no aliasing), the location-identifier requirement, a 500-event batch cap, in-batch duplicate rejection, future-timestamp rejection, and 24-hour idempotency replays. Accepted events return a synthetic `event_id`, `sha256_hash`, and `chain_hash`; rejected events return the same per-event `errors` shape live RegEngine produces. Safe for demos and design-partner testing.
+
+Mock delivery also supports **failure-mode rehearsal** via `delivery.mock_friction` (or the "Rehearse failure modes" toggles in the console): `invalid_key` (401), `subscription_inactive` (402), and `rate_limit` (429) inject the exact failures a live integration hits, so operators can practice diagnosing and retrying — retries reuse the stored idempotency key, so nothing double-ingests.
 
 ### `live`
 Sends real traffic to a RegEngine workspace. Configure from the dashboard or via the API with:
@@ -204,7 +206,31 @@ For controlled live workspace validation, use `scripts/live_trial.py`. It refuse
 ### `none`
 Generates and persists events locally without delivering them anywhere. Useful for seeding fixtures.
 
-Every stored record tracks `delivery_status`, `destination_mode`, `delivery_attempts`, last delivery timestamps, and non-secret `delivery_metadata` such as delivery mode, attempted event count, live endpoint host/path, HTTP status, and idempotency key. The dashboard delivery monitor summarizes posted, failed, generated-only, and retryable records. Failed records can be retried through the dashboard or `POST /api/delivery/retry` after switching to a working `mock` or `live` delivery configuration.
+Every stored record tracks `delivery_status`, `destination_mode`, `delivery_attempts`, last delivery timestamps, and non-secret `delivery_metadata` such as delivery mode, attempted event count, live endpoint host/path, HTTP status, and idempotency key. The dashboard delivery monitor summarizes posted, failed, generated-only, and retryable records — with recovery guidance per failure class — and per-event **rejections** from RegEngine (or the mock) are stored as failed records carrying the validator's errors. Failed records can be retried through the dashboard or `POST /api/delivery/retry` after switching to a working `mock` or `live` delivery configuration; retries reuse each record's stored idempotency key.
+
+## RegEngine integration settings
+
+The console treats RegEngine like any third-party integration a customer configures, backed by three endpoints:
+
+- `GET /api/integration/status` — sanitized connection state: mode, endpoint host, whether an API key / tenant are configured, whether HMAC signing is enabled, and active `mock_friction` codes. Secrets are never returned.
+- `POST /api/integration/configure` — partial update of `mode`, `endpoint`, `api_key`, `tenant_id`, and `mock_friction`; omitted fields keep their stored values so the settings page can switch modes without re-entering credentials.
+- `POST /api/integration/test` — probes RegEngine with the configured (or request-supplied) credentials using the cheapest authenticated read (`GET /api/v1/webhooks/recent?limit=1`) and maps the response to an actionable verdict: `connected`, `unauthorized` (401), `subscription_inactive` (402), `forbidden` (403), `tenant_mismatch` (404), `rate_limited` (429), `service_unavailable` (503), `unreachable`, or `not_configured`. In mock mode with no credentials it reports `mock` without touching the network.
+
+## Customer journey harness
+
+`scripts/customer_journey.py` replays the full "experience in the wild" against a real RegEngine stack — onboarding through evidence export:
+
+```bash
+# Local RegEngine (Postgres + Redis + monolith), provisions everything itself:
+export REGENGINE_ADMIN_KEY=...            # the stack's ADMIN_MASTER_KEY
+export REGENGINE_BASE_URL=http://localhost:8000
+export REGENGINE_REDIS_URL=redis://localhost:6379/0
+uv run python scripts/customer_journey.py --local
+```
+
+Steps: health probe → tenant + API key provisioning through `/v1/admin` → billing activation (seeds `billing:tenant:{id}` in Redis so the subscription gate passes) → connection test → several canonical CTE batches ingested with the same engine and live client the console uses → friction demos (a KDE-rejected event and an idempotency replay) → verification that RegEngine now holds the evidence (`/api/v1/webhooks/recent`, `/api/v1/webhooks/chain/verify`, `/api/v1/fda/export/all`).
+
+For a deployed RegEngine, the harness follows `scripts/live_trial.py`'s gating: it refuses to run without `--confirm-live`, requires pre-provisioned `REGENGINE_LIVE_ENDPOINT` / `REGENGINE_LIVE_API_KEY` / `REGENGINE_LIVE_TENANT_ID`, never provisions or touches Redis, sends one small batch, and skips the deliberate-failure demos.
 
 ## Basic auth and tenant storage
 

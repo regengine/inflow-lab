@@ -1,16 +1,18 @@
 from __future__ import annotations
 
 import asyncio
+import os
 import uuid
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from typing import Any
+from urllib.parse import urlparse
 
 from .audit import summarize_scenario_audit
 from .csv_importer import parse_csv_import
 from .demo_fixtures import get_demo_fixture
 from .engine import LegitFlowEngine
-from .mock_service import MockRegEngineService
+from .mock_service import MockRegEngineHTTPError, MockRegEngineService
 from .schemas.domain import DemoFixtureId, DestinationMode, StoredEventRecord
 from .schemas.ingestion import (
     CSVImportRequest,
@@ -36,7 +38,13 @@ from .schemas.simulation import (
     SimulationConfig,
     StepResponse,
 )
-from .regengine_client import LiveRegEngineClient, LiveRegEngineDeliveryError
+from .regengine_client import (
+    DEFAULT_LIVE_INGEST_ENDPOINT,
+    WEBHOOK_HMAC_SECRET_ENV,
+    LiveRegEngineClient,
+    LiveRegEngineDeliveryError,
+)
+from .schemas.integration import IntegrationConfigureRequest, IntegrationStatusResponse
 from .scenario_saves import ScenarioSaveStore
 from .scenarios import ScenarioId, get_scenario
 from .store import EventStore, mask_secret_in_payload, mask_secret_in_string
@@ -150,15 +158,11 @@ class SimulationController:
                         event=event,
                         parent_lot_codes=lineages[index],
                         destination_mode=self.config.delivery.mode,
-                        delivery_status=outcome.delivery_status,
                         delivery_attempts=outcome.delivery_attempts,
                         last_delivery_attempt_at=outcome.attempted_at,
-                        last_delivery_success_at=outcome.completed_at
-                        if outcome.delivery_status == "posted"
-                        else None,
                         delivery_response=event_response,
                         delivery_metadata=outcome.metadata,
-                        error=outcome.error_message,
+                        **_event_delivery_fields(outcome, event_response),
                     )
                 )
             self.store.add_many(stored_records)
@@ -166,6 +170,8 @@ class SimulationController:
             result = StepResponse(
                 generated=len(events),
                 posted=outcome.posted,
+                accepted=(outcome.response or {}).get("accepted", 0),
+                rejected=(outcome.response or {}).get("rejected", 0),
                 failed=outcome.failed,
                 lot_codes=[event.traceability_lot_code for event in events],
                 delivery_status=outcome.delivery_status,
@@ -262,15 +268,11 @@ class SimulationController:
                             event=event,
                             parent_lot_codes=parsed.parent_lot_codes[index],
                             destination_mode=delivery.mode,
-                            delivery_status=outcome.delivery_status,
                             delivery_attempts=outcome.delivery_attempts,
                             last_delivery_attempt_at=outcome.attempted_at,
-                            last_delivery_success_at=outcome.completed_at
-                            if outcome.delivery_status == "posted"
-                            else None,
                             delivery_response=event_response,
                             delivery_metadata=outcome.metadata,
-                            error=outcome.error_message,
+                            **_event_delivery_fields(outcome, event_response),
                         )
                     )
                 self.store.add_many(stored_records)
@@ -346,15 +348,11 @@ class SimulationController:
                         event=fixture_event.event,
                         parent_lot_codes=list(fixture_event.parent_lot_codes),
                         destination_mode=delivery.mode,
-                        delivery_status=outcome.delivery_status,
                         delivery_attempts=outcome.delivery_attempts,
                         last_delivery_attempt_at=outcome.attempted_at,
-                        last_delivery_success_at=outcome.completed_at
-                        if outcome.delivery_status == "posted"
-                        else None,
                         delivery_response=event_response,
                         delivery_metadata=outcome.metadata,
-                        error=outcome.error_message,
+                        **_event_delivery_fields(outcome, event_response),
                     )
                 )
             self.store.add_many(stored_records)
@@ -474,7 +472,7 @@ class SimulationController:
                     source = request.source or record.payload_source
                     idempotency_key = (
                         _stored_idempotency_key(record)
-                        if delivery.mode == DestinationMode.LIVE
+                        if delivery.mode != DestinationMode.NONE
                         else None
                     )
                     grouped_records.setdefault((source, idempotency_key), []).append(record)
@@ -508,22 +506,21 @@ class SimulationController:
                     for index, record in enumerate(records):
                         event_response = response_events[index] if index < len(response_events) else None
                         next_attempts = record.delivery_attempts + outcome.delivery_attempts
+                        fields = _event_delivery_fields(outcome, event_response)
+                        if fields["delivery_status"] == "posted":
+                            fields["error"] = None
+                        else:
+                            fields["last_delivery_success_at"] = record.last_delivery_success_at
                         updated_records.append(
                             record.model_copy(
                                 update={
                                     "destination_mode": delivery.mode,
-                                    "delivery_status": outcome.delivery_status,
                                     "delivery_attempts": next_attempts,
                                     "last_delivery_attempt_at": outcome.attempted_at
                                     or record.last_delivery_attempt_at,
-                                    "last_delivery_success_at": outcome.completed_at
-                                    if outcome.delivery_status == "posted"
-                                    else record.last_delivery_success_at,
                                     "delivery_response": event_response,
                                     "delivery_metadata": outcome.metadata,
-                                    "error": None
-                                    if outcome.delivery_status == "posted"
-                                    else outcome.error_message,
+                                    **fields,
                                 },
                                 deep=True,
                             )
@@ -566,21 +563,27 @@ class SimulationController:
         api_key = config.delivery.api_key
         attempted_at = datetime.now(UTC)
         delivery_idempotency_key = idempotency_key
-        if config.delivery.mode == DestinationMode.LIVE and delivery_idempotency_key is None:
+        if config.delivery.mode != DestinationMode.NONE and delivery_idempotency_key is None:
             delivery_idempotency_key = uuid.uuid4().hex
         try:
             if config.delivery.mode == DestinationMode.MOCK:
-                response = self.mock_service.ingest(payload).model_dump(mode="json")
+                response = self.mock_service.ingest(
+                    payload,
+                    idempotency_key=delivery_idempotency_key,
+                    friction=tuple(config.delivery.mock_friction),
+                ).model_dump(mode="json")
                 return DeliveryOutcome(
                     response=mask_secret_in_payload(response, api_key),
                     delivery_status="posted",
-                    posted=len(payload.events),
+                    posted=response.get("accepted", len(payload.events)),
+                    failed=response.get("rejected", 0),
                     delivery_attempts=1,
                     attempted_at=attempted_at,
                     completed_at=datetime.now(UTC),
                     metadata={
                         "delivery_mode": "mock",
                         "attempted_event_count": len(payload.events),
+                        "idempotency_key": delivery_idempotency_key,
                     },
                 )
             if config.delivery.mode == DestinationMode.LIVE:
@@ -592,13 +595,28 @@ class SimulationController:
                 return DeliveryOutcome(
                     response=mask_secret_in_payload(result.response, api_key),
                     delivery_status="posted",
-                    posted=len(payload.events),
+                    posted=result.response.get("accepted", len(payload.events)),
+                    failed=result.response.get("rejected", 0),
                     delivery_attempts=1,
                     attempted_at=attempted_at,
                     completed_at=datetime.now(UTC),
                     metadata=result.metadata | {"attempted_event_count": len(payload.events)},
                 )
             return DeliveryOutcome()
+        except MockRegEngineHTTPError as exc:
+            return DeliveryOutcome(
+                delivery_status="failed",
+                failed=len(payload.events),
+                delivery_attempts=1,
+                attempted_at=attempted_at,
+                error_message=str(exc),
+                metadata={
+                    "delivery_mode": "mock",
+                    "attempted_event_count": len(payload.events),
+                    "status_code": exc.status_code,
+                    "idempotency_key": delivery_idempotency_key,
+                },
+            )
         except LiveRegEngineDeliveryError as exc:
             metadata = exc.metadata | {"attempted_event_count": len(payload.events)}
             if delivery_idempotency_key and "idempotency_key" not in metadata:
@@ -671,6 +689,40 @@ class SimulationController:
             },
         }
 
+    def integration_status(self) -> IntegrationStatusResponse:
+        delivery = self.config.delivery
+        endpoint = str(delivery.endpoint) if delivery.endpoint else DEFAULT_LIVE_INGEST_ENDPOINT
+        return IntegrationStatusResponse(
+            mode=delivery.mode,
+            endpoint=endpoint,
+            endpoint_host=urlparse(endpoint).netloc,
+            api_key_configured=bool(delivery.api_key),
+            tenant_configured=bool(delivery.tenant_id),
+            hmac_configured=bool(os.getenv(WEBHOOK_HMAC_SECRET_ENV, "").strip()),
+            mock_friction=list(delivery.mock_friction),
+        )
+
+    async def configure_integration(
+        self, request: IntegrationConfigureRequest
+    ) -> IntegrationStatusResponse:
+        async with self._lock:
+            updates: dict[str, Any] = {}
+            if request.mode is not None:
+                updates["mode"] = request.mode
+            if request.endpoint is not None:
+                updates["endpoint"] = request.endpoint
+            if request.api_key is not None:
+                updates["api_key"] = request.api_key or None
+            if request.tenant_id is not None:
+                updates["tenant_id"] = request.tenant_id or None
+            if request.mock_friction is not None:
+                updates["mock_friction"] = list(request.mock_friction)
+            delivery = self.config.delivery.model_copy(update=updates, deep=True)
+            _validate_live_delivery(delivery)
+            self.config = self.config.model_copy(update={"delivery": delivery}, deep=True)
+        await self._publish_update()
+        return self.integration_status()
+
     def _sanitize_public_config(self, config: SimulationConfig) -> SimulationConfig:
         delivery = config.delivery.model_copy(update={"api_key": None}, deep=True)
         if delivery.mode == DestinationMode.LIVE:
@@ -708,6 +760,30 @@ class SimulationController:
             persist_path=snapshot.config.persist_path,
             delivery_mode=snapshot.config.delivery.mode,
         )
+
+
+def _event_delivery_fields(outcome: DeliveryOutcome, event_response: dict[str, Any] | None) -> dict[str, Any]:
+    """Per-record delivery fields honoring per-event rejection.
+
+    RegEngine (and the mock mirroring it) returns HTTP 2xx with per-event
+    accepted/rejected statuses; a rejected event was not ingested, so its
+    stored record must read as failed with the validator's errors.
+    """
+    status = outcome.delivery_status
+    error = outcome.error_message
+    if (
+        status == "posted"
+        and isinstance(event_response, dict)
+        and event_response.get("status") == "rejected"
+    ):
+        status = "failed"
+        errors = event_response.get("errors") or []
+        error = "; ".join(str(item) for item in errors) or "Event rejected by ingest validation"
+    return {
+        "delivery_status": status,
+        "last_delivery_success_at": outcome.completed_at if status == "posted" else None,
+        "error": error,
+    }
 
 
 def _validate_live_delivery(delivery: DeliveryConfig) -> None:
