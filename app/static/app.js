@@ -109,6 +109,69 @@ function frictionSelections() {
     .map((checkbox) => checkbox.value);
 }
 
+// Progress through the guided flow, used to light up the "How to use this
+// console" stepper. traced/exported are set by user actions; the rest are
+// derived from live state on every snapshot.
+const journey = { traced: false, exported: false };
+
+function renderGuide(status = state.status, events = state.events) {
+  const rail = document.getElementById('guideRail');
+  if (!rail) {
+    return;
+  }
+  const hasEvents = (events || []).length > 0;
+  const delivery = status?.stats?.delivery || {};
+  const delivered = Number(delivery.posted || 0) > 0 || Number(delivery.failed || 0) > 0;
+  const done = {
+    setup: hasEvents,
+    data: hasEvents,
+    delivery: delivered,
+    trace: journey.traced,
+    export: journey.exported,
+  };
+  let currentAssigned = false;
+  rail.querySelectorAll('[data-guide-step]').forEach((step) => {
+    const key = step.dataset.guideStep;
+    if (done[key]) {
+      step.dataset.state = 'done';
+    } else if (!currentAssigned) {
+      step.dataset.state = 'current';
+      currentAssigned = true;
+    } else {
+      step.dataset.state = '';
+    }
+  });
+}
+
+function flashPanel(selector) {
+  const panel = document.querySelector(selector);
+  if (!panel) {
+    return;
+  }
+  panel.scrollIntoView({ behavior: 'smooth', block: 'center' });
+  panel.classList.remove('panel-flash');
+  // Force a reflow so re-adding the class restarts the animation.
+  void panel.offsetWidth;
+  panel.classList.add('panel-flash');
+}
+
+// Where "Take me there" should send the user for each next-action label.
+const NEXT_ACTION_TARGETS = {
+  'Verify RegEngine connection': '.integration-panel',
+  'Retry failed deliveries': '.delivery-monitor',
+  'Load line data': '.run-panel',
+  'Trace a lot': '.lineage-panel',
+  'Export evidence': '.evidence-panel',
+};
+
+function goToNextAction() {
+  const label = ids.nextActionText.textContent.trim();
+  flashPanel(NEXT_ACTION_TARGETS[label] || '.run-panel');
+  if (label === 'Trace a lot') {
+    ids.lotLookup.focus();
+  }
+}
+
 function setStatus(message, tone = 'neutral', holdMs = 0) {
   ids.statusMessage.textContent = message;
   ids.statusMessage.dataset.tone = tone;
@@ -1010,6 +1073,7 @@ function renderSnapshot(status, events, health = state.health) {
   state.health = health;
   state.events = events;
   updateShellStatus(status, events, health);
+  renderGuide(status, events);
   renderReadinessBanner(activeScenarioSummary(), events, status);
   renderStats(status);
   renderDeliverySummary(status);
@@ -1422,6 +1486,8 @@ async function lookupLineage() {
   try {
     const payload = await api(`/api/lineage/${encodeURIComponent(lotCode)}`);
     renderLineage(payload, lotCode);
+    journey.traced = true;
+    renderGuide();
     setStatus(`Loaded lineage for ${lotCode}.`, 'success', 2500);
   } catch (error) {
     ids.lineageResults.innerHTML = `<p class="note">${escapeHtml(error.message)}</p>`;
@@ -1443,6 +1509,16 @@ document.getElementById('refreshBtn').addEventListener('click', refresh);
 document.getElementById('lineageBtn').addEventListener('click', lookupLineage);
 ids.testConnectionBtn?.addEventListener('click', testConnection);
 ids.saveIntegrationBtn?.addEventListener('click', saveIntegrationSettings);
+document.getElementById('nextActionGo')?.addEventListener('click', goToNextAction);
+for (const link of [ids.exportDownloadLink, ids.epcisDownloadLink]) {
+  link?.addEventListener('click', () => {
+    journey.exported = true;
+    renderGuide();
+  });
+}
+document.querySelectorAll('#guideRail [data-guide-target]').forEach((step) => {
+  step.addEventListener('click', () => flashPanel(step.dataset.guideTarget));
+});
 ids.scenarioSave.addEventListener('change', updateScenarioSaveDescription);
 ids.demoFixture.addEventListener('change', updateDemoFixtureDescription);
 ids.exportPreset.addEventListener('change', updateExportLink);
