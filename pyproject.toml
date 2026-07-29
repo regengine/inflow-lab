@@ -2,6 +2,8 @@
 name = "regengine-codex-workspace"
 version = "0.1.0"
 description = "Mock-first FSMA 204 inflow simulator for RegEngine-compatible payloads"
+license = "Apache-2.0"
+license-files = ["LICENSE", "NOTICE"]
 requires-python = ">=3.11"
 dependencies = [
   "fastapi>=0.111.0",

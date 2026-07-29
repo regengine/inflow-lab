@@ -11,6 +11,7 @@ from urllib.parse import urlparse
 
 import httpx
 
+from .contract import INFLOW_CONTRACT_VERSION
 from .schemas.ingestion import IngestPayload
 from .schemas.simulation import SimulationConfig
 
@@ -148,6 +149,7 @@ class LiveRegEngineClient:
                     headers=headers,
                     params={"tenant_id": tenant_id, "limit": 1},
                 )
+                remote_contract = await _fetch_remote_contract_version(client, parsed)
         except httpx.HTTPError as exc:
             return ConnectionCheckResult(
                 verdict="unreachable",
@@ -159,12 +161,38 @@ class LiveRegEngineClient:
             response.status_code,
             ("error", f"Unexpected HTTP {response.status_code} from RegEngine."),
         )
+        if verdict == "connected" and remote_contract is not None and remote_contract != INFLOW_CONTRACT_VERSION:
+            verdict = "contract_mismatch"
+            detail = (
+                f"Credentials are valid, but this simulator implements ingest contract "
+                f"v{INFLOW_CONTRACT_VERSION} while RegEngine advertises v{remote_contract}. "
+                "One side is running an older deploy — update it before ingesting, or "
+                "payloads may validate here and be rejected there (or vice versa)."
+            )
         return ConnectionCheckResult(
             verdict=verdict,
             detail=detail,
             status_code=response.status_code,
             endpoint_host=host,
         )
+
+
+async def _fetch_remote_contract_version(client: httpx.AsyncClient, parsed) -> str | None:
+    """Best-effort read of RegEngine's advertised inflow contract version.
+
+    Returns None when the health endpoint is unreachable, non-JSON (some
+    deployments serve the frontend at /health), or predates the version
+    field — skew detection only engages when both sides advertise.
+    """
+    try:
+        health = await client.get(f"{parsed.scheme}://{parsed.netloc}/health")
+        payload = health.json()
+    except (httpx.HTTPError, ValueError):
+        return None
+    if not isinstance(payload, dict):
+        return None
+    value = payload.get("inflow_contract_version")
+    return str(value) if value is not None else None
 
 
 def _build_signature_header(body_bytes: bytes) -> str | None:

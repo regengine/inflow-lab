@@ -9,6 +9,7 @@ from typing import Any
 from urllib.parse import urlparse
 
 from .audit import summarize_scenario_audit
+from .contract import INFLOW_CONTRACT_VERSION
 from .csv_importer import parse_csv_import
 from .demo_fixtures import get_demo_fixture
 from .engine import LegitFlowEngine
@@ -699,6 +700,7 @@ class SimulationController:
             api_key_configured=bool(delivery.api_key),
             tenant_configured=bool(delivery.tenant_id),
             hmac_configured=bool(os.getenv(WEBHOOK_HMAC_SECRET_ENV, "").strip()),
+            contract_version=INFLOW_CONTRACT_VERSION,
             mock_friction=list(delivery.mock_friction),
         )
 
