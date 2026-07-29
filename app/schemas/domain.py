@@ -31,6 +31,20 @@ class DestinationMode(str, Enum):
     NONE = "none"
 
 
+class OperationScale(str, Enum):
+    """How large an operation the simulated producer is.
+
+    Scales the facility network, lots in flight, and lot volumes so the
+    same line profile can mimic anything from a single-farm micro-producer
+    to a multi-site enterprise network. The wire contract is unchanged —
+    scale only shapes the data.
+    """
+
+    SMALL = "small"
+    MIDSIZE = "midsize"
+    ENTERPRISE = "enterprise"
+
+
 class CSVImportType(str, Enum):
     SCHEDULED_EVENTS = "scheduled_events"
     SEED_LOTS = "seed_lots"

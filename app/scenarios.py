@@ -1,10 +1,11 @@
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from enum import Enum
+from itertools import count
 from typing import Mapping
 
-from .schemas.domain import CTEType
+from .schemas.domain import CTEType, OperationScale
 
 
 class ScenarioId(str, Enum):
@@ -366,3 +367,95 @@ def list_scenario_summaries() -> list[dict[str, str | bool]]:
         }
         for preset in SCENARIO_PRESETS.values()
     ]
+
+
+# Lot-volume multiplier per operation scale, applied to the industry
+# adapter's source quantity range. A small producer harvests quarter-size
+# lots; an enterprise harvests 4x lots.
+SCALE_QUANTITY_MULTIPLIER: dict[OperationScale, float] = {
+    OperationScale.SMALL: 0.25,
+    OperationScale.MIDSIZE: 1.0,
+    OperationScale.ENTERPRISE: 4.0,
+}
+
+# Facility-count targets per tier for the enterprise scale. Tiers that a
+# preset leaves empty (e.g. farms for seafood first-receiver) stay empty.
+_ENTERPRISE_TIER_TARGETS = {
+    "farms": 12,
+    "coolers": 4,
+    "packers": 4,
+    "processors": 3,
+    "dcs": 5,
+    "retailers": 10,
+}
+
+# Generated-location GLN ids start here so they never collide with the
+# hand-authored preset ids (1001+).
+_GENERATED_GLN_BASE = 60000
+
+
+def scale_scenario(preset: ScenarioPreset, scale: OperationScale) -> ScenarioPreset:
+    """Return a copy of the preset sized for the requested operation scale.
+
+    - ``midsize`` is the preset as authored (the historical behavior).
+    - ``small`` trims each facility tier to a single site (two retail
+      destinations), halves the lots-in-flight target, keeps most product
+      moving direct rather than into processing, and de-emphasizes
+      transformation.
+    - ``enterprise`` expands each non-empty tier to a multi-site network
+      (cloned sites with fresh, valid GLNs) and quadruples the
+      lots-in-flight target so commingling and multi-DC routing dominate.
+
+    Deterministic: no RNG — the same preset and scale always produce the
+    same network, so seeded runs stay reproducible.
+    """
+    if scale is OperationScale.MIDSIZE:
+        return preset
+
+    if scale is OperationScale.SMALL:
+        weights = dict(preset.action_weights)
+        if weights.get("transform"):
+            weights["transform"] = max(1, weights["transform"] // 2)
+        return replace(
+            preset,
+            farms=preset.farms[:1],
+            coolers=preset.coolers[:1],
+            packers=preset.packers[:1],
+            processors=preset.processors[:1],
+            dcs=preset.dcs[:1],
+            retailers=preset.retailers[:2],
+            harvest_target=max(1, preset.harvest_target // 2),
+            packed_to_processor_probability=min(preset.packed_to_processor_probability, 0.2),
+            action_weights=weights,
+        )
+
+    gln_ids = count(_GENERATED_GLN_BASE)
+
+    def expand(locations: tuple[Location, ...], target: int) -> tuple[Location, ...]:
+        if not locations:
+            return locations
+        expanded = list(locations)
+        site_number = 2
+        while len(expanded) < target:
+            base = locations[len(expanded) % len(locations)]
+            expanded.append(
+                Location(
+                    f"{base.name} — Site {site_number}",
+                    base.location_type,
+                    _gln(next(gln_ids)),
+                    dict(base.metadata),
+                )
+            )
+            site_number += 1
+        return tuple(expanded)
+
+    return replace(
+        preset,
+        farms=expand(preset.farms, _ENTERPRISE_TIER_TARGETS["farms"]),
+        coolers=expand(preset.coolers, _ENTERPRISE_TIER_TARGETS["coolers"]),
+        packers=expand(preset.packers, _ENTERPRISE_TIER_TARGETS["packers"]),
+        processors=expand(preset.processors, _ENTERPRISE_TIER_TARGETS["processors"]),
+        dcs=expand(preset.dcs, _ENTERPRISE_TIER_TARGETS["dcs"]),
+        retailers=expand(preset.retailers, _ENTERPRISE_TIER_TARGETS["retailers"]),
+        harvest_target=preset.harvest_target * 4,
+    )

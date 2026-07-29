@@ -5,7 +5,7 @@
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
     <title>Meridian Fresh Ops — Plant Operations Console</title>
     <link rel="icon" href="data:," />
-    <link rel="stylesheet" href="/static/styles.css?v=4" />
+    <link rel="stylesheet" href="/static/styles.css?v=5" />
   </head>
   <body>
     <main class="page">
@@ -120,7 +120,7 @@
               </div>
               <span class="mode-alert" id="liveDeliveryWarning" hidden>Connected to RegEngine (live)</span>
             </div>
-            <p class="panel-help">Choose what kind of operation this plant runs. The line profile decides which products, locations, and events the line generates — the defaults work fine for a first run.</p>
+            <p class="panel-help">Choose what kind of operation this plant runs. The line profile decides which products, locations, and events the line generates; the operation size scales the whole flow — a small producer runs one farm with quarter-size lots and mostly direct shipments, an enterprise network runs a dozen sites with 4&times; lots and heavy commingling. The defaults work fine for a first run.</p>
             <form id="config-form" class="setup-grid">
               <label>
                 Operation type
@@ -136,6 +136,14 @@
                   <option value="retailer_readiness_demo">Retailer readiness demo</option>
                   <option value="seafood_first_receiver">Seafood first receiver</option>
                   <option value="dairy_continuous_flow">Dairy continuous flow</option>
+                </select>
+              </label>
+              <label>
+                Operation size
+                <select id="operationScale" name="operationScale">
+                  <option value="small">Small producer</option>
+                  <option value="midsize" selected>Mid-size operation</option>
+                  <option value="enterprise">Enterprise network</option>
                 </select>
               </label>
               <label>
@@ -403,6 +411,6 @@
         </aside>
       </div>
     </main>
-    <script src="/static/app.js?v=4" defer></script>
+    <script src="/static/app.js?v=5" defer></script>
   </body>
 </html>

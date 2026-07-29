@@ -35,6 +35,7 @@ const DEFAULT_LIVE_INGEST_ENDPOINT = 'https://www.regengine.co/api/v1/webhooks/i
 const ids = {
   source: document.getElementById('source'),
   operationType: document.getElementById('operationType'),
+  operationScale: document.getElementById('operationScale'),
   scenario: document.getElementById('scenario'),
   interval: document.getElementById('interval'),
   batchSize: document.getElementById('batchSize'),
@@ -186,6 +187,7 @@ function buildConfig() {
   return {
     source: ids.source.value.trim() || 'codex-simulator',
     scenario: ids.scenario.value,
+    scale: ids.operationScale?.value || 'midsize',
     interval_seconds: Number(ids.interval.value || 1.5),
     batch_size: Number(ids.batchSize.value || 3),
     seed: seedValue === '' ? null : Number(seedValue),
@@ -295,6 +297,9 @@ function applyConfigToForm(config) {
     return;
   }
   ids.source.value = config.source || 'codex-simulator';
+  if (ids.operationScale) {
+    ids.operationScale.value = config.scale || 'midsize';
+  }
   const scenarioId = config.scenario || 'leafy_greens_supplier';
   const scenario = state.scenarioCatalog[scenarioId];
   renderScenarioOptions(
@@ -636,6 +641,8 @@ function renderStats(status) {
   const cards = [
     ['Loop status', status?.running ? 'Running' : 'Stopped'],
     ['Scenario', scenarioLabel(scenarioId)],
+    ['Operation size', engine.scale ?? 'midsize'],
+    ['Facilities', engine.locations ?? '—'],
     ['Total records', stats.total_records ?? 0],
     ['Unique lots', stats.unique_lots ?? 0],
     ['Auth', authState],
