@@ -5,7 +5,7 @@
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
     <title>Meridian Fresh Ops — Plant Operations Console</title>
     <link rel="icon" href="data:," />
-    <link rel="stylesheet" href="/static/styles.css?v=3" />
+    <link rel="stylesheet" href="/static/styles.css?v=4" />
   </head>
   <body>
     <main class="page">
@@ -46,9 +46,10 @@
       </header>
 
       <section class="status-strip" aria-label="Shift summary">
-        <div class="status-card">
+        <div class="status-card next-action-card">
           <span>Next action</span>
           <strong id="nextActionText">Load line data or record a batch</strong>
+          <button class="button secondary next-action-go" id="nextActionGo" type="button">Take me there</button>
         </div>
         <div class="status-card">
           <span>Records</span>
@@ -64,37 +65,38 @@
         </div>
       </section>
 
-      <section class="workflow-rail" aria-label="Plant flow stages">
-        <article>
-          <span>Harvest intake</span>
-          <strong>Field lots arrive</strong>
-          <small>Origin records</small>
-        </article>
-        <article>
-          <span>Cooling</span>
-          <strong>Cold chain start</strong>
-          <small>Cooler receipts</small>
-        </article>
-        <article>
-          <span>Packing</span>
-          <strong>Packout lines</strong>
-          <small>New lot codes</small>
-        </article>
-        <article>
-          <span>Ship &amp; receive</span>
-          <strong>Dock movements</strong>
-          <small>BOL references</small>
-        </article>
-        <article>
-          <span>Processing</span>
-          <strong>Transformation</strong>
-          <small>Batch records</small>
-        </article>
-        <article>
-          <span>Compliance</span>
-          <strong>RegEngine evidence</strong>
-          <small>Audit-ready</small>
-        </article>
+      <section class="guide-rail" id="guideRail" aria-label="How to use this console">
+        <header class="guide-head">
+          <strong>How to use this console</strong>
+          <span>Follow the steps left to right — the highlighted step is where you are now.</span>
+        </header>
+        <ol class="guide-steps">
+          <li data-guide-step="setup" data-guide-target=".compact-panel" data-state="current">
+            <span class="guide-num">1</span>
+            <strong>Set up the line</strong>
+            <small>Pick an operation type and line profile — or just keep the defaults.</small>
+          </li>
+          <li data-guide-step="data" data-guide-target=".run-panel">
+            <span class="guide-num">2</span>
+            <strong>Bring in data</strong>
+            <small>Click <em>Load today's line data</em> for a ready-made shift, or <em>Start line</em> to record live.</small>
+          </li>
+          <li data-guide-step="delivery" data-guide-target=".delivery-monitor">
+            <span class="guide-num">3</span>
+            <strong>Watch delivery</strong>
+            <small>Every event posts to RegEngine (sandbox until you connect). Failures show how to recover.</small>
+          </li>
+          <li data-guide-step="trace" data-guide-target=".lineage-panel">
+            <span class="guide-num">4</span>
+            <strong>Trace a lot</strong>
+            <small>Click any lot code in the shift log to follow it through the plant.</small>
+          </li>
+          <li data-guide-step="export" data-guide-target=".evidence-panel">
+            <span class="guide-num">5</span>
+            <strong>Export evidence</strong>
+            <small>Download the FDA CSV or EPCIS package from the Evidence panel.</small>
+          </li>
+        </ol>
       </section>
 
       <section class="workspace-heading">
@@ -118,6 +120,7 @@
               </div>
               <span class="mode-alert" id="liveDeliveryWarning" hidden>Connected to RegEngine (live)</span>
             </div>
+            <p class="panel-help">Choose what kind of operation this plant runs. The line profile decides which products, locations, and events the line generates — the defaults work fine for a first run.</p>
             <form id="config-form" class="setup-grid">
               <label>
                 Operation type
@@ -158,6 +161,7 @@
               </div>
               <span class="status-pill" id="runStatePill">Idle</span>
             </div>
+            <p class="panel-help"><strong>Start line</strong> records events continuously; <strong>Record next batch</strong> (up top) does one batch at a time. <strong>Clear shift</strong> wipes this workspace's records so you can start fresh.</p>
             <p class="note status-message" id="statusMessage">Ready.</p>
             <div class="action-row">
               <button class="button" id="startBtn" type="button">Start line</button>
@@ -176,6 +180,12 @@
               </div>
               <span class="status-pill" id="connectionPill">Sandbox</span>
             </div>
+            <p class="panel-help">This is where events go. <strong>Sandbox needs no setup</strong> — it behaves like RegEngine, including rejections. To connect your real RegEngine workspace:</p>
+            <ol class="panel-help go-live-steps">
+              <li>Paste the ingest endpoint, API key, and tenant ID from your RegEngine workspace below.</li>
+              <li>Click <strong>Test connection</strong> — the verdict tells you exactly what to fix if something's wrong.</li>
+              <li>Click <strong>Save settings</strong>, then switch Delivery to <strong>Connected</strong>.</li>
+            </ol>
             <div id="connectionChips" class="connection-chips"></div>
             <div class="grid compact-fields">
               <label>
@@ -250,15 +260,6 @@
         </aside>
 
         <section class="center-stack">
-          <div class="tab-strip" aria-label="Workspace sections">
-            <span>Audit view</span>
-            <span>Line lens</span>
-            <span>Record spotlight</span>
-            <span>Lineage</span>
-            <span>Exports</span>
-            <span>Event log</span>
-          </div>
-
           <section class="panel scenario-panel">
             <div class="section-head">
               <div>
@@ -266,6 +267,7 @@
                 <h2>Audit readiness</h2>
               </div>
             </div>
+            <p class="panel-help">Live scoring of how audit-ready the current records are for this line profile — the gaps listed are what an FDA auditor would ask about first.</p>
             <div id="readinessBanner" class="readiness-banner"></div>
             <div id="scenarioWorkbench" class="scenario-workbench"></div>
           </section>
@@ -277,6 +279,7 @@
                 <h2>Record spotlight</h2>
               </div>
             </div>
+            <p class="panel-help">A closer look at the most interesting recent record and its key data elements (KDEs) — the fields regulators require per event type.</p>
             <div id="recordSpotlight" class="record-spotlight"></div>
           </section>
 
@@ -287,6 +290,7 @@
                 <h2>Trace path</h2>
               </div>
             </div>
+            <p class="panel-help">Follow one lot backward to its origin and forward to where it went. Click any lot code anywhere in the console — or use the trace box at the top — to trace it here.</p>
             <div id="lineageResults" class="lineage-results"></div>
           </section>
 
@@ -298,6 +302,7 @@
               </div>
               <button class="button secondary" id="refreshBtn" type="button">Refresh</button>
             </div>
+            <p class="panel-help">Everything recorded this shift, newest first, with per-event delivery status. A <strong>failed</strong> status shows exactly which fields RegEngine wants fixed — click the lot code to trace it.</p>
             <div class="table-wrap">
               <table>
                 <thead>
@@ -328,6 +333,7 @@
               </div>
               <button class="button secondary" id="retryFailedBtn" type="button">Retry failed</button>
             </div>
+            <p class="panel-help">Delivery health at a glance. <strong>Retry failed</strong> is always safe — retries reuse each record's original idempotency key, so nothing is ever ingested twice.</p>
             <div id="deliverySummary" class="delivery-summary"></div>
           </section>
 
@@ -339,6 +345,7 @@
               </div>
               <a class="button secondary" id="epcisDownloadLink" href="/api/mock/regengine/export/epcis" target="_blank" rel="noreferrer">EPCIS JSON</a>
             </div>
+            <p class="panel-help">Download audit-ready exports of the current records: the big button in the header makes the FDA-request CSV, <strong>EPCIS JSON</strong> makes the GS1 interchange format. Filters below narrow by preset, lot, or date.</p>
             <div class="grid export-grid">
               <label>
                 Preset
@@ -369,6 +376,7 @@
                 <h2>Bring in plant records</h2>
               </div>
             </div>
+            <p class="panel-help">Import existing records from CSV — <strong>Scheduled events</strong> for full CTE rows, <strong>Seed lots</strong> to start new lots. Row-level errors and warnings appear below after import.</p>
             <div class="grid export-grid">
               <label>
                 CSV type
@@ -395,6 +403,6 @@
         </aside>
       </div>
     </main>
-    <script src="/static/app.js?v=3" defer></script>
+    <script src="/static/app.js?v=4" defer></script>
   </body>
 </html>

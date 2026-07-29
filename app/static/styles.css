@@ -1253,3 +1253,134 @@ tbody tr.has-audit-warning {
   width: auto;
   margin: 0;
 }
+
+/* Guided "how to use" stepper */
+.guide-rail {
+  border: 1px solid var(--border);
+  border-radius: 12px;
+  background: var(--surface, #fff);
+  padding: 14px 16px;
+  margin: 0 0 18px;
+}
+
+.guide-head {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  gap: 10px;
+  margin-bottom: 10px;
+}
+
+.guide-head span {
+  color: var(--muted, #667085);
+  font-size: 13px;
+}
+
+.guide-steps {
+  list-style: none;
+  display: grid;
+  grid-template-columns: repeat(5, minmax(0, 1fr));
+  gap: 10px;
+  margin: 0;
+  padding: 0;
+}
+
+.guide-steps li {
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  padding: 10px 12px;
+  display: grid;
+  gap: 4px;
+  cursor: pointer;
+  transition: border-color 0.15s ease, background 0.15s ease;
+}
+
+.guide-steps li:hover {
+  border-color: #12805c;
+}
+
+.guide-steps li small {
+  color: var(--muted, #667085);
+  line-height: 1.4;
+}
+
+.guide-num {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 22px;
+  height: 22px;
+  border-radius: 999px;
+  border: 1px solid var(--border);
+  font-size: 12px;
+  font-weight: 700;
+}
+
+.guide-steps li[data-state="current"] {
+  border-color: #12805c;
+  background: #ecfdf3;
+}
+
+.guide-steps li[data-state="current"] .guide-num {
+  background: #12805c;
+  border-color: #12805c;
+  color: #fff;
+}
+
+.guide-steps li[data-state="done"] {
+  opacity: 0.75;
+}
+
+.guide-steps li[data-state="done"] .guide-num {
+  background: var(--surface-muted, #f2f4f7);
+  color: #12805c;
+  border-color: #12805c;
+  font-size: 0;
+}
+
+.guide-steps li[data-state="done"] .guide-num::before {
+  content: "\2713";
+  font-size: 13px;
+}
+
+@media (max-width: 1100px) {
+  .guide-steps {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+}
+
+/* Plain-language helper text under each panel heading */
+.panel-help {
+  margin: 0 0 12px;
+  font-size: 13px;
+  line-height: 1.55;
+  color: var(--muted, #667085);
+}
+
+ol.go-live-steps {
+  padding-left: 20px;
+  display: grid;
+  gap: 4px;
+}
+
+/* Next-action card with a jump button */
+.next-action-card {
+  display: grid;
+  gap: 6px;
+}
+
+.next-action-go {
+  justify-self: start;
+  padding: 4px 10px;
+  font-size: 12px;
+}
+
+/* Flash a panel when the guide or next-action sends the user to it */
+@keyframes panel-flash-glow {
+  0% { box-shadow: 0 0 0 3px rgba(18, 128, 92, 0.55); }
+  100% { box-shadow: 0 0 0 3px rgba(18, 128, 92, 0); }
+}
+
+.panel-flash {
+  animation: panel-flash-glow 1.6s ease-out 1;
+}
