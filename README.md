@@ -349,8 +349,14 @@ Use `config.scenario` to pick a deterministic product/location/flow mix without 
 | Leafy greens supplier | `leafy_greens_supplier` | Farm-origin leafy greens through cooling, packout, and outbound cold chain |
 | Fresh-cut processor | `fresh_cut_processor` | Ingredient lots routed into processor inventory and transformed into fresh-cut outputs |
 | Retailer readiness demo | `retailer_readiness_demo` | Retail-ready cases moving quickly through DC receiving and store-level receipts |
+| Seafood first receiver | `seafood_first_receiver` | Vessel-linked first land-based receiving with dockside handoff continuity |
+| Dairy continuous flow | `dairy_continuous_flow` | Continuous silo/vat movement without produce-style cooling records |
+| Co-packer (nut butters) | `copacker_nut_butter` | Contract manufacturer transforming grower-partner nut lots into branded and private-label nut butters |
+| Broadline distributor | `broadline_distributor` | Pure ship/receive wholesale traceability between grower-shippers and retail/foodservice — no transformation |
+| Foodservice restaurant group | `foodservice_restaurant_group` | Central commissary prepping RTE deli salads for restaurant locations |
+| Shell egg producer-packer | `shell_egg_producer` | Layer houses through egg cooling, grading/packing, and carton distribution — no transformation |
 
-Scenario selection is available in the dashboard, in `SimulationConfig`, and via `GET /api/scenarios`. The default is `leafy_greens_supplier`, and delivery still defaults to **`mock`**.
+Together the presets cover the FSMA 204 covered-entity spectrum — farms, coolers, initial packers, first land-based receivers, processors, co-packers, distributors, retail, foodservice, and shell eggs — anyone who manufactures, processes, packs, or holds FTL foods. Scenario selection is available in the dashboard, in `SimulationConfig`, and via `GET /api/scenarios`. The default is `leafy_greens_supplier`, and delivery still defaults to **`mock`**.
 
 **Operation size.** Every line profile composes with `config.scale` (the "Operation size" selector in the console): `small` runs a single-farm producer — one facility per tier, two retail destinations, half the lots in flight, quarter-size lots, mostly direct shipments with rare transformation; `midsize` (default) is the preset as authored; `enterprise` expands each tier into a multi-site network (12 farms, 4 coolers/packers, 3 processors, 5 DCs, 10 retailers — cloned sites with fresh, valid GLNs) with 4× lots in flight and 4× lot volumes, so commingling and multi-DC routing dominate. Scaling is deterministic (no RNG in network generation), keeps every event RegEngine-canonical, and only shapes the data — the wire contract is untouched. The journey harness accepts `--scale small|midsize|enterprise`.
 
