@@ -8,11 +8,17 @@ from ..scenarios import ScenarioId
 from .domain import DestinationMode
 
 
+MockFrictionCode = Literal["invalid_key", "subscription_inactive", "rate_limit"]
+
+
 class DeliveryConfig(BaseModel):
     mode: DestinationMode = DestinationMode.MOCK
     endpoint: HttpUrl | None = None
     api_key: str | None = None
     tenant_id: str | None = None
+    # Failure-injection codes honored by mock delivery only, so operators can
+    # rehearse the auth/billing/rate-limit friction a live integration hits.
+    mock_friction: list[MockFrictionCode] = Field(default_factory=list)
 
 
 class SimulationConfig(BaseModel):

@@ -77,7 +77,37 @@ const ids = {
   readinessBanner: document.getElementById('readinessBanner'),
   scenarioWorkbench: document.getElementById('scenarioWorkbench'),
   recordSpotlight: document.getElementById('recordSpotlight'),
+  connectionPill: document.getElementById('connectionPill'),
+  connectionChips: document.getElementById('connectionChips'),
+  connectionResult: document.getElementById('connectionResult'),
+  testConnectionBtn: document.getElementById('testConnectionBtn'),
+  saveIntegrationBtn: document.getElementById('saveIntegrationBtn'),
+  frictionInvalidKey: document.getElementById('frictionInvalidKey'),
+  frictionSubscription: document.getElementById('frictionSubscription'),
+  frictionRateLimit: document.getElementById('frictionRateLimit'),
 };
+
+const DELIVERY_MODE_LABELS = {
+  mock: 'sandbox',
+  live: 'connected',
+  none: 'off',
+};
+
+// Recovery guidance keyed by the HTTP status a delivery failure carried —
+// the same failure vocabulary a live RegEngine integration produces.
+const DELIVERY_RECOVERY_HINTS = {
+  401: 'RegEngine rejected the API key. Fix the key in RegEngine connection settings, then retry.',
+  402: 'The RegEngine subscription for this tenant is inactive. Reactivate billing, then retry — the retry reuses the original idempotency key, so nothing double-ingests.',
+  403: 'RegEngine refused the request. Check that the tenant ID matches the API key and the key has the webhooks.ingest scope.',
+  422: 'RegEngine rejected the request shape (for example, more than 500 events in one batch).',
+  429: 'RegEngine is rate limiting this tenant. Wait for the window to pass, then retry.',
+};
+
+function frictionSelections() {
+  return [ids.frictionInvalidKey, ids.frictionSubscription, ids.frictionRateLimit]
+    .filter((checkbox) => checkbox && checkbox.checked)
+    .map((checkbox) => checkbox.value);
+}
 
 function setStatus(message, tone = 'neutral', holdMs = 0) {
   ids.statusMessage.textContent = message;
@@ -102,6 +132,7 @@ function buildConfig() {
       endpoint: endpoint || null,
       api_key: apiKey || null,
       tenant_id: tenantId || null,
+      mock_friction: frictionSelections(),
     },
   };
 }
@@ -338,13 +369,13 @@ function preferredTraceLot(lotCodes = []) {
 function nextAction(status, events, deliveryMode) {
   const delivery = status?.stats?.delivery || {};
   if (deliveryMode === 'live') {
-    return 'Confirm live credentials';
+    return 'Verify RegEngine connection';
   }
   if (Number(delivery.retryable || 0) > 0) {
     return 'Retry failed deliveries';
   }
   if (!events.length) {
-    return 'Load fixture';
+    return 'Load line data';
   }
   if (!ids.lotLookup.value.trim()) {
     return 'Trace a lot';
@@ -356,13 +387,18 @@ function updateShellStatus(status = state.status, events = state.events, health 
   const deliveryMode = status?.config?.delivery?.mode || ids.deliveryMode.value || 'mock';
   const build = health?.build || {};
   ids.tenantBadge.textContent = health?.tenant || 'local-demo';
-  ids.deliveryModePill.textContent = deliveryMode;
+  ids.deliveryModePill.textContent = DELIVERY_MODE_LABELS[deliveryMode] || deliveryMode;
   ids.deliveryModePill.dataset.tone = deliveryMode === 'live' ? 'error' : deliveryMode === 'mock' ? 'success' : 'neutral';
-  ids.runStatePill.textContent = status?.running ? 'Running' : 'Stopped';
+  ids.runStatePill.textContent = status?.running ? 'Running' : 'Idle';
   ids.runStatePill.dataset.tone = status?.running ? 'success' : 'neutral';
   ids.buildBadge.textContent = build.commit_sha_short ? `${build.version || '0.1.0'} ${build.commit_sha_short}` : build.version || '0.1.0';
   ids.liveDeliveryWarning.hidden = deliveryMode !== 'live';
   ids.nextActionText.textContent = nextAction(status, events || [], deliveryMode);
+  if (ids.connectionPill) {
+    ids.connectionPill.textContent =
+      deliveryMode === 'live' ? 'Connected' : deliveryMode === 'mock' ? 'Sandbox' : 'Off';
+    ids.connectionPill.dataset.tone = deliveryMode === 'live' ? 'error' : deliveryMode === 'mock' ? 'success' : 'neutral';
+  }
 }
 
 function activeScenarioSummary() {
@@ -581,6 +617,7 @@ function renderDeliverySummary(status) {
   ];
   const lastAttempt = delivery.last_attempt_at ? new Date(delivery.last_attempt_at).toLocaleString() : 'No attempts yet';
   const lastSuccess = delivery.last_success_at ? new Date(delivery.last_success_at).toLocaleString() : 'No successful delivery yet';
+  const recoveryHint = deliveryRecoveryHint(state.events);
   ids.deliverySummary.innerHTML = `
     <div class="delivery-cards">
       ${cards
@@ -613,8 +650,36 @@ function renderDeliverySummary(status) {
           `
           : ''
       }
+      ${
+        recoveryHint
+          ? `
+            <div>
+              <dt>How to recover</dt>
+              <dd>${escapeHtml(recoveryHint)}</dd>
+            </div>
+          `
+          : ''
+      }
     </dl>
   `;
+}
+
+function deliveryRecoveryHint(events = []) {
+  const failedRecord = (events || []).find((record) => record.delivery_status === 'failed');
+  if (!failedRecord) {
+    return '';
+  }
+  const statusCode = failedRecord.delivery_metadata?.status_code;
+  if (statusCode && DELIVERY_RECOVERY_HINTS[statusCode]) {
+    return DELIVERY_RECOVERY_HINTS[statusCode];
+  }
+  if ((failedRecord.error || '').includes('Missing required KDEs')) {
+    return 'RegEngine rejected the record for missing KDEs. Fix the source data (the errors name the exact fields), then retry or re-import.';
+  }
+  if ((failedRecord.error || '').includes('Duplicate event')) {
+    return 'RegEngine saw a duplicate of this event in the same batch — it was already recorded.';
+  }
+  return 'Check the error detail, fix the cause, then use Retry failed. Retries reuse the original idempotency key so nothing double-ingests.';
 }
 
 function pickSpotlightRecord(events) {
@@ -952,7 +1017,7 @@ function renderSnapshot(status, events, health = state.health) {
   renderRecordSpotlight(events);
   renderEvents(events);
   if (Date.now() >= state.statusHoldUntil) {
-    setStatus(status.running ? 'Simulator loop is running.' : 'Simulator loop is stopped.');
+    setStatus(status.running ? 'Production line is running.' : 'Production line is idle.');
   }
 }
 
@@ -1020,13 +1085,129 @@ function connectLiveUpdates() {
   });
 }
 
+const CONNECTION_VERDICT_TONES = {
+  connected: 'success',
+  mock: 'success',
+  unauthorized: 'error',
+  subscription_inactive: 'error',
+  forbidden: 'error',
+  tenant_mismatch: 'error',
+  rate_limited: 'error',
+  service_unavailable: 'error',
+  unreachable: 'error',
+  not_configured: 'neutral',
+};
+
+function renderConnectionStatus(integration) {
+  if (!ids.connectionChips || !integration) {
+    return;
+  }
+  const chips = [
+    ['Endpoint', integration.endpoint_host || 'default'],
+    ['API key', integration.api_key_configured ? 'Configured' : 'Not set'],
+    ['Tenant', integration.tenant_configured ? 'Configured' : 'Not set'],
+    ['HMAC signing', integration.hmac_configured ? 'On' : 'Off'],
+  ];
+  ids.connectionChips.innerHTML = chips
+    .map(
+      ([label, value]) => `
+        <span class="connection-chip">
+          <span>${escapeHtml(label)}</span>
+          <strong>${escapeHtml(value)}</strong>
+        </span>
+      `,
+    )
+    .join('');
+  if (Array.isArray(integration.mock_friction)) {
+    if (ids.frictionInvalidKey) ids.frictionInvalidKey.checked = integration.mock_friction.includes('invalid_key');
+    if (ids.frictionSubscription) ids.frictionSubscription.checked = integration.mock_friction.includes('subscription_inactive');
+    if (ids.frictionRateLimit) ids.frictionRateLimit.checked = integration.mock_friction.includes('rate_limit');
+  }
+}
+
+async function loadIntegrationStatus() {
+  const integration = await api('/api/integration/status');
+  renderConnectionStatus(integration);
+}
+
+async function saveIntegrationSettings() {
+  try {
+    const request = {
+      mode: ids.deliveryMode.value,
+      mock_friction: frictionSelections(),
+    };
+    const endpoint = ids.endpoint.value.trim();
+    if (endpoint) {
+      request.endpoint = endpoint;
+    }
+    const apiKey = ids.apiKey.value.trim();
+    if (apiKey) {
+      request.api_key = apiKey;
+    }
+    const tenantId = ids.tenantId.value.trim();
+    if (tenantId) {
+      request.tenant_id = tenantId;
+    }
+    const integration = await api('/api/integration/configure', {
+      method: 'POST',
+      body: JSON.stringify(request),
+    });
+    renderConnectionStatus(integration);
+    setStatus('Saved RegEngine connection settings.', 'success', 2500);
+    await refresh();
+  } catch (error) {
+    setStatus(error.message, 'error', 5000);
+  }
+}
+
+async function testConnection() {
+  if (ids.connectionResult) {
+    ids.connectionResult.innerHTML = '<p class="note">Testing connection…</p>';
+  }
+  try {
+    const request = {};
+    const endpoint = ids.endpoint.value.trim();
+    if (endpoint) {
+      request.endpoint = endpoint;
+    }
+    const apiKey = ids.apiKey.value.trim();
+    if (apiKey) {
+      request.api_key = apiKey;
+    }
+    const tenantId = ids.tenantId.value.trim();
+    if (tenantId) {
+      request.tenant_id = tenantId;
+    }
+    const result = await api('/api/integration/test', {
+      method: 'POST',
+      body: JSON.stringify(request),
+    });
+    const tone = CONNECTION_VERDICT_TONES[result.verdict] || 'neutral';
+    const statusLine = result.status_code ? ` (HTTP ${result.status_code})` : '';
+    if (ids.connectionResult) {
+      ids.connectionResult.innerHTML = `
+        <div class="connection-verdict" data-tone="${tone}">
+          <strong>${escapeHtml(result.verdict.replaceAll('_', ' '))}${escapeHtml(statusLine)}</strong>
+          <p>${escapeHtml(result.detail)}</p>
+        </div>
+      `;
+    }
+    setStatus(`Connection test: ${result.verdict.replaceAll('_', ' ')}.`, tone === 'error' ? 'error' : 'success', 4000);
+  } catch (error) {
+    if (ids.connectionResult) {
+      ids.connectionResult.innerHTML = `<div class="connection-verdict" data-tone="error"><p>${escapeHtml(error.message)}</p></div>`;
+    }
+    setStatus(error.message, 'error', 5000);
+  }
+}
+
 async function startLoop() {
   try {
     await api('/api/simulate/start', {
       method: 'POST',
       body: JSON.stringify({ config: buildConfig() }),
     });
-    setStatus('Started simulator loop.', 'success', 2500);
+    setStatus('Started production line.', 'success', 2500);
     await refresh();
   } catch (error) {
     setStatus(error.message, 'error', 5000);
@@ -1036,7 +1217,7 @@ async function startLoop() {
 async function stopLoop() {
   try {
     await api('/api/simulate/stop', { method: 'POST' });
-    setStatus('Stopped simulator loop.', 'success', 2500);
+    setStatus('Paused production line.', 'success', 2500);
     await refresh();
   } catch (error) {
     setStatus(error.message, 'error', 5000);
@@ -1053,11 +1234,13 @@ async function stepOnce() {
       updateExportLink();
     }
     if (result.delivery_status === 'failed') {
-      setStatus(`Generated ${result.generated} event(s), but delivery failed: ${result.error || 'delivery error'}`, 'error', 7000);
+      setStatus(`Recorded ${result.generated} event(s), but delivery failed: ${result.error || 'delivery error'}`, 'error', 7000);
     } else if (result.delivery_status === 'generated') {
-      setStatus(`Generated ${result.generated} event(s) without delivery.`, 'success', 2500);
+      setStatus(`Recorded ${result.generated} event(s) without delivery.`, 'success', 2500);
+    } else if (result.rejected > 0) {
+      setStatus(`Recorded ${result.generated} event(s); RegEngine accepted ${result.accepted} and rejected ${result.rejected}.`, 'error', 7000);
     } else {
-      setStatus(`Generated and posted ${result.posted} event(s).`, 'success', 2500);
+      setStatus(`Recorded and posted ${result.posted} event(s).`, 'success', 2500);
     }
     await refresh();
   } catch (error) {
@@ -1138,7 +1321,12 @@ async function loadSelectedDemoFixture() {
         delivery: config.delivery,
       }),
     });
-    ids.scenario.value = result.scenario;
+    const fixtureScenario = state.scenarioCatalog[result.scenario];
+    renderScenarioOptions(
+      state.allScenarios.length ? state.allScenarios : Object.values(state.scenarioCatalog),
+      result.scenario,
+      fixtureScenario?.operation_type || null,
+    );
     ids.lineageResults.innerHTML = '';
     const traceLot = preferredTraceLot(result.lot_codes || []);
     if (traceLot) {
@@ -1147,11 +1335,11 @@ async function loadSelectedDemoFixture() {
       updateExportLink();
     }
     if (result.status === 'delivery_failed') {
-      setStatus(`Loaded ${result.stored} fixture event(s), but delivery failed: ${result.error || 'delivery error'}`, 'error', 7000);
+      setStatus(`Loaded ${result.stored} line event(s), but delivery failed: ${result.error || 'delivery error'}`, 'error', 7000);
     } else if (result.delivery_mode === 'none') {
-      setStatus(`Loaded ${result.stored} fixture event(s) without delivery.`, 'success', 3500);
+      setStatus(`Loaded ${result.stored} line event(s) without delivery.`, 'success', 3500);
     } else {
-      setStatus(`Loaded fixture and posted ${result.posted} event(s).`, 'success', 3500);
+      setStatus(`Loaded line data and posted ${result.posted} event(s).`, 'success', 3500);
     }
     await refresh();
   } catch (error) {
@@ -1218,7 +1406,7 @@ async function resetState() {
       body: JSON.stringify(buildConfig()),
     });
     ids.lineageResults.innerHTML = '';
-    setStatus('Reset simulator state and persisted event log.', 'success', 2500);
+    setStatus('Cleared line state and shift log.', 'success', 2500);
     await refresh();
   } catch (error) {
     setStatus(error.message, 'error', 5000);
@@ -1253,6 +1441,8 @@ document.getElementById('loadFixtureBtn').addEventListener('click', loadSelected
 document.getElementById('resetBtn').addEventListener('click', resetState);
 document.getElementById('refreshBtn').addEventListener('click', refresh);
 document.getElementById('lineageBtn').addEventListener('click', lookupLineage);
+ids.testConnectionBtn?.addEventListener('click', testConnection);
+ids.saveIntegrationBtn?.addEventListener('click', saveIntegrationSettings);
 ids.scenarioSave.addEventListener('change', updateScenarioSaveDescription);
 ids.demoFixture.addEventListener('change', updateDemoFixtureDescription);
 ids.exportPreset.addEventListener('change', updateExportLink);
@@ -1280,6 +1470,9 @@ loadDemoFixtures().catch((error) => {
   setStatus(error.message, 'error', 5000);
 });
 loadExportPresets().catch((error) => {
+  setStatus(error.message, 'error', 5000);
+});
+loadIntegrationStatus().catch((error) => {
   setStatus(error.message, 'error', 5000);
 });
 connectLiveUpdates();

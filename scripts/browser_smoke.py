@@ -33,6 +33,7 @@ class BrowserSmokeConfig:
     password: str | None
     tenant: str | None
     expected_build_sha: str | None
+    executable_path: str | None = None
 
 
 def main() -> int:
@@ -59,6 +60,7 @@ def _load_config() -> BrowserSmokeConfig:
         tenant=_env_text("REGENGINE_BROWSER_TENANT") or _env_text("REGENGINE_REMOTE_TENANT"),
         expected_build_sha=_env_text("REGENGINE_BROWSER_EXPECTED_BUILD_SHA")
         or _env_text("REGENGINE_EXPECTED_BUILD_SHA"),
+        executable_path=_env_text("REGENGINE_BROWSER_EXECUTABLE"),
     )
 
 
@@ -120,7 +122,10 @@ def _run_dashboard_smoke(base_url: str, config: BrowserSmokeConfig) -> None:
     failed = False
     try:
         with sync_playwright() as playwright:
-            browser = playwright.chromium.launch(headless=config.headless)
+            launch_options: dict[str, object] = {"headless": config.headless}
+            if config.executable_path:
+                launch_options["executable_path"] = config.executable_path
+            browser = playwright.chromium.launch(**launch_options)
             context_options = _browser_context_options(config)
             context = browser.new_context(**context_options)
             page = context.new_page()
@@ -128,7 +133,7 @@ def _run_dashboard_smoke(base_url: str, config: BrowserSmokeConfig) -> None:
             page.on("pageerror", lambda error: console_errors.append(str(error)))
 
             page.goto(base_url, wait_until="domcontentloaded")
-            expect(page.get_by_role("heading", name="RegEngine Inflow Lab")).to_be_visible()
+            expect(page.get_by_role("heading", name="Plant Operations Console")).to_be_visible()
 
             page.locator("#advancedConfig").evaluate("element => { element.open = true; }")
             page.locator("#batchSize").fill("1")
@@ -138,24 +143,27 @@ def _run_dashboard_smoke(base_url: str, config: BrowserSmokeConfig) -> None:
             page.locator("#apiKey").fill("")
             page.locator("#tenantId").fill("")
             page.locator("#stopBtn").click()
-            expect(page.locator("#statusMessage")).to_contain_text("Stopped simulator loop")
+            expect(page.locator("#statusMessage")).to_contain_text("Paused production line")
 
             page.locator("#startBtn").click()
-            expect(page.locator("#statusMessage")).to_contain_text("Started simulator loop")
+            expect(page.locator("#statusMessage")).to_contain_text("Started production line")
             page.locator("#stopBtn").click()
-            expect(page.locator("#statusMessage")).to_contain_text("Stopped simulator loop")
+            expect(page.locator("#statusMessage")).to_contain_text("Paused production line")
 
             page.locator("#resetBtn").click()
-            expect(page.locator("#statusMessage")).to_contain_text("Reset simulator state")
+            expect(page.locator("#statusMessage")).to_contain_text("Cleared line state")
 
             page.locator("#stepBtn").click()
-            expect(page.locator("#statusMessage")).to_contain_text("Generated and posted")
+            expect(page.locator("#statusMessage")).to_contain_text("Recorded and posted")
             expect(page.locator("#eventsBody tr")).to_have_count(1)
+
+            page.locator("#testConnectionBtn").click()
+            expect(page.locator("#connectionResult")).to_contain_text("mock")
 
             page.locator('#demoFixture option[value="fresh_cut_transformation"]').wait_for(state="attached")
             page.locator("#demoFixture").select_option("fresh_cut_transformation")
             page.locator("#loadFixtureBtn").click()
-            expect(page.locator("#statusMessage")).to_contain_text("Loaded fixture and posted")
+            expect(page.locator("#statusMessage")).to_contain_text("Loaded line data and posted")
             expect(page.locator("#eventsBody")).to_contain_text("TLC-DEMO-FC-OUT-001")
 
             page.locator("#lotLookup").fill("TLC-DEMO-FC-OUT-001")

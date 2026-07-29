@@ -34,6 +34,29 @@ class LiveIngestResult:
     metadata: dict[str, Any]
 
 
+@dataclass(frozen=True, slots=True)
+class ConnectionCheckResult:
+    verdict: str
+    detail: str
+    status_code: int | None = None
+    endpoint_host: str = ""
+
+
+# Interpretation of the authenticated read probe, keyed by HTTP status.
+# These mirror the failure modes RegEngine's webhook surface actually
+# returns, so the settings page can give recovery guidance instead of a
+# bare status code.
+_CONNECTION_VERDICTS: dict[int, tuple[str, str]] = {
+    200: ("connected", "Authenticated read succeeded. Credentials and tenant are valid."),
+    401: ("unauthorized", "RegEngine rejected the API key (HTTP 401). Check the key value and that it has not expired or been revoked."),
+    402: ("subscription_inactive", "The tenant's subscription is not active (HTTP 402). Billing status must be active or trialing before ingestion resumes."),
+    403: ("forbidden", "RegEngine refused the request (HTTP 403). The key may be missing the webhooks.read scope, or the tenant does not match the key."),
+    404: ("tenant_mismatch", "RegEngine returned HTTP 404. Webhook reads return 404 when the tenant does not match the API key's tenant."),
+    429: ("rate_limited", "RegEngine is rate limiting this tenant (HTTP 429). Wait for the window shown in Retry-After and try again."),
+    503: ("service_unavailable", "RegEngine is up but a required backing service is unavailable (HTTP 503). Try again shortly."),
+}
+
+
 class LiveRegEngineDeliveryError(RuntimeError):
     def __init__(self, message: str, metadata: dict[str, Any]) -> None:
         super().__init__(message)
@@ -92,6 +115,56 @@ class LiveRegEngineClient:
         except httpx.HTTPStatusError as exc:
             raise LiveRegEngineDeliveryError(str(exc), metadata) from exc
         return LiveIngestResult(response=response.json(), metadata=metadata)
+
+    async def check_connection(self, config: SimulationConfig) -> ConnectionCheckResult:
+        """Probe RegEngine with the configured credentials without ingesting.
+
+        Uses GET /api/v1/webhooks/recent?limit=1 — the cheapest authenticated
+        read on the webhook surface — and maps the response to the same
+        failure vocabulary a live integrator sees (bad key, wrong tenant,
+        lapsed subscription, rate limit).
+        """
+        endpoint = str(config.delivery.endpoint) if config.delivery.endpoint else DEFAULT_LIVE_INGEST_ENDPOINT
+        api_key = config.delivery.api_key
+        tenant_id = config.delivery.tenant_id
+        parsed = urlparse(endpoint)
+        host = parsed.netloc
+        if not api_key or not tenant_id:
+            return ConnectionCheckResult(
+                verdict="not_configured",
+                detail="Both an API key and a tenant id are required before testing the connection.",
+                endpoint_host=host,
+            )
+
+        probe_url = f"{parsed.scheme}://{parsed.netloc}/api/v1/webhooks/recent"
+        headers = {
+            "X-RegEngine-API-Key": api_key,
+            "X-Tenant-ID": tenant_id,
+        }
+        try:
+            async with httpx.AsyncClient(timeout=_live_timeout_seconds()) as client:
+                response = await client.get(
+                    probe_url,
+                    headers=headers,
+                    params={"tenant_id": tenant_id, "limit": 1},
+                )
+        except httpx.HTTPError as exc:
+            return ConnectionCheckResult(
+                verdict="unreachable",
+                detail=f"Could not reach RegEngine at {host}: {exc.__class__.__name__}",
+                endpoint_host=host,
+            )
+
+        verdict, detail = _CONNECTION_VERDICTS.get(
+            response.status_code,
+            ("error", f"Unexpected HTTP {response.status_code} from RegEngine."),
+        )
+        return ConnectionCheckResult(
+            verdict=verdict,
+            detail=detail,
+            status_code=response.status_code,
+            endpoint_host=host,
+        )
 
 
 def _build_signature_header(body_bytes: bytes) -> str | None:
