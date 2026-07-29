@@ -1,5 +1,7 @@
 # RegEngine Inflow Lab
 
+[![License: Apache 2.0](https://img.shields.io/badge/License-Apache%202.0-blue.svg)](LICENSE)
+
 Inflow Lab plays the role of **a RegEngine customer's own software**: a fictional factory's production system ("Meridian Fresh Foods — Plant Operations Console") that generates FSMA 204 CTE events through a realistic supply-chain lifecycle and delivers them to RegEngine exactly the way a real integrator does — API key, tenant header, idempotency keys, optional HMAC signing, and real per-event accept/reject responses. Ships with a FastAPI backend, the operator console, a built-in RegEngine stand-in that mirrors the live webhook's validation, and an end-to-end customer-journey harness.
 
 > **Non-production sandbox.** Inflow Lab is a demo, onboarding, and integration-validation tool for RegEngine — not a product, not a source of compliance record, and not built for public exposure. Meridian Fresh Foods is fictional and all data is synthetic. Without Basic Auth it serves a single shared `local-demo` tenant; keep it on localhost or behind auth, and never enter real data. See [REPO_PURPOSE.md](REPO_PURPOSE.md).
@@ -228,7 +230,7 @@ The console treats RegEngine like any third-party integration a customer configu
 
 - `GET /api/integration/status` — sanitized connection state: mode, endpoint host, whether an API key / tenant are configured, whether HMAC signing is enabled, and active `mock_friction` codes. Secrets are never returned.
 - `POST /api/integration/configure` — partial update of `mode`, `endpoint`, `api_key`, `tenant_id`, and `mock_friction`; omitted fields keep their stored values so the settings page can switch modes without re-entering credentials.
-- `POST /api/integration/test` — probes RegEngine with the configured (or request-supplied) credentials using the cheapest authenticated read (`GET /api/v1/webhooks/recent?limit=1`) and maps the response to an actionable verdict: `connected`, `unauthorized` (401), `subscription_inactive` (402), `forbidden` (403), `tenant_mismatch` (404), `rate_limited` (429), `service_unavailable` (503), `unreachable`, or `not_configured`. In mock mode with no credentials it reports `mock` without touching the network.
+- `POST /api/integration/test` — probes RegEngine with the configured (or request-supplied) credentials using the cheapest authenticated read (`GET /api/v1/webhooks/recent?limit=1`) and maps the response to an actionable verdict: `connected`, `contract_mismatch` (authenticated read succeeded but the two deploys advertise different ingest contract versions), `unauthorized` (401), `subscription_inactive` (402), `forbidden` (403), `tenant_mismatch` (404), `rate_limited` (429), `service_unavailable` (503), `unreachable`, or `not_configured`. In mock mode with no credentials it reports `mock` without touching the network.
 
 ## Customer journey harness
 
