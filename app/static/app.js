@@ -1152,6 +1152,7 @@ function connectLiveUpdates() {
 const CONNECTION_VERDICT_TONES = {
   connected: 'success',
   mock: 'success',
+  contract_mismatch: 'error',
   unauthorized: 'error',
   subscription_inactive: 'error',
   forbidden: 'error',
@@ -1171,6 +1172,7 @@ function renderConnectionStatus(integration) {
     ['API key', integration.api_key_configured ? 'Configured' : 'Not set'],
     ['Tenant', integration.tenant_configured ? 'Configured' : 'Not set'],
     ['HMAC signing', integration.hmac_configured ? 'On' : 'Off'],
+    ['Contract', integration.contract_version ? `v${integration.contract_version}` : 'n/a'],
   ];
   ids.connectionChips.innerHTML = chips
     .map(

@@ -1,0 +1,7 @@
+RegEngine Inflow Lab
+Copyright 2024-2026 RegEngine Inc.
+
+This product plays the customer side of RegEngine FSMA 204 integrations:
+a simulator, operator console, and end-to-end journey harness. It is
+licensed under the Apache License, Version 2.0 to encourage integrators
+and partners to reuse its payload contract and client patterns.

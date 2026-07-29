@@ -33,6 +33,7 @@ Inflow Lab plays the role of **a RegEngine customer's own software**: a fictiona
   - [Docker (optional)](#docker-optional)
 - [Logs and troubleshooting](#logs-and-troubleshooting)
 - [Contributing](#contributing)
+- [License](#license)
 
 ## What it does
 
@@ -614,7 +615,9 @@ The live delivery client targets the current RegEngine webhook shape:
 }
 ```
 
-Required KDEs per CTE are mirrored in `app/cte_rules.py` and pinned to RegEngine's `REQUIRED_KDES_BY_CTE` by `tests/test_regengine_contract_pin.py`; the detailed contract reference lives in `.agents/skills/regengine-api-contract/references/contract.md`. The mock FDA export mirrors RegEngine's documented 11-column request export shape. The EPCIS 2.0 export is a separate derived JSON-LD scaffold and does not change this webhook contract.
+Required KDEs per CTE are mirrored in `app/cte_rules.py` and pinned to RegEngine's `REQUIRED_KDES_BY_CTE` by `tests/test_regengine_contract_pin.py`; the detailed contract reference lives in `.agents/skills/regengine-api-contract/references/contract.md`.
+
+**Contract version handshake.** Both sides advertise an ingest contract version (`app/contract.py` here, `webhook_models.INFLOW_CONTRACT_VERSION` in RegEngine) — inflow-lab via `/api/healthz`, `/api/health`, and `/api/integration/status`; RegEngine via `/health`. The test-connection probe compares them and reports a `contract_mismatch` verdict when deployed instances have skewed (one side running an older deploy), so version drift is a visible, named state instead of a silent live-post failure. Bump the version in both repos together whenever the wire contract changes. The mock FDA export mirrors RegEngine's documented 11-column request export shape. The EPCIS 2.0 export is a separate derived JSON-LD scaffold and does not change this webhook contract.
 
 ## Deployment
 
@@ -794,3 +797,12 @@ House rules in short:
 - Maintain lot lineage across CTEs.
 - Run `uv run pytest` after any Python change.
 - Prefer small, composable modules and deterministic tests.
+
+## License
+
+Apache License 2.0 — see [LICENSE](LICENSE) and [NOTICE](NOTICE).
+
+Inflow Lab is deliberately permissive, unlike the main RegEngine engine: it is
+adoption infrastructure. Integrators, ERP vendors, and design partners are
+encouraged to copy the payload contract, reuse the client patterns (idempotency,
+HMAC signing, retry semantics), and fork the simulator for their own testing.

@@ -24,12 +24,20 @@ def assert_json_omits(payload: object, *needles: str) -> None:
 
 
 class FakeProbeResponse:
-    def __init__(self, status_code: int) -> None:
+    def __init__(self, status_code: int, payload: Any = None) -> None:
         self.status_code = status_code
+        self._payload = payload
+
+    def json(self) -> Any:
+        if self._payload is None:
+            raise ValueError("not json")
+        return self._payload
 
 
 class ProbeAsyncClient:
     status_code = 200
+    # None -> /health raises (non-JSON); a dict -> served as the health body.
+    health_payload: Any = None
     calls: list[dict[str, Any]] = []
 
     def __init__(self, *, timeout: float) -> None:
@@ -41,7 +49,15 @@ class ProbeAsyncClient:
     async def __aexit__(self, exc_type: object, exc: object, tb: object) -> None:
         return None
 
-    async def get(self, url: str, *, headers: dict[str, str], params: dict[str, Any]) -> FakeProbeResponse:
+    async def get(
+        self,
+        url: str,
+        *,
+        headers: dict[str, str] | None = None,
+        params: dict[str, Any] | None = None,
+    ) -> FakeProbeResponse:
+        if url.endswith("/health"):
+            return FakeProbeResponse(200, ProbeAsyncClient.health_payload)
         ProbeAsyncClient.calls.append({"url": url, "headers": headers, "params": params})
         return FakeProbeResponse(ProbeAsyncClient.status_code)
 
@@ -99,6 +115,7 @@ def test_integration_test_reports_mock_mode_without_probing() -> None:
 
 def test_integration_test_maps_probe_status_to_customer_verdicts(monkeypatch: Any) -> None:
     monkeypatch.setattr("app.regengine_client.httpx.AsyncClient", ProbeAsyncClient)
+    ProbeAsyncClient.health_payload = None
     expectations = {
         200: "connected",
         401: "unauthorized",
@@ -130,6 +147,49 @@ def test_integration_test_maps_probe_status_to_customer_verdicts(monkeypatch: An
             "tenant_id": "22222222-2222-2222-2222-222222222222",
             "limit": 1,
         }
+
+
+def test_connection_reports_contract_mismatch_when_versions_diverge(monkeypatch: Any) -> None:
+    from app.contract import INFLOW_CONTRACT_VERSION
+
+    monkeypatch.setattr("app.regengine_client.httpx.AsyncClient", ProbeAsyncClient)
+    ProbeAsyncClient.status_code = 200
+    credentials = {
+        "api_key": "rge_live_probe_key",
+        "tenant_id": "22222222-2222-2222-2222-222222222222",
+    }
+
+    # RegEngine advertises a different contract version -> mismatch verdict.
+    ProbeAsyncClient.health_payload = {"status": "healthy", "inflow_contract_version": "999"}
+    body = client.post("/api/integration/test", json=credentials).json()
+    assert body["verdict"] == "contract_mismatch"
+    assert "999" in body["detail"]
+    assert INFLOW_CONTRACT_VERSION in body["detail"]
+
+    # Same version -> connected.
+    ProbeAsyncClient.health_payload = {
+        "status": "healthy",
+        "inflow_contract_version": INFLOW_CONTRACT_VERSION,
+    }
+    body = client.post("/api/integration/test", json=credentials).json()
+    assert body["verdict"] == "connected"
+
+    # Older RegEngine (no version field) or non-JSON /health -> no mismatch.
+    for payload in ({"status": "healthy"}, None):
+        ProbeAsyncClient.health_payload = payload
+        body = client.post("/api/integration/test", json=credentials).json()
+        assert body["verdict"] == "connected", payload
+
+
+def test_healthz_and_integration_status_advertise_contract_version() -> None:
+    from app.contract import INFLOW_CONTRACT_VERSION
+
+    healthz = client.get("/api/healthz").json()
+    assert healthz["contract_version"] == INFLOW_CONTRACT_VERSION
+    health = client.get("/api/health").json()
+    assert health["contract_version"] == INFLOW_CONTRACT_VERSION
+    status = client.get("/api/integration/status").json()
+    assert status["contract_version"] == INFLOW_CONTRACT_VERSION
 
 
 def test_integration_test_requires_credentials_for_live_probe() -> None:

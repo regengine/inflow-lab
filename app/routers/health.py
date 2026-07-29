@@ -7,6 +7,7 @@ from fastapi import APIRouter, Depends
 
 from ..auth import TenantContext
 from ..build_info import current_build_info
+from ..contract import INFLOW_CONTRACT_VERSION
 from ..controller import SimulationController
 from ..dependencies import get_active_controller, get_tenant_context
 
@@ -24,6 +25,7 @@ async def health(
         "ok": True,
         "utc_time": datetime.now(UTC).isoformat(),
         "build": build,
+        "contract_version": INFLOW_CONTRACT_VERSION,
         "tenant": context.tenant_id,
         "auth": {
             "enabled": context.auth_enabled,
@@ -40,4 +42,5 @@ async def healthz() -> dict[str, Any]:
         "ok": True,
         "utc_time": datetime.now(UTC).isoformat(),
         "build": current_build_info().public_dict(),
+        "contract_version": INFLOW_CONTRACT_VERSION,
     }

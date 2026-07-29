@@ -15,6 +15,7 @@ class IntegrationStatusResponse(BaseModel):
     api_key_configured: bool
     tenant_configured: bool
     hmac_configured: bool
+    contract_version: str
     mock_friction: list[MockFrictionCode] = Field(default_factory=list)
 
 
