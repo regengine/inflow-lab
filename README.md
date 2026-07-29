@@ -350,6 +350,8 @@ Use `config.scenario` to pick a deterministic product/location/flow mix without 
 
 Scenario selection is available in the dashboard, in `SimulationConfig`, and via `GET /api/scenarios`. The default is `leafy_greens_supplier`, and delivery still defaults to **`mock`**.
 
+**Operation size.** Every line profile composes with `config.scale` (the "Operation size" selector in the console): `small` runs a single-farm producer — one facility per tier, two retail destinations, half the lots in flight, quarter-size lots, mostly direct shipments with rare transformation; `midsize` (default) is the preset as authored; `enterprise` expands each tier into a multi-site network (12 farms, 4 coolers/packers, 3 processors, 5 DCs, 10 retailers — cloned sites with fresh, valid GLNs) with 4× lots in flight and 4× lot volumes, so commingling and multi-DC routing dominate. Scaling is deterministic (no RNG in network generation), keeps every event RegEngine-canonical, and only shapes the data — the wire contract is untouched. The journey harness accepts `--scale small|midsize|enterprise`.
+
 Per-scenario save/load stores one saved slot per scenario under `data/scenario_saves/`. A saved scenario includes the sanitized simulator config and the current stored event records, so operators can restore repeatable demo states after switching scenarios. Live API keys are never saved; live delivery settings are restored as mock delivery to preserve mock-first safety.
 
 ## Demo fixtures
