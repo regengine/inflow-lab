@@ -15,12 +15,15 @@ class IngestPayload(BaseModel):
 
 
 class IngestResponseEvent(BaseModel):
+    # Mirrors RegEngine's EventResult: rejected events carry errors and no
+    # event_id/hashes, accepted events carry all three.
     traceability_lot_code: str
     cte_type: CTEType
     status: Literal["accepted", "rejected"]
-    event_id: str
-    sha256_hash: str
-    chain_hash: str
+    event_id: str | None = None
+    sha256_hash: str | None = None
+    chain_hash: str | None = None
+    errors: list[str] = Field(default_factory=list)
 
 
 class MockIngestResponse(BaseModel):

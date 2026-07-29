@@ -15,7 +15,7 @@ from .auth_middleware import auth_and_tenant_middleware
 from .build_info import APP_VERSION
 from .cors import cors_origins_from_env
 from .exceptions import handle_value_error
-from .routers import events, health, ingestion, mock_regengine, operator, scenarios, simulation
+from .routers import events, health, ingestion, integration, mock_regengine, operator, scenarios, simulation
 from .tenancy import controller, scenario_saves
 
 
@@ -58,6 +58,7 @@ def create_app() -> FastAPI:
     fastapi_app.include_router(operator.router)
     fastapi_app.include_router(scenarios.router)
     fastapi_app.include_router(simulation.router)
+    fastapi_app.include_router(integration.router)
     fastapi_app.include_router(ingestion.router)
     fastapi_app.include_router(events.router)
     fastapi_app.include_router(mock_regengine.router)
