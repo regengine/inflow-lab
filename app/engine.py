@@ -8,8 +8,15 @@ from itertools import count
 from typing import Any
 
 from .industry_adapters import get_industry_adapter
-from .schemas.domain import CTEType, RegEngineEvent
-from .scenarios import Location, ProductSpec, ScenarioId, get_scenario
+from .schemas.domain import CTEType, OperationScale, RegEngineEvent
+from .scenarios import (
+    SCALE_QUANTITY_MULTIPLIER,
+    Location,
+    ProductSpec,
+    ScenarioId,
+    get_scenario,
+    scale_scenario,
+)
 
 
 DEFAULT_MAX_FUTURE_HOURS = 20
@@ -56,18 +63,27 @@ class LegitFlowEngine:
         self,
         seed: int | None = 204,
         scenario: ScenarioId | str = ScenarioId.LEAFY_GREENS_SUPPLIER,
+        scale: OperationScale | str = OperationScale.MIDSIZE,
     ) -> None:
         self._initial_seed = seed
         self._initial_scenario = ScenarioId(scenario)
-        self.reset(seed, scenario=scenario)
+        self._initial_scale = OperationScale(scale)
+        self.reset(seed, scenario=scenario, scale=scale)
 
-    def reset(self, seed: int | None = None, scenario: ScenarioId | str | None = None) -> None:
+    def reset(
+        self,
+        seed: int | None = None,
+        scenario: ScenarioId | str | None = None,
+        scale: OperationScale | str | None = None,
+    ) -> None:
         # Deterministic simulator RNG, not security-sensitive.
         self.rng = random.Random(seed if seed is not None else self._initial_seed)  # nosec B311
         self._lot_counter = count(1)
         self._ref_counter = count(1)
         self._time_cursor = datetime.now(UTC) - timedelta(hours=12)
-        self.scenario = get_scenario(scenario or self._initial_scenario)
+        self.scale = OperationScale(scale or self._initial_scale)
+        self.quantity_multiplier = SCALE_QUANTITY_MULTIPLIER[self.scale]
+        self.scenario = scale_scenario(get_scenario(scenario or self._initial_scenario), self.scale)
         self.scenario_id = self.scenario.id
         self.adapter = get_industry_adapter(self.scenario.industry_type)
 
@@ -115,6 +131,8 @@ class LegitFlowEngine:
     def snapshot(self) -> dict[str, int | str]:
         return {
             "scenario": self.scenario_id.value,
+            "scale": self.scale.value,
+            "locations": len(self.all_locations),
             "harvested": len(self.harvested),
             "cooled": len(self.cooled),
             "packed": len(self.packed),
@@ -149,7 +167,10 @@ class LegitFlowEngine:
         product: ProductSpec = self.rng.choice(self.products)
         lot_code = self._make_lot_code(prefix="TLC")
         quantity_low, quantity_high = self.adapter.source_quantity_range(product)
-        quantity = self._quantity(quantity_low, quantity_high)
+        quantity = self._quantity(
+            quantity_low * self.quantity_multiplier,
+            quantity_high * self.quantity_multiplier,
+        )
         timestamp = self._advance_time(15, 90)
         reference_prefix = "LAND" if self.scenario.source_cte_type == CTEType.FIRST_LAND_BASED_RECEIVING else "HAR"
         reference_number = self._reference(reference_prefix)

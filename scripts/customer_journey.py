@@ -369,7 +369,7 @@ async def run_journey(args: argparse.Namespace) -> int:
         # error, which is not the journey we want to demonstrate.
         os.environ.setdefault("REGENGINE_SIM_MAX_FUTURE_HOURS", "0")
         engine = LegitFlowEngine()
-        engine.reset(args.seed, scenario=ScenarioId.FRESH_CUT_PROCESSOR)
+        engine.reset(args.seed, scenario=ScenarioId.FRESH_CUT_PROCESSOR, scale=args.scale)
         ingested = 0
         for index in range(batches):
             payload = generate_batch(engine, batch_size)
@@ -411,6 +411,12 @@ def main() -> int:
     parser.add_argument("--batches", type=int, default=3, help="Number of ingest batches (local mode; deployed is always 1).")
     parser.add_argument("--batch-size", type=int, default=5, help="Events per batch (capped at 3 in deployed mode).")
     parser.add_argument("--seed", type=int, default=204, help="Engine seed for reproducible journeys.")
+    parser.add_argument(
+        "--scale",
+        choices=["small", "midsize", "enterprise"],
+        default="midsize",
+        help="Operation size: single-farm small producer, the default mid-size operation, or a multi-site enterprise network.",
+    )
     parser.add_argument("--no-friction", dest="friction", action="store_false", help="Skip the KDE-rejection and idempotency-replay demos.")
     args = parser.parse_args()
     return asyncio.run(run_journey(args))

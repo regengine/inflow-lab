@@ -99,8 +99,12 @@ class SimulationController:
             previous_config = self.config
             self.config = config
             self.store.configure(config.persist_path)
-            if not self.running and (config.seed != previous_config.seed or config.scenario != previous_config.scenario):
-                self.engine.reset(config.seed, scenario=config.scenario)
+            if not self.running and (
+                config.seed != previous_config.seed
+                or config.scenario != previous_config.scenario
+                or config.scale != previous_config.scale
+            ):
+                self.engine.reset(config.seed, scenario=config.scenario, scale=config.scale)
             if not self.running:
                 self._stop_event = asyncio.Event()
                 self._task = asyncio.create_task(self._run_loop())
@@ -126,7 +130,7 @@ class SimulationController:
             if config is not None:
                 self.config = config
             self.store.configure(self.config.persist_path)
-            self.engine.reset(self.config.seed, scenario=self.config.scenario)
+            self.engine.reset(self.config.seed, scenario=self.config.scenario, scale=self.config.scale)
             self.store.reset()
             self.mock_service.reset()
         await self._publish_update()
@@ -331,7 +335,7 @@ class SimulationController:
                 deep=True,
             )
             self.store.configure(self.config.persist_path)
-            self.engine.reset(self.config.seed, scenario=fixture.scenario)
+            self.engine.reset(self.config.seed, scenario=fixture.scenario, scale=self.config.scale)
             if request.reset:
                 self.store.reset()
                 self.mock_service.reset()
@@ -416,7 +420,7 @@ class SimulationController:
             self.config = snapshot.config
             self.store.configure(self.config.persist_path)
             loaded_records = self.store.replace_all(snapshot.records)
-            self.engine.reset(self.config.seed, scenario=self.config.scenario)
+            self.engine.reset(self.config.seed, scenario=self.config.scenario, scale=self.config.scale)
             result = ScenarioLoadResponse(
                 status="loaded",
                 save=self._scenario_save_summary(snapshot),

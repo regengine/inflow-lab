@@ -5,7 +5,7 @@ from typing import Any, Literal
 from pydantic import BaseModel, Field, HttpUrl, field_validator
 
 from ..scenarios import ScenarioId
-from .domain import DestinationMode
+from .domain import DestinationMode, OperationScale
 
 
 MockFrictionCode = Literal["invalid_key", "subscription_inactive", "rate_limit"]
@@ -24,6 +24,7 @@ class DeliveryConfig(BaseModel):
 class SimulationConfig(BaseModel):
     source: str = "codex-simulator"
     scenario: ScenarioId = ScenarioId.LEAFY_GREENS_SUPPLIER
+    scale: OperationScale = OperationScale.MIDSIZE
     interval_seconds: float = 1.5
     batch_size: int = 3
     seed: int | None = 204
