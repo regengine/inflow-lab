@@ -794,6 +794,11 @@ If the health check fails before request logs appear, the first place to look is
 
 ## Contributing
 
+See [CONTRIBUTING.md](CONTRIBUTING.md) for the full contribution workflow.
+Commits require DCO sign-off (`git commit -s`) — see the
+[Developer Certificate of Origin (DCO)](CONTRIBUTING.md#developer-certificate-of-origin-dco)
+section.
+
 Before touching code, read:
 
 - `AGENTS.md` — repository operating agreements
