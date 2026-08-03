@@ -1384,3 +1384,130 @@ ol.go-live-steps {
 .panel-flash {
   animation: panel-flash-glow 1.6s ease-out 1;
 }
+
+/* First-run welcome overlay */
+.welcome-overlay {
+  position: fixed;
+  inset: 0;
+  z-index: 60;
+  display: grid;
+  place-items: center;
+  padding: 24px;
+  background: rgba(2, 6, 23, 0.55);
+}
+
+.welcome-card {
+  width: min(560px, 100%);
+  padding: 28px;
+  border: 1px solid var(--border);
+  border-radius: 16px;
+  background: var(--surface);
+  box-shadow: var(--shadow-strong);
+}
+
+.welcome-card h2 {
+  margin-bottom: 10px;
+  font-size: 1.5rem;
+}
+
+.welcome-card p {
+  margin: 0 0 12px;
+  line-height: 1.55;
+}
+
+.welcome-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 10px;
+  margin-top: 18px;
+}
+
+/* Guided-tour popover, pinned above the bottom of the viewport so it never
+   covers the highlighted panel scrolled to center */
+.tour-popover {
+  position: fixed;
+  left: 50%;
+  bottom: 28px;
+  transform: translateX(-50%);
+  z-index: 70;
+  width: min(460px, calc(100vw - 32px));
+  padding: 18px 20px;
+  border: 1px solid var(--border-strong);
+  border-radius: 14px;
+  background: var(--surface);
+  box-shadow: var(--shadow-strong);
+}
+
+.tour-popover header {
+  display: flex;
+  justify-content: space-between;
+  align-items: baseline;
+  gap: 10px;
+  margin-bottom: 8px;
+}
+
+.tour-progress {
+  color: var(--muted);
+  font-size: 0.78rem;
+  font-weight: 700;
+  letter-spacing: 0.02em;
+  text-transform: uppercase;
+}
+
+.tour-popover h3 {
+  margin-bottom: 6px;
+}
+
+.tour-popover p {
+  margin: 0;
+  color: var(--muted);
+  font-size: 0.9rem;
+  line-height: 1.5;
+}
+
+.tour-actions {
+  display: flex;
+  justify-content: flex-end;
+  gap: 10px;
+  margin-top: 14px;
+}
+
+.tour-highlight {
+  box-shadow: 0 0 0 3px rgba(18, 128, 92, 0.55), var(--shadow-strong);
+  border-radius: 10px;
+}
+
+.guide-tour-btn {
+  margin-left: auto;
+  padding: 4px 12px;
+  min-height: 32px;
+  font-size: 13px;
+}
+
+.guide-steps li:focus-visible {
+  outline: 3px solid rgba(0, 127, 115, 0.25);
+  outline-offset: 2px;
+  border-color: #12805c;
+}
+
+/* Async buttons spin while their request is in flight */
+.button.is-busy::after {
+  content: "";
+  width: 13px;
+  height: 13px;
+  margin-left: 8px;
+  border: 2px solid currentColor;
+  border-right-color: transparent;
+  border-radius: 999px;
+  animation: button-spin 0.7s linear infinite;
+}
+
+@keyframes button-spin {
+  to { transform: rotate(360deg); }
+}
+
+/* Armed state for the destructive Clear shift confirm */
+.button.danger.is-armed {
+  background: #8f1d1d;
+  box-shadow: 0 0 0 3px rgba(196, 59, 59, 0.28);
+}

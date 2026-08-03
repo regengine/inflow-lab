@@ -41,7 +41,7 @@ Inflow Lab plays the role of **a RegEngine customer's own software**: a fictiona
 
 Inflow Lab reproduces the full experience a RegEngine customer has in the wild, playing the customer's side of the integration:
 
-- **A factory persona.** The console presents as Meridian Fresh Foods' own production software — line setup, line control, a shift log, traceability views — with RegEngine demoted to an *Integrations* settings panel the way a real customer configures a third-party service (endpoint, API key, tenant, test connection).
+- **A factory persona.** The console presents as Meridian Fresh Foods' own production software — line setup, line control, a shift log, traceability views — with RegEngine demoted to an *Integrations* settings panel the way a real customer configures a third-party service (endpoint, API key, tenant, test connection). First-time visitors get a welcome dialog and an optional five-step guided tour of the workspace (persisted per browser, re-launchable via *Take the tour*).
 - **A realistic event generator.** Lots walk through a believable supply-chain lifecycle so the resulting trace feels legitimate rather than random:
   1. **Harvesting** originates at farms
   2. **Cooling** moves harvested lots through cooler facilities
@@ -148,7 +148,7 @@ uv run --no-dev --group browser playwright install chromium
 uv run --no-dev --group browser python scripts/browser_smoke.py
 ```
 
-The smoke starts a temporary local server with mock delivery, drives Chromium through the console start/pause, clear, single-batch, connection-test, line-data load, transformed-lot lineage lookup, and CSV warning display flows, then exits nonzero with a clear failure message if a browser assertion fails. It forces the delivery mode to `mock` before taking any action. Set `REGENGINE_BROWSER_EXECUTABLE` to point at a pre-installed Chromium instead of downloading one (useful in sandboxed CI environments).
+The smoke starts a temporary local server with mock delivery, drives Chromium through the first-run welcome and guided tour (including onboarding persistence across a reload), the console start/pause, two-step clear confirm, single-batch, connection-test, line-data load, transformed-lot lineage lookup, Enter-to-trace, and CSV warning display flows, then exits nonzero with a clear failure message if a browser assertion fails. It forces the delivery mode to `mock` before taking any action. Set `REGENGINE_BROWSER_EXECUTABLE` to point at a pre-installed Chromium instead of downloading one (useful in sandboxed CI environments).
 
 Set `REGENGINE_BROWSER_BASE_URL` to run against an already-started local or remote instance instead of letting the script start one. For Basic Auth deployments, set `REGENGINE_BROWSER_USERNAME` and `REGENGINE_BROWSER_PASSWORD`; set `REGENGINE_BROWSER_TENANT` to send `X-RegEngine-Tenant` for an isolated smoke tenant. The script also accepts the equivalent `REGENGINE_REMOTE_*` variables used by `scripts/remote_smoke.py`.
 

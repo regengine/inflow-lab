@@ -133,9 +133,28 @@ def _run_dashboard_smoke(base_url: str, config: BrowserSmokeConfig) -> None:
             page.on("pageerror", lambda error: console_errors.append(str(error)))
 
             page.goto(base_url, wait_until="domcontentloaded")
-            expect(page.get_by_role("heading", name="Plant Operations Console")).to_be_visible()
+            expect(page.get_by_role("heading", name="Plant Operations Console", exact=True)).to_be_visible()
             expect(page.locator("#guideRail")).to_contain_text("How to use this console")
             expect(page.locator('#guideRail [data-guide-step="setup"]')).to_be_visible()
+
+            # First visit shows the onboarding welcome; walk into the guided
+            # tour, navigate forward and back, then skip out of it.
+            expect(page.locator("#welcomeOverlay")).to_be_visible()
+            page.locator("#welcomeTourBtn").click()
+            expect(page.locator("#welcomeOverlay")).to_be_hidden()
+            expect(page.locator("#tourPopover")).to_be_visible()
+            expect(page.locator("#tourProgress")).to_have_text("Step 1 of 5")
+            page.locator("#tourNextBtn").click()
+            expect(page.locator("#tourProgress")).to_have_text("Step 2 of 5")
+            page.locator("#tourBackBtn").click()
+            expect(page.locator("#tourProgress")).to_have_text("Step 1 of 5")
+            page.locator("#tourSkipBtn").click()
+            expect(page.locator("#tourPopover")).to_be_hidden()
+
+            # Onboarding is persisted, so a reload must not re-interrupt.
+            page.reload(wait_until="domcontentloaded")
+            expect(page.get_by_role("heading", name="Plant Operations Console", exact=True)).to_be_visible()
+            expect(page.locator("#welcomeOverlay")).to_be_hidden()
 
             page.locator("#advancedConfig").evaluate("element => { element.open = true; }")
             page.locator("#batchSize").fill("1")
@@ -144,14 +163,27 @@ def _run_dashboard_smoke(base_url: str, config: BrowserSmokeConfig) -> None:
             page.locator("#endpoint").fill("")
             page.locator("#apiKey").fill("")
             page.locator("#tenantId").fill("")
-            page.locator("#stopBtn").click()
-            expect(page.locator("#statusMessage")).to_contain_text("Paused production line")
 
+            # Pressing Enter inside the setup form must not trigger the
+            # implicit form submission (which used to reload the page).
+            page.evaluate("window.__smokeMarker = true")
+            page.locator("#source").press("Enter")
+            page.wait_for_timeout(300)
+            if page.evaluate("window.__smokeMarker") is not True:
+                raise RuntimeError("Enter inside the setup form reloaded the page")
+
+            # Start/Pause mirror the loop state: pausing is only possible
+            # while running, starting only while idle.
+            expect(page.locator("#stopBtn")).to_be_disabled()
             page.locator("#startBtn").click()
             expect(page.locator("#statusMessage")).to_contain_text("Started production line")
+            expect(page.locator("#startBtn")).to_be_disabled()
             page.locator("#stopBtn").click()
             expect(page.locator("#statusMessage")).to_contain_text("Paused production line")
 
+            # Clear shift is two-step: first click arms, second click wipes.
+            page.locator("#resetBtn").click()
+            expect(page.locator("#resetBtn")).to_contain_text("Confirm clear shift")
             page.locator("#resetBtn").click()
             expect(page.locator("#statusMessage")).to_contain_text("Cleared line state")
 
@@ -182,6 +214,10 @@ def _run_dashboard_smoke(base_url: str, config: BrowserSmokeConfig) -> None:
             page.locator("#importCsvBtn").click()
             expect(page.locator("#statusMessage")).to_contain_text("warning")
             expect(page.locator("#importResults")).to_contain_text("Missing expected harvesting KDE: reference_document")
+
+            # Enter in the quick-trace box traces the lot without the button.
+            page.locator("#lotLookup").press("Enter")
+            expect(page.locator("#statusMessage")).to_contain_text("Loaded lineage for TLC-DEMO-FC-OUT-001")
 
             browser.close()
     except Exception:
