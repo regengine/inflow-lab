@@ -5,7 +5,7 @@
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
     <title>Meridian Fresh Ops — Plant Operations Console</title>
     <link rel="icon" href="data:," />
-    <link rel="stylesheet" href="/static/styles.css?v=5" />
+    <link rel="stylesheet" href="/static/styles.css?v=6" />
   </head>
   <body>
     <main class="page">
@@ -69,29 +69,30 @@
         <header class="guide-head">
           <strong>How to use this console</strong>
           <span>Follow the steps left to right — the highlighted step is where you are now.</span>
+          <button class="button secondary guide-tour-btn" id="tourBtn" type="button">Take the tour</button>
         </header>
         <ol class="guide-steps">
-          <li data-guide-step="setup" data-guide-target=".compact-panel" data-state="current">
+          <li data-guide-step="setup" data-guide-target=".compact-panel" data-state="current" tabindex="0">
             <span class="guide-num">1</span>
             <strong>Set up the line</strong>
             <small>Pick an operation type and line profile — or just keep the defaults.</small>
           </li>
-          <li data-guide-step="data" data-guide-target=".run-panel">
+          <li data-guide-step="data" data-guide-target=".run-panel" tabindex="0">
             <span class="guide-num">2</span>
             <strong>Bring in data</strong>
             <small>Click <em>Load today's line data</em> for a ready-made shift, or <em>Start line</em> to record live.</small>
           </li>
-          <li data-guide-step="delivery" data-guide-target=".delivery-monitor">
+          <li data-guide-step="delivery" data-guide-target=".delivery-monitor" tabindex="0">
             <span class="guide-num">3</span>
             <strong>Watch delivery</strong>
             <small>Every event posts to RegEngine (sandbox until you connect). Failures show how to recover.</small>
           </li>
-          <li data-guide-step="trace" data-guide-target=".lineage-panel">
+          <li data-guide-step="trace" data-guide-target=".lineage-panel" tabindex="0">
             <span class="guide-num">4</span>
             <strong>Trace a lot</strong>
             <small>Click any lot code in the shift log to follow it through the plant.</small>
           </li>
-          <li data-guide-step="export" data-guide-target=".evidence-panel">
+          <li data-guide-step="export" data-guide-target=".evidence-panel" tabindex="0">
             <span class="guide-num">5</span>
             <strong>Export evidence</strong>
             <small>Download the FDA CSV or EPCIS package from the Evidence panel.</small>
@@ -415,6 +416,39 @@
         </aside>
       </div>
     </main>
-    <script src="/static/app.js?v=5" defer></script>
+    <div class="welcome-overlay" id="welcomeOverlay" role="dialog" aria-modal="true" aria-labelledby="welcomeTitle" hidden>
+      <div class="welcome-card">
+        <p class="eyebrow">Meridian Fresh Foods</p>
+        <h2 id="welcomeTitle">Welcome to the Plant Operations Console</h2>
+        <p>
+          This console plays the part of a food company's own production software. You'll run a
+          production line, record FSMA&nbsp;204 traceability events as product moves through the
+          plant, watch each record post to RegEngine, and export audit-ready evidence.
+        </p>
+        <p class="note">
+          Everything here is synthetic and sandboxed — you can't break anything, so click around freely.
+        </p>
+        <div class="welcome-actions">
+          <button class="button" id="welcomeTourBtn" type="button">Start the guided tour</button>
+          <button class="button secondary" id="welcomeSampleBtn" type="button">Load a sample shift</button>
+          <button class="button secondary" id="welcomeSkipBtn" type="button">Explore on my own</button>
+        </div>
+      </div>
+    </div>
+
+    <div class="tour-popover" id="tourPopover" role="dialog" aria-modal="false" aria-labelledby="tourTitle" hidden>
+      <header>
+        <span class="tour-progress" id="tourProgress">Step 1 of 5</span>
+        <button class="link-button" id="tourSkipBtn" type="button">Skip tour</button>
+      </header>
+      <h3 id="tourTitle"></h3>
+      <p id="tourBody"></p>
+      <div class="tour-actions">
+        <button class="button secondary" id="tourBackBtn" type="button">Back</button>
+        <button class="button" id="tourNextBtn" type="button">Next</button>
+      </div>
+    </div>
+
+    <script src="/static/app.js?v=6" defer></script>
   </body>
 </html>

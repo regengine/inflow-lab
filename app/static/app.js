@@ -6,6 +6,8 @@ const state = {
   scenarioCatalog: {},
   eventSource: null,
   fallbackTimer: null,
+  reconnectTimer: null,
+  reconnectDelayMs: 0,
   statusHoldUntil: 0,
   scenarioLabels: {
     leafy_greens_supplier: 'Leafy greens supplier',
@@ -90,7 +92,50 @@ const ids = {
   frictionInvalidKey: document.getElementById('frictionInvalidKey'),
   frictionSubscription: document.getElementById('frictionSubscription'),
   frictionRateLimit: document.getElementById('frictionRateLimit'),
+  startBtn: document.getElementById('startBtn'),
+  stopBtn: document.getElementById('stopBtn'),
+  stepBtn: document.getElementById('stepBtn'),
+  replayBtn: document.getElementById('replayBtn'),
+  resetBtn: document.getElementById('resetBtn'),
+  refreshBtn: document.getElementById('refreshBtn'),
+  lineageBtn: document.getElementById('lineageBtn'),
+  importCsvBtn: document.getElementById('importCsvBtn'),
+  loadFixtureBtn: document.getElementById('loadFixtureBtn'),
 };
+
+// Keep Start/Pause honest about the loop state. Buttons mid-request keep
+// their busy-disabled state until the request settles.
+function syncRunButtons(running = Boolean(state.status?.running)) {
+  if (ids.startBtn.dataset.busy !== '1') {
+    ids.startBtn.disabled = running;
+  }
+  if (ids.stopBtn.dataset.busy !== '1') {
+    ids.stopBtn.disabled = !running;
+  }
+}
+
+// Runs an async handler with the button disabled and spinning so double-clicks
+// can't fire duplicate requests.
+async function runWithBusy(button, handler) {
+  if (button.dataset.busy === '1') {
+    return;
+  }
+  button.dataset.busy = '1';
+  button.classList.add('is-busy');
+  button.disabled = true;
+  try {
+    await handler();
+  } finally {
+    delete button.dataset.busy;
+    button.classList.remove('is-busy');
+    button.disabled = false;
+    syncRunButtons();
+  }
+}
+
+function bindAsyncClick(button, handler) {
+  button?.addEventListener('click', () => runWithBusy(button, handler));
+}
 
 const DELIVERY_MODE_LABELS = {
   mock: 'sandbox',
@@ -158,6 +203,134 @@ function flashPanel(selector) {
   // Force a reflow so re-adding the class restarts the animation.
   void panel.offsetWidth;
   panel.classList.add('panel-flash');
+}
+
+// --- Onboarding: first-run welcome + guided tour -------------------------
+// Seen-state lives in localStorage so the welcome only interrupts once per
+// browser; private-mode storage failures degrade to "never show".
+const ONBOARDING_KEY = 'inflowLab.onboarded.v1';
+
+function onboardingSeen() {
+  try {
+    return window.localStorage.getItem(ONBOARDING_KEY) === 'done';
+  } catch (error) {
+    return true;
+  }
+}
+
+function markOnboarded() {
+  try {
+    window.localStorage.setItem(ONBOARDING_KEY, 'done');
+  } catch (error) {
+    // Storage unavailable — the welcome simply shows again next visit.
+  }
+}
+
+// Fuller copy than the guide rail's one-liners: each tour stop explains what
+// the panel is for and what to actually click.
+const TOUR_STEPS = [
+  {
+    target: '.compact-panel',
+    title: 'Set up the production line',
+    body: 'This panel decides what the plant makes. The line profile picks products, locations, and event flow; the operation size scales lot counts and site counts. The defaults are fine for a first run — you can change them any time.',
+  },
+  {
+    target: '.run-panel',
+    title: 'Bring in traceability data',
+    body: 'Start line records events continuously, Record next batch (in the header) does one batch at a time, and Load today’s line data fills the shift with a ready-made trace instantly. Clear shift wipes the workspace when you want a fresh start.',
+  },
+  {
+    target: '.delivery-monitor',
+    title: 'Watch delivery to RegEngine',
+    body: 'Every recorded event posts to RegEngine — the built-in sandbox until you connect a real workspace in the Integrations panel. Failures land here with recovery guidance, and Retry failed is always safe: retries reuse the original idempotency key.',
+  },
+  {
+    target: '.lineage-panel',
+    title: 'Trace a lot through the plant',
+    body: 'Click any lot code in the shift log — or type one into the trace box at the top — to follow it backward to its origin and forward to wherever it went, including through transformations.',
+  },
+  {
+    target: '.evidence-panel',
+    title: 'Export audit evidence',
+    body: 'When the shift log has records, download the FDA-request CSV (header button) or the EPCIS 2.0 JSON package. The filters narrow the export by preset, lot, or date range. That’s the whole loop — you’re ready to run it yourself.',
+  },
+];
+
+const tour = { active: false, index: 0 };
+
+const tourEls = {
+  popover: document.getElementById('tourPopover'),
+  progress: document.getElementById('tourProgress'),
+  title: document.getElementById('tourTitle'),
+  body: document.getElementById('tourBody'),
+  back: document.getElementById('tourBackBtn'),
+  next: document.getElementById('tourNextBtn'),
+  skip: document.getElementById('tourSkipBtn'),
+};
+
+function clearTourHighlight() {
+  document.querySelectorAll('.tour-highlight').forEach((node) => node.classList.remove('tour-highlight'));
+}
+
+function showTourStep(index) {
+  tour.index = Math.min(Math.max(index, 0), TOUR_STEPS.length - 1);
+  const step = TOUR_STEPS[tour.index];
+  tourEls.progress.textContent = `Step ${tour.index + 1} of ${TOUR_STEPS.length}`;
+  tourEls.title.textContent = step.title;
+  tourEls.body.textContent = step.body;
+  tourEls.back.disabled = tour.index === 0;
+  tourEls.next.textContent = tour.index === TOUR_STEPS.length - 1 ? 'Finish' : 'Next';
+  clearTourHighlight();
+  const target = document.querySelector(step.target);
+  if (target) {
+    target.classList.add('tour-highlight');
+    target.scrollIntoView({ behavior: 'smooth', block: 'center' });
+  }
+}
+
+function startTour() {
+  tour.active = true;
+  tourEls.popover.hidden = false;
+  showTourStep(0);
+  tourEls.next.focus();
+}
+
+function endTour() {
+  tour.active = false;
+  tourEls.popover.hidden = true;
+  clearTourHighlight();
+  markOnboarded();
+  document.getElementById('tourBtn')?.focus();
+}
+
+function advanceTour(delta) {
+  const next = tour.index + delta;
+  if (next >= TOUR_STEPS.length) {
+    endTour();
+    setStatus('Tour finished — load line data or record a batch to see it all in action.', 'success', 5000);
+    return;
+  }
+  showTourStep(next);
+}
+
+const welcomeEls = {
+  overlay: document.getElementById('welcomeOverlay'),
+  tour: document.getElementById('welcomeTourBtn'),
+  sample: document.getElementById('welcomeSampleBtn'),
+  skip: document.getElementById('welcomeSkipBtn'),
+};
+
+function hideWelcome() {
+  welcomeEls.overlay.hidden = true;
+  markOnboarded();
+}
+
+function maybeShowWelcome() {
+  if (onboardingSeen()) {
+    return;
+  }
+  welcomeEls.overlay.hidden = false;
+  welcomeEls.tour.focus();
 }
 
 // Where "Take me there" should send the user for each next-action label.
@@ -463,6 +636,7 @@ function updateShellStatus(status = state.status, events = state.events, health 
   ids.deliveryModePill.dataset.tone = deliveryMode === 'live' ? 'error' : deliveryMode === 'mock' ? 'success' : 'neutral';
   ids.runStatePill.textContent = status?.running ? 'Running' : 'Idle';
   ids.runStatePill.dataset.tone = status?.running ? 'success' : 'neutral';
+  syncRunButtons(Boolean(status?.running));
   ids.buildBadge.textContent = build.commit_sha_short ? `${build.version || '0.1.0'} ${build.commit_sha_short}` : build.version || '0.1.0';
   ids.liveDeliveryWarning.hidden = deliveryMode !== 'live';
   ids.nextActionText.textContent = nextAction(status, events || [], deliveryMode);
@@ -1135,10 +1309,15 @@ function connectLiveUpdates() {
     startFallbackPolling();
     return;
   }
+  if (state.reconnectTimer) {
+    clearTimeout(state.reconnectTimer);
+    state.reconnectTimer = null;
+  }
 
   state.eventSource = new EventSource('/api/simulate/stream?limit=100');
 
   state.eventSource.addEventListener('open', () => {
+    state.reconnectDelayMs = 0;
     stopFallbackPolling();
   });
 
@@ -1150,13 +1329,21 @@ function connectLiveUpdates() {
     }
   });
 
+  // On stream loss, poll for freshness right away and keep trying to get the
+  // stream back with capped exponential backoff instead of giving up forever.
   state.eventSource.addEventListener('error', () => {
     if (state.eventSource) {
       state.eventSource.close();
       state.eventSource = null;
     }
-    setStatus('Live update stream disconnected. Falling back to refresh.', 'error', 5000);
     startFallbackPolling();
+    state.reconnectDelayMs = Math.min(Math.max(state.reconnectDelayMs || 0, 1000) * 2, 30000);
+    if (!state.reconnectTimer) {
+      state.reconnectTimer = setTimeout(() => {
+        state.reconnectTimer = null;
+        connectLiveUpdates();
+      }, state.reconnectDelayMs);
+    }
   });
 }
 
@@ -1508,29 +1695,100 @@ async function lookupLineage() {
   }
 }
 
-document.getElementById('startBtn').addEventListener('click', startLoop);
-document.getElementById('stopBtn').addEventListener('click', stopLoop);
-document.getElementById('stepBtn').addEventListener('click', stepOnce);
-document.getElementById('replayBtn').addEventListener('click', replayCurrentLog);
-document.getElementById('importCsvBtn').addEventListener('click', importCsv);
-document.getElementById('retryFailedBtn').addEventListener('click', retryFailedDeliveries);
-document.getElementById('saveScenarioBtn').addEventListener('click', saveCurrentScenario);
-document.getElementById('loadScenarioBtn').addEventListener('click', loadSavedScenario);
-document.getElementById('loadFixtureBtn').addEventListener('click', loadSelectedDemoFixture);
-document.getElementById('resetBtn').addEventListener('click', resetState);
-document.getElementById('refreshBtn').addEventListener('click', refresh);
-document.getElementById('lineageBtn').addEventListener('click', lookupLineage);
-ids.testConnectionBtn?.addEventListener('click', testConnection);
-ids.saveIntegrationBtn?.addEventListener('click', saveIntegrationSettings);
+bindAsyncClick(ids.startBtn, startLoop);
+bindAsyncClick(ids.stopBtn, stopLoop);
+bindAsyncClick(ids.stepBtn, stepOnce);
+bindAsyncClick(ids.replayBtn, replayCurrentLog);
+bindAsyncClick(ids.importCsvBtn, importCsv);
+bindAsyncClick(ids.retryFailedBtn, retryFailedDeliveries);
+bindAsyncClick(ids.saveScenarioBtn, saveCurrentScenario);
+bindAsyncClick(ids.loadScenarioBtn, loadSavedScenario);
+bindAsyncClick(ids.loadFixtureBtn, loadSelectedDemoFixture);
+bindAsyncClick(ids.refreshBtn, refresh);
+bindAsyncClick(ids.lineageBtn, lookupLineage);
+bindAsyncClick(ids.testConnectionBtn, testConnection);
+bindAsyncClick(ids.saveIntegrationBtn, saveIntegrationSettings);
+
+// Clear shift is destructive, so the first click arms the button and only a
+// second click within the arm window actually wipes the workspace.
+let resetArmTimer = null;
+function disarmReset() {
+  if (resetArmTimer) {
+    clearTimeout(resetArmTimer);
+    resetArmTimer = null;
+  }
+  ids.resetBtn.classList.remove('is-armed');
+  ids.resetBtn.textContent = 'Clear shift';
+}
+ids.resetBtn.addEventListener('click', () => {
+  if (ids.resetBtn.dataset.busy === '1') {
+    return;
+  }
+  if (!ids.resetBtn.classList.contains('is-armed')) {
+    ids.resetBtn.classList.add('is-armed');
+    ids.resetBtn.textContent = 'Confirm clear shift';
+    setStatus('Clearing wipes every record in this workspace. Click Confirm clear shift to proceed.', 'neutral', 6000);
+    resetArmTimer = setTimeout(disarmReset, 6000);
+    return;
+  }
+  disarmReset();
+  runWithBusy(ids.resetBtn, resetState);
+});
+
+// The setup grid is a <form>; without this, pressing Enter in a text field
+// triggers the implicit submission and reloads the whole page.
+document.getElementById('config-form').addEventListener('submit', (event) => event.preventDefault());
+
+ids.lotLookup.addEventListener('keydown', (event) => {
+  if (event.key === 'Enter') {
+    event.preventDefault();
+    runWithBusy(ids.lineageBtn, lookupLineage);
+  }
+});
+
 document.getElementById('nextActionGo')?.addEventListener('click', goToNextAction);
 for (const link of [ids.exportDownloadLink, ids.epcisDownloadLink]) {
   link?.addEventListener('click', () => {
+    if (!state.events.length) {
+      return;
+    }
     journey.exported = true;
     renderGuide();
   });
 }
 document.querySelectorAll('#guideRail [data-guide-target]').forEach((step) => {
   step.addEventListener('click', () => flashPanel(step.dataset.guideTarget));
+  step.addEventListener('keydown', (event) => {
+    if (event.key === 'Enter' || event.key === ' ') {
+      event.preventDefault();
+      flashPanel(step.dataset.guideTarget);
+    }
+  });
+});
+
+document.getElementById('tourBtn')?.addEventListener('click', startTour);
+tourEls.next.addEventListener('click', () => advanceTour(1));
+tourEls.back.addEventListener('click', () => advanceTour(-1));
+tourEls.skip.addEventListener('click', endTour);
+welcomeEls.tour.addEventListener('click', () => {
+  hideWelcome();
+  startTour();
+});
+welcomeEls.sample.addEventListener('click', () => {
+  hideWelcome();
+  runWithBusy(ids.loadFixtureBtn, loadSelectedDemoFixture);
+  flashPanel('.run-panel');
+});
+welcomeEls.skip.addEventListener('click', hideWelcome);
+document.addEventListener('keydown', (event) => {
+  if (event.key !== 'Escape') {
+    return;
+  }
+  if (!welcomeEls.overlay.hidden) {
+    hideWelcome();
+  } else if (tour.active) {
+    endTour();
+  }
 });
 ids.scenarioSave.addEventListener('change', updateScenarioSaveDescription);
 ids.demoFixture.addEventListener('change', updateDemoFixtureDescription);
@@ -1569,3 +1827,4 @@ refresh().catch((error) => {
   setStatus(error.message, 'error', 5000);
   startFallbackPolling();
 });
+maybeShowWelcome();
