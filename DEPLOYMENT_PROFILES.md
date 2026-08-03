@@ -232,6 +232,26 @@ REGENGINE_BUILD_BRANCH=main
 
 Attach a Railway volume at `/data` before using the service for partner demos. After a Railway domain is generated, update `REGENGINE_CORS_ORIGINS` to that exact HTTPS origin.
 
+### Automated deploys (preferred)
+
+`.github/workflows/deploy.yml` deploys every push to `main` and can be run
+on demand from the Actions tab. It sets the build variables itself and then
+polls `/api/healthz` until the deployed commit matches, so a green run means
+the build is actually live rather than merely accepted.
+
+It needs one repository secret, `RAILWAY_TOKEN` (a Railway project token
+scoped to the Inflow Lab service). Until that secret exists the workflow skips
+with a warning annotation instead of failing `main`.
+
+Use this **or** Railway's built-in GitHub auto-deploy, not both — two
+publishers racing on one service makes deploy history impossible to read.
+
+> Deploying by hand is what let the shared demo drift 47 commits behind `main`
+> for roughly 100 days: the ritual below is easy to forget and nothing failed
+> loudly when it was. Prefer the workflow.
+
+### Manual CLI deploy (fallback)
+
 When deploying from the CLI, update the non-secret build variables before `railway up` so health checks can identify stale deployments:
 
 ```bash
@@ -239,6 +259,14 @@ railway variable set --skip-deploys REGENGINE_BUILD_SHA="$(git rev-parse HEAD)" 
   REGENGINE_BUILD_BRANCH="$(git branch --show-current)"
 railway up --ci -m "Deploy $(git rev-parse --short HEAD)"
 ```
+
+`REGENGINE_BUILD_SHA` takes precedence over Railway's own
+`RAILWAY_GIT_COMMIT_SHA` (see `app/build_info.py`), and `.dockerignore`
+excludes `.git`, so this variable is the container's only source of build
+identity. A stale value makes `/api/healthz` report a commit that is not
+deployed. If you later switch the service to Railway's GitHub integration,
+**delete `REGENGINE_BUILD_SHA` and `REGENGINE_BUILD_BRANCH`** so Railway's
+injected metadata is used instead.
 
 Validate the deployed Railway demo with the remote smoke harness:
 

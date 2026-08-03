@@ -1,0 +1,89 @@
+name: Smoke Failure Issue
+
+# Remote Smoke correctly detected the stale shared demo on 100 consecutive runs
+# (runs 7 through 106) and nothing happened, because a red scheduled workflow
+# only exists on a tab nobody opens. This turns that signal into a filed issue.
+#
+# Called by the smoke workflows via `uses:` when their run fails. Reuses one
+# open issue per smoke workflow so a long outage produces a single thread with
+# a comment per failure rather than a hundred duplicate issues.
+
+on:
+  workflow_call:
+    inputs:
+      smoke_name:
+        description: Human-readable name of the smoke check that failed
+        required: true
+        type: string
+      run_url:
+        description: URL of the failing workflow run
+        required: true
+        type: string
+
+permissions:
+  contents: read
+  issues: write
+
+jobs:
+  file-issue:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+
+    steps:
+      - name: Open or update the failure issue
+        uses: actions/github-script@v8
+        env:
+          SMOKE_NAME: ${{ inputs.smoke_name }}
+          RUN_URL: ${{ inputs.run_url }}
+        with:
+          script: |
+            const smokeName = process.env.SMOKE_NAME;
+            const runUrl = process.env.RUN_URL;
+            const title = `${smokeName} is failing against the shared demo`;
+
+            // Match on an invisible marker rather than the title text so that
+            // retitling the issue by hand does not orphan the thread and spawn
+            // a duplicate.
+            const marker = `<!-- smoke-failure-tracker:${smokeName} -->`;
+
+            const existing = await github.paginate(
+              github.rest.issues.listForRepo,
+              { owner: context.repo.owner, repo: context.repo.repo, state: 'open', per_page: 100 },
+            );
+            const tracker = existing.find((issue) => (issue.body || '').includes(marker));
+
+            const detail = [
+              `**${smokeName}** failed against the deployed shared demo.`,
+              '',
+              `- Failing run: ${runUrl}`,
+              `- Commit under test: \`${context.sha}\``,
+              '',
+              'A drift failure here usually means the deployed service is behind `main`.',
+              'Check what the service actually reports:',
+              '',
+              '```bash',
+              'curl -s https://regengine-inflow-lab-production.up.railway.app/api/healthz',
+              '```',
+              '',
+              'If `build.commit_sha` is not current `main`, the service needs a deploy',
+              '(see `.github/workflows/deploy.yml`).',
+            ].join('\n');
+
+            if (tracker) {
+              await github.rest.issues.createComment({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number: tracker.number,
+                body: detail,
+              });
+              core.notice(`Commented on existing failure issue #${tracker.number}`);
+              return;
+            }
+
+            const created = await github.rest.issues.create({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              title,
+              body: `${marker}\n\n${detail}\n\nThis issue is reused for subsequent failures. Close it once the smoke passes again.`,
+            });
+            core.notice(`Opened failure issue #${created.data.number}`);

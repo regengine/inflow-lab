@@ -68,3 +68,16 @@ jobs:
           REGENGINE_BROWSER_TENANT: ${{ github.event.inputs.tenant || 'remote-browser-smoke-nightly' }}
           REGENGINE_BROWSER_EXPECTED_BUILD_SHA: ${{ github.sha }}
         run: uv run --frozen --no-dev --group browser python scripts/browser_smoke.py
+
+  # A red scheduled run is invisible; a filed issue is not. See
+  # .github/workflows/smoke-failure-issue.yml.
+  report-failure:
+    needs: remote-browser-smoke
+    if: failure()
+    uses: ./.github/workflows/smoke-failure-issue.yml
+    permissions:
+      contents: read
+      issues: write
+    with:
+      smoke_name: Remote Browser Smoke
+      run_url: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
