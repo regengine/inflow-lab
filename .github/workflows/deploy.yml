@@ -1,0 +1,107 @@
+name: Deploy
+
+# Replaces the manual `railway up` ritual documented in DEPLOYMENT_PROFILES.md.
+# That ritual stopped being performed on 2026-04-26 and the shared demo drifted
+# 47 commits behind main without anything failing loudly, so deploys now happen
+# here where a missed one is visible.
+#
+# Requires a RAILWAY_TOKEN repository secret (a Railway *project* token for the
+# Inflow Lab service). Without it every run skips with a warning annotation
+# rather than failing main — the Remote Smoke drift check is the backstop that
+# escalates an un-deployed main into a filed issue.
+#
+# Use this OR Railway's own GitHub auto-deploy integration, not both: two
+# publishers racing on one service produces confusing deploy history.
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+    inputs:
+      reason:
+        description: Why this manual deploy is being run
+        required: false
+        type: string
+        default: manual deploy
+
+permissions:
+  contents: read
+
+# Never let two deploys overlap, but never cancel one mid-flight either —
+# a half-applied container swap is worse than a queued deploy.
+concurrency:
+  group: railway-deploy-inflow-lab
+  cancel-in-progress: false
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v6
+
+      - name: Check deploy credentials
+        id: creds
+        env:
+          RAILWAY_TOKEN: ${{ secrets.RAILWAY_TOKEN }}
+        run: |
+          if [ -z "$RAILWAY_TOKEN" ]; then
+            echo "configured=false" >> "$GITHUB_OUTPUT"
+            echo "::warning title=Deploy skipped::RAILWAY_TOKEN secret is not set, so this commit was NOT deployed. Add it in Settings > Secrets and variables > Actions."
+          else
+            echo "configured=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Install Railway CLI
+        if: steps.creds.outputs.configured == 'true'
+        run: npm install -g @railway/cli
+
+      # .dockerignore excludes .git, so the container cannot derive its own
+      # commit. app/build_info.py reads REGENGINE_BUILD_SHA first, which makes
+      # this the single source of build identity behind /api/healthz — and the
+      # reason a stale manual value silently masked the real deployed commit
+      # for 100 days. Setting it fresh on every deploy is what keeps healthz
+      # honest.
+      - name: Publish build metadata
+        if: steps.creds.outputs.configured == 'true'
+        env:
+          RAILWAY_TOKEN: ${{ secrets.RAILWAY_TOKEN }}
+        run: |
+          railway variables \
+            --set "REGENGINE_BUILD_SHA=${GITHUB_SHA}" \
+            --set "REGENGINE_BUILD_BRANCH=${GITHUB_REF_NAME}" \
+            --skip-deploys
+
+      - name: Deploy to Railway
+        if: steps.creds.outputs.configured == 'true'
+        env:
+          RAILWAY_TOKEN: ${{ secrets.RAILWAY_TOKEN }}
+        run: railway up --ci --detach
+
+      # Deploying is not the same as being deployed. Poll healthz until the
+      # commit it reports actually matches this run, so a green check means the
+      # new build is live rather than merely accepted.
+      - name: Verify deployed commit
+        if: steps.creds.outputs.configured == 'true'
+        env:
+          BASE_URL: https://regengine-inflow-lab-production.up.railway.app
+        run: |
+          short_sha="$(echo "$GITHUB_SHA" | cut -c1-7)"
+          echo "Waiting for $BASE_URL to report commit $short_sha ..."
+          for attempt in $(seq 1 40); do
+            deployed="$(curl -fsS --max-time 10 "$BASE_URL/api/healthz" \
+              | python3 -c 'import json,sys; print(json.load(sys.stdin).get("build",{}).get("commit_sha",""))' \
+              2>/dev/null || true)"
+            case "$deployed" in
+              "$short_sha"*|"$GITHUB_SHA")
+                echo "Deployed commit confirmed: $deployed"
+                exit 0
+                ;;
+            esac
+            echo "attempt $attempt/40: healthz reports '${deployed:-unavailable}', retrying in 15s"
+            sleep 15
+          done
+          echo "::error title=Deploy not confirmed::healthz never reported ${short_sha} after 10 minutes."
+          exit 1
