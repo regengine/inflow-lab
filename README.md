@@ -165,7 +165,7 @@ The smoke harness uses FastAPI's in-process `TestClient` to exercise the operato
 For a deployed shared-demo instance, run the remote smoke harness against the public HTTPS URL:
 
 ```bash
-export REGENGINE_REMOTE_BASE_URL=https://regengine-inflow-lab-production.up.railway.app
+export REGENGINE_REMOTE_BASE_URL=https://regengine-inflow-lab-gh-production.up.railway.app
 export REGENGINE_REMOTE_USERNAME=demo
 export REGENGINE_REMOTE_PASSWORD='replace-with-shared-demo-password'
 export REGENGINE_REMOTE_TENANT=remote-smoke
