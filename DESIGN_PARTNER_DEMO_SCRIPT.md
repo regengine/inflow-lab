@@ -116,16 +116,16 @@ Use this section for the shared Railway demo when a non-engineer needs to prep, 
 
 Remote demo facts:
 
-- URL: `https://regengine-inflow-lab-production.up.railway.app`
+- URL: `https://regengine-inflow-lab-gh-production.up.railway.app`
 - Username: stored in Railway as `REGENGINE_BASIC_AUTH_USERNAME`
 - Password: stored in Railway as `REGENGINE_BASIC_AUTH_PASSWORD`; the current local operator copy is expected at `/tmp/regengine_inflow_lab_demo_basic_auth_password`
-- Storage: tenant-scoped event logs under the Railway `/data` volume
+- Storage: tenant-scoped event logs on the service's local disk (ephemeral by design — demo data resets on redeploy)
 - Delivery mode: keep `mock` for normal partner demos
 
 Set operator shell variables before running the commands below:
 
 ```bash
-export DEMO_BASE_URL='https://regengine-inflow-lab-production.up.railway.app'
+export DEMO_BASE_URL='https://regengine-inflow-lab-gh-production.up.railway.app'
 export DEMO_USERNAME='demo'
 export DEMO_PASSWORD="$(cat /tmp/regengine_inflow_lab_demo_basic_auth_password)"
 export DEMO_TENANT='partner-acme'

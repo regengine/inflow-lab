@@ -62,11 +62,11 @@ jobs:
               'Check what the service actually reports:',
               '',
               '```bash',
-              'curl -s https://regengine-inflow-lab-production.up.railway.app/api/healthz',
+              'curl -s https://regengine-inflow-lab-gh-production.up.railway.app/api/healthz',
               '```',
               '',
-              'If `build.commit_sha` is not current `main`, the service needs a deploy',
-              '(see `.github/workflows/deploy.yml`).',
+              'If `build.commit_sha` is not current `main`, check the Railway service',
+              '`regengine-inflow-lab-gh` — it auto-deploys from GitHub on every push to main.',
             ].join('\n');
 
             if (tracker) {

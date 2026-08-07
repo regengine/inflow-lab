@@ -132,7 +132,7 @@ uvicorn app.main:app --host 127.0.0.1 --port 8000
 Preferred gated script flow:
 
 ```bash
-export REGENGINE_REMOTE_BASE_URL=https://regengine-inflow-lab-production.up.railway.app
+export REGENGINE_REMOTE_BASE_URL=https://regengine-inflow-lab-gh-production.up.railway.app
 export REGENGINE_REMOTE_USERNAME=demo
 export REGENGINE_REMOTE_PASSWORD='<shared-demo-password>'
 export REGENGINE_REMOTE_TENANT=live-trial
@@ -234,17 +234,16 @@ Attach a Railway volume at `/data` before using the service for partner demos. A
 
 ### Automated deploys (preferred)
 
-`.github/workflows/deploy.yml` deploys every push to `main` and can be run
-on demand from the Actions tab. It sets the build variables itself and then
-polls `/api/healthz` until the deployed commit matches, so a green run means
-the build is actually live rather than merely accepted.
+The shared demo service (`regengine-inflow-lab-gh` on Railway) is connected
+to this GitHub repository, so **every push to `main` deploys automatically**
+— no repository secrets, no workflow, no manual ritual. `/api/healthz`
+reports the deployed commit from Railway's own `RAILWAY_GIT_COMMIT_SHA`, so
+drift between `main` and the live service is directly observable (and the
+nightly Remote Smoke checks assert on it).
 
-It needs one repository secret, `RAILWAY_TOKEN` (a Railway project token
-scoped to the Inflow Lab service). Until that secret exists the workflow skips
-with a warning annotation instead of failing `main`.
-
-Use this **or** Railway's built-in GitHub auto-deploy, not both — two
-publishers racing on one service makes deploy history impossible to read.
+A CLI-driven deploy workflow (`deploy.yml` + `RAILWAY_TOKEN`) existed
+briefly before the GitHub connection; it was removed because two publishers
+racing on one service make deploy history impossible to read.
 
 > Deploying by hand is what let the shared demo drift 47 commits behind `main`
 > for roughly 100 days: the ritual below is easy to forget and nothing failed
@@ -271,7 +270,7 @@ injected metadata is used instead.
 Validate the deployed Railway demo with the remote smoke harness:
 
 ```bash
-export REGENGINE_REMOTE_BASE_URL=https://regengine-inflow-lab-production.up.railway.app
+export REGENGINE_REMOTE_BASE_URL=https://regengine-inflow-lab-gh-production.up.railway.app
 export REGENGINE_REMOTE_USERNAME=demo
 export REGENGINE_REMOTE_PASSWORD='<shared-demo-password>'
 export REGENGINE_REMOTE_TENANT=remote-smoke
@@ -283,7 +282,7 @@ The harness keeps delivery in `mock` mode, uses the dedicated smoke tenant by de
 Validate the deployed browser dashboard through the same shared-demo auth path:
 
 ```bash
-export REGENGINE_BROWSER_BASE_URL=https://regengine-inflow-lab-production.up.railway.app
+export REGENGINE_BROWSER_BASE_URL=https://regengine-inflow-lab-gh-production.up.railway.app
 export REGENGINE_BROWSER_USERNAME=demo
 export REGENGINE_BROWSER_PASSWORD='<shared-demo-password>'
 export REGENGINE_BROWSER_TENANT=remote-browser-smoke
@@ -303,7 +302,7 @@ Then run `.github/workflows/remote-smoke.yml` or `.github/workflows/remote-brows
 
 | Input | Default | Purpose |
 |---|---|---|
-| `base_url` | `https://regengine-inflow-lab-production.up.railway.app` | Deployed shared-demo URL to validate |
+| `base_url` | `https://regengine-inflow-lab-gh-production.up.railway.app` | Deployed shared-demo URL to validate |
 | `tenant` | `remote-smoke` or `remote-browser-smoke` | Tenant used for isolated smoke data |
 
 The workflows install repo dependencies with `uv` and run `scripts/remote_smoke.py` or `scripts/browser_smoke.py` through `uv run`. They do not require live RegEngine credentials and keep delivery in `mock` mode. Nightly scheduled runs target the Railway shared-demo URL with `remote-smoke-nightly` and `remote-browser-smoke-nightly` tenants, and both remote workflows compare `/api/healthz` build metadata to the workflow commit.
