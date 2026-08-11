@@ -61,7 +61,6 @@ jobs:
           output-file: /tmp/codex-output.md
           safety-strategy: drop-sudo
           sandbox: workspace-write
-          codex-args: '["--full-auto"]'
 
       - name: Explain Codex Action failure
         if: failure() && steps.run_codex.outcome == 'failure'
