@@ -263,6 +263,10 @@ next one starts.
    origin (`app/auth_middleware.py` gates writes on the same list).
    Verify: `curl -sD - -o /dev/null -H "Origin: https://<new-domain>" https://<new-domain>/api/healthz`
    must echo the origin back in `access-control-allow-origin`.
+   (On Railway the service now also trusts its own `RAILWAY_PUBLIC_DOMAIN`
+   origin *in addition to* this list, so a stale configured value can no
+   longer lock the service out of its own domain — but explicit origins for
+   any other dashboard host still need this step.)
 2. **Replace secret reference variables with concrete values.**
    `REGENGINE_BASIC_AUTH_USERNAME`, `REGENGINE_BASIC_AUTH_PASSWORD`, and
    `REGENGINE_WEBHOOK_HMAC_SECRET` may reference the old service. Deleting
