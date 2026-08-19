@@ -63,13 +63,32 @@ class EventStore:
             self.persist_path = Path(persist_path)
             self._load_from_disk()
 
+    def _set_records(self, records_oldest_first: Iterable[StoredEventRecord]) -> None:
+        """Rebuild the in-memory ring from an oldest-first sequence.
+
+        ``_records`` is newest-first, and that is a contract rather than a
+        convention: ``add_many`` uses ``appendleft``, ``recent()`` reads a
+        left-slice, and ``maxlen`` eviction drops from the right — so an
+        inverted deque does not merely return records in the wrong order,
+        it evicts the newest record on the next write.
+
+        Order of operations matters and is easy to get backwards.
+        ``deque(iterable, maxlen=n)`` keeps the *last* n items, so the
+        truncation has to happen while the sequence is still oldest-first;
+        reversing before truncating retains the oldest n and throws the
+        newest away. Every rebuild goes through here so the three call
+        sites cannot drift apart again — they previously had three
+        different behaviours, only one of them right.
+        """
+        newest_last: deque[StoredEventRecord] = deque(records_oldest_first, maxlen=self.max_records)
+        self._records = deque(reversed(newest_last), maxlen=self.max_records)
+
     def _load_from_disk(self) -> None:
         self.persist_path.parent.mkdir(parents=True, exist_ok=True)
         records = self.read_persisted_records(str(self.persist_path))
-        loaded_records: deque[StoredEventRecord] = deque(records, maxlen=self.max_records)
         counter = max((record.sequence_no for record in records), default=0)
 
-        self._records = deque(reversed(loaded_records), maxlen=self.max_records)
+        self._set_records(records)
         self._counter = counter
 
     def read_persisted_records(self, persist_path: str | None = None) -> list[StoredEventRecord]:
@@ -126,7 +145,7 @@ class EventStore:
                 else:
                     updated_records.append(record)
 
-            self._records = deque(updated_records, maxlen=self.max_records)
+            self._set_records(updated_records)
             persisted_records = sorted(updated_records, key=lambda record: record.sequence_no)
             tmp_path = self.persist_path.with_suffix(f"{self.persist_path.suffix}.tmp")
             with tmp_path.open("w", encoding="utf-8") as handle:
@@ -146,7 +165,7 @@ class EventStore:
                 for record in persisted_records:
                     handle.write(json.dumps(record.model_dump(mode="json")) + "\n")
             tmp_path.replace(self.persist_path)
-            self._records = deque(reversed(persisted_records), maxlen=self.max_records)
+            self._set_records(persisted_records)
             self._counter = max((record.sequence_no for record in persisted_records), default=0)
         return persisted_records
 
