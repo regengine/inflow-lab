@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import os
 import uuid
+from collections import defaultdict, deque
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from typing import Any
@@ -155,8 +156,9 @@ class SimulationController:
 
             stored_records: list[StoredEventRecord] = []
             response_events = (outcome.response or {}).get("events", []) if outcome.response else []
+            paired_responses = _pair_event_responses(events, response_events)
             for index, event in enumerate(events):
-                event_response = response_events[index] if index < len(response_events) else None
+                event_response = paired_responses[index]
                 stored_records.append(
                     StoredEventRecord(
                         payload_source=self.config.source,
@@ -265,8 +267,9 @@ class SimulationController:
                 payload = IngestPayload(source=source, events=parsed.events)
                 outcome = await self._deliver_payload(payload, import_config)
                 response_events = (outcome.response or {}).get("events", []) if outcome.response else []
+                paired_responses = _pair_event_responses(parsed.events, response_events)
                 for index, event in enumerate(parsed.events):
-                    event_response = response_events[index] if index < len(response_events) else None
+                    event_response = paired_responses[index]
                     stored_records.append(
                         StoredEventRecord(
                             payload_source=source,
@@ -344,9 +347,10 @@ class SimulationController:
             payload = IngestPayload(source=source, events=events)
             outcome = await self._deliver_payload(payload, self.config)
             response_events = (outcome.response or {}).get("events", []) if outcome.response else []
+            paired_responses = _pair_event_responses(events, response_events)
             stored_records = []
             for index, fixture_event in enumerate(fixture.events):
-                event_response = response_events[index] if index < len(response_events) else None
+                event_response = paired_responses[index]
                 stored_records.append(
                     StoredEventRecord(
                         payload_source=source,
@@ -508,8 +512,11 @@ class SimulationController:
                         }
                     )
 
+                    paired_responses = _pair_event_responses(
+                        [record.event for record in records], response_events
+                    )
                     for index, record in enumerate(records):
-                        event_response = response_events[index] if index < len(response_events) else None
+                        event_response = paired_responses[index]
                         next_attempts = record.delivery_attempts + outcome.delivery_attempts
                         fields = _event_delivery_fields(outcome, event_response)
                         if fields["delivery_status"] == "posted":
@@ -767,6 +774,54 @@ class SimulationController:
             delivery_mode=snapshot.config.delivery.mode,
         )
 
+
+def _pair_event_responses(
+    events: list[Any],
+    response_events: list[Any],
+) -> list[dict[str, Any] | None]:
+    """Match each sent event to its own verdict, keyed on identity.
+
+    RegEngine does not answer in request order. Its webhook route builds
+    the response in phases — replay-window and KDE rejections first, then
+    rules-enforcement rejections, then every acceptance — so the response
+    list is partitioned rejected-first. Zipping it against the request by
+    array index therefore attaches one event's verdict to a different
+    event whenever a rejection follows an acceptance: a valid lot is
+    stored as ``failed`` carrying another lot's validation errors, and the
+    ``event_id``/``sha256_hash``/``chain_hash`` of a real accepted event
+    are copied onto the wrong record. Those hashes are the evidence.
+
+    ``(traceability_lot_code, cte_type)`` is on the wire on both sides and
+    is the join key. A key can legitimately repeat inside one batch — the
+    same lot and CTE at two different timestamps — so responses are held
+    in a per-key queue and consumed in order rather than collapsed into a
+    dict. Within a partition RegEngine preserves request order, so the
+    Nth event with a given key gets the Nth response with that key.
+
+    A key with no response left is ``None``: no verdict. Callers must
+    treat that as "unknown", never fall back to positional matching —
+    a wrong verdict is worse than an absent one.
+
+    Note this is invisible to the unit suite by construction:
+    ``mock_service`` appends accepted and rejected in a single pass, so
+    the mock's response *is* in request order.
+    """
+    by_key: dict[tuple[str, str], deque[dict[str, Any]]] = defaultdict(deque)
+    for response in response_events:
+        if not isinstance(response, dict):
+            continue
+        lot_code = response.get("traceability_lot_code")
+        cte_type = response.get("cte_type")
+        if lot_code is None or cte_type is None:
+            continue
+        by_key[(str(lot_code), str(cte_type))].append(response)
+
+    paired: list[dict[str, Any] | None] = []
+    for event in events:
+        cte_type = getattr(event.cte_type, "value", event.cte_type)
+        queue = by_key.get((str(event.traceability_lot_code), str(cte_type)))
+        paired.append(queue.popleft() if queue else None)
+    return paired
 
 def _event_delivery_fields(outcome: DeliveryOutcome, event_response: dict[str, Any] | None) -> dict[str, Any]:
     """Per-record delivery fields honoring per-event rejection.
