@@ -290,6 +290,26 @@ next one starts.
 > days after the cutover PR merged — with the failure attributed to the wrong
 > cause until the allowlist was probed directly.
 
+`scripts/cutover_preflight.sh <old-url> <new-url>` mechanises what steps 1 and
+3 can be checked from outside: every read-only path in the dashboard's proxy
+contract answering alike on both services, the new service reporting
+GitHub-injected build identity rather than a stale `REGENGINE_BUILD_SHA`, and
+the new service trusting its own origin. It is read-only — the demo is shared,
+and the POST routes the dashboard proxies mutate its state.
+
+It deliberately cannot check step 2, and says so on success rather than
+implying a clean bill of health. The Basic-auth credentials live as secrets on
+two different platforms, so from outside a service with the *wrong* credentials
+is indistinguishable from one with the right ones — both answer 401 to an
+unauthenticated probe. Vercel's `INFLOW_LAB_BASIC_AUTH_USERNAME` / `_PASSWORD`
+must equal the new service's `REGENGINE_BASIC_AUTH_USERNAME` / `_PASSWORD`, as
+concrete values. If they differ, every proxied call answers 401 the moment
+`INFLOW_LAB_SERVICE_URL` is flipped.
+
+Verify the flip on `/api/simulate/status`, not `/api/healthz`: the proxy
+answers HTTP 200 with `{"offline":true}` when the backend is unreachable
+(`optionalOfflineResponse`), so a 200 on the health path alone proves nothing.
+
 ### Manual CLI deploy (fallback)
 
 When deploying from the CLI, update the non-secret build variables before `railway up` so health checks can identify stale deployments:
