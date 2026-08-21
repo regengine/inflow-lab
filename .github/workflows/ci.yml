@@ -35,12 +35,7 @@ jobs:
           restore-keys: uv-${{ runner.os }}-
 
       - name: Install uv
-        # Upgrade pip alongside uv. pip-audit below scans the ambient
-        # environment, so a stale runner pip fails this job for a vulnerability
-        # in a build tool that is not a project dependency. Upgrading it fixes
-        # that at the source; the alternative is a standing --ignore-vuln per
-        # advisory, which red-lines every PR until someone adds the next one.
-        run: python -m pip install --upgrade pip uv
+        run: python -m pip install --upgrade uv
 
       - name: Install dependencies
         run: uv sync --frozen --group dev
@@ -51,13 +46,12 @@ jobs:
       - name: Check dependency health
         run: |
           uv pip check
-          # No --ignore-vuln entries. The previous one suppressed PYSEC-2026-196
-          # against the runner's bundled pip 26.1.1 "until the runner image
-          # ships pip >= 26.1.2". It duly did — and PYSEC-2026-3721 then landed
-          # against 26.1.2, failing this job on an unrelated docs commit. That
-          # is the treadmill an ignore list creates. The install step upgrades
-          # pip instead, so the scan sees a current build tool and this gate
-          # reflects project dependencies, which is what it is for.
+          # No --ignore-vuln entries. pip is a real locked dependency of this
+          # project, not an ambient build tool: pip-audit -> pip-api -> pip, in
+          # the dev group. So an advisory against it is fixed the same way as
+          # any other — bump it in uv.lock (uv lock --upgrade-package pip).
+          # The suppression this replaced pinned its own expiry to the runner
+          # image shipping a newer pip, which was never going to clear it.
           uv run --frozen --group dev pip-audit
           uv run --frozen --group dev bandit -q -r app scripts
 
