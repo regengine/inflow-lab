@@ -283,7 +283,7 @@ next one starts.
    new commit with `commit_source: RAILWAY_GIT_COMMIT_SHA`.
 4. **Carry the persistent volume across before sending traffic.** The demo
    writes its event history to `REGENGINE_DATA_DIR` (`app/tenancy.py:22`,
-   `/data/tenants/<tenant>/events.jsonl` in production), and on Railway that
+   `/data/tenants/{tenant_id}/events.jsonl` in production), and on Railway that
    path only survives a redeploy if a volume is mounted there. A service
    created fresh has none, and nothing about the running service says so: it
    answers 200, serves the right contract, reports the right build identity,
