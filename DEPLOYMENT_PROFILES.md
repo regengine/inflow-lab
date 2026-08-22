@@ -281,8 +281,23 @@ next one starts.
    inert until production is redeployed.
    Verify: `https://<dashboard-host>/api/inflow-lab/api/healthz` reports the
    new commit with `commit_source: RAILWAY_GIT_COMMIT_SHA`.
-4. **Only then retire the old service.** Until step 3 lands everywhere, the
-   old service is the live backend for whatever still points at it.
+4. **Carry the persistent volume across before sending traffic.** The demo
+   writes its event history to `REGENGINE_DATA_DIR` (`app/tenancy.py:22`,
+   `/data/tenants/{tenant_id}/events.jsonl` in production), and on Railway that
+   path only survives a redeploy if a volume is mounted there. A service
+   created fresh has none, and nothing about the running service says so: it
+   answers 200, serves the right contract, reports the right build identity,
+   and quietly starts from an empty store after every deploy — which for a
+   GitHub-connected service is *every push to `main`*.
+   Verify: the new service's config must carry a `volumeMounts` entry whose
+   `mountPath` matches `REGENGINE_DATA_DIR` on the old one. In the August 2026
+   cutover the old service mounted a volume at `/data` and the replacement had
+   no `volumeMounts` key at all, which would have discarded the demo's history
+   on the first push after the switch.
+5. **Only then retire the old service.** Until step 3 lands everywhere, the
+   old service is the live backend for whatever still points at it. Note that
+   the volume belongs to the old service — deleting it destroys the data
+   unless it has been migrated or detached first.
 
 > Steps 1–2 are exactly what the GitHub-connected cutover missed in August
 > 2026: the new service referenced the old one's variables, the URL-bearing
@@ -297,8 +312,11 @@ GitHub-injected build identity rather than a stale `REGENGINE_BUILD_SHA`, and
 the new service trusting its own origin. It is read-only — the demo is shared,
 and the POST routes the dashboard proxies mutate its state.
 
-It deliberately cannot check step 2, and says so on success rather than
-implying a clean bill of health. The Basic-auth credentials live as secrets on
+It deliberately cannot check steps 2 or 4, and says so on success rather than
+implying a clean bill of health. Both are invisible from outside: a service
+with the wrong credentials and a service with the right ones both answer 401,
+and a service with no volume is indistinguishable from one with a volume until
+the next redeploy discards the data. The Basic-auth credentials live as secrets on
 two different platforms, so from outside a service with the *wrong* credentials
 is indistinguishable from one with the right ones — both answer 401 to an
 unauthenticated probe. Vercel's `INFLOW_LAB_BASIC_AUTH_USERNAME` / `_PASSWORD`

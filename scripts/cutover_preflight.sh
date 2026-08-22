@@ -8,13 +8,24 @@
 # shared and the POST routes the dashboard proxies (simulate start/stop/reset,
 # fixture load) mutate its state.
 #
-# What it CANNOT check, and why it matters more than everything it can:
-# whether the new service's REGENGINE_BASIC_AUTH_USERNAME / _PASSWORD match the
-# INFLOW_LAB_BASIC_AUTH_USERNAME / _PASSWORD that Vercel injects. Both are
-# secrets held by the two platforms, so from outside, a service with *different*
-# credentials is indistinguishable from one with the same ones — both answer 401
-# to an unauthenticated probe. That is checklist step 2, and it is the failure
-# this script exists to remind you is still open.
+# What it CANNOT check, and why those matter more than everything it can. Both
+# are invisible from outside by construction, so a green run here is not a clean
+# bill of health:
+#
+#   1. Whether the new service's REGENGINE_BASIC_AUTH_USERNAME / _PASSWORD match
+#      the INFLOW_LAB_BASIC_AUTH_USERNAME / _PASSWORD that Vercel injects. Both
+#      are secrets held by two different platforms, so a service with the wrong
+#      credentials and one with the right credentials both answer 401 to an
+#      unauthenticated probe. Checklist step 2.
+#
+#   2. Whether the new service mounts a persistent volume at REGENGINE_DATA_DIR.
+#      The demo writes its event history there, and on Railway that path only
+#      survives a redeploy if a volume is mounted. A service without one answers
+#      200, serves this entire contract correctly, reports the right build
+#      identity — and starts from an empty store after every deploy, which for a
+#      GitHub-connected service means every push to main. Checklist step 4.
+#      Check it in the Railway config, not from out here: the old service's
+#      `volumeMounts` mountPath must exist on the new service too.
 #
 # Usage:
 #   scripts/cutover_preflight.sh <old-base-url> <new-base-url>
@@ -100,11 +111,16 @@ fi
 cat <<'DONE'
 PRE-FLIGHT PASSED — everything checkable from outside matches.
 
-Still unverified, and the likeliest way this breaks:
-  Vercel INFLOW_LAB_BASIC_AUTH_USERNAME / _PASSWORD  must equal
-  Railway REGENGINE_BASIC_AUTH_USERNAME / _PASSWORD  on the NEW service,
-as concrete values, not reference variables to the old service. If they differ,
-every proxied call answers 401 the moment you flip INFLOW_LAB_SERVICE_URL.
+Two things remain unverified, both invisible from outside:
+
+  1. Vercel INFLOW_LAB_BASIC_AUTH_USERNAME / _PASSWORD must equal Railway
+     REGENGINE_BASIC_AUTH_USERNAME / _PASSWORD on the NEW service, as concrete
+     values rather than reference variables to the old one. If they differ,
+     every proxied call answers 401 the moment you flip INFLOW_LAB_SERVICE_URL.
+
+  2. The NEW service must mount a persistent volume at REGENGINE_DATA_DIR. Check
+     the Railway config, not this script. Without it the demo answers normally
+     and silently loses its event history on every redeploy.
 
 After flipping and redeploying Vercel (env is baked at build), confirm with:
   curl -s https://<dashboard-host>/api/inflow-lab/api/simulate/status

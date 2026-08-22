@@ -46,12 +46,13 @@ jobs:
       - name: Check dependency health
         run: |
           uv pip check
-          # PYSEC-2026-196 is an advisory against the GitHub runner's bundled
-          # pip (26.1.1; fixed in 26.1.2) — a build tool, not a project
-          # dependency. It fails pip-audit's ambient-env scan and is unrelated
-          # to this repo. Ignore it so the gate reflects project deps only;
-          # remove once the runner image ships pip >= 26.1.2.
-          uv run --frozen --group dev pip-audit --ignore-vuln PYSEC-2026-196
+          # No --ignore-vuln entries. pip is a real locked dependency of this
+          # project, not an ambient build tool: pip-audit -> pip-api -> pip, in
+          # the dev group. So an advisory against it is fixed the same way as
+          # any other — bump it in uv.lock (uv lock --upgrade-package pip).
+          # The suppression this replaced pinned its own expiry to the runner
+          # image shipping a newer pip, which was never going to clear it.
+          uv run --frozen --group dev pip-audit
           uv run --frozen --group dev bandit -q -r app scripts
 
   browser-smoke:
