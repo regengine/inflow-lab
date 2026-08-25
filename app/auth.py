@@ -56,10 +56,11 @@ def tenant_context_from_request(request: Request) -> TenantContext | JSONRespons
             return _unauthorized_response()
 
         supplied_username, supplied_password = credentials
-        if not (
-            secrets.compare_digest(supplied_username, config.username or "")
-            and secrets.compare_digest(supplied_password, config.password or "")
-        ):
+        # Evaluate both digests unconditionally so a wrong username cannot
+        # short-circuit the password compare (timing side channel).
+        user_ok = secrets.compare_digest(supplied_username, config.username or "")
+        pass_ok = secrets.compare_digest(supplied_password, config.password or "")
+        if not (user_ok and pass_ok):
             return _unauthorized_response()
         username = supplied_username
 
