@@ -702,7 +702,7 @@ function renderReadinessBanner(summary, events, status = state.status) {
   }
   const readiness = backendAudit(status, summary) || pendingAuditModel(summary);
   ids.readinessBanner.innerHTML = `
-    <div class="readiness-banner-shell" data-tone="${readiness.tone}">
+    <div class="readiness-banner-shell" data-tone="${escapeHtml(readiness.tone)}">
       <div class="readiness-score">
         <span>Readiness</span>
         <strong>${escapeHtml(readiness.score)}</strong>
