@@ -180,6 +180,8 @@ def run_live_trial(
         return summary
     finally:
         stop_simulation(client, config)
+        if owns_client:
+            client.close()
 
 
 def run_mock_dry_run(client: httpx.Client, config: LiveTrialConfig) -> dict[str, Any]:

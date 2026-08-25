@@ -4,7 +4,7 @@ import json
 
 import httpx
 
-from scripts.live_trial import main
+from scripts.live_trial import config_from_env, main, run_live_trial
 
 
 BASE_ENV = {
@@ -95,6 +95,38 @@ def test_live_trial_confirm_live_requires_live_environment(capsys):
     assert exit_code == 1
     assert "REGENGINE_LIVE_ENDPOINT" in captured.err
     assert server.requests == []
+
+
+def test_run_live_trial_closes_the_client_it_creates_itself(monkeypatch):
+    server = FakeLiveTrialServer()
+    created_clients: list[httpx.Client] = []
+    real_client_cls = httpx.Client
+
+    def client_factory(*args, **kwargs):
+        kwargs["transport"] = httpx.MockTransport(server.handle)
+        client = real_client_cls(*args, **kwargs)
+        created_clients.append(client)
+        return client
+
+    monkeypatch.setattr("scripts.live_trial.httpx.Client", client_factory)
+
+    config = config_from_env(BASE_ENV, require_live=False)
+    run_live_trial(config, confirm_live=False)
+
+    assert len(created_clients) == 1
+    assert created_clients[0].is_closed
+
+
+def test_run_live_trial_leaves_a_caller_supplied_client_open():
+    server = FakeLiveTrialServer()
+    config = config_from_env(BASE_ENV, require_live=False)
+
+    with httpx.Client(
+        base_url=BASE_ENV["REGENGINE_REMOTE_BASE_URL"],
+        transport=httpx.MockTransport(server.handle),
+    ) as client:
+        run_live_trial(config, confirm_live=False, client=client)
+        assert not client.is_closed
 
 
 class FakeLiveTrialServer:
