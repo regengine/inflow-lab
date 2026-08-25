@@ -5,7 +5,8 @@ import asyncio
 from fastapi.testclient import TestClient
 
 from app.engine import LegitFlowEngine
-from app.main import app, controller
+from app.main import app
+from app.tenancy import controller
 from app.mock_service import validate_event_like_regengine
 from app.scenarios import SCENARIO_PRESETS, ScenarioId, get_scenario, scale_scenario
 from app.schemas.domain import OperationScale

@@ -16,7 +16,6 @@ from .build_info import APP_VERSION
 from .cors import cors_origins_from_env
 from .exceptions import handle_value_error
 from .routers import events, health, ingestion, integration, mock_regengine, operator, scenarios, simulation
-from .tenancy import controller, scenario_saves
 
 
 static_dir = Path(__file__).parent / "static"

@@ -24,7 +24,7 @@ import asyncio
 from datetime import UTC, datetime
 
 from app.controller import DeliveryOutcome, _pair_event_responses
-from app.main import controller
+from app.tenancy import controller
 from app.schemas.domain import CTEType
 from app.schemas.simulation import SimulationConfig
 

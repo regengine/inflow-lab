@@ -6,7 +6,8 @@ from typing import Any
 
 from fastapi.testclient import TestClient
 
-from app.main import app, controller
+from app.main import app
+from app.tenancy import controller
 from app.schemas.simulation import SimulationConfig
 
 
