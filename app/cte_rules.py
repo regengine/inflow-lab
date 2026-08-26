@@ -124,8 +124,30 @@ RECOMMENDED_KDES: dict[CTEType, tuple[str, ...]] = {
     ),
     CTEType.SHIPPING: ("carrier", "reference_document_type"),
     CTEType.RECEIVING: ("reference_document_type",),
-    CTEType.TRANSFORMATION: ("input_traceability_lot_codes", "input_products", "reference_document_type"),
+    CTEType.TRANSFORMATION: ("reference_document_type",),
 }
+
+# FDA's CTE/KDE reference requires, for each FTL food used as an ingredient,
+# that food's traceability lot code and product description linked to the
+# new lot -- unconditionally, not "if applicable" (fda.gov/media/163132/
+# download, cited in issue #189). That makes them stronger than the rest of
+# RECOMMENDED_KDES, but they can't move into REQUIRED_KDES itself: REQUIRED_KDES
+# is pinned byte-for-byte to RegEngine's live webhook contract
+# (tests/test_regengine_contract_pin.py), and promoting these here without a
+# coordinated change on RegEngine's side would just be local drift from what
+# live ingest actually enforces. validate_event_kdes below checks this tuple
+# at required-KDE severity directly, so the gap is real (not silently
+# swallowed as "recommended") without misrepresenting the pinned contract.
+# The per-input quantity/unit-of-measure FDA also requires here is a further,
+# deeper gap: nothing upstream of this module captures it per input lot yet
+# (industry_adapters.transformation_kdes only computes an aggregate
+# yield_ratio), so it isn't listed anywhere below -- flagging an unpopulated
+# KDE as required would fail every transformation event the simulator itself
+# generates. See issue #189's writeup for what emitting it would take.
+TRANSFORMATION_INPUT_LINKAGE_KDES: tuple[str, ...] = (
+    "input_traceability_lot_codes",
+    "input_products",
+)
 
 INDUSTRY_EVENT_REQUIREMENTS: dict[str, tuple[EventRequirement, ...]] = {
     "produce": (
@@ -238,6 +260,16 @@ def validate_event_kdes(event: RegEngineEvent) -> list[CTEValidationWarning]:
                     message=f"Missing expected {event.cte_type.value} KDE: {field}",
                 )
             )
+
+    if event.cte_type == CTEType.TRANSFORMATION:
+        for field in TRANSFORMATION_INPUT_LINKAGE_KDES:
+            if not _has_value(available.get(field)):
+                warnings.append(
+                    CTEValidationWarning(
+                        field=field,
+                        message=f"Missing expected {event.cte_type.value} KDE: {field}",
+                    )
+                )
 
     for field in RECOMMENDED_KDES.get(event.cte_type, ()):
         if not _has_value(available.get(field)):

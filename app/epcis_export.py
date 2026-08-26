@@ -17,8 +17,18 @@ _BIZ_STEPS = {
     CTEType.FIRST_LAND_BASED_RECEIVING: "urn:epcglobal:cbv:bizstep:receiving",
     CTEType.SHIPPING: "urn:epcglobal:cbv:bizstep:shipping",
     CTEType.RECEIVING: "urn:epcglobal:cbv:bizstep:receiving",
-    CTEType.TRANSFORMATION: "urn:epcglobal:cbv:bizstep:transforming",
+    # "transforming" isn't one of GS1 CBV's 41 standard bizStep terms (verified
+    # against GS1's own epcis-context.jsonld, issue #188) -- using the reserved
+    # urn:epcglobal:cbv:bizstep: prefix for a term GS1 never defined would
+    # masquerade as standard CBV, so this is minted under our own namespace.
+    CTEType.TRANSFORMATION: "urn:regengine:bizstep:transformation",
 }
+
+# The only sourceDestinationType issue #187 asks for -- CBV also defines
+# owning_party/possessing_party, but this app has no ownership/possession
+# model distinct from location, so "location" is the one type it can back
+# with real data.
+_SDT_LOCATION = "urn:epcglobal:cbv:sdt:location"
 
 _DISPOSITIONS = {
     CTEType.HARVESTING: "urn:epcglobal:cbv:disp:active",
@@ -82,6 +92,19 @@ def _render_event(
     event["disposition"] = _DISPOSITIONS[record.event.cte_type]
     event["readPoint"] = _location_reference(record.event.location_name, location_gln)
     event["bizLocation"] = _location_reference(record.event.location_name, location_gln)
+
+    # readPoint/bizLocation only ever describe *this* event's own location.
+    # CBV's mechanism for "who this lot moved from/to" in a handoff is
+    # sourceList/destinationList, not a second bizLocation -- without these,
+    # the ship-to and previous-source KDEs were only ever visible inside the
+    # free-form regengine:kdes extension (issue #187).
+    source_list = _source_list(record)
+    if source_list:
+        event["sourceList"] = source_list
+    destination_list = _destination_list(record)
+    if destination_list:
+        event["destinationList"] = destination_list
+
     event["regengine:sequenceNo"] = record.sequence_no
     event["regengine:cteType"] = record.event.cte_type.value
     event["regengine:traceabilityLotCode"] = record.event.traceability_lot_code
@@ -201,6 +224,26 @@ def _input_lot_codes(record: StoredEventRecord) -> list[str]:
     return lot_codes
 
 
+def _source_list(record: StoredEventRecord) -> list[dict[str, str]]:
+    """Receiving's immediate previous source, in CBV's sourceList shape."""
+    if record.event.cte_type != CTEType.RECEIVING:
+        return []
+    previous_source = record.event.kdes.get("immediate_previous_source")
+    if not isinstance(previous_source, str) or not previous_source:
+        return []
+    return [{"type": _SDT_LOCATION, "source": _location_id(previous_source)}]
+
+
+def _destination_list(record: StoredEventRecord) -> list[dict[str, str]]:
+    """Shipping's immediate subsequent recipient, in CBV's destinationList shape."""
+    if record.event.cte_type != CTEType.SHIPPING:
+        return []
+    ship_to = record.event.kdes.get("ship_to_location")
+    if not isinstance(ship_to, str) or not ship_to:
+        return []
+    return [{"type": _SDT_LOCATION, "destination": _location_id(ship_to)}]
+
+
 def _biz_transactions(record: StoredEventRecord) -> list[dict[str, str]]:
     reference_type = record.event.kdes.get("reference_document_type")
     reference_number = record.event.kdes.get("reference_document_number")
@@ -226,12 +269,16 @@ def _lot_identifier(lot_code: str) -> str:
 def _location_reference(location_name: str, location_gln: Callable[[str], str]) -> dict[str, str]:
     gln = location_gln(location_name)
     reference = {
-        "id": f"urn:regengine:location:{quote(location_name, safe='')}",
+        "id": _location_id(location_name),
         "regengine:locationName": location_name,
     }
     if gln:
         reference["regengine:gln"] = gln
     return reference
+
+
+def _location_id(location_name: str) -> str:
+    return f"urn:regengine:location:{quote(location_name, safe='')}"
 
 
 def _reference_type_identifier(reference_type: str) -> str:

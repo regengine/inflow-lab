@@ -5,7 +5,7 @@ import io
 from dataclasses import dataclass
 from typing import Callable, Iterable
 
-from .schemas.domain import CTEType, FDAExportPreset, StoredEventRecord
+from .schemas.domain import CTEType, FDAExportPreset, RegEngineEvent, StoredEventRecord
 
 
 FDA_EXPORT_COLUMNS = [
@@ -16,6 +16,12 @@ FDA_EXPORT_COLUMNS = [
     "Unit of Measure",
     "Location Description",
     "Location Identifier (GLN)",
+    # FDA's CTE/KDE reference requires two location descriptions per
+    # Shipping/Receiving record (the counterparty on the handoff, not just
+    # this event's own location) plus the TLC-source reference -- both were
+    # already sitting in event.kdes but never read here (issue #186).
+    "Ship-To / Previous Source Location Description",
+    "TLC Source Reference",
     "Date",
     "Time",
     "Reference Document Type",
@@ -114,6 +120,8 @@ def render_fda_request_csv(
                 "Unit of Measure": event.unit_of_measure,
                 "Location Description": event.location_name,
                 "Location Identifier (GLN)": location_gln(event.location_name),
+                "Ship-To / Previous Source Location Description": _linked_location_description(event),
+                "TLC Source Reference": _tlc_source_reference(event),
                 "Date": event.timestamp.date().isoformat(),
                 "Time": event.timestamp.time().isoformat(timespec="seconds"),
                 "Reference Document Type": event.kdes.get("reference_document_type", ""),
@@ -121,6 +129,34 @@ def render_fda_request_csv(
             }
         )
     return output.getvalue()
+
+
+def _linked_location_description(event: RegEngineEvent) -> str:
+    """The second, counterparty location FDA's KDE table requires per row.
+
+    "Location Description" above is always *this* event's own location
+    (ship-from for Shipping, receiving for Receiving). A Shipping row also
+    needs the immediate subsequent recipient, and a Receiving row also needs
+    the immediate previous source -- both already live in event.kdes, so a
+    Shipping- or Receiving-only export no longer silently drops half of the
+    required location pair just because its paired leg isn't in the batch.
+    """
+    if event.cte_type == CTEType.SHIPPING:
+        return event.kdes.get("ship_to_location") or ""
+    if event.cte_type == CTEType.RECEIVING:
+        return event.kdes.get("immediate_previous_source") or ""
+    return ""
+
+
+def _tlc_source_reference(event: RegEngineEvent) -> str:
+    """Same short/long key aliasing cte_rules.merged_event_values uses.
+
+    The engine always sets both tlc_source_reference and the verbose
+    traceability_lot_code_source_reference together, but hand-crafted or
+    CSV-imported events aren't guaranteed to -- falling back keeps this
+    column consistent with what the validator already treats as satisfied.
+    """
+    return event.kdes.get("tlc_source_reference") or event.kdes.get("traceability_lot_code_source_reference") or ""
 
 
 def export_filename(preset_id: FDAExportPreset) -> str:

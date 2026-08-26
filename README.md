@@ -378,7 +378,7 @@ The dashboard fixture loader resets the current event log before loading the sel
 
 ## FDA export presets
 
-`GET /api/mock/regengine/export/fda-request` still returns the same 11-column FDA request CSV and remains backward compatible with optional `start_date` and `end_date` filters. Date filters must be valid inclusive `YYYY-MM-DD` dates, and `start_date` must not be later than `end_date`. It now also accepts:
+`GET /api/mock/regengine/export/fda-request` still returns the same FDA request CSV (13 columns since the FSMA-required Ship-To / Previous Source and TLC Source Reference columns were added) and remains backward compatible with optional `start_date` and `end_date` filters. Date filters must be valid inclusive `YYYY-MM-DD` dates, and `start_date` must not be later than `end_date`. It now also accepts:
 
 - `preset`: one of `all_records`, `lot_trace`, `shipment_handoff`, `receiving_log`, or `transformation_batches`
 - `traceability_lot_code`: optional for most presets, required for `lot_trace`
@@ -465,7 +465,7 @@ All routes accept optional `X-RegEngine-Tenant` for tenant-scoped storage. If Ba
 |---|---|---|
 | `POST` | `/api/mock/regengine/ingest` | RegEngine-shaped ingest mirroring the live webhook's validation (per-event accept/reject) |
 | `GET` | `/api/mock/regengine/export/presets` | List FDA request export presets |
-| `GET` | `/api/mock/regengine/export/fda-request` | Mock 11-column FDA request CSV |
+| `GET` | `/api/mock/regengine/export/fda-request` | Mock 13-column FDA request CSV |
 | `GET` | `/api/mock/regengine/export/epcis` | Scaffolded EPCIS 2.0 JSON-LD export |
 
 ### Example: start the simulator in live mode
@@ -627,7 +627,7 @@ The live delivery client targets the current RegEngine webhook shape:
 
 Required KDEs per CTE are mirrored in `app/cte_rules.py` and pinned to RegEngine's `REQUIRED_KDES_BY_CTE` by `tests/test_regengine_contract_pin.py`; the detailed contract reference lives in `.agents/skills/regengine-api-contract/references/contract.md`.
 
-**Contract version handshake.** Both sides advertise an ingest contract version (`app/contract.py` here, `webhook_models.INFLOW_CONTRACT_VERSION` in RegEngine) — inflow-lab via `/api/healthz`, `/api/health`, and `/api/integration/status`; RegEngine via `/health`. The test-connection probe compares them and reports a `contract_mismatch` verdict when deployed instances have skewed (one side running an older deploy), so version drift is a visible, named state instead of a silent live-post failure. Bump the version in both repos together whenever the wire contract changes. The mock FDA export mirrors RegEngine's documented 11-column request export shape. The EPCIS 2.0 export is a separate derived JSON-LD scaffold and does not change this webhook contract.
+**Contract version handshake.** Both sides advertise an ingest contract version (`app/contract.py` here, `webhook_models.INFLOW_CONTRACT_VERSION` in RegEngine) — inflow-lab via `/api/healthz`, `/api/health`, and `/api/integration/status`; RegEngine via `/health`. The test-connection probe compares them and reports a `contract_mismatch` verdict when deployed instances have skewed (one side running an older deploy), so version drift is a visible, named state instead of a silent live-post failure. Bump the version in both repos together whenever the wire contract changes. The mock FDA export was RegEngine's documented 11-column request export shape; it now carries two additional columns (Ship-To / Previous Source Location Description, TLC Source Reference) that FSMA 204 requires for Shipping and Receiving but that shape omitted. **RegEngine's mirrored export needs the same two columns before the shapes match again.** The EPCIS 2.0 export is a separate derived JSON-LD scaffold and does not change this webhook contract.
 
 ## Deployment
 
