@@ -40,6 +40,22 @@ class TenantContext:
 
     @property
     def uses_default_storage(self) -> bool:
+        """True only for the built-in shared demo tenant with auth disabled.
+
+        Tenant routing does not depend on Basic Auth: ``X-RegEngine-Tenant``
+        is honored either way, so ``tenant_id`` is already the header's value
+        when one was sent and this property is False for it. What auth gates
+        is narrower -- whether the caller may hand the store its own
+        ``persist_path``, which only the unauthenticated local demo does
+        (``tenancy.scope_config``), and which
+        ``tenancy._ensure_persist_path_within_root`` keeps out of every
+        tenant's storage.
+
+        Issue #65 read this as "true whenever auth is off", which would
+        collapse every request onto the shared ``local-demo`` store. The
+        ``tenant_id`` half of the condition is what makes that untrue; keep
+        both halves.
+        """
         return self.tenant_id == DEFAULT_TENANT_ID and not self.auth_enabled
 
 

@@ -57,6 +57,36 @@ _TLC_DESCRIPTION_KDES = (
 )
 
 
+# Leading characters that make a spreadsheet treat a cell as a live formula
+# rather than as text. `\t` and `\r` are here because Excel strips them and
+# then evaluates whatever follows, so a cell of "\t=cmd|'/c calc'!A1" is a
+# formula too.
+CSV_FORMULA_PREFIXES = ("=", "+", "-", "@", "\t", "\r")
+# Prepending an apostrophe is the spreadsheet convention for "this cell is
+# text": Excel and Google Sheets both consume it on import and display the
+# original value, and every non-spreadsheet CSV reader sees one extra
+# leading character rather than executing anything.
+CSV_TEXT_PREFIX = "'"
+
+
+def neutralize_csv_cell(value: Any) -> Any:
+    """Stop a cell from becoming a live formula when the export is opened.
+
+    Every value in this export is ultimately caller-supplied -- the ingest
+    payload's ``product_description``, ``location_name`` and the
+    ``reference_document_*`` KDEs all land in cells verbatim -- and this file
+    is a compliance artifact: a human opens it in Excel or Sheets to review
+    FSMA evidence. A description of ``=cmd|'/c calc'!A1`` would execute on
+    open (DDE), and the tamer ``=HYPERLINK(...)``/``=WEBSERVICE(...)`` forms
+    quietly exfiltrate the rest of the sheet to a remote host. Non-string
+    values (the numeric quantity) are returned untouched: a number cannot
+    carry a formula, and quoting it would change what the column means.
+    """
+    if isinstance(value, str) and value.startswith(CSV_FORMULA_PREFIXES):
+        return CSV_TEXT_PREFIX + value
+    return value
+
+
 def _first_text(values: dict[str, Any], keys: Iterable[str]) -> str:
     for key in keys:
         value = values.get(key)
@@ -166,29 +196,31 @@ def render_fda_request_csv(
         previous_source = ""
         if event.cte_type in (CTEType.RECEIVING, CTEType.FIRST_LAND_BASED_RECEIVING):
             previous_source = _first_text(values, _PREVIOUS_SOURCE_KDES)
-        writer.writerow(
-            {
-                "Traceability Lot Code": event.traceability_lot_code,
-                "Traceability Lot Code Description": (
-                    _first_text(values, _TLC_DESCRIPTION_KDES) or event.product_description
-                ),
-                "Product Description": event.product_description,
-                "Quantity": event.quantity,
-                "Unit of Measure": event.unit_of_measure,
-                "Location Description": _primary_location(event, values),
-                "Location Identifier (GLN)": location_gln(event.location_name),
-                "Date": timestamp.date().isoformat(),
-                "Time": timestamp.time().isoformat(timespec="seconds"),
-                "Reference Document Type": event.kdes.get("reference_document_type", ""),
-                "Reference Document Number": event.kdes.get("reference_document_number", ""),
-                "Immediate Subsequent Recipient Location": _first_text(
-                    values, _SUBSEQUENT_RECIPIENT_KDES
-                ),
-                "Immediate Previous Source Location": previous_source,
-                "Traceability Lot Code Source Reference": _first_text(values, _TLC_SOURCE_KDES),
-                "Event Type (CTE)": event.cte_type.value,
-            }
-        )
+        row: dict[str, Any] = {
+            "Traceability Lot Code": event.traceability_lot_code,
+            "Traceability Lot Code Description": (
+                _first_text(values, _TLC_DESCRIPTION_KDES) or event.product_description
+            ),
+            "Product Description": event.product_description,
+            "Quantity": event.quantity,
+            "Unit of Measure": event.unit_of_measure,
+            "Location Description": _primary_location(event, values),
+            "Location Identifier (GLN)": location_gln(event.location_name),
+            "Date": timestamp.date().isoformat(),
+            "Time": timestamp.time().isoformat(timespec="seconds"),
+            "Reference Document Type": event.kdes.get("reference_document_type", ""),
+            "Reference Document Number": event.kdes.get("reference_document_number", ""),
+            "Immediate Subsequent Recipient Location": _first_text(
+                values, _SUBSEQUENT_RECIPIENT_KDES
+            ),
+            "Immediate Previous Source Location": previous_source,
+            "Traceability Lot Code Source Reference": _first_text(values, _TLC_SOURCE_KDES),
+            "Event Type (CTE)": event.cte_type.value,
+        }
+        # Neutralize on the way out, once, for every column: a new column (the
+        # export has grown from eleven to fifteen) is covered by construction
+        # rather than by remembering to wrap its value.
+        writer.writerow({column: neutralize_csv_cell(value) for column, value in row.items()})
     return output.getvalue()
 
 

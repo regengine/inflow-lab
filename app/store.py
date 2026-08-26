@@ -5,6 +5,7 @@ import logging
 import os
 from collections import Counter, deque
 from datetime import datetime
+from itertools import islice
 from pathlib import Path
 from threading import RLock
 from typing import Any, Iterable
@@ -25,6 +26,30 @@ LINEAGE_PLACEHOLDER_DESCRIPTION = "Unknown lot (no stored record)"
 # Sentinel that replaces secrets in scrubbed output. Not a credential.
 MASKED_SECRET = "***MASKED***"  # nosec B105
 SECRET_FIELD_NAMES = {"api_key", "apikey", "x_regengine_api_key", "authorization"}
+
+# How many records one store keeps -- in memory *and* on disk. The two used to
+# be governed by different rules: the deque capped at 5000 while ``add_many``
+# appended to the log forever, so a long run left a file the store no longer
+# fully represented and every read reparsed it from byte zero to find that
+# out. One bound now covers both (see ``_rotate_persisted``), so "what the
+# store serves" and "what the file holds" cannot drift apart.
+MAX_HISTORY_ENV = "REGENGINE_STORE_MAX_HISTORY"
+DEFAULT_MAX_HISTORY = 50_000
+
+
+def default_max_history() -> int:
+    raw_limit = (os.getenv(MAX_HISTORY_ENV) or "").strip()
+    if not raw_limit:
+        return DEFAULT_MAX_HISTORY
+    try:
+        limit = int(raw_limit)
+    except ValueError:
+        logger.warning("Ignoring malformed %s=%r; using default %s", MAX_HISTORY_ENV, raw_limit, DEFAULT_MAX_HISTORY)
+        return DEFAULT_MAX_HISTORY
+    if limit <= 0:
+        logger.warning("Ignoring non-positive %s=%r; using default %s", MAX_HISTORY_ENV, raw_limit, DEFAULT_MAX_HISTORY)
+        return DEFAULT_MAX_HISTORY
+    return limit
 
 
 def _scrub_secrets(value: Any) -> Any:
@@ -82,10 +107,46 @@ def _serialize_record(record: StoredEventRecord) -> str:
 
 
 class EventStore:
-    def __init__(self, persist_path: str = "data/events.jsonl", max_records: int = 5000) -> None:
+    """In-memory record history with the JSONL file as its write-ahead log.
+
+    Reads (``stats``, ``lineage``, ``all_between``, ``failed_delivery_records``
+    and everything the API builds on them) are served from memory. They used
+    to re-open the log and re-validate every line through Pydantic on each
+    call, so a status poll cost a full-file parse and the in-memory copy was
+    decorative -- while the writes it was meant to protect (fsync before
+    exposure, rollback on failure, one scrubbing serializer) all still go to
+    disk first. Disk therefore stays the durable record and the source of
+    truth on restart; it is simply not re-read to answer a question already
+    answered in memory.
+
+    ``max_records`` bounds the *recent* window ``recent()`` serves.
+    ``max_history`` bounds retained history, in memory and in the file
+    together.
+    """
+
+    def __init__(
+        self,
+        persist_path: str = "data/events.jsonl",
+        max_records: int = 5000,
+        max_history: int | None = None,
+    ) -> None:
         self.persist_path = Path(persist_path)
         self.max_records = max_records
-        self._records: deque[StoredEventRecord] = deque(maxlen=max_records)
+        self.max_history = max_history if max_history is not None else default_max_history()
+        # Oldest-first, unlike the newest-first ring this replaced: appends go
+        # to the right and ``maxlen`` evicts the oldest from the left, which
+        # is the direction retention actually wants. ``recent()`` reverses a
+        # slice of the tail instead of the deque carrying the inverted order.
+        self._history: deque[StoredEventRecord] = deque(maxlen=self.max_history)
+        # Records currently in the live persist file. Kept in step with the
+        # writes rather than recomputed, so nothing has to stat or reparse the
+        # file to know whether it is due for rotation.
+        self._persisted_count = 0
+        # Records evicted from memory but still in the live file, held until
+        # the next rotation copies them to the archive. Bounded by the
+        # rotation slack below, so this never grows past a fraction of
+        # ``max_history``.
+        self._pending_archive: list[StoredEventRecord] = []
         self._counter = 0
         self._lock = RLock()
         # Lines the most recent read could not parse; see
@@ -98,33 +159,37 @@ class EventStore:
             self.persist_path = Path(persist_path)
             self._load_from_disk()
 
-    def _set_records(self, records_oldest_first: Iterable[StoredEventRecord]) -> None:
-        """Rebuild the in-memory ring from an oldest-first sequence.
+    def _set_history(self, records: Iterable[StoredEventRecord]) -> None:
+        """Rebuild retained history from any set of records.
 
-        ``_records`` is newest-first, and that is a contract rather than a
-        convention: ``add_many`` uses ``appendleft``, ``recent()`` reads a
-        left-slice, and ``maxlen`` eviction drops from the right — so an
-        inverted deque does not merely return records in the wrong order,
-        it evicts the newest record on the next write.
-
-        Order of operations matters and is easy to get backwards.
-        ``deque(iterable, maxlen=n)`` keeps the *last* n items, so the
-        truncation has to happen while the sequence is still oldest-first;
-        reversing before truncating retains the oldest n and throws the
-        newest away. Every rebuild goes through here so the three call
-        sites cannot drift apart again — they previously had three
-        different behaviours, only one of them right.
+        Sorted by ``sequence_no`` so history is always in write order
+        regardless of what the caller hands over, then truncated by
+        ``maxlen`` -- and the order of those two steps matters:
+        ``deque(iterable, maxlen=n)`` keeps the *last* n items, so sorting
+        first is what makes the retained tail the newest n rather than an
+        arbitrary n.
         """
-        newest_last: deque[StoredEventRecord] = deque(records_oldest_first, maxlen=self.max_records)
-        self._records = deque(reversed(newest_last), maxlen=self.max_records)
+        ordered = sorted(records, key=lambda record: record.sequence_no)
+        self._history = deque(ordered, maxlen=self.max_history)
 
     def _load_from_disk(self) -> None:
         self.persist_path.parent.mkdir(parents=True, exist_ok=True)
         records = self.read_persisted_records(str(self.persist_path))
         counter = max((record.sequence_no for record in records), default=0)
 
-        self._set_records(records)
-        self._counter = counter
+        with self._lock:
+            # A reload can follow a ``configure`` onto a different file, so
+            # anything still pending from the previous log must not be
+            # archived beside the new one.
+            self._pending_archive.clear()
+            self._set_history(records)
+            self._persisted_count = len(records)
+            self._counter = counter
+            # A file inherited from a build with a larger retention bound (or
+            # from before there was one) is trimmed here rather than left to
+            # sit outside what this store can serve.
+            self._note_evicted(records[: max(0, len(records) - self.max_history)])
+            self._rotate_persisted_if_needed()
 
     def read_persisted_records(self, persist_path: str | None = None) -> list[StoredEventRecord]:
         """Every readable record in the log, skipping lines that will not parse.
@@ -192,10 +257,16 @@ class EventStore:
 
     def reset(self) -> None:
         with self._lock:
-            self._records.clear()
+            self._history.clear()
+            self._pending_archive.clear()
+            self._persisted_count = 0
             self._counter = 0
             if self.persist_path.exists():
                 self.persist_path.unlink()
+            # The rotation archive is this store's own older records, so a
+            # reset that left it behind would resurrect them in the next
+            # export that reads it.
+            self._archive_path().unlink(missing_ok=True)
             self.persist_path.parent.mkdir(parents=True, exist_ok=True)
 
     def _ends_with_newline(self, size: int) -> bool:
@@ -276,9 +347,13 @@ class EventStore:
                     record.sequence_no = sequence_no
                 raise
 
-            for record in record_list:
-                self._records.appendleft(record)
+            overflow = len(self._history) + len(record_list) - self.max_history
+            if overflow > 0:
+                self._note_evicted(list(islice(self._history, 0, overflow)))
+            self._history.extend(record_list)
+            self._persisted_count += len(record_list)
             self._counter = start_counter + len(record_list)
+            self._rotate_persisted_if_needed()
 
         logger.info(
             "event store persisted %d record(s)",
@@ -337,6 +412,90 @@ class EventStore:
         finally:
             os.close(dir_fd)
 
+    def _archive_path(self) -> Path:
+        """Where rotated-out records go: ``events.jsonl.1`` beside the log."""
+        return self.persist_path.with_suffix(f"{self.persist_path.suffix}.1")
+
+    @property
+    def _rotation_slack(self) -> int:
+        """How far past ``max_history`` the live file may run before rotating.
+
+        Rotation rewrites the whole retained file, so doing it on the append
+        that first crosses the bound would make every subsequent append pay
+        for a full rewrite. The slack amortizes it: one rewrite per
+        ``max_history // 10`` records instead of one per batch.
+        """
+        return max(1, self.max_history // 10)
+
+    def _note_evicted(self, evicted: list[StoredEventRecord]) -> None:
+        """Remember records dropped from memory but still in the live file."""
+        if evicted:
+            self._pending_archive.extend(evicted)
+
+    def _rotate_persisted_if_needed(self) -> None:
+        if self._persisted_count <= self.max_history + self._rotation_slack:
+            return
+        self._rotate_persisted()
+
+    def _rotate_persisted(self) -> None:
+        """Move the log's oldest records to the archive and rewrite the rest.
+
+        The deque has always had a cap while the file had none, so a long run
+        produced a file the store could not fully serve and had no way to
+        report that. Retention is now one bound over both: records leave the
+        live log exactly when they leave memory, and they leave by being
+        appended to ``events.jsonl.1`` rather than deleted -- rotation is an
+        attic, not a shredder, which matters for a log whose whole purpose is
+        showing the shape of FSMA evidence.
+
+        Best effort on purpose. The records being rotated are already durably
+        appended, so a rotation that cannot write logs and returns, leaving
+        the file long and the pending set intact for the next attempt; it
+        never fails the write that triggered it.
+        """
+        retained = list(self._history)
+        pending = list(self._pending_archive)
+        try:
+            if pending:
+                archive_path = self._archive_path()
+                with archive_path.open("a", encoding="utf-8") as handle:
+                    for record in pending:
+                        handle.write(_serialize_record(record) + "\n")
+                    handle.flush()
+                    os.fsync(handle.fileno())
+            self._rewrite_persisted(retained)
+        except OSError as exc:
+            logger.error(
+                "event store could not rotate the persist file",
+                extra={
+                    "persist_path": str(self.persist_path),
+                    "record_count": self._persisted_count,
+                },
+                exc_info=exc,
+            )
+            return
+        self._pending_archive.clear()
+        self._persisted_count = len(retained)
+        logger.info(
+            "event store rotated %d record(s) out of the live log",
+            len(pending),
+            extra={
+                "persist_path": str(self.persist_path),
+                "archive_path": str(self._archive_path()),
+                "record_count": len(retained),
+            },
+        )
+
+    def _commit_rewrite(self, persisted_records: list[StoredEventRecord]) -> None:
+        """Adopt a freshly rewritten file as both history and live log."""
+        self._set_history(persisted_records)
+        self._persisted_count = len(persisted_records)
+        self._counter = max((record.sequence_no for record in persisted_records), default=0)
+        dropped = len(persisted_records) - len(self._history)
+        if dropped > 0:
+            self._note_evicted(persisted_records[:dropped])
+            self._rotate_persisted_if_needed()
+
     def _rewrite_persisted(self, persisted_records: list[StoredEventRecord]) -> None:
         """Durably replace the persist file with ``persisted_records``.
 
@@ -380,8 +539,7 @@ class EventStore:
 
             persisted_records = sorted(updated_records, key=lambda record: record.sequence_no)
             self._rewrite_persisted(persisted_records)
-            self._set_records(persisted_records)
-            self._counter = max((record.sequence_no for record in persisted_records), default=0)
+            self._commit_rewrite(persisted_records)
 
         return [record for record in updated_records if record.record_id in replacements]
 
@@ -389,13 +547,16 @@ class EventStore:
         persisted_records = sorted(list(records), key=lambda record: record.sequence_no)
         with self._lock:
             self._rewrite_persisted(persisted_records)
-            self._set_records(persisted_records)
-            self._counter = max((record.sequence_no for record in persisted_records), default=0)
+            self._commit_rewrite(persisted_records)
         return persisted_records
 
     def recent(self, limit: int = 100) -> list[StoredEventRecord]:
+        """The newest records first, capped by ``max_records``."""
+        window = min(limit, self.max_records)
+        if window <= 0:
+            return []
         with self._lock:
-            return list(self._records)[:limit]
+            return list(islice(reversed(self._history), window))
 
     def failed_delivery_records(
         self,
@@ -619,8 +780,15 @@ class EventStore:
         return sorted(filtered, key=lambda record: record.event.timestamp)
 
     def _all_records(self) -> list[StoredEventRecord]:
-        records = self.read_persisted_records()
-        if records:
-            return sorted(records, key=lambda record: record.sequence_no)
+        """Retained history, oldest first, without touching the disk.
+
+        Every read path funnels through here. It used to re-read and
+        re-validate the whole JSONL on each call -- for a status poll, a
+        lineage query, an export -- which made read cost grow with the log
+        and made the durable write path pay for reads it had already
+        satisfied. History is kept in step with the log by the write paths
+        above and reloaded from it on ``configure``/restart, so the file
+        remains the durable record while the answer comes from memory.
+        """
         with self._lock:
-            return sorted(self._records, key=lambda record: record.sequence_no)
+            return list(self._history)

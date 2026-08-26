@@ -7,7 +7,10 @@ Inflow Lab is a simulator. Its security boundary is designed for safe demos, tes
 - Simulated events are not customer source-of-record data.
 - Local event logs are demo/test artifacts.
 - Tenant-scoped simulator data must remain isolated under the configured tenant storage path.
-- Reset and delete operations must not affect other tenant scopes.
+- Tenant isolation does not depend on Basic Auth. `X-RegEngine-Tenant` selects a tenant's own controller and storage whether or not credentials are configured; a request that sends no header gets the shared `local-demo` store, which is the documented default for a local demo and not a tenant. Auth changes who may *ask* for a tenant, not whether the tenants are separated. (The number of tenants one process will materialize is bounded either way — see the Authentication Boundary.)
+- Tenant storage is reachable only by naming a tenant, never by naming a path. A caller-supplied `persist_path` (accepted only for the unauthenticated local demo) is confined to the data root *and* refused if it resolves inside the tenant storage root — otherwise `data/tenants/<other>/events.jsonl` would read another tenant's log through the exports and, since a reset unlinks its persist path, delete it.
+- Reset and delete operations must not affect other tenant scopes. A tenant delete resolves its target and refuses to recurse into anything that is not a directory *inside* the tenant storage root, so the recursive delete is bounded by construction rather than by the tenant-id regex alone.
+- Retained history is bounded on disk as well as in memory. One retention bound (`REGENGINE_STORE_MAX_HISTORY`, default `50000`) governs both: records leave the live event log when they leave the in-memory history, and they leave by being appended to a `.1` archive beside it rather than deleted. The store therefore cannot hold a log it no longer fully represents, and disk growth is bounded for the same reason memory is. Reads are served from memory; the log stays the durable record and is what a restart reloads from.
 
 ## Authentication Boundary
 
@@ -39,6 +42,8 @@ Inflow Lab is a simulator. Its security boundary is designed for safe demos, tes
 ## Evidence Boundary
 
 Inflow Lab can demonstrate the shape of FSMA evidence, but production evidence belongs in RegEngine.
+
+- Exported evidence artifacts are inert. Every cell of the FDA-request CSV is caller-influenced (product descriptions, location names, `reference_document_*` KDEs), and the file exists to be opened in a spreadsheet by a human reviewing FSMA evidence — so a value that begins with `=`, `+`, `-`, `@`, a tab, or a carriage return is written prefixed with an apostrophe and opens as text rather than as a live formula. The neutralization is applied to every column on the way out, so a column added later is covered without being remembered.
 
 ```text
 simulated event != production evidence

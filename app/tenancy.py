@@ -10,7 +10,7 @@ from typing import Any
 
 from fastapi import HTTPException
 
-from .auth import DEFAULT_TENANT_ID, TenantContext, normalize_tenant_id
+from .auth import DEFAULT_TENANT_ID, TENANT_HEADER, TenantContext, normalize_tenant_id
 from .controller import SimulationController
 from .engine import LegitFlowEngine
 from .mock_service import MockRegEngineService
@@ -173,7 +173,7 @@ async def delete_tenant(tenant_id: str) -> tuple[bool, bool]:
     and safe to follow with a reset: once the directory is gone the tenant is
     no longer quarantined, so the next request creates a clean controller.
     """
-    directory = tenant_dir(tenant_id)
+    directory = assert_deletable_tenant_dir(tenant_dir(tenant_id))
     removed_data = directory.exists()
     tenant_controller = pop_tenant_controller(tenant_id)
     try:
@@ -252,6 +252,18 @@ def _ensure_persist_path_within_root(persist_path: str) -> str:
     Raises ValueError (mapped to HTTP 400 by ``handle_value_error``) on escape.
     The message deliberately omits the offending path to avoid reflecting it.
 
+    Staying inside the data root is necessary but not sufficient: the tenant
+    directories live *under* that root, so ``data/tenants/acme/events.jsonl``
+    passed the original check and pointed the shared default-tenant store
+    straight at tenant ``acme``'s log -- readable through the exports and,
+    because ``EventStore.reset`` unlinks its persist path, deletable by a
+    plain ``POST /api/simulate/reset``. That is exactly what
+    ``SECURITY_BOUNDARIES.md`` promises cannot happen ("Reset and delete
+    operations must not affect other tenant scopes"), and in the default
+    no-auth profile it needed no credentials at all. Tenant storage is
+    therefore reachable only by sending ``X-RegEngine-Tenant``, never by
+    naming a path.
+
     Note on relative paths: the UI submits the relative default
     ``data/events.jsonl``, while in deployments ``REGENGINE_DATA_DIR`` is often
     an *absolute* volume path. A strict within-DATA_ROOT check would then
@@ -263,6 +275,7 @@ def _ensure_persist_path_within_root(persist_path: str) -> str:
     candidate = Path(persist_path)
     resolved = candidate.resolve()
     root = DATA_ROOT.resolve()
+    _reject_tenant_storage_path(resolved)
     if resolved == root or root in resolved.parents:
         return persist_path
     if not candidate.is_absolute():
@@ -270,6 +283,16 @@ def _ensure_persist_path_within_root(persist_path: str) -> str:
         if resolved == cwd or cwd in resolved.parents:
             return persist_path
     raise ValueError("persist_path must stay within the permitted data directory")
+
+
+def _reject_tenant_storage_path(resolved: Path) -> None:
+    """Refuse a caller-supplied path that reaches into tenant storage."""
+    tenant_root = TENANT_DATA_ROOT.resolve()
+    if resolved == tenant_root or tenant_root in resolved.parents:
+        raise ValueError(
+            "persist_path must not point into tenant storage; select a tenant with the "
+            f"{TENANT_HEADER} header instead"
+        )
 
 
 def scope_config(context: TenantContext, config: SimulationConfig) -> SimulationConfig:
@@ -311,6 +334,27 @@ def scope_scenario_save_request(
 
 def tenant_dir(tenant_id: str) -> Path:
     return TENANT_DATA_ROOT / tenant_id
+
+
+def assert_deletable_tenant_dir(directory: Path) -> Path:
+    """Refuse to recursively delete anything outside the tenant data root.
+
+    A defensive assert, not a validator: every caller already runs the id
+    through ``operator_tenant_id`` (strict regex, and a URL path segment
+    cannot contain ``/``), so this is unreachable today. It exists because
+    the consequence of the day it *is* reachable -- a ``shutil.rmtree`` on an
+    attacker-influenced path -- is unrecoverable, and because the guarantee
+    should hold by construction rather than by the continued correctness of a
+    regex three call frames away. Resolves both sides so a symlinked tenant
+    directory cannot point the delete somewhere else.
+    """
+    resolved = directory.resolve()
+    tenant_root = TENANT_DATA_ROOT.resolve()
+    if resolved == tenant_root or not resolved.is_relative_to(tenant_root):
+        raise RuntimeError(
+            "refusing to delete a path outside the tenant data root"
+        )
+    return directory
 
 
 def tenant_events_path(tenant_id: str) -> Path:
