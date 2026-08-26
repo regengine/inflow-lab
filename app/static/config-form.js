@@ -86,7 +86,9 @@ export function buildConfig() {
     interval_seconds: Number(ids.interval.value || 1.5),
     batch_size: Number(ids.batchSize.value || 3),
     seed: seedValue === '' ? null : Number(seedValue),
-    persist_path: 'data/events.jsonl',
+    // Deliberately omitted: the server derives the default log path from
+    // REGENGINE_DATA_DIR. Sending a literal here overrode that and put the
+    // default scope's events outside a mounted volume.
     delivery: {
       mode: ids.deliveryMode.value,
       endpoint: endpoint || null,

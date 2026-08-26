@@ -62,7 +62,7 @@ export function renderStats(status) {
     ['Unique lots', stats.unique_lots ?? 0],
     ['Auth', authState],
     ['Storage', storageScope],
-    ['Persist path', stats.persist_path ?? 'data/events.jsonl'],
+    ['Persist path', stats.persist_path ?? '—'],
     ['Harvested queue', engine.harvested ?? 0],
     ['In transit', engine.in_transit ?? 0],
     ['Processor inventory', engine.processor_inventory ?? 0],
