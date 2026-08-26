@@ -25,3 +25,41 @@ browser = [
 [tool.pytest.ini_options]
 pythonpath = ["."]
 testpaths = ["tests"]
+
+# Lint / type-check configuration. Both tools run in CI (.github/workflows
+# ci.yml, `lint` job) through `uvx <tool>@<pinned version>` rather than as
+# dependency-group entries: neither is imported by the app, and keeping them
+# out of uv.lock leaves `uv pip check` and pip-audit reasoning about runtime
+# dependencies only. Run them locally the same way:
+#
+#     uvx ruff@0.15.8 check .
+#     uvx mypy@1.19.1
+[tool.ruff]
+line-length = 100
+extend-exclude = ["data", "output"]
+
+[tool.ruff.lint]
+# Deliberately close to ruff's default rule set: the pyflakes checks (unused
+# imports and variables, undefined names, shadowed imports) plus the pycodestyle
+# errors and warnings that are about correctness rather than formatting. This is
+# exactly the set that is green across app/, scripts/ and tests/ today, so the
+# gate only ever goes red on something newly introduced. E501 (line length) is
+# intentionally absent -- the existing code has long lines throughout and
+# reflowing them would be churn, not a fix.
+select = ["E4", "E7", "E9", "F", "W"]
+
+[tool.mypy]
+# Scoped to scripts/ on purpose. app/ currently has ~6 real annotation gaps
+# (app/csv_importer.py, app/mock_service.py, app/regengine_client.py,
+# app/tenancy.py); annotating them is a separate change owned by the app team,
+# and a gate that lands red is a gate everyone learns to ignore. Widen `files`
+# once those are cleared.
+files = ["scripts"]
+python_version = "3.11"
+mypy_path = "."
+namespace_packages = true
+explicit_package_bases = true
+# The scripts import fastapi/httpx/playwright, none of which the linter run
+# installs; type-check the scripts themselves, not their dependencies.
+follow_imports = "silent"
+ignore_missing_imports = true

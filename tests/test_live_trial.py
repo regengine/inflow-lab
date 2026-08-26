@@ -139,3 +139,61 @@ class FakeLiveTrialServer:
 
 def decode_json(request: httpx.Request) -> dict:
     return json.loads(request.content.decode("utf-8"))
+
+
+def test_live_trial_closes_the_client_it_creates(monkeypatch):
+    """run_live_trial owns any client it constructs, so it must close it."""
+    server = FakeLiveTrialServer()
+    created: list[httpx.Client] = []
+    real_client_cls = httpx.Client
+
+    def fake_client(**kwargs):
+        kwargs.pop("verify", None)
+        client = real_client_cls(**kwargs, transport=httpx.MockTransport(server.handle))
+        created.append(client)
+        return client
+
+    monkeypatch.setattr(httpx, "Client", fake_client)
+
+    exit_code = main(["--dry-run-only"], environ=BASE_ENV)
+
+    assert exit_code == 0
+    assert len(created) == 1
+    assert created[0].is_closed
+
+
+def test_live_trial_leaves_a_caller_supplied_client_open():
+    server = FakeLiveTrialServer()
+    client = httpx.Client(
+        base_url=BASE_ENV["REGENGINE_REMOTE_BASE_URL"],
+        transport=httpx.MockTransport(server.handle),
+    )
+    try:
+        exit_code = main(["--dry-run-only"], environ=BASE_ENV, client=client)
+        assert exit_code == 0
+        assert not client.is_closed
+    finally:
+        client.close()
+
+
+def test_live_trial_rejects_a_base_url_outside_the_host_allowlist(capsys):
+    """The demo base URL carries the shared Basic Auth secrets on every request.
+
+    Same guard remote_smoke.py uses, from the same shared helper.
+    """
+    environ = {**BASE_ENV, "REGENGINE_REMOTE_BASE_URL": "https://attacker.example"}
+
+    exit_code = main(["--dry-run-only"], environ=environ)
+
+    captured = capsys.readouterr()
+    assert exit_code == 1
+    assert "not allowed" in captured.err
+
+
+def test_live_trial_allows_any_live_ingest_endpoint():
+    """The live endpoint gets its own API key, never the demo Basic Auth."""
+    from scripts.live_trial import config_from_env
+
+    config = config_from_env(LIVE_ENV, require_live=True)
+
+    assert config.live_endpoint == LIVE_ENV["REGENGINE_LIVE_ENDPOINT"]

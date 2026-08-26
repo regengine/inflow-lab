@@ -13,26 +13,77 @@ on:
 permissions:
   contents: read
 
+# Every `uses:` below is pinned to a commit SHA with the release in a trailing
+# comment; .github/dependabot.yml keeps those pins fresh. Do not replace one
+# with a bare tag - a retagged upstream release would change what runs here.
 jobs:
+  lint:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+
+      - name: Set up Python
+        uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6.3.0
+        with:
+          python-version: '3.12'
+
+      - name: Install uv
+        run: python -m pip install --upgrade uv
+
+      # Run through `uvx <tool>@<version>` rather than the dev dependency
+      # group: neither tool is imported by the app, and keeping them out of
+      # uv.lock leaves `uv pip check` / pip-audit reasoning about runtime
+      # dependencies only. Both versions are pinned so an upstream release
+      # cannot turn CI red on its own. Rule selection and scope live in
+      # pyproject.toml ([tool.ruff], [tool.mypy]).
+      - name: Ruff
+        run: uvx ruff@0.15.8 check --output-format=github .
+
+      - name: Mypy
+        run: uvx mypy@1.19.1
+
+      # No package.json, no ESLint: the operator console is a single vanilla
+      # script served straight from app/static. node --check is the gate that
+      # needs no toolchain and no config, and it catches the failure that
+      # actually breaks the dashboard -- a syntax error that only shows up when
+      # a browser parses the file. node is preinstalled on ubuntu-latest.
+      - name: Check operator console JavaScript parses
+        run: |
+          for file in app/static/*.js; do
+            echo "node --check $file"
+            node --check "$file"
+          done
+
   pytest:
     runs-on: ubuntu-latest
     timeout-minutes: 20
 
+    strategy:
+      fail-fast: false
+      matrix:
+        # 3.11 is the floor declared in pyproject.toml; 3.12 is what the
+        # Dockerfile (and therefore the Railway deploy) actually runs, so a
+        # 3.12-only failure must not reach production first.
+        python-version: ['3.11', '3.12']
+
     steps:
       - name: Check out repository
-        uses: actions/checkout@v6
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
 
       - name: Set up Python
-        uses: actions/setup-python@v6
+        uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6.3.0
         with:
-          python-version: '3.11'
+          python-version: ${{ matrix.python-version }}
 
       - name: Cache uv
-        uses: actions/cache@v4
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
         with:
           path: ~/.cache/uv
-          key: uv-${{ runner.os }}-${{ hashFiles('uv.lock') }}
-          restore-keys: uv-${{ runner.os }}-
+          key: uv-${{ runner.os }}-py${{ matrix.python-version }}-${{ hashFiles('uv.lock') }}
+          restore-keys: uv-${{ runner.os }}-py${{ matrix.python-version }}-
 
       - name: Install uv
         run: python -m pip install --upgrade uv
@@ -44,6 +95,8 @@ jobs:
         run: uv run --frozen --group dev pytest
 
       - name: Check dependency health
+        # One pass is enough; the lock is universal, not per-interpreter.
+        if: matrix.python-version == '3.11'
         run: |
           uv pip check
           # No --ignore-vuln entries. pip is a real locked dependency of this
@@ -55,21 +108,64 @@ jobs:
           uv run --frozen --group dev pip-audit
           uv run --frozen --group dev bandit -q -r app scripts
 
+  # Railway builds this Dockerfile fresh on every deploy, so without this job
+  # production is the first place it is ever built. A bad COPY path or a
+  # 3.12-only import error would pass every other job green.
+  docker-image:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+
+      - name: Build the image Railway deploys
+        run: docker build --tag inflow-lab:ci .
+
+      - name: Boot the image and probe /api/healthz
+        # The image sets REGENGINE_REQUIRE_AUTH=1, so it refuses to start
+        # without credentials — passing throwaway ones here exercises that
+        # fail-closed startup path as well as the entrypoint and gosu drop.
+        run: |
+          docker run --detach --name inflow-lab-ci \
+            --publish 8000:8000 \
+            --env REGENGINE_BASIC_AUTH_USERNAME=ci \
+            --env REGENGINE_BASIC_AUTH_PASSWORD=ci-not-a-real-secret \
+            inflow-lab:ci
+          for attempt in $(seq 1 30); do
+            if curl -fsS http://127.0.0.1:8000/api/healthz > /tmp/healthz.json; then
+              cat /tmp/healthz.json
+              exit 0
+            fi
+            sleep 2
+          done
+          echo "::error::container never became healthy"
+          docker logs inflow-lab-ci
+          exit 1
+
+      - name: Container logs
+        if: always()
+        run: docker logs inflow-lab-ci || true
+
+      - name: Stop the container
+        if: always()
+        run: docker rm --force inflow-lab-ci || true
+
   browser-smoke:
     runs-on: ubuntu-latest
     timeout-minutes: 30
 
     steps:
       - name: Check out repository
-        uses: actions/checkout@v6
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
 
       - name: Set up Python
-        uses: actions/setup-python@v6
+        uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6.3.0
         with:
           python-version: '3.11'
 
       - name: Cache uv
-        uses: actions/cache@v4
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
         with:
           path: ~/.cache/uv
           key: uv-${{ runner.os }}-${{ hashFiles('uv.lock') }}
@@ -85,3 +181,15 @@ jobs:
 
       - name: Run browser smoke
         run: uv run --frozen --no-dev --group browser python scripts/browser_smoke.py
+
+      # browser_smoke.py writes output/playwright/browser_smoke_failure.png on
+      # any failure. Without this the screenshot dies with the runner and the
+      # failure has to be reproduced locally to see what Playwright saw.
+      - name: Upload failure screenshots
+        if: failure()
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6.0.0
+        with:
+          name: browser-smoke-failure-${{ github.run_id }}-${{ github.run_attempt }}
+          path: output/playwright/
+          if-no-files-found: ignore
+          retention-days: 7

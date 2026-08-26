@@ -12,7 +12,11 @@ from fastapi.testclient import TestClient
 REPO_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(REPO_ROOT))
 
-from app.main import app
+# Imported after the sys.path bootstrap above so
+# `python scripts/smoke_regression.py` works from a clean checkout; hence the
+# E402 waivers.
+from app.main import app  # noqa: E402
+from scripts import _smoke_common as smoke  # noqa: E402
 
 
 TENANTS = ["release-smoke-main", "release-smoke-other"]
@@ -175,24 +179,35 @@ def cleanup_smoke_tenants() -> None:
 
 def assert_json(response, expected_status: int) -> dict[str, Any]:
     assert_status(response, expected_status)
-    return response.json()
+    return smoke.response_json(response, response.request.url.path, failure=SmokeFailure)
 
 
 def assert_status(response, expected_status: int) -> None:
-    if response.status_code != expected_status:
-        raise SmokeFailure(
-            f"Expected status {expected_status}, got {response.status_code}: {response.text}"
-        )
+    smoke.assert_status(
+        response,
+        expected_status,
+        f"{response.request.method} {response.request.url.path}",
+        failure=SmokeFailure,
+        redact=redact,
+    )
+
+
+def redact(value: str) -> str:
+    """Scrub anything credential-shaped in the environment out of a body.
+
+    The release smoke runs in-process against a TestClient, so an echoed 500
+    body can carry whatever REGENGINE_BASIC_AUTH_PASSWORD (or any other
+    credential env var) is set to on the operator's machine.
+    """
+    return smoke.redact_secrets(value, sorted(smoke.secret_values()))
 
 
 def assert_equal(actual: Any, expected: Any, label: str) -> None:
-    if actual != expected:
-        raise SmokeFailure(f"{label}: expected {expected!r}, got {actual!r}")
+    smoke.assert_equal(actual, expected, label, failure=SmokeFailure)
 
 
 def assert_in(member: Any, container: Any, label: str) -> None:
-    if member not in container:
-        raise SmokeFailure(f"{label}: expected {member!r} to be present")
+    smoke.assert_in(member, container, label, failure=SmokeFailure)
 
 
 if __name__ == "__main__":

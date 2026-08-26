@@ -2,11 +2,10 @@ from __future__ import annotations
 
 import os
 import sys
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
-from urllib.parse import urlparse
 
 import httpx
 
@@ -14,7 +13,10 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
-from app.build_info import APP_VERSION
+# Imported after the sys.path bootstrap above so `python scripts/remote_smoke.py`
+# works from a clean checkout; hence the E402 waivers.
+from app.build_info import APP_VERSION  # noqa: E402
+from scripts import _smoke_common as smoke  # noqa: E402
 
 
 DEFAULT_TENANT = "remote-smoke"
@@ -82,8 +84,8 @@ def main() -> int:
     return 0
 
 
-def config_from_env(environ: dict[str, str] | None = None) -> RemoteSmokeConfig:
-    environ = environ or os.environ
+def config_from_env(environ: Mapping[str, str] | None = None) -> RemoteSmokeConfig:
+    env: Mapping[str, str] = environ if environ else os.environ
     missing = [
         name
         for name in (
@@ -91,7 +93,7 @@ def config_from_env(environ: dict[str, str] | None = None) -> RemoteSmokeConfig:
             "REGENGINE_REMOTE_USERNAME",
             "REGENGINE_REMOTE_PASSWORD",
         )
-        if not environ.get(name)
+        if not env.get(name)
     ]
     if missing:
         raise RemoteSmokeFailure(
@@ -99,20 +101,20 @@ def config_from_env(environ: dict[str, str] | None = None) -> RemoteSmokeConfig:
         )
 
     base_url = normalize_base_url(
-        environ["REGENGINE_REMOTE_BASE_URL"],
-        allowed_hosts=allowed_base_hosts(environ),
+        env["REGENGINE_REMOTE_BASE_URL"],
+        allowed_hosts=allowed_base_hosts(env),
     )
     return RemoteSmokeConfig(
         base_url=base_url,
-        username=environ["REGENGINE_REMOTE_USERNAME"],
-        password=environ["REGENGINE_REMOTE_PASSWORD"],
-        tenant=environ.get("REGENGINE_REMOTE_TENANT") or DEFAULT_TENANT,
-        cors_origin=normalize_optional_origin(environ.get("REGENGINE_REMOTE_CORS_ORIGIN")),
+        username=env["REGENGINE_REMOTE_USERNAME"],
+        password=env["REGENGINE_REMOTE_PASSWORD"],
+        tenant=env.get("REGENGINE_REMOTE_TENANT") or DEFAULT_TENANT,
+        cors_origin=normalize_optional_origin(env.get("REGENGINE_REMOTE_CORS_ORIGIN")),
         untrusted_origin=normalize_optional_origin(
-            environ.get("REGENGINE_REMOTE_UNTRUSTED_ORIGIN")
+            env.get("REGENGINE_REMOTE_UNTRUSTED_ORIGIN")
         )
         or DEFAULT_UNTRUSTED_ORIGIN,
-        expected_build_sha=environ.get("REGENGINE_EXPECTED_BUILD_SHA") or None,
+        expected_build_sha=env.get("REGENGINE_EXPECTED_BUILD_SHA") or None,
     )
 
 
@@ -284,16 +286,9 @@ def request_json(
         params=params,
     )
     assert_status(config, response, 200, path)
-    try:
-        payload = response.json()
-    except ValueError as exc:
-        raise RemoteSmokeFailure(
-            f"{path}: expected JSON response, got "
-            f"{config.redact(response.text[:300])!r}"
-        ) from exc
-    if not isinstance(payload, dict):
-        raise RemoteSmokeFailure(f"{path}: expected JSON object response")
-    return payload
+    return smoke.response_json(
+        response, path, failure=RemoteSmokeFailure, redact=config.redact
+    )
 
 
 def request(
@@ -309,14 +304,14 @@ def request(
 ) -> httpx.Response:
     request_headers = {"X-RegEngine-Tenant": config.tenant}
     request_headers.update(headers or {})
-    auth = httpx.BasicAuth(config.username, config.password) if authenticated else None
-    return client.request(
+    return smoke.request(
+        client,
         method,
         path,
         headers=request_headers,
         json=json,
         params=params,
-        auth=auth,
+        auth=httpx.BasicAuth(config.username, config.password) if authenticated else None,
     )
 
 
@@ -340,12 +335,13 @@ def assert_status(
     expected_status: int,
     label: str,
 ) -> None:
-    if response.status_code != expected_status:
-        body = config.redact(response.text[:500])
-        raise RemoteSmokeFailure(
-            f"{label}: expected HTTP {expected_status}, got "
-            f"{response.status_code}: {body}"
-        )
+    smoke.assert_status(
+        response,
+        expected_status,
+        label,
+        failure=RemoteSmokeFailure,
+        redact=config.redact,
+    )
 
 
 def assert_header(
@@ -355,51 +351,33 @@ def assert_header(
     expected_value: str,
     label: str,
 ) -> None:
-    actual = response.headers.get(header_name)
-    if actual != expected_value:
-        raise RemoteSmokeFailure(
-            f"{label}: expected {header_name}={expected_value!r}, got "
-            f"{config.redact(str(actual))!r}"
-        )
+    smoke.assert_header(
+        response,
+        header_name,
+        expected_value,
+        label,
+        failure=RemoteSmokeFailure,
+        redact=config.redact,
+    )
 
 
 def assert_equal(actual: Any, expected: Any, label: str) -> None:
-    if actual != expected:
-        raise RemoteSmokeFailure(f"{label}: expected {expected!r}, got {actual!r}")
+    smoke.assert_equal(actual, expected, label, failure=RemoteSmokeFailure)
 
 
 def assert_in(member: Any, container: Any, label: str) -> None:
-    if member not in container:
-        raise RemoteSmokeFailure(f"{label}: expected {member!r} to be present")
+    smoke.assert_in(member, container, label, failure=RemoteSmokeFailure)
 
 
 def assert_build_info(config: RemoteSmokeConfig, build: Any) -> dict[str, Any]:
-    if not isinstance(build, dict):
-        raise RemoteSmokeFailure("healthz build: expected build metadata object")
-    assert_equal(build.get("version"), APP_VERSION, "healthz build version")
-    for field in ("commit_sha", "commit_sha_short", "branch", "deployment_id"):
-        value = build.get(field)
-        if value is not None and not isinstance(value, str):
-            raise RemoteSmokeFailure(f"healthz build {field}: expected string or null")
-    return build
+    return smoke.assert_build_info(build, APP_VERSION, failure=RemoteSmokeFailure)
 
 
 def assert_build_sha(actual: Any, expected: str, label: str) -> None:
-    if not isinstance(actual, str) or not actual:
-        raise RemoteSmokeFailure(f"{label}: expected deployed commit {expected[:12]}, got none")
-    if not _sha_prefix_match(actual, expected):
-        raise RemoteSmokeFailure(
-            f"{label}: expected deployed commit {expected[:12]}, got {actual[:12]}"
-        )
+    smoke.assert_build_sha(actual, expected, label, failure=RemoteSmokeFailure)
 
 
-def _sha_prefix_match(actual: str, expected: str) -> bool:
-    actual = actual.strip().lower()
-    expected = expected.strip().lower()
-    return actual.startswith(expected) or expected.startswith(actual)
-
-
-def allowed_base_hosts(environ: dict[str, str] | None = None) -> tuple[str, ...]:
+def allowed_base_hosts(environ: Mapping[str, str] | None = None) -> tuple[str, ...]:
     """Hosts remote smoke may send the shared-demo Basic Auth secrets to.
 
     The workflow_dispatch `base_url` input is free text, so without this the
@@ -408,72 +386,43 @@ def allowed_base_hosts(environ: dict[str, str] | None = None) -> tuple[str, ...]
     with REGENGINE_REMOTE_ALLOWED_HOSTS (comma separated, a leading dot matches
     subdomains) -- an env var, so it cannot be set from a dispatch input.
     """
-    environ = environ if environ is not None else os.environ
-    raw = (environ.get(ALLOWED_HOSTS_ENV) or "").strip()
-    if raw:
-        return tuple(item.strip().lower() for item in raw.split(",") if item.strip())
-    return DEFAULT_ALLOWED_BASE_HOSTS
+    return smoke.allowed_hosts_from_env(
+        ALLOWED_HOSTS_ENV, DEFAULT_ALLOWED_BASE_HOSTS, environ
+    )
 
 
 def normalize_base_url(value: str, allowed_hosts: Sequence[str] | None = None) -> str:
-    base_url = value.strip().rstrip("/")
-    parsed = urlparse(base_url)
-    if parsed.scheme not in {"http", "https"} or not parsed.netloc:
-        raise RemoteSmokeFailure(
+    return smoke.normalize_base_url(
+        value,
+        allowed_hosts=allowed_hosts if allowed_hosts is not None else allowed_base_hosts(),
+        failure=RemoteSmokeFailure,
+        scheme_error=(
             "REGENGINE_REMOTE_BASE_URL must be an HTTP(S) URL such as "
             "https://demo.example.com"
-        )
-    hosts = tuple(allowed_hosts) if allowed_hosts is not None else allowed_base_hosts()
-    host = (parsed.hostname or "").strip().lower().rstrip(".")
-    if not _host_allowed(host, hosts):
-        raise RemoteSmokeFailure(
+        ),
+        host_error=lambda host, hosts: (
             f"REGENGINE_REMOTE_BASE_URL host {host!r} is not allowed. Remote smoke "
             "attaches the shared-demo Basic Auth credentials to every "
             "authenticated request, so it only runs against "
             f"{', '.join(hosts)}. Set {ALLOWED_HOSTS_ENV} to extend the allowlist."
-        )
-    return base_url
-
-
-def _host_allowed(host: str, allowed_hosts: Sequence[str]) -> bool:
-    if not host:
-        return False
-    for entry in allowed_hosts:
-        entry = entry.strip().lower()
-        if entry.startswith("."):
-            if host == entry[1:] or host.endswith(entry):
-                return True
-        elif host == entry:
-            return True
-    return False
+        ),
+    )
 
 
 def normalize_optional_origin(value: str | None) -> str | None:
-    if not value or not value.strip():
-        return None
-    origin = value.strip().rstrip("/")
-    parsed = urlparse(origin)
-    if parsed.scheme not in {"http", "https"} or not parsed.netloc:
-        raise RemoteSmokeFailure(
+    return smoke.normalize_optional_origin(
+        value,
+        failure=RemoteSmokeFailure,
+        error=(
             "Remote smoke CORS origins must be HTTP(S) origins such as "
             "https://demo.example.com"
-        )
-    return f"{parsed.scheme}://{parsed.netloc}"
+        ),
+    )
 
 
-def origin_from_url(value: str) -> str:
-    parsed = urlparse(value)
-    port = f":{parsed.port}" if parsed.port else ""
-    return f"{parsed.scheme}://{parsed.hostname}{port}"
-
-
-def secret_values(*extra_values: str | None) -> set[str]:
-    values = {value for value in extra_values if value}
-    for key, value in os.environ.items():
-        key_lower = key.lower()
-        if value and any(token in key_lower for token in ("password", "api_key", "apikey", "secret", "token")):
-            values.add(value)
-    return {value for value in values if len(value) >= 4}
+origin_from_url = smoke.origin_from_url
+secret_values = smoke.secret_values
+_sha_prefix_match = smoke.sha_prefix_match
 
 
 if __name__ == "__main__":
