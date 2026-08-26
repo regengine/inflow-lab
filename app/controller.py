@@ -83,6 +83,11 @@ class SimulationController:
         self._task: asyncio.Task[None] | None = None
         self._stop_event = asyncio.Event()
         self._lock = asyncio.Lock()
+        # Guards run-loop lifecycle (`_task`/`_stop_event`) and keeps
+        # stop-then-reconfigure sequences atomic against a concurrent start().
+        # The run loop itself never takes this lock, so it is always safe to
+        # await the loop task while holding it.
+        self._lifecycle_lock = asyncio.Lock()
         self._revision = 0
         self._change_condition = asyncio.Condition()
 
@@ -95,51 +100,72 @@ class SimulationController:
         return self._revision
 
     async def start(self, config: SimulationConfig) -> None:
-        async with self._lock:
-            _validate_live_delivery(config.delivery)
-            previous_config = self.config
-            self.config = config
-            self.store.configure(config.persist_path)
-            if not self.running and (
-                config.seed != previous_config.seed
-                or config.scenario != previous_config.scenario
-                or config.scale != previous_config.scale
-            ):
-                self.engine.reset(config.seed, scenario=config.scenario, scale=config.scale)
-            if not self.running:
-                self._stop_event = asyncio.Event()
-                self._task = asyncio.create_task(self._run_loop())
+        async with self._lifecycle_lock:
+            was_running = self.running
+            async with self._lock:
+                _validate_live_delivery(config.delivery)
+                previous_config = self.config
+                self.config = config
+                self.store.configure(config.persist_path)
+                if not was_running and (
+                    config.seed != previous_config.seed
+                    or config.scenario != previous_config.scenario
+                    or config.scale != previous_config.scale
+                ):
+                    self.engine.reset(config.seed, scenario=config.scenario, scale=config.scale)
+            if not was_running:
+                self._launch_run_loop()
         await self._publish_update()
 
-    async def stop(self) -> None:
-        if not self.running:
-            return
-        self._stop_event.set()
+    def _launch_run_loop(self) -> None:
+        """Start a fresh run loop. Caller must hold `_lifecycle_lock`."""
+        stop_event = asyncio.Event()
+        self._stop_event = stop_event
+        # The loop owns its own stop event, so a superseded loop can never be
+        # kept alive by a later start() swapping `self._stop_event`.
+        self._task = asyncio.create_task(self._run_loop(stop_event))
+
+    async def _stop_run_loop(self) -> bool:
+        """Stop and await the current run loop. Caller must hold `_lifecycle_lock`.
+
+        Returns True when a live loop was actually stopped.
+        """
         task = self._task
         if task is None:
-            return
-        await task
+            return False
         self._task = None
-        await self._publish_update()
+        if task.done():
+            return False
+        self._stop_event.set()
+        await task
+        return True
+
+    async def stop(self) -> None:
+        async with self._lifecycle_lock:
+            stopped = await self._stop_run_loop()
+        if stopped:
+            await self._publish_update()
 
     async def shutdown(self) -> None:
         await self.stop()
 
     async def reset(self, config: SimulationConfig | None = None) -> None:
-        await self.stop()
-        async with self._lock:
-            if config is not None:
-                self.config = config
-            self.store.configure(self.config.persist_path)
-            self.engine.reset(self.config.seed, scenario=self.config.scenario, scale=self.config.scale)
-            self.store.reset()
-            self.mock_service.reset()
+        async with self._lifecycle_lock:
+            await self._stop_run_loop()
+            async with self._lock:
+                if config is not None:
+                    self.config = config
+                self.store.configure(self.config.persist_path)
+                self.engine.reset(self.config.seed, scenario=self.config.scenario, scale=self.config.scale)
+                self.store.reset()
+                self.mock_service.reset()
         await self._publish_update()
 
     async def step(self, batch_size: int | None = None, config: SimulationConfig | None = None) -> StepResponse:
         async with self._lock:
             _validate_live_delivery(self.config.delivery)
-            size = batch_size or self.config.batch_size
+            step_config = self.config.model_copy(deep=True)
+            size = batch_size or step_config.batch_size
             events = []
             lineages = []
             for _ in range(size):
@@ -147,13 +173,16 @@ class SimulationController:
                 events.append(event)
                 lineages.append(parent_lot_codes)
 
-            payload = IngestPayload(source=self.config.source, events=events)
-            outcome = await self._deliver_payload(
-                payload,
-                self.config,
-                idempotency_key=uuid.uuid4().hex,
-            )
+        # Delivery can block on the network for the full live timeout, so it
+        # happens outside the controller lock — start/stop/status stay responsive.
+        payload = IngestPayload(source=step_config.source, events=events)
+        outcome = await self._deliver_payload(
+            payload,
+            step_config,
+            idempotency_key=uuid.uuid4().hex,
+        )
 
+        async with self._lock:
             stored_records: list[StoredEventRecord] = []
             response_events = (outcome.response or {}).get("events", []) if outcome.response else []
             paired_responses = _pair_event_responses(events, response_events)
@@ -161,10 +190,10 @@ class SimulationController:
                 event_response = paired_responses[index]
                 stored_records.append(
                     StoredEventRecord(
-                        payload_source=self.config.source,
+                        payload_source=step_config.source,
                         event=event,
                         parent_lot_codes=lineages[index],
-                        destination_mode=self.config.delivery.mode,
+                        destination_mode=step_config.delivery.mode,
                         delivery_attempts=outcome.delivery_attempts,
                         last_delivery_attempt_at=outcome.attempted_at,
                         delivery_response=event_response,
@@ -182,7 +211,7 @@ class SimulationController:
                 failed=outcome.failed,
                 lot_codes=[event.traceability_lot_code for event in events],
                 delivery_status=outcome.delivery_status,
-                delivery_mode=self.config.delivery.mode,
+                delivery_mode=step_config.delivery.mode,
                 delivery_attempts=outcome.delivery_attempts,
                 response=outcome.response,
                 error=outcome.error_message,
@@ -207,39 +236,41 @@ class SimulationController:
             records = self.store.read_persisted_records(persist_path)
             events = [record.event for record in records]
 
-            if not events:
-                result = ReplayResponse(
-                    status="empty",
-                    read=0,
-                    replayed=0,
-                    posted=0,
-                    failed=0,
-                    source=source,
-                    persist_path=persist_path,
-                    delivery_mode=delivery.mode,
-                    delivery_attempts=0,
-                )
-            else:
-                payload = IngestPayload(source=source, events=events)
-                outcome = await self._deliver_payload(payload, replay_config)
-                replay_status = {
-                    "posted": "posted",
-                    "failed": "failed",
-                    "generated": "rebuilt",
-                }[outcome.delivery_status]
-                result = ReplayResponse(
-                    status=replay_status,
-                    read=len(records),
-                    replayed=len(events),
-                    posted=outcome.posted,
-                    failed=outcome.failed,
-                    source=source,
-                    persist_path=persist_path,
-                    delivery_mode=delivery.mode,
-                    delivery_attempts=outcome.delivery_attempts,
-                    response=outcome.response,
-                    error=outcome.error_message,
-                )
+        if not events:
+            result = ReplayResponse(
+                status="empty",
+                read=0,
+                replayed=0,
+                posted=0,
+                failed=0,
+                source=source,
+                persist_path=persist_path,
+                delivery_mode=delivery.mode,
+                delivery_attempts=0,
+            )
+        else:
+            # Delivery happens outside the controller lock; a slow live
+            # endpoint must not block start/stop/status.
+            payload = IngestPayload(source=source, events=events)
+            outcome = await self._deliver_payload(payload, replay_config)
+            replay_status = {
+                "posted": "posted",
+                "failed": "failed",
+                "generated": "rebuilt",
+            }[outcome.delivery_status]
+            result = ReplayResponse(
+                status=replay_status,
+                read=len(records),
+                replayed=len(events),
+                posted=outcome.posted,
+                failed=outcome.failed,
+                source=source,
+                persist_path=persist_path,
+                delivery_mode=delivery.mode,
+                delivery_attempts=outcome.delivery_attempts,
+                response=outcome.response,
+                error=outcome.error_message,
+            )
         await self._publish_update()
         return result
 
@@ -261,30 +292,33 @@ class SimulationController:
                 default_timestamp=datetime.now(UTC),
             )
 
-            outcome = DeliveryOutcome()
-            stored_records: list[StoredEventRecord] = []
-            if parsed.events:
-                payload = IngestPayload(source=source, events=parsed.events)
-                outcome = await self._deliver_payload(payload, import_config)
-                response_events = (outcome.response or {}).get("events", []) if outcome.response else []
-                paired_responses = _pair_event_responses(parsed.events, response_events)
-                for index, event in enumerate(parsed.events):
-                    event_response = paired_responses[index]
-                    stored_records.append(
-                        StoredEventRecord(
-                            payload_source=source,
-                            event=event,
-                            parent_lot_codes=parsed.parent_lot_codes[index],
-                            destination_mode=delivery.mode,
-                            delivery_attempts=outcome.delivery_attempts,
-                            last_delivery_attempt_at=outcome.attempted_at,
-                            delivery_response=event_response,
-                            delivery_metadata=outcome.metadata,
-                            **_event_delivery_fields(outcome, event_response),
-                        )
+        outcome = DeliveryOutcome()
+        stored_records: list[StoredEventRecord] = []
+        if parsed.events:
+            # Delivery runs without the controller lock held.
+            payload = IngestPayload(source=source, events=parsed.events)
+            outcome = await self._deliver_payload(payload, import_config)
+            response_events = (outcome.response or {}).get("events", []) if outcome.response else []
+            paired_responses = _pair_event_responses(parsed.events, response_events)
+            for index, event in enumerate(parsed.events):
+                event_response = paired_responses[index]
+                stored_records.append(
+                    StoredEventRecord(
+                        payload_source=source,
+                        event=event,
+                        parent_lot_codes=parsed.parent_lot_codes[index],
+                        destination_mode=delivery.mode,
+                        delivery_attempts=outcome.delivery_attempts,
+                        last_delivery_attempt_at=outcome.attempted_at,
+                        delivery_response=event_response,
+                        delivery_metadata=outcome.metadata,
+                        **_event_delivery_fields(outcome, event_response),
                     )
+                )
+            async with self._lock:
                 self.store.add_many(stored_records)
 
+        async with self._lock:
             rejected = parsed.total - len(parsed.events)
             if outcome.delivery_status == "failed":
                 status = "delivery_failed"
@@ -323,29 +357,36 @@ class SimulationController:
     ) -> DemoFixtureLoadResponse:
         request = request or DemoFixtureLoadRequest()
         fixture = get_demo_fixture(fixture_id)
-        await self.stop()
+
+        # Stop-then-reconfigure is one atomic critical section so a concurrent
+        # start() cannot slip a run loop in between the two halves.
+        async with self._lifecycle_lock:
+            await self._stop_run_loop()
+            async with self._lock:
+                source = request.source or self.config.source
+                delivery = request.delivery or self.config.delivery
+                _validate_live_delivery(delivery)
+                self.config = self.config.model_copy(
+                    update={
+                        "source": source,
+                        "scenario": fixture.scenario,
+                        "delivery": delivery,
+                    },
+                    deep=True,
+                )
+                fixture_config = self.config.model_copy(deep=True)
+                self.store.configure(self.config.persist_path)
+                self.engine.reset(self.config.seed, scenario=fixture.scenario, scale=self.config.scale)
+                if request.reset:
+                    self.store.reset()
+                    self.mock_service.reset()
+
+        events = [fixture_event.event for fixture_event in fixture.events]
+        # Delivery runs without the controller lock held.
+        payload = IngestPayload(source=source, events=events)
+        outcome = await self._deliver_payload(payload, fixture_config)
 
         async with self._lock:
-            source = request.source or self.config.source
-            delivery = request.delivery or self.config.delivery
-            _validate_live_delivery(delivery)
-            self.config = self.config.model_copy(
-                update={
-                    "source": source,
-                    "scenario": fixture.scenario,
-                    "delivery": delivery,
-                },
-                deep=True,
-            )
-            self.store.configure(self.config.persist_path)
-            self.engine.reset(self.config.seed, scenario=fixture.scenario, scale=self.config.scale)
-            if request.reset:
-                self.store.reset()
-                self.mock_service.reset()
-
-            events = [fixture_event.event for fixture_event in fixture.events]
-            payload = IngestPayload(source=source, events=events)
-            outcome = await self._deliver_payload(payload, self.config)
             response_events = (outcome.response or {}).get("events", []) if outcome.response else []
             paired_responses = _pair_event_responses(events, response_events)
             stored_records = []
@@ -415,22 +456,25 @@ class SimulationController:
         return result
 
     async def load_scenario_save(self, scenario_id: ScenarioId) -> ScenarioLoadResponse:
-        await self.stop()
         snapshot = self.scenario_saves.get(scenario_id)
         if snapshot is None:
             raise KeyError(scenario_id.value)
 
-        async with self._lock:
-            self.config = snapshot.config
-            self.store.configure(self.config.persist_path)
-            loaded_records = self.store.replace_all(snapshot.records)
-            self.engine.reset(self.config.seed, scenario=self.config.scenario, scale=self.config.scale)
-            result = ScenarioLoadResponse(
-                status="loaded",
-                save=self._scenario_save_summary(snapshot),
-                config=self.config,
-                loaded_records=len(loaded_records),
-            )
+        async with self._lifecycle_lock:
+            await self._stop_run_loop()
+            async with self._lock:
+                self.config = snapshot.config
+                self.store.configure(self.config.persist_path)
+                loaded_records = self.store.replace_all(snapshot.records)
+                self.engine.reset(
+                    self.config.seed, scenario=self.config.scenario, scale=self.config.scale
+                )
+                result = ScenarioLoadResponse(
+                    status="loaded",
+                    save=self._scenario_save_summary(snapshot),
+                    config=self.config,
+                    loaded_records=len(loaded_records),
+                )
         await self._publish_update()
         return result
 
@@ -441,125 +485,129 @@ class SimulationController:
         request = request or DeliveryRetryRequest()
         async with self._lock:
             delivery = request.delivery or self.config.delivery
+            base_config = self.config.model_copy(deep=True)
             candidates = self.store.failed_delivery_records(request.record_ids, limit=request.limit)
             requested = len(request.record_ids) if request.record_ids else len(candidates)
             skipped = max(0, requested - len(candidates))
 
-            if not candidates:
-                result = DeliveryRetryResponse(
-                    status="empty",
-                    requested=requested,
-                    retryable=0,
-                    attempted=0,
-                    posted=0,
-                    failed=0,
-                    skipped=skipped,
-                    delivery_mode=delivery.mode,
-                    record_ids=[],
+        if not candidates:
+            result = DeliveryRetryResponse(
+                status="empty",
+                requested=requested,
+                retryable=0,
+                attempted=0,
+                posted=0,
+                failed=0,
+                skipped=skipped,
+                delivery_mode=delivery.mode,
+                record_ids=[],
+            )
+        elif delivery.mode == DestinationMode.NONE:
+            result = DeliveryRetryResponse(
+                status="skipped",
+                requested=requested,
+                retryable=len(candidates),
+                attempted=0,
+                posted=0,
+                failed=0,
+                skipped=skipped + len(candidates),
+                delivery_mode=delivery.mode,
+                record_ids=[record.record_id for record in candidates],
+                error="Retry requires mock or live delivery mode.",
+            )
+        else:
+            _validate_live_delivery(delivery)
+            posted = 0
+            failed = 0
+            updated_records: list[StoredEventRecord] = []
+            responses: list[dict[str, Any]] = []
+            grouped_records: dict[tuple[str, str | None], list[StoredEventRecord]] = {}
+            for record in candidates:
+                source = request.source or record.payload_source
+                idempotency_key = (
+                    _stored_idempotency_key(record)
+                    if delivery.mode != DestinationMode.NONE
+                    else None
                 )
-            elif delivery.mode == DestinationMode.NONE:
-                result = DeliveryRetryResponse(
-                    status="skipped",
-                    requested=requested,
-                    retryable=len(candidates),
-                    attempted=0,
-                    posted=0,
-                    failed=0,
-                    skipped=skipped + len(candidates),
-                    delivery_mode=delivery.mode,
-                    record_ids=[record.record_id for record in candidates],
-                    error="Retry requires mock or live delivery mode.",
+                grouped_records.setdefault((source, idempotency_key), []).append(record)
+
+            # Deliveries run without the controller lock held: a multi-group
+            # retry against a slow endpoint must not queue up operator actions.
+            for (source, idempotency_key), records in grouped_records.items():
+                retry_config = base_config.model_copy(
+                    update={
+                        "source": source,
+                        "delivery": delivery,
+                    },
+                    deep=True,
                 )
-            else:
-                _validate_live_delivery(delivery)
-                posted = 0
-                failed = 0
-                updated_records: list[StoredEventRecord] = []
-                responses: list[dict[str, Any]] = []
-                grouped_records: dict[tuple[str, str | None], list[StoredEventRecord]] = {}
-                for record in candidates:
-                    source = request.source or record.payload_source
-                    idempotency_key = (
-                        _stored_idempotency_key(record)
-                        if delivery.mode != DestinationMode.NONE
-                        else None
-                    )
-                    grouped_records.setdefault((source, idempotency_key), []).append(record)
+                payload = IngestPayload(source=source, events=[record.event for record in records])
+                outcome = await self._deliver_payload(
+                    payload,
+                    retry_config,
+                    idempotency_key=idempotency_key,
+                )
+                response_events = (outcome.response or {}).get("events", []) if outcome.response else []
+                responses.append(
+                    {
+                        "source": source,
+                        "delivery_status": outcome.delivery_status,
+                        "posted": outcome.posted,
+                        "failed": outcome.failed,
+                        "response": outcome.response,
+                        "error": outcome.error_message,
+                    }
+                )
 
-                for (source, idempotency_key), records in grouped_records.items():
-                    retry_config = self.config.model_copy(
-                        update={
-                            "source": source,
-                            "delivery": delivery,
-                        },
-                        deep=True,
-                    )
-                    payload = IngestPayload(source=source, events=[record.event for record in records])
-                    outcome = await self._deliver_payload(
-                        payload,
-                        retry_config,
-                        idempotency_key=idempotency_key,
-                    )
-                    response_events = (outcome.response or {}).get("events", []) if outcome.response else []
-                    responses.append(
-                        {
-                            "source": source,
-                            "delivery_status": outcome.delivery_status,
-                            "posted": outcome.posted,
-                            "failed": outcome.failed,
-                            "response": outcome.response,
-                            "error": outcome.error_message,
-                        }
-                    )
-
-                    paired_responses = _pair_event_responses(
-                        [record.event for record in records], response_events
-                    )
-                    for index, record in enumerate(records):
-                        event_response = paired_responses[index]
-                        next_attempts = record.delivery_attempts + outcome.delivery_attempts
-                        fields = _event_delivery_fields(outcome, event_response)
-                        if fields["delivery_status"] == "posted":
-                            fields["error"] = None
-                        else:
-                            fields["last_delivery_success_at"] = record.last_delivery_success_at
-                        updated_records.append(
-                            record.model_copy(
-                                update={
-                                    "destination_mode": delivery.mode,
-                                    "delivery_attempts": next_attempts,
-                                    "last_delivery_attempt_at": outcome.attempted_at
-                                    or record.last_delivery_attempt_at,
-                                    "delivery_response": event_response,
-                                    "delivery_metadata": outcome.metadata,
-                                    **fields,
-                                },
-                                deep=True,
-                            )
+                paired_responses = _pair_event_responses(
+                    [record.event for record in records], response_events
+                )
+                for index, record in enumerate(records):
+                    event_response = paired_responses[index]
+                    next_attempts = record.delivery_attempts + outcome.delivery_attempts
+                    fields = _event_delivery_fields(outcome, event_response)
+                    if fields["delivery_status"] == "posted":
+                        fields["error"] = None
+                    else:
+                        fields["last_delivery_success_at"] = record.last_delivery_success_at
+                    updated_records.append(
+                        record.model_copy(
+                            update={
+                                "destination_mode": delivery.mode,
+                                "delivery_attempts": next_attempts,
+                                "last_delivery_attempt_at": outcome.attempted_at
+                                or record.last_delivery_attempt_at,
+                                "delivery_response": event_response,
+                                "delivery_metadata": outcome.metadata,
+                                **fields,
+                            },
+                            deep=True,
                         )
-                    posted += outcome.posted
-                    failed += outcome.failed
+                    )
+                posted += outcome.posted
+                failed += outcome.failed
 
+            async with self._lock:
                 self.store.update_many(updated_records)
-                if posted and failed:
-                    status = "partial"
-                elif failed:
-                    status = "failed"
-                else:
-                    status = "posted"
-                result = DeliveryRetryResponse(
-                    status=status,
-                    requested=requested,
-                    retryable=len(candidates),
-                    attempted=len(candidates),
-                    posted=posted,
-                    failed=failed,
-                    skipped=skipped,
-                    delivery_mode=delivery.mode,
-                    record_ids=[record.record_id for record in candidates],
-                    responses=responses,
-                    error=next((item["error"] for item in responses if item.get("error")), None),
-                )
+            if posted and failed:
+                status = "partial"
+            elif failed:
+                status = "failed"
+            else:
+                status = "posted"
+            result = DeliveryRetryResponse(
+                status=status,
+                requested=requested,
+                retryable=len(candidates),
+                attempted=len(candidates),
+                posted=posted,
+                failed=failed,
+                skipped=skipped,
+                delivery_mode=delivery.mode,
+                record_ids=[record.record_id for record in candidates],
+                responses=responses,
+                error=next((item["error"] for item in responses if item.get("error")), None),
+            )
         await self._publish_update()
         return result
 
@@ -657,14 +705,14 @@ class SimulationController:
                 metadata=metadata,
             )
 
-    async def _run_loop(self) -> None:
-        while not self._stop_event.is_set():
+    async def _run_loop(self, stop_event: asyncio.Event) -> None:
+        while not stop_event.is_set():
             await self.step(self.config.batch_size)
             if self.config.interval_seconds <= 0:
                 await asyncio.sleep(0)
             else:
                 try:
-                    await asyncio.wait_for(self._stop_event.wait(), timeout=self.config.interval_seconds)
+                    await asyncio.wait_for(stop_event.wait(), timeout=self.config.interval_seconds)
                 except asyncio.TimeoutError:
                     continue
 
