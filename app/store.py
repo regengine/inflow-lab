@@ -74,6 +74,38 @@ class EventStore:
         self.max_records = max_records
         self._records: deque[StoredEventRecord] = deque(maxlen=max_records)
         self._counter = 0
+        # threading.RLock, not asyncio.Lock (#136). Two different kinds of
+        # caller take it: EventStore.__init__/_load_from_disk and
+        # MockRegEngineService.__init__ (mock_service.py, via
+        # read_persisted_records) call in from plain synchronous code with
+        # no event loop running at all, while app.controller offloads the
+        # write paths (add_many/update_many/replace_all/configure) and the
+        # replay read (read_persisted_records) onto worker threads via
+        # asyncio.to_thread so a large write or replay can't stall the
+        # single event loop (see the locking comment in
+        # SimulationController, app/controller.py).
+        #
+        # That split only works because every public method on this class
+        # is a plain `def`, never `async def`: each one acquires and fully
+        # releases this lock within its own synchronous call frame, with no
+        # `await` anywhere inside the locked section for it to suspend on.
+        # asyncio.to_thread runs one such call start-to-finish on a single
+        # worker thread, which preserves both guarantees this lock has to
+        # provide:
+        #   - cross-call mutual exclusion, because RLock serializes *any*
+        #     threads that ask for it, not just the event loop's own thread;
+        #   - same-call reentrancy (configure -> _load_from_disk ->
+        #     read_persisted_records; update_many -> _all_records ->
+        #     read_persisted_records), because RLock is only reentrant for
+        #     the thread that already holds it, and that nested chain never
+        #     leaves the one worker thread running it.
+        # Do NOT turn one of these methods into `async def` while it still
+        # holds this lock across an `await` -- that would let the event
+        # loop thread block waiting on a worker thread for the lock while
+        # that worker is itself waiting on the event loop to resume it: a
+        # deadlock. If a method here ever needs to suspend mid-critical-
+        # section, that is a sign it no longer belongs behind this lock as
+        # written, not a reason to relax the "no await while held" rule.
         self._lock = RLock()
         self._load_from_disk()
 
@@ -111,6 +143,17 @@ class EventStore:
         self._counter = counter
 
     def read_persisted_records(self, persist_path: str | None = None) -> list[StoredEventRecord]:
+        """Read the full persisted log from disk, synchronously.
+
+        Stays a plain synchronous method deliberately (#136): it is called
+        from EventStore.__init__/_load_from_disk and from
+        MockRegEngineService.__init__ (mock_service.py), both of which run
+        before/without any event loop, so an ``async def`` here would break
+        construction. Async callers with a loop running (app.controller's
+        ``replay``) instead offload a whole call to a worker thread via
+        ``asyncio.to_thread`` -- see the lock comment in ``__init__`` above
+        for why that is safe.
+        """
         path = Path(persist_path) if persist_path else self.persist_path
         records: list[StoredEventRecord] = []
 

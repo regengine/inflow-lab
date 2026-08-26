@@ -7,7 +7,7 @@ import uuid
 from collections import defaultdict, deque
 from dataclasses import dataclass
 from datetime import UTC, datetime
-from typing import Any
+from typing import Any, Iterable
 from urllib.parse import urlparse
 
 from .audit import summarize_scenario_audit
@@ -105,7 +105,7 @@ class SimulationController:
             _validate_live_delivery(config.delivery)
             previous_config = self.config
             self.config = config
-            self.store.configure(config.persist_path)
+            await self._store_configure(config.persist_path)
             if not self.running and (
                 config.seed != previous_config.seed
                 or config.scenario != previous_config.scenario
@@ -136,7 +136,7 @@ class SimulationController:
         async with self._lock:
             if config is not None:
                 self.config = config
-            self.store.configure(self.config.persist_path)
+            await self._store_configure(self.config.persist_path)
             self.engine.reset(self.config.seed, scenario=self.config.scenario, scale=self.config.scale)
             self.store.reset()
             self.mock_service.reset()
@@ -178,7 +178,7 @@ class SimulationController:
                         **_event_delivery_fields(outcome, event_response),
                     )
                 )
-            self.store.add_many(stored_records)
+            await self._store_add_many(stored_records)
 
             result = StepResponse(
                 generated=len(events),
@@ -210,7 +210,7 @@ class SimulationController:
                 },
                 deep=True,
             )
-            records = self.store.read_persisted_records(persist_path)
+            records = await self._store_read_persisted_records(persist_path)
             events = [record.event for record in records]
 
             if not events:
@@ -261,7 +261,12 @@ class SimulationController:
                 },
                 deep=True,
             )
-            parsed = parse_csv_import(
+            # CPU-bound parsing (#136): offload it too, same reasoning as
+            # the store calls above -- a large csv_text body would
+            # otherwise tie up the event loop for the whole parse before
+            # the store write even starts.
+            parsed = await asyncio.to_thread(
+                parse_csv_import,
                 request.import_type,
                 request.csv_text,
                 default_timestamp=datetime.now(UTC),
@@ -289,7 +294,7 @@ class SimulationController:
                             **_event_delivery_fields(outcome, event_response),
                         )
                     )
-                self.store.add_many(stored_records)
+                await self._store_add_many(stored_records)
 
             rejected = parsed.total - len(parsed.events)
             if outcome.delivery_status == "failed":
@@ -343,7 +348,7 @@ class SimulationController:
                 },
                 deep=True,
             )
-            self.store.configure(self.config.persist_path)
+            await self._store_configure(self.config.persist_path)
             self.engine.reset(self.config.seed, scenario=fixture.scenario, scale=self.config.scale)
             if request.reset:
                 self.store.reset()
@@ -370,7 +375,7 @@ class SimulationController:
                         **_event_delivery_fields(outcome, event_response),
                     )
                 )
-            self.store.add_many(stored_records)
+            await self._store_add_many(stored_records)
             result = DemoFixtureLoadResponse(
                 status="delivery_failed" if outcome.delivery_status == "failed" else "loaded",
                 fixture_id=fixture.id,
@@ -428,8 +433,8 @@ class SimulationController:
 
         async with self._lock:
             self.config = snapshot.config
-            self.store.configure(self.config.persist_path)
-            loaded_records = self.store.replace_all(snapshot.records)
+            await self._store_configure(self.config.persist_path)
+            loaded_records = await self._store_replace_all(snapshot.records)
             self.engine.reset(self.config.seed, scenario=self.config.scenario, scale=self.config.scale)
             result = ScenarioLoadResponse(
                 status="loaded",
@@ -561,7 +566,7 @@ class SimulationController:
                     posted += outcome.posted
                     failed += outcome.failed
 
-                self.store.update_many(updated_records)
+                await self._store_update_many(updated_records)
                 if posted and failed:
                     status = "partial"
                 elif failed:
@@ -583,6 +588,82 @@ class SimulationController:
                 )
         await self._publish_update()
         return result
+
+    # -- Running EventStore's blocking calls off the event loop (#136) -----
+    #
+    # EventStore guards its state with a threading.RLock (see the comment
+    # on that lock in app/store.py) and does plain synchronous
+    # open()/write()/replace() calls. Called directly from one of the
+    # `async def` methods above, that I/O would run on the single event
+    # loop thread and block every other request in this process -- other
+    # tenants' SSE streams, health checks, unrelated API calls -- for as
+    # long as a big CSV import, delivery retry, or replay takes.
+    #
+    # The methods below are the only place offloading happens. Each one
+    # runs exactly one EventStore call, start to finish, on a worker
+    # thread via asyncio.to_thread, then returns its result (or re-raises
+    # its exception) to the caller, so e.g. ``await
+    # self._store_add_many(...)`` behaves like ``self.store.add_many(...)``
+    # in every observable way except which thread does the work, and that
+    # the event loop stays free to run other coroutines while it waits.
+    # EventStore's own methods are untouched and still fully synchronous --
+    # deliberately, since read_persisted_records() in particular is also
+    # called from plain sync code with no event loop at all
+    # (EventStore.__init__ and MockRegEngineService.__init__).
+    #
+    # Why this is safe for the RLock specifically: every EventStore method
+    # wrapped below is a plain `def`, never `async def`, so it acquires
+    # and fully releases the RLock within one synchronous call frame --
+    # there is no `await` anywhere inside the locked section for it to
+    # suspend on. asyncio.to_thread hands that whole frame to one worker
+    # thread and waits for it to finish before this coroutine resumes, so:
+    #   - the lock still serializes concurrent callers correctly, exactly
+    #     as it does today, because RLock provides mutual exclusion across
+    #     *any* threads asking for it, not only reentrancy within one --
+    #     it does not matter that the thread asking now is a worker thread
+    #     instead of the event loop's own thread;
+    #   - the reentrant re-acquisitions inside the store (configure ->
+    #     _load_from_disk -> read_persisted_records; update_many ->
+    #     _all_records -> read_persisted_records) stay on that same single
+    #     worker thread from start to finish, so RLock's "reentrant only
+    #     for the thread that already holds it" guarantee is never asked
+    #     to span two different threads, which is the one thing that would
+    #     actually break it.
+    # Do not turn EventStore's add_many/update_many/replace_all/configure/
+    # read_persisted_records into `async def` methods that hold its lock
+    # across an `await` -- that would let the event loop thread block
+    # waiting on a worker thread for the lock while that worker is itself
+    # waiting on the event loop to resume it: a deadlock. Keep EventStore
+    # synchronous and do the `asyncio.to_thread` here, at the call site.
+    #
+    # Separately: self._lock above (SimulationController's own lock) is an
+    # asyncio.Lock, not a threading lock, and EventStore never touches it.
+    # Holding it across one of these awaits, as step/import_csv/replay/etc.
+    # do, is ordinary cooperative-lock usage with no OS thread pinned to
+    # it, so it cannot deadlock against the RLock inside asyncio.to_thread
+    # -- there is no cycle where one waits on the other.
+    async def _store_add_many(
+        self, records: Iterable[StoredEventRecord]
+    ) -> list[StoredEventRecord]:
+        return await asyncio.to_thread(self.store.add_many, records)
+
+    async def _store_update_many(
+        self, records: Iterable[StoredEventRecord]
+    ) -> list[StoredEventRecord]:
+        return await asyncio.to_thread(self.store.update_many, records)
+
+    async def _store_replace_all(
+        self, records: Iterable[StoredEventRecord]
+    ) -> list[StoredEventRecord]:
+        return await asyncio.to_thread(self.store.replace_all, records)
+
+    async def _store_read_persisted_records(
+        self, persist_path: str | None = None
+    ) -> list[StoredEventRecord]:
+        return await asyncio.to_thread(self.store.read_persisted_records, persist_path)
+
+    async def _store_configure(self, persist_path: str) -> None:
+        await asyncio.to_thread(self.store.configure, persist_path)
 
     async def _deliver_payload(
         self,
