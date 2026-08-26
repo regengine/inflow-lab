@@ -36,12 +36,12 @@ Open `http://127.0.0.1:8000` and keep a terminal ready for quick API checks.
 ## Happy-Path Walkthrough
 
 1. Confirm operator context.
-   - Dashboard action: point to the stats cards for `Tenant`, `Auth`, `Storage scope`, `Loop status`, and `Persist path`.
+   - Dashboard action: point to the stats cards for `Auth`, `Storage`, `Loop status`, and `Persist path`. (The configured tenant shows in the Integrations panel, not the stats cards.)
    - Expected result: local demos show tenant `local-demo`, auth `Off`, storage `Local`, loop `Stopped`.
    - Talking point: "A shared demo can use Basic Auth and tenant headers, but local mock mode stays frictionless."
 
 2. Load the fresh-cut fixture.
-   - Dashboard action: set delivery mode to `Mock RegEngine`, choose fixture `Fresh-cut transformation`, click `Load fixture`.
+   - Dashboard action: set delivery mode to `Sandbox (built-in stand-in)`, choose fixture `Fresh-cut transformation`, click `Load today's line data`.
    - Expected result: scenario changes to `Fresh-cut processor`, total records becomes `13`, delivery monitor shows posted records, recent events include harvesting, cooling, packing, shipping, receiving, and transformation.
    - Talking point: "The fixture is deterministic so every partner sees the same batch, documents, and lot codes."
 
@@ -51,7 +51,7 @@ Open `http://127.0.0.1:8000` and keep a terminal ready for quick API checks.
    - Talking point: "Transformation consumes packed ingredient lots and emits a new output lot. The trace can move backward to harvest and forward to shipment and receipt."
 
 4. Show FDA-request export.
-   - Dashboard action: set export preset to `Lot trace`, set Traceability Lot Code to `TLC-DEMO-FC-OUT-001`, click `Download CSV`.
+   - Dashboard action: set export preset to `Lot trace`, set Traceability Lot Code to `TLC-DEMO-FC-OUT-001`, click `Compliance export`.
    - Expected result: downloaded CSV includes `BATCH-DEMO-FC-001` and the transitive lot history.
    - API check:
 
@@ -60,7 +60,7 @@ curl "http://127.0.0.1:8000/api/mock/regengine/export/fda-request?preset=lot_tra
 ```
 
 5. Show EPCIS export.
-   - Dashboard action: with the same lot filter, click `Download EPCIS`.
+   - Dashboard action: with the same lot filter, click `EPCIS JSON`.
    - Expected result: JSON-LD export includes an `EPCISDocument` with `ObjectEvent` and `TransformationEvent` entries.
    - API check:
 
@@ -69,7 +69,7 @@ curl "http://127.0.0.1:8000/api/mock/regengine/export/epcis?traceability_lot_cod
 ```
 
 6. Demonstrate operator controls.
-   - Dashboard action: click `Save scenario`, switch the scenario preset, click `Reset state`, then `Load saved`.
+   - Dashboard action: click `Save state`, switch the scenario preset, click `Clear shift`, then `Load saved`.
    - Expected result: the fresh-cut scenario and all 13 records return.
    - Talking point: "Design partners can rehearse the same story without rebuilding data by hand."
 
@@ -219,7 +219,7 @@ Pre-call checklist:
 
 During-call checklist:
 
-- Keep the dashboard delivery mode on `Mock RegEngine`.
+- Keep the dashboard delivery mode on `Sandbox (built-in stand-in)`.
 - Do not paste live API keys, live tenant ids, partner secrets, or downloaded exports into chat.
 - If a route fails, check the visible dashboard error first, then Railway request logs by tenant and path.
 - If the loop starts unexpectedly, click `Stop` before resetting or loading fixtures.
@@ -237,7 +237,7 @@ Post-call cleanup checklist:
 
 - If the dashboard looks stale, click `Refresh` or reload the browser tab.
 - If the loop is still running, click `Stop` before loading fixtures or resetting.
-- If live delivery fails, switch delivery mode to `Mock RegEngine` and use `Retry failed deliveries` to prove recovery behavior.
+- If live delivery fails, switch delivery mode to `Sandbox (built-in stand-in)` and use `Retry failed deliveries` to prove recovery behavior.
 - If lineage for `TLC-DEMO-FC-OUT-001` is empty, reload the `Fresh-cut transformation` fixture.
 - If downloaded exports are empty, confirm the event count is nonzero and the lot filter has no extra spaces.
 

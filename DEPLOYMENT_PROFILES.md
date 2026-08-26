@@ -86,7 +86,7 @@ Expected health context:
 - `auth.enabled`: `true`
 - `auth.username`: configured username
 - `auth.uses_default_storage`: `false`
-- `status.config.persist_path`: `data/tenants/partner-acme/events.jsonl`
+- `status.config.persist_path`: `/data/tenants/partner-acme/events.jsonl` (absolute, because this profile exports `REGENGINE_DATA_DIR=/data` above; it reads `data/tenants/...` only when that variable is unset)
 
 Tenant selection notes:
 
