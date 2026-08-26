@@ -8,12 +8,20 @@ import base64
 import csv
 import io
 import json
+from datetime import UTC, datetime, timedelta
 
 import pytest
 from fastapi.testclient import TestClient
 
+from app.demo_fixtures import DEMO_FIXTURES
 from app.main import app, controller
+from app.schemas.domain import DemoFixtureId
 from app.schemas.simulation import SimulationConfig
+
+# The mock enforces RegEngine's 90-day replay window by default, so payloads
+# are built relative to "now" and date filters are derived from the fixture
+# they filter rather than from a pinned calendar date.
+RECENT_MOMENT = (datetime.now(UTC) - timedelta(days=1)).replace(microsecond=0)
 
 
 client = TestClient(app)
@@ -200,9 +208,9 @@ def test_epcis_export_scaffold_maps_lineage_to_jsonld_without_changing_ingest_co
                     "quantity": 12,
                     "unit_of_measure": "cases",
                     "location_name": "Distribution Center #4",
-                    "timestamp": "2026-02-05T08:30:00Z",
+                    "timestamp": RECENT_MOMENT.isoformat().replace("+00:00", "Z"),
                     "kdes": {
-                        "receive_date": "2026-02-05",
+                        "receive_date": RECENT_MOMENT.date().isoformat(),
                         "receiving_location": "Distribution Center #4",
                         "immediate_previous_source": "Coastal Packhouse",
                         "reference_document": "Bill of Lading BOL-EP-CHECK",
@@ -232,8 +240,10 @@ def test_epcis_export_supports_date_filters_and_missing_lot_errors(tmp_path):
         json={"delivery": {"mode": "none"}},
     )
 
+    fixture = DEMO_FIXTURES[DemoFixtureId.FRESH_CUT_TRANSFORMATION]
+    last_day = fixture.events[-1].event.timestamp.date().isoformat()
     filtered_response = client.get(
-        "/api/mock/regengine/export/epcis?start_date=2026-02-07&end_date=2026-02-07"
+        f"/api/mock/regengine/export/epcis?start_date={last_day}&end_date={last_day}"
     )
     assert filtered_response.status_code == 200
     filtered_events = filtered_response.json()["epcisBody"]["eventList"]

@@ -13,10 +13,11 @@ just the check list, so the next constraint RegEngine adds is caught here.
 
 #102 — RegEngine rejects any event older than ``WEBHOOK_MAX_EVENT_AGE_DAYS``
 (default 90) with "replay window exceeded". That one is handler-level, so it
-is a per-event rejection inside a 200. The mock models it, but defaults to
-``REGENGINE_MOCK_EVENT_AGE_MODE=warn`` because the shipped demo fixtures
-carry fixed 2026-02 timestamps that predate the window; see
-``test_default_age_mode_is_warn_while_shipped_fixtures_predate_the_window``.
+is a per-event rejection inside a 200. The mock models it and now *enforces*
+it by default (``REGENGINE_MOCK_EVENT_AGE_MODE=reject``): the shipped demo
+fixtures used to carry fixed 2026-02 timestamps that predated the window and
+forced the default down to "warn", but they are now rebased onto the window;
+see ``test_default_age_mode_is_reject_now_that_shipped_fixtures_are_in_window``.
 """
 
 from __future__ import annotations
@@ -346,7 +347,12 @@ def test_off_mode_is_silent_and_accepting(monkeypatch) -> None:
     assert "X-Mock-Event-Age-Warning" not in response.headers
 
 
-@pytest.mark.parametrize("raw,expected", [("", "warn"), ("nonsense", "warn"), ("REJECT", "reject")])
+@pytest.mark.parametrize(
+    "raw,expected",
+    # Unset and unrecognised both fall back to the shipped default, which is
+    # now "reject" (live parity); "warn"/"off" are explicit opt-outs.
+    [("", "reject"), ("nonsense", "reject"), ("REJECT", "reject"), ("warn", "warn")],
+)
 def test_event_age_mode_env_parsing(monkeypatch, raw: str, expected: str) -> None:
     monkeypatch.setenv(EVENT_AGE_MODE_ENV, raw)
     assert event_age_mode() == expected
@@ -372,22 +378,27 @@ def test_engine_default_history_stays_well_inside_the_window() -> None:
         assert field_constraint_errors(event) == [], event.timestamp
 
 
-def test_default_age_mode_is_warn_while_shipped_fixtures_predate_the_window() -> None:
-    """The reason enforcement is off by default, made explicit.
+def test_default_age_mode_is_reject_now_that_shipped_fixtures_are_in_window() -> None:
+    """The reason enforcement is on by default, made explicit.
 
-    ``app/demo_fixtures.py`` carries fixed 2026-02 timestamps, so a default
-    of "reject" would make every demo-fixture load and the browser smoke fail
-    against the mock. If the fixtures are ever rebased onto relative
-    timestamps, this test stops constraining the default and the mock should
-    switch to "reject" for true parity.
+    ``app/demo_fixtures.py`` used to carry fixed 2026-02 timestamps, so a
+    default of "reject" would have made every demo-fixture load and the
+    browser smoke fail against the mock, and the default was pinned to "warn".
+    The fixtures are now rebased onto timestamps relative to "now", so the
+    mock can enforce the floor exactly like a live tenant.
+
+    The coupling runs both ways: enforcement is only safe while nothing we
+    ship is out of window, so this test asserts the precondition alongside the
+    default. If a fixture ever goes stale again, this fails here rather than
+    as a mystery "0 accepted" in a design-partner demo.
+    (``tests/test_fixture_freshness.py`` is the broader guard.)
     """
     stale = [
-        fixture_event.event
+        f"{fixture.id.value}:{fixture_event.event.traceability_lot_code}"
         for fixture in DEMO_FIXTURES.values()
         for fixture_event in fixture.events
         if replay_window_errors(fixture_event.event)
     ]
-    if stale:
-        # Asserts the shipped default only — an explicit
-        # REGENGINE_MOCK_EVENT_AGE_MODE=reject run is opting in knowingly.
-        assert DEFAULT_EVENT_AGE_MODE == "warn"
+
+    assert stale == [], f"shipped fixtures outside the replay window: {stale}"
+    assert DEFAULT_EVENT_AGE_MODE == "reject"

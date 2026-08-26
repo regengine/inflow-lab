@@ -31,17 +31,19 @@ MAX_FUTURE_HOURS = 24
 MAX_EVENT_AGE_DAYS = 90
 MAX_EVENT_AGE_DAYS_ENV = "REGENGINE_MOCK_MAX_EVENT_AGE_DAYS"
 EVENT_AGE_MODE_ENV = "REGENGINE_MOCK_EVENT_AGE_MODE"
-# The shipped demo fixtures carry fixed 2026-02 timestamps, so enforcing the
-# floor by default would reject every fixture event and take the dashboard
-# demo and the browser smoke down with it. Default to "warn": the mock still
-# accepts, but every out-of-window event is logged at WARNING and counted on
-# the response headers, so the drift is impossible to miss. Set
-# REGENGINE_MOCK_EVENT_AGE_MODE=reject for true live parity.
+# Enforced by default: the demo fixtures used to carry fixed 2026-02
+# timestamps, so rejecting on age would have taken the dashboard demo and the
+# browser smoke down with it, and the default had to be "warn". The fixtures
+# are now rebased onto the live replay window (see app/demo_fixtures.py), so
+# the mock enforces the floor like a live tenant does. "warn" still accepts
+# but logs every out-of-window event at WARNING and counts it on the response
+# headers; "off" drops the check entirely. Both remain available for replaying
+# genuinely historical data through the mock.
 EVENT_AGE_MODE_WARN = "warn"
 EVENT_AGE_MODE_REJECT = "reject"
 EVENT_AGE_MODE_OFF = "off"
 EVENT_AGE_MODES = (EVENT_AGE_MODE_WARN, EVENT_AGE_MODE_REJECT, EVENT_AGE_MODE_OFF)
-DEFAULT_EVENT_AGE_MODE = EVENT_AGE_MODE_WARN
+DEFAULT_EVENT_AGE_MODE = EVENT_AGE_MODE_REJECT
 
 # Where RegEngine draws the line between Pydantic request-body validation and
 # handler logic. Anything in BATCH_FATAL_FIELD_CHECKS is a field constraint on
@@ -138,9 +140,10 @@ class MockRegEngineService:
     ``PER_EVENT_HANDLER_CHECKS`` and #101.
 
     The replay-window floor is configurable via
-    ``REGENGINE_MOCK_EVENT_AGE_MODE`` (warn/reject/off, default warn) and
-    ``REGENGINE_MOCK_MAX_EVENT_AGE_DAYS`` (default 90) because the shipped
-    demo fixtures predate the window; see the constant comments and #102.
+    ``REGENGINE_MOCK_EVENT_AGE_MODE`` (warn/reject/off, default reject — the
+    shipped fixtures now sit inside the window) and
+    ``REGENGINE_MOCK_MAX_EVENT_AGE_DAYS`` (default 90); see the constant
+    comments and #102.
 
     The chain hash is resumed from the persisted event log when an event
     source is attached (see :meth:`attach_event_source`), so a restart of a
@@ -439,7 +442,7 @@ def max_event_age_days() -> int:
 
 
 def event_age_mode() -> str:
-    """How the mock treats out-of-window events: warn (default), reject, off."""
+    """How the mock treats out-of-window events: reject (default), warn, off."""
     mode = os.getenv(EVENT_AGE_MODE_ENV, "").strip().lower()
     return mode if mode in EVENT_AGE_MODES else DEFAULT_EVENT_AGE_MODE
 

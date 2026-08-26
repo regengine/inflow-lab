@@ -43,7 +43,29 @@ def setup_function() -> None:
     asyncio.run(controller.reset(SimulationConfig()))
 
 
+# Payloads are built relative to "now" so they always sit inside RegEngine's
+# replay window (WEBHOOK_MAX_EVENT_AGE_DAYS=90). Pinned calendar dates went
+# stale and made every parity payload a rejection once the mock started
+# enforcing the floor by default.
+EVENT_AGE = timedelta(days=1)
+
+
+#: Resolved once per run so two payloads built in the same test are byte-equal
+#: — the in-batch duplicate check keys on (CTE, lot, timestamp, location).
+BASE_MOMENT = (datetime.now(UTC) - EVENT_AGE).replace(microsecond=0)
+
+
+def event_moment(offset: timedelta = timedelta(0)) -> datetime:
+    """A recent, in-replay-window instant; `offset` moves it forward."""
+    return BASE_MOMENT + offset
+
+
+def iso(moment: datetime) -> str:
+    return moment.isoformat().replace("+00:00", "Z")
+
+
 def receiving_event(lot_code: str = "TLC-PARITY-000001", **overrides) -> dict:
+    moment = event_moment()
     event = {
         "cte_type": "receiving",
         "traceability_lot_code": lot_code,
@@ -51,9 +73,9 @@ def receiving_event(lot_code: str = "TLC-PARITY-000001", **overrides) -> dict:
         "quantity": 500,
         "unit_of_measure": "cases",
         "location_name": "Distribution Center #4",
-        "timestamp": "2026-02-05T08:30:00Z",
+        "timestamp": iso(moment),
         "kdes": {
-            "receive_date": "2026-02-05",
+            "receive_date": moment.date().isoformat(),
             "receiving_location": "Distribution Center #4",
             "ship_from_location": "Valley Fresh Farms",
             "immediate_previous_source": "Valley Fresh Farms",
@@ -140,7 +162,7 @@ def test_duplicate_event_in_batch_is_rejected_once():
 
 def test_same_lot_at_a_different_timestamp_is_not_a_duplicate():
     first = receiving_event("TLC-PARITY-DUP-02")
-    second = receiving_event("TLC-PARITY-DUP-02", timestamp="2026-02-05T09:30:00Z")
+    second = receiving_event("TLC-PARITY-DUP-02", timestamp=iso(event_moment(timedelta(hours=1))))
     response = client.post("/api/mock/regengine/ingest", json=payload_dict(first, second))
     assert response.status_code == 200
     assert response.json()["accepted"] == 2
@@ -276,7 +298,10 @@ def test_verify_signature_accepts_a_bare_hex_digest(monkeypatch):
 
 def test_idempotency_replay_just_inside_the_window():
     service = MockRegEngineService()
-    now = datetime(2026, 2, 5, 12, 0, tzinfo=UTC)
+    # A frozen clock just after the payload's own timestamp: the events are
+    # built relative to "now", so a pinned calendar instant would read them as
+    # future-dated and 422 the batch.
+    now = event_moment(timedelta(hours=1))
     service.time_source = lambda: now
     first = service.ingest(ingest_payload(receiving_event("TLC-PARITY-TTL-01")), idempotency_key="ttl-1")
 
@@ -287,7 +312,10 @@ def test_idempotency_replay_just_inside_the_window():
 
 def test_idempotency_entry_expires_just_outside_the_window():
     service = MockRegEngineService()
-    now = datetime(2026, 2, 5, 12, 0, tzinfo=UTC)
+    # A frozen clock just after the payload's own timestamp: the events are
+    # built relative to "now", so a pinned calendar instant would read them as
+    # future-dated and 422 the batch.
+    now = event_moment(timedelta(hours=1))
     service.time_source = lambda: now
     first = service.ingest(ingest_payload(receiving_event("TLC-PARITY-TTL-02")), idempotency_key="ttl-2")
 
@@ -302,7 +330,10 @@ def test_idempotency_entry_expires_just_outside_the_window():
 
 def test_expired_entries_are_dropped_from_the_cache():
     service = MockRegEngineService()
-    now = datetime(2026, 2, 5, 12, 0, tzinfo=UTC)
+    # A frozen clock just after the payload's own timestamp: the events are
+    # built relative to "now", so a pinned calendar instant would read them as
+    # future-dated and 422 the batch.
+    now = event_moment(timedelta(hours=1))
     service.time_source = lambda: now
     service.ingest(ingest_payload(receiving_event("TLC-PARITY-TTL-03")), idempotency_key="ttl-3")
     assert len(service._idempotency_cache) == 1

@@ -8,6 +8,7 @@ import tempfile
 import time
 from contextlib import contextmanager
 from dataclasses import dataclass
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Iterator
 
@@ -36,9 +37,26 @@ CREDENTIAL_SOURCES = (
     ("REGENGINE_REMOTE_USERNAME", "REGENGINE_REMOTE_PASSWORD"),
 )
 
-CSV_WITH_KDE_WARNINGS = """cte_type,traceability_lot_code,product_description,quantity,unit_of_measure,location_name,timestamp,kdes
-harvesting,TLC-BROWSER-WARN,Romaine Lettuce,10,cases,Valley Fresh Farms,2026-02-10T08:00:00Z,"{""harvest_date"":""2026-02-10""}"
-"""
+# The imported row must land inside RegEngine's replay window
+# (WEBHOOK_MAX_EVENT_AGE_DAYS=90), otherwise the mock rejects it outright and
+# the smoke never reaches the KDE-warning assertion it exists to make. Built
+# relative to "now" rather than pinned to a calendar date so it cannot go
+# stale again; a day back is recent enough to always be in-window and old
+# enough to never trip the 24h future ceiling.
+IMPORT_CSV_AGE = timedelta(days=1)
+
+
+def import_csv_with_kde_warnings(now: datetime | None = None) -> str:
+    """A one-row scheduled-events CSV that is valid except for missing KDEs."""
+    moment = (now or datetime.now(UTC)) - IMPORT_CSV_AGE
+    timestamp = moment.strftime("%Y-%m-%dT%H:%M:%SZ")
+    harvest_date = moment.date().isoformat()
+    return (
+        "cte_type,traceability_lot_code,product_description,quantity,"
+        "unit_of_measure,location_name,timestamp,kdes\n"
+        f"harvesting,TLC-BROWSER-WARN,Romaine Lettuce,10,cases,Valley Fresh Farms,"
+        f'{timestamp},"{{""harvest_date"":""{harvest_date}""}}"\n'
+    )
 
 
 @dataclass(frozen=True, slots=True)
@@ -238,7 +256,7 @@ def _run_dashboard_smoke(base_url: str, config: BrowserSmokeConfig) -> None:
 
             csv_path = output_dir / "browser_smoke_import.csv"
             output_dir.mkdir(parents=True, exist_ok=True)
-            csv_path.write_text(CSV_WITH_KDE_WARNINGS, encoding="utf-8")
+            csv_path.write_text(import_csv_with_kde_warnings(), encoding="utf-8")
             page.locator("#csvImportType").select_option("scheduled_events")
             page.locator("#csvFile").set_input_files(str(csv_path))
             page.locator("#importCsvBtn").click()
