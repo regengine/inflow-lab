@@ -89,11 +89,25 @@ class ReplayResponse(BaseModel):
     error: str | None = None
 
 
+# Upper bound on a single CSV import body, in characters.
+#
+# `parse_csv_import` is CPU-bound and runs synchronously on the app's single
+# event loop, so an unbounded `csv_text` makes the worst-case stall unbounded
+# too: one oversized import blocks every other request in the process. The
+# limit is enforced by pydantic, which means it rejects with a 422 before the
+# parser ever sees the body.
+#
+# 4 MiB of characters is roughly 25k-40k typical CTE rows -- far above any
+# real demo or design-partner import, and far below a body that would stall
+# the loop noticeably.
+MAX_CSV_IMPORT_CHARS = 4 * 1024 * 1024
+
+
 class CSVImportRequest(BaseModel):
     model_config = STRICT_REQUEST
 
     import_type: CSVImportType
-    csv_text: str
+    csv_text: str = Field(max_length=MAX_CSV_IMPORT_CHARS)
     source: str | None = None
     delivery: DeliveryConfig | None = None
 

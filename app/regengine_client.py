@@ -166,6 +166,61 @@ def assert_delivery_endpoint_allowed(endpoint: str) -> None:
             )
 
 
+# RegEngine's IngestEvent declares `input_traceability_lot_codes` as a
+# **top-level** field, and its canonical-event writer populates
+# `kdes["input_lot_codes"]` (the thing transformation lineage rows are built
+# from) only from that top-level field. The simulator's RegEngineEvent carries
+# the value inside the free-form `kdes` dict, where RegEngine's ingest path
+# never looks -- so a transformation used to be accepted while producing zero
+# input->output lineage links. Pydantic ignores the unknown key, so nothing
+# rejected and nothing mapped.
+#
+# Hoisting happens here, at serialization time, rather than on RegEngineEvent:
+# the `kdes` copy stays exactly where it is (this repo's lineage view, EPCIS
+# export, CSV importer and the mock all read it) and the wire body additionally
+# carries the field where RegEngine reads it. Both sides then agree.
+INPUT_LOT_CODES_FIELD = "input_traceability_lot_codes"
+
+
+def _input_lot_codes(kdes: Any) -> list[str] | None:
+    """Input lot codes from an event's KDEs, or None when it declares none.
+
+    Accepts the list form the engine and CSV importer produce and the bare
+    string form a hand-written payload may carry.
+    """
+    if not isinstance(kdes, dict):
+        return None
+    raw = kdes.get(INPUT_LOT_CODES_FIELD)
+    if isinstance(raw, str):
+        raw = [raw]
+    if not isinstance(raw, list):
+        return None
+    codes = [item.strip() for item in raw if isinstance(item, str) and item.strip()]
+    return codes or None
+
+
+def build_wire_body(payload: IngestPayload) -> dict[str, Any]:
+    """Serialize an IngestPayload into the exact dict sent to RegEngine.
+
+    Identical to `payload.model_dump(mode="json")` except that an event whose
+    KDEs declare input lot codes also carries them at the top level, where
+    RegEngine's `IngestEvent` reads them. Events that declare none are left
+    untouched rather than sent an explicit `null`: the field is optional and
+    defaults to None on RegEngine, so omitting it keeps every non-transformation
+    event's wire shape byte-for-byte what it was before.
+    """
+    body = payload.model_dump(mode="json")
+    events = body.get("events")
+    if isinstance(events, list):
+        for event in events:
+            if not isinstance(event, dict):
+                continue
+            codes = _input_lot_codes(event.get("kdes"))
+            if codes is not None:
+                event[INPUT_LOT_CODES_FIELD] = codes
+    return body
+
+
 def _response_error_detail(response: httpx.Response) -> str:
     """RegEngine's error body as a short string, JSON or not.
 
@@ -210,15 +265,46 @@ class ConnectionCheckResult:
 # These mirror the failure modes RegEngine's webhook surface actually
 # returns, so the settings page can give recovery guidance instead of a
 # bare status code.
+#
+# Scope caveat, deliberately reflected in the wording below: the probe is a
+# GET on /api/v1/webhooks/recent, whose dependency chain is strictly weaker
+# than POST /api/v1/webhooks/ingest. The read route carries neither the
+# ingest route's active-subscription gate, nor its `webhooks.ingest`
+# permission requirement, nor its HMAC signature verification, and it has
+# its own rate-limit budget. A green read therefore proves the key and
+# tenant are valid *for reads* and nothing more -- claiming it certifies
+# ingestion is how a "connected" badge ends up sitting above a run in which
+# every delivery 401s. The HMAC half of that gap is closed separately below
+# by comparing signing posture across the two sides; subscription state and
+# permission scope remain unobservable from this endpoint, so the 200 detail
+# names them as unproven rather than implying otherwise.
 _CONNECTION_VERDICTS: dict[int, tuple[str, str]] = {
-    200: ("connected", "Authenticated read succeeded. Credentials and tenant are valid."),
+    200: (
+        "connected",
+        "Authenticated read succeeded: the API key and tenant are valid for reads on this "
+        "RegEngine workspace. This probe reads /api/v1/webhooks/recent, so it does not prove "
+        "ingestion will succeed -- the subscription gate, the webhooks.ingest permission scope "
+        "and the ingest rate limit apply to the write path only. Send a test batch to confirm "
+        "end-to-end delivery.",
+    ),
     401: ("unauthorized", "RegEngine rejected the API key (HTTP 401). Check the key value and that it has not expired or been revoked."),
-    402: ("subscription_inactive", "The tenant's subscription is not active (HTTP 402). Billing status must be active or trialing before ingestion resumes."),
+    402: (
+        "subscription_inactive",
+        "RegEngine returned HTTP 402 for the read probe: the tenant's subscription is not "
+        "active. Billing status must be active or trialing before ingestion resumes.",
+    ),
     403: ("forbidden", "RegEngine refused the request (HTTP 403). The key may be missing the webhooks.read scope, or the tenant does not match the key."),
     404: ("tenant_mismatch", "RegEngine returned HTTP 404. Webhook reads return 404 when the tenant does not match the API key's tenant."),
-    429: ("rate_limited", "RegEngine is rate limiting this tenant (HTTP 429). Wait for the window shown in Retry-After and try again."),
+    429: (
+        "rate_limited",
+        "RegEngine is rate limiting this tenant's webhook reads (HTTP 429). Wait for the window "
+        "shown in Retry-After and try again. Ingestion is metered separately, so this limit does "
+        "not necessarily apply to delivery.",
+    ),
     503: ("service_unavailable", "RegEngine is up but a required backing service is unavailable (HTTP 503). Try again shortly."),
 }
+
+SIGNATURE_MISMATCH_VERDICT = "signature_mismatch"
 
 
 class LiveRegEngineDeliveryError(RuntimeError):
@@ -249,7 +335,7 @@ class LiveRegEngineClient:
         # between our HMAC input and the wire body would cause RegEngine's
         # signature check to 401 on every request.
         body_bytes = json.dumps(
-            payload.model_dump(mode="json"),
+            build_wire_body(payload),
             separators=(",", ":"),
             sort_keys=True,
         ).encode("utf-8")
@@ -329,7 +415,7 @@ class LiveRegEngineClient:
                     headers=headers,
                     params={"tenant_id": tenant_id, "limit": 1},
                 )
-                remote_contract = await _fetch_remote_contract_version(client, parsed)
+                remote_health = await _fetch_remote_health(client, parsed)
         except httpx.HTTPError as exc:
             return ConnectionCheckResult(
                 verdict="unreachable",
@@ -341,6 +427,19 @@ class LiveRegEngineClient:
             response.status_code,
             ("error", f"Unexpected HTTP {response.status_code} from RegEngine."),
         )
+        # The read probe cannot see the ingest route's signature check, so
+        # compare signing posture across the two sides instead. This is the one
+        # ingest-only gate that is observable without writing, and the one most
+        # likely to be half-configured in a shared demo.
+        signature_detail = _signature_posture_detail(_remote_hmac_configured(remote_health))
+        if verdict == "connected" and signature_detail is not None:
+            return ConnectionCheckResult(
+                verdict=SIGNATURE_MISMATCH_VERDICT,
+                detail=signature_detail,
+                status_code=response.status_code,
+                endpoint_host=host,
+            )
+        remote_contract = _remote_contract_version(remote_health)
         if verdict == "connected" and remote_contract is not None and remote_contract != INFLOW_CONTRACT_VERSION:
             verdict = "contract_mismatch"
             detail = (
@@ -357,22 +456,77 @@ class LiveRegEngineClient:
         )
 
 
-async def _fetch_remote_contract_version(client: httpx.AsyncClient, parsed) -> str | None:
-    """Best-effort read of RegEngine's advertised inflow contract version.
+async def _fetch_remote_health(client: httpx.AsyncClient, parsed) -> dict[str, Any] | None:
+    """Best-effort read of RegEngine's /health document.
 
-    Returns None when the health endpoint is unreachable, non-JSON (some
-    deployments serve the frontend at /health), or predates the version
-    field — skew detection only engages when both sides advertise.
+    Returns None when the health endpoint is unreachable or non-JSON (some
+    deployments serve the frontend at /health). Every skew check built on it
+    engages only when the remote actually advertises the field it needs, so an
+    older RegEngine simply yields no extra verdict.
     """
     try:
         health = await client.get(f"{parsed.scheme}://{parsed.netloc}/health")
         payload = health.json()
     except (httpx.HTTPError, ValueError):
         return None
-    if not isinstance(payload, dict):
+    return payload if isinstance(payload, dict) else None
+
+
+def _remote_contract_version(health: dict[str, Any] | None) -> str | None:
+    """RegEngine's advertised inflow contract version, when it advertises one."""
+    if health is None:
         return None
-    value = payload.get("inflow_contract_version")
+    value = health.get("inflow_contract_version")
     return str(value) if value is not None else None
+
+
+# Key names RegEngine's /health may use for its `webhook_hmac_configured()`
+# posture flag. Only a real boolean (or its string spelling) counts -- a
+# missing or unrecognized value leaves signing posture unknown, and unknown
+# never produces a verdict.
+_REMOTE_HMAC_KEYS = ("webhook_hmac_configured", "hmac_configured")
+
+
+def _remote_hmac_configured(health: dict[str, Any] | None) -> bool | None:
+    if health is None:
+        return None
+    for key in _REMOTE_HMAC_KEYS:
+        value = health.get(key)
+        if isinstance(value, bool):
+            return value
+        if isinstance(value, str):
+            normalized = value.strip().lower()
+            if normalized in _TRUTHY:
+                return True
+            if normalized in {"0", "false", "no", "off"}:
+                return False
+    return None
+
+
+def _signature_posture_detail(remote_hmac_configured: bool | None) -> str | None:
+    """Explain a webhook-signing mismatch between the two sides, if any.
+
+    Returns None when the posture matches or when RegEngine does not advertise
+    its posture at all — the probe never invents a failure it cannot see.
+    """
+    if remote_hmac_configured is None:
+        return None
+    local_configured = bool(os.getenv(WEBHOOK_HMAC_SECRET_ENV, "").strip())
+    if local_configured == remote_hmac_configured:
+        return None
+    if remote_hmac_configured:
+        return (
+            "Credentials are valid for reads, but RegEngine has webhook HMAC signing enabled "
+            f"while {WEBHOOK_HMAC_SECRET_ENV} is unset here. Every live ingest would be sent "
+            "unsigned and rejected with HTTP 401 — the read probe cannot see this because only "
+            "the ingest route verifies signatures. Set the same secret on both sides."
+        )
+    return (
+        f"Credentials are valid for reads, but {WEBHOOK_HMAC_SECRET_ENV} is set here while "
+        "RegEngine reports webhook HMAC signing disabled. Ingest still succeeds and RegEngine's "
+        "verifier no-ops, so bodies go unverified — set WEBHOOK_HMAC_SECRET on RegEngine, or "
+        "clear the local secret, so both sides agree."
+    )
 
 
 def _build_signature_header(body_bytes: bytes) -> str | None:

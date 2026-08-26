@@ -482,18 +482,47 @@ class LegitFlowEngine:
             total_output_qty=gross_output_qty,
         )
         input_lot_codes = [lot.lot_code for lot in inputs]
+        if rework_lots:
+            # A rework lot is real output mass from this batch (`yield_ratio`
+            # already counts it) and now carries a CTE of its own, so it belongs
+            # in the batch's declared output set. `rework_traceability_lot_codes`
+            # still marks which of those outputs are rework rather than sellable.
+            batch_kdes["output_traceability_lot_codes"] = [
+                *batch_kdes.get("output_traceability_lot_codes", []),
+                *(lot.lot_code for lot in rework_lots),
+            ]
 
         # One TRANSFORMATION record per output lot: every new traceability lot
         # code needs its own CTE, otherwise outputs[1:] first appear in the
         # store as a SHIPPING event that looks like it came straight from the
         # pre-transformation inputs.
+        #
+        # Rework lots get a record for exactly the same reason. A rework lot is
+        # minted here and pushed back into `processor_inventory`, where a later
+        # `_transform` can sample it as an input -- at which point it appears in
+        # that event's `input_traceability_lot_codes`. Without a CTE of its own
+        # it has no record to anchor to, so `EventStore.lineage_edges` drops the
+        # edge and the rendered graph shows fewer inputs than the payload
+        # declares. It is also real mass produced by this batch (`yield_ratio`
+        # already counts it), so emitting it keeps the mass balance honest.
         results: list[tuple[RegEngineEvent, list[str]]] = []
-        for output_lot in outputs:
+        emitted: list[tuple[Lot, bool]] = [(lot, False) for lot in outputs]
+        emitted.extend((lot, True) for lot in rework_lots)
+        for output_lot, is_rework in emitted:
             kdes = deepcopy(batch_kdes)
             kdes["output_traceability_lot_code"] = output_lot.lot_code
-            kdes["output_lot_count"] = len(outputs)
+            kdes["output_lot_count"] = len(emitted)
             kdes["tlc_source_reference"] = output_lot.tlc_source_reference
             kdes["traceability_lot_code_source_reference"] = output_lot.tlc_source_reference
+            if is_rework:
+                # Additive markers only: the required transformation KDEs still
+                # come from the shared batch record, so the wire contract is
+                # unchanged and the batch stays identifiable across siblings.
+                kdes["rework_output"] = True
+                kdes["rework_hold_reference"] = self._reference_document(
+                    output_lot.current_reference_type,
+                    output_lot.current_reference_number,
+                )
             event = RegEngineEvent(
                 cte_type=CTEType.TRANSFORMATION,
                 traceability_lot_code=output_lot.lot_code,
