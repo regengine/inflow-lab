@@ -5,7 +5,7 @@ import logging
 from collections import Counter, deque
 from pathlib import Path
 from threading import RLock
-from typing import Any, Iterable
+from typing import Any, Iterable, NamedTuple
 
 from .schemas.domain import LineageEdge, LineageNode, StoredEventRecord
 
@@ -68,12 +68,35 @@ def mask_secret_in_payload(value: Any, secret: str | None = None) -> Any:
     return value
 
 
+class CorruptRecordLine(NamedTuple):
+    """One JSONL line ``read_persisted_records`` could not parse and skipped.
+
+    Populated on ``EventStore.last_read_corrupt_lines`` after every
+    ``read_persisted_records()`` call (#93) so a caller holding the store
+    can tell a read that quietly dropped bad lines apart from one that
+    returned the tenant's complete history -- see
+    ``EventStore.last_read_was_complete``. Never carries the line's own
+    content: it failed to parse *as* a record, so it could still hold a
+    secret-named KDE the model never got a chance to scrub.
+    """
+
+    path: str
+    line_number: int
+    error: str
+
+
 class EventStore:
     def __init__(self, persist_path: str = "data/events.jsonl", max_records: int = 5000) -> None:
         self.persist_path = Path(persist_path)
         self.max_records = max_records
         self._records: deque[StoredEventRecord] = deque(maxlen=max_records)
         self._counter = 0
+        # Freshly overwritten by every read_persisted_records() call (#93);
+        # see that method and last_read_was_complete for why this exists.
+        # Initialized empty here so the attribute always exists even before
+        # the _load_from_disk() call a few lines down performs the first
+        # real read.
+        self.last_read_corrupt_lines: list[CorruptRecordLine] = []
         # threading.RLock, not asyncio.Lock (#136). Two different kinds of
         # caller take it: EventStore.__init__/_load_from_disk and
         # MockRegEngineService.__init__ (mock_service.py, via
@@ -153,9 +176,27 @@ class EventStore:
         ``replay``) instead offload a whole call to a worker thread via
         ``asyncio.to_thread`` -- see the lock comment in ``__init__`` above
         for why that is safe.
+
+        A line that fails to parse -- a future StoredEventRecord/CTEType
+        schema change, a write torn by a crash mid-append, a hand-edited
+        file -- is skipped and logged rather than aborting the whole read
+        (#93): one bad line must not make a tenant's entire history
+        unreadable, and since __init__/_load_from_disk calls this too, it
+        must not stop the app from starting on a corrupt store either.
+
+        The return type deliberately stays a plain list so callers that
+        already unpack it directly keep working unchanged (mock_service.py's
+        ``_resume_chain_hash`` does ``sorted(store.read_persisted_records(),
+        ...)``; controller.py's ``_store_read_persisted_records`` awaits this
+        through ``asyncio.to_thread`` and hands the list straight to its own
+        caller). A skipped line is instead recorded on
+        ``self.last_read_corrupt_lines`` -- see ``last_read_was_complete``
+        for how a caller tells a read that dropped lines apart from one that
+        returned the complete history.
         """
         path = Path(persist_path) if persist_path else self.persist_path
         records: list[StoredEventRecord] = []
+        corrupt_lines: list[CorruptRecordLine] = []
 
         with self._lock:
             if path.exists():
@@ -166,15 +207,51 @@ class EventStore:
                         try:
                             records.append(StoredEventRecord.model_validate_json(line))
                         except ValueError as exc:
-                            raise ValueError(
-                                f"Could not load stored event record from {path}:{line_number}"
-                            ) from exc
+                            # Skip and log rather than abort (#93). The raw
+                            # line itself is never logged: it failed to
+                            # parse *as* a record, so it could still carry a
+                            # secret-named KDE the model never got a chance
+                            # to scrub.
+                            logger.error(
+                                "skipping unreadable event record at %s:%d (%s)",
+                                path,
+                                line_number,
+                                exc,
+                            )
+                            corrupt_lines.append(
+                                CorruptRecordLine(path=str(path), line_number=line_number, error=str(exc))
+                            )
+            # Overwritten every call, including empty, so this always
+            # reflects *this* read rather than stale state left by a
+            # previous one -- see last_read_was_complete.
+            self.last_read_corrupt_lines = corrupt_lines
         return records
+
+    @property
+    def last_read_was_complete(self) -> bool:
+        """False if the most recent ``read_persisted_records()`` skipped a line.
+
+        A short or empty read result can mean two very different things:
+        "this genuinely is the tenant's whole history" or "some of it was
+        unreadable and got skipped" (#93). Callers that need to tell those
+        apart -- rather than inferring completeness from record count alone
+        -- should check this immediately after the read. It reflects the
+        single most recent ``read_persisted_records()`` call on this store,
+        including nested/reentrant ones made while already holding this
+        store's lock (``_load_from_disk``, and ``update_many`` via
+        ``_all_records``).
+        """
+        return not self.last_read_corrupt_lines
 
     def reset(self) -> None:
         with self._lock:
             self._records.clear()
             self._counter = 0
+            # The file backing last_read_corrupt_lines is about to be
+            # deleted; carrying its stale diagnostics forward would make a
+            # freshly reset (empty, healthy) store still report a past
+            # corruption that reset() just removed.
+            self.last_read_corrupt_lines = []
             if self.persist_path.exists():
                 self.persist_path.unlink()
             self.persist_path.parent.mkdir(parents=True, exist_ok=True)
@@ -341,6 +418,16 @@ class EventStore:
                 "last_error": latest_failure.error if latest_failure else None,
             },
             "persist_path": str(self.persist_path),
+            # #93: lets a caller of the already-wired /api/simulate/status
+            # and /api/health (both flow stats() into their response) tell
+            # a read that skipped unreadable lines apart from one that
+            # returned the tenant's complete history -- without changing
+            # the shape of anything that already unpacks stats()'s return
+            # value (it stays a plain dict; this only adds a key).
+            "store_integrity": {
+                "complete": self.last_read_was_complete,
+                "corrupt_lines_skipped": len(self.last_read_corrupt_lines),
+            },
         }
 
     def lineage(self, traceability_lot_code: str) -> list[StoredEventRecord]:
