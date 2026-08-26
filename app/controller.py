@@ -79,6 +79,10 @@ class SimulationController:
         self.scenario_saves = scenario_saves
         self.mock_service = mock_service
         self.live_client = live_client
+        # Let the mock rebuild its hash chain from whatever this controller has
+        # already persisted, so a restart continues the chain instead of
+        # forking it. Resumption is lazy, so this costs nothing at startup.
+        self.mock_service.attach_event_source(store)
         self.config = SimulationConfig(persist_path=str(store.persist_path))
         self._task: asyncio.Task[None] | None = None
         self._stop_event = asyncio.Event()
