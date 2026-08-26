@@ -154,7 +154,7 @@ def _render_transformation_event(
         "type": "TransformationEvent",
         "transformationID": transformation_id,
         "inputQuantityList": [
-            _quantity_element(lot_code=lot_code)
+            _input_quantity_element(record, lot_code)
             for lot_code in _input_lot_codes(record)
         ],
         "outputQuantityList": [
@@ -203,6 +203,49 @@ def _quantity_element(
     if product_description:
         element["regengine:productDescription"] = product_description
     return element
+
+
+def _input_quantity_element(record: StoredEventRecord, lot_code: str) -> dict[str, Any]:
+    """quantity/uom for one transformation input lot, read if it was ever recorded.
+
+    EPCIS's QuantityElement schema requires `quantity` alongside `epcClass`
+    (issue #159), but as of this fix nothing upstream of this module
+    actually captures a *per-input* quantity for transformation events:
+    industry_adapters.transformation_kdes (which builds
+    input_traceability_lot_codes) only ever computes an aggregate
+    yield_ratio across all inputs, so engine.py's per-lot
+    Lot.quantity/.unit_of_measure never reaches event.kdes for any
+    engine-generated or bundled demo-fixture transformation today --
+    verified directly against both files, and independently documented by
+    cte_rules.py's TRANSFORMATION_INPUT_LINKAGE_KDES comment (issue #189).
+    Fabricating a number here would be worse than omitting it for a
+    regulatory export, so this reads an "input_lot_quantities" KDE
+    (lot_code -> {"quantity": ..., "unit_of_measure": ...}) if one is
+    present -- keyed by lot code rather than positionally paired with
+    input_traceability_lot_codes, since _input_lot_codes() above merges
+    lot codes from three different sources that don't share one common
+    order -- and otherwise leaves quantity/uom out, exactly as before.
+    A hand-crafted or CSV-imported event's free-form kdes JSON can already
+    populate this key today; making industry_adapters.transformation_kdes
+    do the same for engine-generated events is the upstream change that
+    would make this non-empty for the simulator's own data (see this
+    project's issue #159 for the full writeup of that gap).
+    """
+    per_lot = record.event.kdes.get("input_lot_quantities")
+    quantity: float | None = None
+    unit_of_measure: str | None = None
+    if isinstance(per_lot, dict):
+        entry = per_lot.get(lot_code)
+        if isinstance(entry, dict):
+            raw_quantity = entry.get("quantity")
+            # bool is a subclass of int in Python -- exclude it explicitly
+            # so a stray True/False can't be coerced into a fake quantity.
+            if isinstance(raw_quantity, (int, float)) and not isinstance(raw_quantity, bool):
+                quantity = float(raw_quantity)
+            raw_uom = entry.get("unit_of_measure")
+            if isinstance(raw_uom, str) and raw_uom:
+                unit_of_measure = raw_uom
+    return _quantity_element(lot_code=lot_code, quantity=quantity, unit_of_measure=unit_of_measure)
 
 
 def _input_lot_codes(record: StoredEventRecord) -> list[str]:

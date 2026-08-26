@@ -1,0 +1,284 @@
+"""Regression coverage for issues #157 and #159.
+
+Mirrors tests/test_conformance.py's approach for #186-#189: render each
+export through its real, unmocked render_* function and assert on the
+actual output. Where DEMO_FIXTURES already exercises the scenario (the
+demo transformation's genuine absence of per-input quantity data), that
+bundled fixture data is used directly. DEMO_FIXTURES' own dt() helper
+always normalizes timestamps to UTC before construction, though, so it
+never produces a non-UTC-offset timestamp or a transformation event with a
+populated input_lot_quantities KDE -- those two specific edge cases are
+exercised with hand-built RegEngineEvent/StoredEventRecord objects instead,
+still run through the real render functions.
+"""
+
+from __future__ import annotations
+
+import csv
+import io
+from datetime import UTC, datetime, timedelta, timezone
+
+from app.demo_fixtures import DEMO_FIXTURES
+from app.epcis_export import render_epcis_document
+from app.fda_export import render_fda_request_csv
+from app.schemas.domain import CTEType, DemoFixtureId, RegEngineEvent, StoredEventRecord
+
+
+def _records_for(fixture_id: DemoFixtureId) -> list[StoredEventRecord]:
+    fixture = DEMO_FIXTURES[fixture_id]
+    return [
+        StoredEventRecord(
+            sequence_no=index,
+            payload_source="test-export-correctness",
+            event=fixture_event.event,
+            parent_lot_codes=list(fixture_event.parent_lot_codes),
+        )
+        for index, fixture_event in enumerate(fixture.events, start=1)
+    ]
+
+
+def _record(event: RegEngineEvent, **kwargs: object) -> StoredEventRecord:
+    return StoredEventRecord(payload_source="test-export-correctness", event=event, **kwargs)
+
+
+def _no_gln(_location_name: str) -> str:
+    return ""
+
+
+def _fda_rows(records: list[StoredEventRecord]) -> list[dict[str, str]]:
+    csv_text = render_fda_request_csv(records, location_gln=_no_gln)
+    return list(csv.DictReader(io.StringIO(csv_text)))
+
+
+def _epcis_events(records: list[StoredEventRecord]) -> list[dict]:
+    document = render_epcis_document(
+        records,
+        source="test-export-correctness",
+        location_gln=_no_gln,
+        creation_date=datetime(2026, 2, 5, tzinfo=UTC),
+    )
+    return document["epcisBody"]["eventList"]
+
+
+# ---------------------------------------------------------------------------
+# #157 -- FDA export splits Date/Time off of a raw, non-normalized timestamp
+# ---------------------------------------------------------------------------
+
+
+def _event_at(timestamp: datetime, *, lot_code: str = "TLC-TS-1") -> RegEngineEvent:
+    return RegEngineEvent(
+        cte_type=CTEType.RECEIVING,
+        traceability_lot_code=lot_code,
+        product_description="Romaine Lettuce",
+        quantity=10.0,
+        unit_of_measure="cases",
+        location_name="Distribution Center #4",
+        timestamp=timestamp,
+        kdes={},
+    )
+
+
+def test_fda_export_normalizes_a_positive_offset_timestamp_to_utc() -> None:
+    """Reproduces issue #157's own repro case: a timestamp carrying an
+    explicit non-UTC offset must be converted to UTC before Date/Time are
+    split off of it, not exported using the offset's own local reading."""
+    event = _event_at(datetime(2026, 2, 5, 23, 30, 0, tzinfo=timezone(timedelta(hours=5))))
+    row = _fda_rows([_record(event)])[0]
+
+    # 2026-02-05T23:30:00+05:00 is 2026-02-05T18:30:00Z.
+    assert row["Date"] == "2026-02-05"
+    assert row["Time"] == "18:30:00"
+
+
+def test_fda_export_two_events_five_hours_apart_never_collide_on_date_and_time() -> None:
+    """The issue's headline impact case: a +05:00 event and a Z event that
+    share the same local wall-clock digits must not render identical
+    Date/Time once they are actually five hours apart in absolute time."""
+    offset_event = _event_at(
+        datetime(2026, 2, 5, 23, 30, 0, tzinfo=timezone(timedelta(hours=5))),
+        lot_code="TLC-TS-OFFSET",
+    )
+    utc_event = _event_at(datetime(2026, 2, 5, 23, 30, 0, tzinfo=UTC), lot_code="TLC-TS-UTC")
+    rows = _fda_rows([_record(offset_event), _record(utc_event)])
+    by_lot = {row["Traceability Lot Code"]: row for row in rows}
+
+    assert (by_lot["TLC-TS-OFFSET"]["Date"], by_lot["TLC-TS-OFFSET"]["Time"]) == ("2026-02-05", "18:30:00")
+    assert (by_lot["TLC-TS-UTC"]["Date"], by_lot["TLC-TS-UTC"]["Time"]) == ("2026-02-05", "23:30:00")
+    assert by_lot["TLC-TS-OFFSET"] != by_lot["TLC-TS-UTC"]
+
+
+def test_fda_export_normalizes_a_negative_offset_timestamp_across_a_date_boundary() -> None:
+    """A negative offset can push the UTC date to the *next* calendar day --
+    this only comes out right if normalization happens before .date() is
+    ever read, not after."""
+    event = _event_at(datetime(2026, 2, 5, 22, 0, 0, tzinfo=timezone(timedelta(hours=-5))))
+    row = _fda_rows([_record(event)])[0]
+
+    # 2026-02-05T22:00:00-05:00 is 2026-02-06T03:00:00Z.
+    assert row["Date"] == "2026-02-06"
+    assert row["Time"] == "03:00:00"
+
+
+def test_fda_export_treats_a_naive_timestamp_as_already_utc_not_local_time() -> None:
+    """A tzinfo-less timestamp is read as UTC -- matching
+    csv_importer._ensure_timezone's own convention for naive rows -- rather
+    than handed to .astimezone(), which would reinterpret it using
+    whatever local timezone the export happens to run under and make the
+    output depend on where the process is deployed."""
+    event = _event_at(datetime(2026, 2, 5, 23, 30, 0))  # no tzinfo
+    row = _fda_rows([_record(event)])[0]
+
+    assert row["Date"] == "2026-02-05"
+    assert row["Time"] == "23:30:00"
+
+
+def test_fda_export_demo_fixture_dates_are_unaffected_by_normalization() -> None:
+    """Every bundled demo fixture is already authored in UTC (via
+    demo_fixtures.dt()'s own .astimezone(UTC)), so normalizing must be a
+    no-op for the export's existing, already-correct real-fixture output --
+    this fix must not shift dates that were never wrong."""
+    for fixture_id in DemoFixtureId:
+        records = _records_for(fixture_id)
+        rows = _fda_rows(records)
+        for row, record in zip(rows, records):
+            assert row["Date"] == record.event.timestamp.date().isoformat()
+            assert row["Time"] == record.event.timestamp.time().isoformat(timespec="seconds")
+
+
+# ---------------------------------------------------------------------------
+# #159 -- EPCIS TransformationEvent inputQuantityList entries carry no
+# quantity
+# ---------------------------------------------------------------------------
+
+
+def test_engine_generated_transformation_has_no_per_input_quantity_data_today() -> None:
+    """Documents the actual, current state of the data rather than assuming
+    it: the bundled fresh_cut_transformation demo fixture -- the same shape
+    of data the engine itself generates -- has no per-input quantity
+    anywhere in its TransformationEvent's kdes, so inputQuantityList
+    entries correctly have no quantity/uom key. This is issue #159's own
+    documented finding (independently confirmed by
+    app/cte_rules.py's TRANSFORMATION_INPUT_LINKAGE_KDES comment and by
+    app/industry_adapters.py's transformation_kdes, which only ever
+    computes an aggregate yield_ratio, never a per-lot figure) -- not a gap
+    this test suite is failing to catch. Lot identity is still populated;
+    only the quantity that nothing upstream captures is absent.
+    """
+    records = _records_for(DemoFixtureId.FRESH_CUT_TRANSFORMATION)
+    events = _epcis_events(records)
+    transformation_event = next(e for e in events if e["type"] == "TransformationEvent")
+
+    assert transformation_event["inputQuantityList"], "sanity: fixture has input lots"
+    for entry in transformation_event["inputQuantityList"]:
+        assert "quantity" not in entry
+        assert "uom" not in entry
+        assert entry["regengine:traceabilityLotCode"]
+        assert entry["epcClass"]
+
+
+def _transformation_record(input_lot_quantities: dict[str, dict[str, object]] | None) -> StoredEventRecord:
+    kdes: dict[str, object] = {
+        "transformation_date": "2026-02-06",
+        "transformation_location": "ReadyFresh Processing Plant",
+        "input_traceability_lot_codes": ["TLC-IN-1", "TLC-IN-2"],
+        "input_products": ["Romaine Lettuce", "Spinach"],
+        "reference_document_type": "Batch Record",
+        "reference_document_number": "BATCH-TEST-001",
+    }
+    if input_lot_quantities is not None:
+        kdes["input_lot_quantities"] = input_lot_quantities
+    event = RegEngineEvent(
+        cte_type=CTEType.TRANSFORMATION,
+        traceability_lot_code="TLC-OUT-1",
+        product_description="Fresh Cut Salad Mix",
+        quantity=100.0,
+        unit_of_measure="cases",
+        location_name="ReadyFresh Processing Plant",
+        timestamp=datetime(2026, 2, 6, 17, 20, 0, tzinfo=UTC),
+        kdes=kdes,
+    )
+    return _record(event, parent_lot_codes=["TLC-IN-1", "TLC-IN-2"])
+
+
+def test_input_quantity_is_populated_when_the_data_is_actually_present() -> None:
+    """When a per-input quantity/uom *is* available -- e.g. a hand-crafted
+    or CSV-imported event whose free-form kdes JSON supplies an
+    input_lot_quantities mapping -- the exporter must use it, keyed by lot
+    code so lookup is correct regardless of which of _input_lot_codes'
+    three merged sources produced a given lot code."""
+    record = _transformation_record(
+        {
+            "TLC-IN-1": {"quantity": 288, "unit_of_measure": "cases"},
+            "TLC-IN-2": {"quantity": 248, "unit_of_measure": "cases"},
+        }
+    )
+    events = _epcis_events([record])
+    transformation_event = next(e for e in events if e["type"] == "TransformationEvent")
+    by_lot = {entry["regengine:traceabilityLotCode"]: entry for entry in transformation_event["inputQuantityList"]}
+
+    assert by_lot["TLC-IN-1"]["quantity"] == 288
+    assert by_lot["TLC-IN-1"]["uom"] == "cases"
+    assert by_lot["TLC-IN-2"]["quantity"] == 248
+    assert by_lot["TLC-IN-2"]["uom"] == "cases"
+
+
+def test_input_quantity_partial_coverage_only_fills_in_the_lot_it_covers() -> None:
+    """A partial input_lot_quantities mapping must not fabricate a value
+    for the lot code it doesn't cover -- half-known is not license to
+    guess the other half."""
+    record = _transformation_record({"TLC-IN-1": {"quantity": 288, "unit_of_measure": "cases"}})
+    events = _epcis_events([record])
+    transformation_event = next(e for e in events if e["type"] == "TransformationEvent")
+    by_lot = {entry["regengine:traceabilityLotCode"]: entry for entry in transformation_event["inputQuantityList"]}
+
+    assert by_lot["TLC-IN-1"]["quantity"] == 288
+    assert "quantity" not in by_lot["TLC-IN-2"]
+
+
+def test_input_quantity_ignores_a_boolean_masquerading_as_numeric() -> None:
+    """bool is a subclass of int in Python -- a stray True/False surviving
+    from hand-authored or CSV-sourced kdes must not silently become a fake
+    quantity of 1 or 0."""
+    record = _transformation_record({"TLC-IN-1": {"quantity": True, "unit_of_measure": "cases"}})
+    events = _epcis_events([record])
+    transformation_event = next(e for e in events if e["type"] == "TransformationEvent")
+    entry = next(
+        e for e in transformation_event["inputQuantityList"] if e["regengine:traceabilityLotCode"] == "TLC-IN-1"
+    )
+
+    assert "quantity" not in entry
+
+
+def test_input_quantity_absent_entirely_matches_the_pre_fix_shape() -> None:
+    """No input_lot_quantities KDE at all -- today's actual upstream
+    reality for every engine-generated transformation -- must still render
+    a valid QuantityElement: lot identity present, quantity/uom simply
+    absent, not a raised error or a null placeholder."""
+    record = _transformation_record(None)
+    events = _epcis_events([record])
+    transformation_event = next(e for e in events if e["type"] == "TransformationEvent")
+
+    for entry in transformation_event["inputQuantityList"]:
+        assert "quantity" not in entry
+        assert "uom" not in entry
+        assert entry["epcClass"]
+        assert entry["regengine:traceabilityLotCode"]
+
+
+def test_output_quantity_list_is_unaffected_by_the_input_quantity_change() -> None:
+    """outputQuantityList already worked correctly before this fix (it has
+    always passed event.quantity/unit_of_measure) -- guard against a
+    regression there while touching the surrounding function."""
+    record = _transformation_record(None)
+    events = _epcis_events([record])
+    transformation_event = next(e for e in events if e["type"] == "TransformationEvent")
+
+    assert transformation_event["outputQuantityList"] == [
+        {
+            "epcClass": "urn:regengine:lot:TLC-OUT-1",
+            "regengine:traceabilityLotCode": "TLC-OUT-1",
+            "quantity": 100.0,
+            "uom": "cases",
+            "regengine:productDescription": "Fresh Cut Salad Mix",
+        }
+    ]

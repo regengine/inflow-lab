@@ -3,6 +3,7 @@ from __future__ import annotations
 import csv
 import io
 from dataclasses import dataclass
+from datetime import UTC, datetime
 from typing import Callable, Iterable
 
 from .schemas.domain import CTEType, FDAExportPreset, RegEngineEvent, StoredEventRecord
@@ -111,6 +112,8 @@ def render_fda_request_csv(
     writer.writeheader()
     for record in records:
         event = record.event
+        # Normalize before splitting -- see _normalize_to_utc below (issue #157).
+        normalized_timestamp = _normalize_to_utc(event.timestamp)
         writer.writerow(
             {
                 "Traceability Lot Code": event.traceability_lot_code,
@@ -122,13 +125,41 @@ def render_fda_request_csv(
                 "Location Identifier (GLN)": location_gln(event.location_name),
                 "Ship-To / Previous Source Location Description": _linked_location_description(event),
                 "TLC Source Reference": _tlc_source_reference(event),
-                "Date": event.timestamp.date().isoformat(),
-                "Time": event.timestamp.time().isoformat(timespec="seconds"),
+                "Date": normalized_timestamp.date().isoformat(),
+                "Time": normalized_timestamp.time().isoformat(timespec="seconds"),
                 "Reference Document Type": event.kdes.get("reference_document_type", ""),
                 "Reference Document Number": event.kdes.get("reference_document_number", ""),
             }
         )
     return output.getvalue()
+
+
+def _normalize_to_utc(value: datetime) -> datetime:
+    """Normalize to UTC before Date/Time are ever split off of a timestamp.
+
+    Two events at genuinely different absolute instants must not collapse
+    onto identical Date/Time text columns just because they were recorded
+    with different UTC offsets (issue #157) -- event.timestamp carries
+    whatever tzinfo the source data happened to have (a CSV row's explicit
+    "+05:00" is preserved as-is by csv_importer._ensure_timezone, which only
+    ever fills in a *missing* tzinfo), and this export previously called
+    .date()/.time() straight off of that without ever converting first.
+    A naive timestamp (no tzinfo at all) is treated as already being UTC --
+    the same assumption _ensure_timezone makes -- via .replace() rather than
+    handed to .astimezone(), which would silently reinterpret it using
+    *this process's* local timezone instead.
+
+    Compliance-relevant choice, stated explicitly: every exported Date and
+    Time is UTC wall-clock, full stop. Unlike the EPCIS export (which
+    stamps a per-event eventTimeZoneOffset because eventTime there keeps
+    the original offset), this FDA CSV has no offset column at all -- so
+    normalizing every row to the same fixed zone is what keeps the
+    sortable spreadsheet sortable and comparable, rather than adding a
+    column FDA's own export format doesn't define a place for.
+    """
+    if value.tzinfo is None:
+        value = value.replace(tzinfo=UTC)
+    return value.astimezone(UTC)
 
 
 def _linked_location_description(event: RegEngineEvent) -> str:
