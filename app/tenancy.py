@@ -27,6 +27,38 @@ logger = logging.getLogger(__name__)
 DATA_ROOT = Path(os.getenv("REGENGINE_DATA_DIR", "data"))
 TENANT_DATA_ROOT = DATA_ROOT / "tenants"
 
+
+def data_root() -> Path:
+    """The simulator's storage root, resolved at call time.
+
+    ``DATA_ROOT`` above is a snapshot taken when this module is imported, which
+    is the right thing for the module-level stores it builds but the wrong
+    thing for anything asked for a path *later*: a process (or a test) that
+    exports ``REGENGINE_DATA_DIR`` after import would be ignored. So the
+    environment wins when it is set, and the module attribute is the fallback
+    -- the two agree whenever the variable was already set at import, and the
+    fallback is what lets tests relocate storage by monkeypatching
+    ``DATA_ROOT`` directly (see ``tests/test_release_scripts.py``).
+    """
+    configured = os.getenv("REGENGINE_DATA_DIR", "").strip()
+    if configured:
+        return Path(configured)
+    return DATA_ROOT
+
+
+def default_events_path() -> Path:
+    """Event log for the default (non-tenant) scope.
+
+    This is the single definition of that path. ``SimulationConfig`` defaults
+    ``persist_path`` to it rather than to a literal ``data/events.jsonl``:
+    the literal is CWD-relative, so on a deployment whose volume is mounted at
+    ``REGENGINE_DATA_DIR=/data`` the default tenant's events landed *outside*
+    the volume and were discarded on every redeploy, while tenant storage --
+    derived here -- survived. See DEPLOYMENT_PROFILES.md step 4.
+    """
+    return data_root() / "events.jsonl"
+
+
 # Selecting a tenant with ``X-RegEngine-Tenant`` lazily materializes a whole
 # controller (engine, event store, scenario saves, clients) plus an on-disk
 # directory. That header is honored even when Basic Auth is disabled — the
@@ -50,7 +82,7 @@ DEFAULT_MAX_TENANTS = 100
 _DELETE_QUARANTINE_SECONDS = 30.0
 
 engine = LegitFlowEngine(seed=204)
-store = EventStore(persist_path=str(DATA_ROOT / "events.jsonl"))
+store = EventStore(persist_path=str(default_events_path()))
 scenario_saves = ScenarioSaveStore(save_dir=str(DATA_ROOT / "scenario_saves"))
 mock_service = MockRegEngineService()
 controller = SimulationController(

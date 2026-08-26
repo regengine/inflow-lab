@@ -6,8 +6,8 @@ This guide gives concrete run profiles for local development, shared design-part
 
 | Profile | Bind address | Auth | Storage | Delivery default | Best for |
 |---|---|---|---|---|---|
-| Local demo | `127.0.0.1` | Off | `data/events.jsonl` | `mock` | Solo development and screen-share demos |
-| Shared demo | `0.0.0.0` behind TLS/proxy | Basic Auth on | `data/tenants/{tenant_id}/` | `mock` | Design partners, multiple tenants, non-live workshops |
+| Local demo | `127.0.0.1` | Off | `{REGENGINE_DATA_DIR}/events.jsonl` (default `data/events.jsonl`) | `mock` | Solo development and screen-share demos |
+| Shared demo | `0.0.0.0` behind TLS/proxy | Basic Auth on | `{REGENGINE_DATA_DIR}/tenants/{tenant_id}/` (default `data/tenants/{tenant_id}/`) | `mock` | Design partners, multiple tenants, non-live workshops |
 | Live ingest trial | Prefer private host or VPN | Basic Auth on | Tenant-scoped | `mock`; switch request to `live` | Controlled RegEngine workspace validation |
 
 ## Single-process requirement
@@ -350,9 +350,10 @@ next one starts.
    Verify: `https://<dashboard-host>/api/inflow-lab/api/healthz` reports the
    new commit with `commit_source: RAILWAY_GIT_COMMIT_SHA`.
 4. **Carry the persistent volume across before sending traffic.** The demo
-   writes its event history to `REGENGINE_DATA_DIR` (`app/tenancy.py:22`,
-   `/data/tenants/{tenant_id}/events.jsonl` in production), and on Railway that
-   path only survives a redeploy if a volume is mounted there. A service
+   writes its event history to `REGENGINE_DATA_DIR` (`data_root()` in
+   `app/tenancy.py`; `/data/tenants/{tenant_id}/events.jsonl` for a tenant and
+   `/data/events.jsonl` for the default scope in production), and on Railway
+   that path only survives a redeploy if a volume is mounted there. A service
    created fresh has none, and nothing about the running service says so: it
    answers 200, serves the right contract, reports the right build identity,
    and quietly starts from an empty store after every deploy — which for a
@@ -362,6 +363,15 @@ next one starts.
    cutover the old service mounted a volume at `/data` and the replacement had
    no `volumeMounts` key at all, which would have discarded the demo's history
    on the first push after the switch.
+   A mounted volume was also not, until recently, sufficient on its own: the
+   default (no-`X-RegEngine-Tenant`) scope defaulted its `persist_path` to the
+   literal relative `data/events.jsonl` rather than deriving it from
+   `REGENGINE_DATA_DIR`, so its events landed in a container-local `data/`
+   *outside* the mounted volume and were discarded on every redeploy even when
+   step 4 was done correctly. Tenant-scoped storage was always derived and was
+   never affected. Both now come from `app/tenancy.data_root()`; check
+   `status.config.persist_path` on an unauthenticated `/api/health` and confirm
+   it is under the mount path, not a relative `data/...`.
 5. **Only then retire the old service.** Until step 3 lands everywhere, the
    old service is the live backend for whatever still points at it. Note that
    the volume belongs to the old service — deleting it destroys the data

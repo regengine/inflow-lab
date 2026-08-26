@@ -23,13 +23,15 @@ old runs. An explicit ``--basetemp=...`` on the command line still wins.
 2. Who owns the checkout's data root while a session runs (#134 follow-up)
 --------------------------------------------------------------------------
 Giving each session its own ``tmp_path`` tree is not the whole story, because
-the parts of the app under test do *not* use ``tmp_path``. The default
-(non-tenant) simulation config carries the literal relative default
-``persist_path = "data/events.jsonl"`` (``app/schemas/simulation.py``), which
-``EventStore`` resolves against the process working directory, and
-``EventStore._all_records()`` re-reads that file from disk on every lineage,
-stats and export call. Tenant storage (``data/tenants/<id>/``) and scenario
-saves (``data/scenario_saves/``) are equally fixed and equally checkout-wide.
+the parts of the app under test do *not* use ``tmp_path``. Every storage path
+in the app hangs off one data root (``REGENGINE_DATA_DIR``, default ``data``):
+the default (non-tenant) event log, tenant storage (``data/tenants/{id}/``) and
+scenario saves (``data/scenario_saves/``). ``EventStore`` resolves that root
+against the process working directory when it is relative, and
+``EventStore._all_records()`` re-reads the log from disk on every lineage,
+stats and export call. Neither documented way of running this suite sets
+``REGENGINE_DATA_DIR``, so for every session that root is the same checkout
+``data/``.
 
 So *every* pytest process started in this checkout reads and writes one and
 the same event log, no matter what ``--basetemp`` it was given. Two sessions
@@ -47,13 +49,22 @@ resource, not a retry or a sleep: nothing is re-run and no ordering is
 tweaked. The lock is released by the kernel when the process exits, so a
 crashed run cannot wedge later ones.
 
-The real fix belongs one level down, in the app: if
-``SimulationConfig.persist_path`` defaulted to ``<REGENGINE_DATA_DIR>/events.jsonl``
-instead of the hardcoded ``data/events.jsonl``, each session could simply
-export its own ``REGENGINE_DATA_DIR`` and be genuinely parallel. That is
-``app/schemas/simulation.py`` (plus the tests that pin the literal string) and
-is not this file's to change. Until then, serialization is the honest
-guarantee.
+An earlier version of this file proposed the fix one level down: make
+``SimulationConfig.persist_path`` default to ``<REGENGINE_DATA_DIR>/events.jsonl``
+instead of the hardcoded ``data/events.jsonl``, then let each session export
+its own root and be genuinely parallel. Half of that landed — the default now
+derives from the data root (``app/schemas/simulation.py``,
+``tenancy.default_events_path``), which is a production fix: on Railway the
+volume is mounted at ``REGENGINE_DATA_DIR=/data`` and the default tenant's
+events used to land outside it. The other half does not follow. Exporting a
+per-session root here would move the data root away from the checkout, and
+``tenancy._ensure_persist_path_within_root`` requires a caller-supplied
+*absolute* ``persist_path`` to sit inside that root — which is exactly what
+the dozens of tests that point ``persist_path`` at ``tmp_path`` are, and
+``tmp_path`` follows an explicit ``--basetemp`` rather than this file. Pinning
+``--basetemp`` under the checkout while the data root lives elsewhere turns
+those tests into HTTP 400s. So serialization remains the honest guarantee;
+``tests/test_isolation.py`` asserts both halves of that reasoning.
 
 Set ``REGENGINE_TEST_NO_SUITE_LOCK=1`` to opt out (e.g. when running the suite
 against a data root you know is private).
@@ -62,6 +73,7 @@ against a data root you know is private).
 from __future__ import annotations
 
 import os
+import sys
 from pathlib import Path
 
 import pytest
@@ -110,13 +122,17 @@ def _acquire_data_root_lock(config) -> None:
     try:
         fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
     except OSError:
+        message = (
+            f"waiting for another pytest session to release {path} "
+            "(the checkout's data root is shared; see tests/conftest.py)"
+        )
         reporter = config.pluginmanager.get_plugin("terminalreporter")
         if reporter is not None:
-            reporter.write_line(
-                f"waiting for another pytest session to release {path} "
-                "(the checkout's data root is shared; see tests/conftest.py)",
-                yellow=True,
-            )
+            reporter.write_line(message, yellow=True)
+        else:
+            # This hook can run before the terminal reporter is registered, and
+            # a silent multi-minute stall is indistinguishable from a hang.
+            print(message, file=sys.stderr, flush=True)
         fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
     setattr(config, _LOCK_STASH_KEY, handle)
 

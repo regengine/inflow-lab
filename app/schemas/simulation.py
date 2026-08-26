@@ -17,6 +17,26 @@ MockFrictionCode = Literal["invalid_key", "subscription_inactive", "rate_limit"]
 STRICT_REQUEST = ConfigDict(extra="forbid")
 
 
+def default_persist_path() -> str:
+    """Where the default (non-tenant) scope writes its event log.
+
+    Derived from ``REGENGINE_DATA_DIR`` via ``app.tenancy.default_events_path``
+    -- the same helper every other storage path in the app already comes from
+    -- rather than the literal ``data/events.jsonl`` this used to be. That
+    literal was CWD-relative, so on a deployment whose persistent volume is
+    mounted at ``REGENGINE_DATA_DIR=/data`` it relocated tenant storage but not
+    the default tenant's events, which landed in a container-local ``data/``
+    and were discarded on every redeploy (DEPLOYMENT_PROFILES.md step 4).
+
+    Resolved on each instantiation, not frozen at import, so setting the
+    variable inside a process or a test still takes effect. The import is
+    deferred because ``app.tenancy`` imports this module.
+    """
+    from ..tenancy import default_events_path
+
+    return str(default_events_path())
+
+
 class DeliveryConfig(BaseModel):
     model_config = STRICT_REQUEST
 
@@ -38,7 +58,7 @@ class SimulationConfig(BaseModel):
     interval_seconds: float = 1.5
     batch_size: int = 3
     seed: int | None = 204
-    persist_path: str = "data/events.jsonl"
+    persist_path: str = Field(default_factory=default_persist_path)
     delivery: DeliveryConfig = Field(default_factory=DeliveryConfig)
 
     @field_validator("interval_seconds")

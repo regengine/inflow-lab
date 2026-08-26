@@ -12,6 +12,7 @@ from fastapi.testclient import TestClient
 
 from app.main import app, controller
 from app.schemas.simulation import SimulationConfig
+from app.tenancy import default_events_path, tenant_events_path
 
 
 client = TestClient(app)
@@ -66,8 +67,11 @@ def test_tenant_header_scopes_event_storage_and_rejects_invalid_ids(tmp_path):
     beta_status = client.get("/api/simulate/status", headers=beta_headers).json()
     assert alpha_status["stats"]["total_records"] == 1
     assert beta_status["stats"]["total_records"] == 0
-    assert alpha_status["config"]["persist_path"] == "data/tenants/tenant-alpha/events.jsonl"
-    assert beta_status["config"]["persist_path"] == "data/tenants/tenant-beta/events.jsonl"
+    # Derived, not written out: every storage path in the app comes from
+    # REGENGINE_DATA_DIR, so a literal here would assert the checkout default
+    # rather than the scoping this test is about.
+    assert alpha_status["config"]["persist_path"] == str(tenant_events_path("tenant-alpha"))
+    assert beta_status["config"]["persist_path"] == str(tenant_events_path("tenant-beta"))
     assert not alpha_path.exists()
 
     alpha_events = client.get("/api/events", headers=alpha_headers).json()["events"]
@@ -106,11 +110,11 @@ def test_default_mode_rejects_persist_path_outside_data_root(escape_path):
 
 def test_default_data_root_is_used_for_local_and_tenant_paths():
     health = client.get("/api/health").json()
-    assert health["status"]["config"]["persist_path"] == "data/events.jsonl"
+    assert health["status"]["config"]["persist_path"] == str(default_events_path())
 
     tenant_health = client.get("/api/health", headers={"X-RegEngine-Tenant": "tenant-path-check"}).json()
-    assert tenant_health["status"]["config"]["persist_path"] == (
-        "data/tenants/tenant-path-check/events.jsonl"
+    assert tenant_health["status"]["config"]["persist_path"] == str(
+        tenant_events_path("tenant-path-check")
     )
 
 
@@ -156,7 +160,7 @@ def test_operator_can_list_reset_and_delete_tenant_state(monkeypatch):
     assert tenants[tenant_id]["cached"] is True
     assert tenants[tenant_id]["running"] is False
     assert tenants[tenant_id]["total_records"] == 3
-    assert tenants[tenant_id]["persist_path"] == f"data/tenants/{tenant_id}/events.jsonl"
+    assert tenants[tenant_id]["persist_path"] == str(tenant_events_path(tenant_id))
     assert tenants[tenant_id]["exists_on_disk"] is True
 
     tenant_reset = client.post(
