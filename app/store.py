@@ -1,12 +1,17 @@
 from __future__ import annotations
 
 import json
+import logging
+import os
 from collections import Counter, deque
 from pathlib import Path
 from threading import RLock
 from typing import Any, Iterable
 
 from .schemas.domain import LineageEdge, LineageNode, StoredEventRecord
+
+
+logger = logging.getLogger(__name__)
 
 
 # Sentinel that replaces secrets in scrubbed output. Not a credential.
@@ -117,17 +122,114 @@ class EventStore:
                 self.persist_path.unlink()
             self.persist_path.parent.mkdir(parents=True, exist_ok=True)
 
+    def _file_size(self) -> int:
+        try:
+            return self.persist_path.stat().st_size
+        except OSError:
+            return 0
+
+    def _truncate_to(self, size: int) -> None:
+        """Best-effort rollback of a partially written append."""
+        try:
+            os.truncate(self.persist_path, size)
+        except OSError as exc:  # pragma: no cover - depends on the failure mode
+            logger.error(
+                "event store could not roll back partial write",
+                extra={"persist_path": str(self.persist_path), "target_size": size},
+                exc_info=exc,
+            )
+
     def add_many(self, records: Iterable[StoredEventRecord]) -> list[StoredEventRecord]:
-        stored: list[StoredEventRecord] = []
+        """Append records, exposing them in memory only once they are on disk.
+
+        The in-memory deque and the sequence counter are the read path for
+        ``recent()``/``stats()``, so mutating them before the append lands
+        makes a failed write look like a successful one until the next
+        reload. Everything is serialized first, written as a single append,
+        and only then committed to memory; a failed write is truncated back
+        to the pre-write size so no torn line survives.
+        """
+        record_list = list(records)
+        if not record_list:
+            return []
+
         with self._lock:
-            with self.persist_path.open("a", encoding="utf-8") as handle:
-                for record in records:
-                    self._counter += 1
-                    record.sequence_no = self._counter
-                    self._records.appendleft(record)
-                    handle.write(json.dumps(_scrub_secrets(record.model_dump(mode="json"))) + "\n")
-                    stored.append(record)
-        return stored
+            self.persist_path.parent.mkdir(parents=True, exist_ok=True)
+            start_counter = self._counter
+            previous_sequence_numbers = [record.sequence_no for record in record_list]
+            lines: list[str] = []
+            for offset, record in enumerate(record_list, start=1):
+                record.sequence_no = start_counter + offset
+                lines.append(json.dumps(_scrub_secrets(record.model_dump(mode="json"))))
+
+            original_size = self._file_size()
+            try:
+                with self.persist_path.open("a", encoding="utf-8") as handle:
+                    handle.write("\n".join(lines) + "\n")
+                    handle.flush()
+                    os.fsync(handle.fileno())
+            except OSError as exc:
+                logger.error(
+                    "event store failed to persist %d record(s); rolling back",
+                    len(record_list),
+                    extra={
+                        "persist_path": str(self.persist_path),
+                        "record_count": len(record_list),
+                    },
+                    exc_info=exc,
+                )
+                self._truncate_to(original_size)
+                for record, sequence_no in zip(record_list, previous_sequence_numbers):
+                    record.sequence_no = sequence_no
+                raise
+
+            for record in record_list:
+                self._records.appendleft(record)
+            self._counter = start_counter + len(record_list)
+
+        logger.info(
+            "event store persisted %d record(s)",
+            len(record_list),
+            extra={
+                "persist_path": str(self.persist_path),
+                "record_count": len(record_list),
+                "last_sequence_no": self._counter,
+            },
+        )
+        return record_list
+
+    def check_writable(self) -> dict[str, Any]:
+        """Cheap, non-destructive probe that the persist path accepts writes.
+
+        Appends a single blank line (ignored by the JSONL reader) and
+        truncates it away again, so it exercises the real file on the real
+        volume without mutating stored records. Used by the health checks
+        so an unwritable data directory cannot report healthy.
+        """
+        with self._lock:
+            path = self.persist_path
+            try:
+                path.parent.mkdir(parents=True, exist_ok=True)
+                existed = path.exists()
+                original_size = self._file_size() if existed else 0
+                with path.open("a", encoding="utf-8") as handle:
+                    handle.write("\n")
+                    handle.flush()
+                if existed:
+                    self._truncate_to(original_size)
+                else:
+                    try:
+                        path.unlink()
+                    except OSError:  # pragma: no cover - benign cleanup race
+                        pass
+            except OSError as exc:
+                logger.error(
+                    "event store write probe failed",
+                    extra={"persist_path": str(path)},
+                    exc_info=exc,
+                )
+                return {"ok": False, "persist_path": str(path), "error": f"{type(exc).__name__}: {exc}"}
+        return {"ok": True, "persist_path": str(path), "error": None}
 
     def update_many(self, records: Iterable[StoredEventRecord]) -> list[StoredEventRecord]:
         replacements = {record.record_id: record for record in records}
