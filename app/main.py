@@ -10,7 +10,7 @@ from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
 
 from . import tenancy
-from .auth import basic_auth_config_from_env
+from .auth import basic_auth_config_from_env, enforce_auth_requirement
 from .auth_middleware import auth_and_tenant_middleware
 from .build_info import APP_VERSION
 from .cors import cors_origins_for_app, cors_origins_from_env  # noqa: F401  (re-exported for tests)
@@ -26,6 +26,7 @@ logger = logging.getLogger("inflow_lab")
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    enforce_auth_requirement()
     if not basic_auth_config_from_env().enabled:
         logger.warning(
             "inflow-lab is starting WITHOUT authentication (REGENGINE_BASIC_AUTH_USERNAME/"

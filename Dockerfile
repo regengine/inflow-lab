@@ -2,7 +2,8 @@ FROM python:3.12-slim
 
 ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \
-    REGENGINE_DATA_DIR=/data
+    REGENGINE_DATA_DIR=/data \
+    REGENGINE_REQUIRE_AUTH=1
 
 WORKDIR /app
 ENV PATH="/app/.venv/bin:$PATH"
@@ -31,4 +32,8 @@ HEALTHCHECK --interval=30s --timeout=5s --start-period=15s --retries=3 \
   CMD python -c "import json, os, urllib.request; port=os.getenv('PORT', '8000'); json.load(urllib.request.urlopen(f'http://127.0.0.1:{port}/api/healthz', timeout=3))"
 
 ENTRYPOINT ["docker-entrypoint.sh"]
-CMD ["sh", "-c", "uvicorn app.main:app --host 0.0.0.0 --port ${PORT:-8000}"]
+# `sh -c` is required for ${PORT} expansion, but `exec` is required inside it:
+# without it the shell forks uvicorn and stays as the container's final process,
+# so SIGTERM (every redeploy/`docker stop`) never reaches uvicorn and the FastAPI
+# lifespan shutdown never runs. Do not drop the `exec`.
+CMD ["sh", "-c", "exec uvicorn app.main:app --host 0.0.0.0 --port ${PORT:-8000}"]

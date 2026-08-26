@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import os
 import sys
+from collections.abc import Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -17,6 +18,15 @@ from app.build_info import APP_VERSION
 
 
 DEFAULT_TENANT = "remote-smoke"
+# Hosts remote smoke is allowed to send the shared-demo Basic Auth secrets to.
+# A leading dot matches subdomains. `demo.example.com` is the RFC 2606 reserved
+# documentation domain used by the docs and the offline test transport; it is
+# not routable, so it cannot receive credentials.
+DEFAULT_ALLOWED_BASE_HOSTS = (
+    "regengine-inflow-lab-gh-production.up.railway.app",
+    "demo.example.com",
+)
+ALLOWED_HOSTS_ENV = "REGENGINE_REMOTE_ALLOWED_HOSTS"
 DEFAULT_UNTRUSTED_ORIGIN = "https://untrusted.example"
 FRESH_CUT_OUTPUT_LOT = "TLC-DEMO-FC-OUT-001"
 
@@ -88,7 +98,10 @@ def config_from_env(environ: dict[str, str] | None = None) -> RemoteSmokeConfig:
             "Missing required environment variables: " + ", ".join(missing)
         )
 
-    base_url = normalize_base_url(environ["REGENGINE_REMOTE_BASE_URL"])
+    base_url = normalize_base_url(
+        environ["REGENGINE_REMOTE_BASE_URL"],
+        allowed_hosts=allowed_base_hosts(environ),
+    )
     return RemoteSmokeConfig(
         base_url=base_url,
         username=environ["REGENGINE_REMOTE_USERNAME"],
@@ -386,7 +399,23 @@ def _sha_prefix_match(actual: str, expected: str) -> bool:
     return actual.startswith(expected) or expected.startswith(actual)
 
 
-def normalize_base_url(value: str) -> str:
+def allowed_base_hosts(environ: dict[str, str] | None = None) -> tuple[str, ...]:
+    """Hosts remote smoke may send the shared-demo Basic Auth secrets to.
+
+    The workflow_dispatch `base_url` input is free text, so without this the
+    dispatcher could point the run at a host they control and collect the live
+    REGENGINE_REMOTE_USERNAME/PASSWORD out of the Basic Auth header. Override
+    with REGENGINE_REMOTE_ALLOWED_HOSTS (comma separated, a leading dot matches
+    subdomains) -- an env var, so it cannot be set from a dispatch input.
+    """
+    environ = environ if environ is not None else os.environ
+    raw = (environ.get(ALLOWED_HOSTS_ENV) or "").strip()
+    if raw:
+        return tuple(item.strip().lower() for item in raw.split(",") if item.strip())
+    return DEFAULT_ALLOWED_BASE_HOSTS
+
+
+def normalize_base_url(value: str, allowed_hosts: Sequence[str] | None = None) -> str:
     base_url = value.strip().rstrip("/")
     parsed = urlparse(base_url)
     if parsed.scheme not in {"http", "https"} or not parsed.netloc:
@@ -394,7 +423,29 @@ def normalize_base_url(value: str) -> str:
             "REGENGINE_REMOTE_BASE_URL must be an HTTP(S) URL such as "
             "https://demo.example.com"
         )
+    hosts = tuple(allowed_hosts) if allowed_hosts is not None else allowed_base_hosts()
+    host = (parsed.hostname or "").strip().lower().rstrip(".")
+    if not _host_allowed(host, hosts):
+        raise RemoteSmokeFailure(
+            f"REGENGINE_REMOTE_BASE_URL host {host!r} is not allowed. Remote smoke "
+            "attaches the shared-demo Basic Auth credentials to every "
+            "authenticated request, so it only runs against "
+            f"{', '.join(hosts)}. Set {ALLOWED_HOSTS_ENV} to extend the allowlist."
+        )
     return base_url
+
+
+def _host_allowed(host: str, allowed_hosts: Sequence[str]) -> bool:
+    if not host:
+        return False
+    for entry in allowed_hosts:
+        entry = entry.strip().lower()
+        if entry.startswith("."):
+            if host == entry[1:] or host.endswith(entry):
+                return True
+        elif host == entry:
+            return True
+    return False
 
 
 def normalize_optional_origin(value: str | None) -> str | None:

@@ -2,8 +2,10 @@ from __future__ import annotations
 
 import hashlib
 import hmac
+import ipaddress
 import json
 import os
+import socket
 import uuid
 from dataclasses import dataclass
 from typing import Any
@@ -27,6 +29,167 @@ DEFAULT_LIVE_TIMEOUT_SECONDS = 30.0
 # pre-signing migration ramp on both sides.
 # Bandit B105 false positive: this is an env var key, not a secret literal.
 WEBHOOK_HMAC_SECRET_ENV = "REGENGINE_WEBHOOK_HMAC_SECRET"  # nosec B105
+
+# --- Egress restriction (SSRF / credential-exfiltration guard) -------------
+#
+# Delivery endpoints are caller-supplied (POST /api/integration/test, and the
+# inline `delivery` block accepted by the CSV-import, replay and demo-fixture
+# routes). Every outbound call carries the RegEngine API key and tenant id in
+# request headers, so an unrestricted endpoint is both an SSRF pivot and a
+# credential-exfiltration channel. Both outbound paths -- ingest() and
+# check_connection() -- validate the endpoint before sending anything.
+#
+# Optional strict allowlist: comma-separated hosts. A leading dot matches
+# subdomains (".regengine.co" allows "www.regengine.co"). When unset, any
+# public host is allowed but private/loopback/link-local destinations are not.
+ALLOWED_DELIVERY_HOSTS_ENV = "REGENGINE_ALLOWED_DELIVERY_HOSTS"
+# Escape hatch for developers pointing the simulator at a RegEngine stack
+# running on localhost (see scripts/customer_journey.py). Off by default.
+ALLOW_PRIVATE_DELIVERY_ENV = "REGENGINE_ALLOW_PRIVATE_DELIVERY_HOSTS"
+# DNS resolution of non-literal hosts can be disabled in sealed environments.
+DELIVERY_DNS_GUARD_ENV = "REGENGINE_DELIVERY_DNS_GUARD"
+
+_TRUTHY = frozenset({"1", "true", "yes", "on"})
+_BLOCKED_HOSTNAMES = frozenset(
+    {
+        "localhost",
+        "ip6-localhost",
+        "ip6-loopback",
+        "metadata",
+        "metadata.google.internal",
+        "instance-data",
+    }
+)
+_BLOCKED_HOST_SUFFIXES = (".localhost", ".internal", ".local")
+BLOCKED_ENDPOINT_VERDICT = "blocked_endpoint"
+
+
+class BlockedDeliveryEndpointError(ValueError):
+    """Raised when a delivery endpoint is not an allowed egress destination."""
+
+
+def _env_flag(name: str) -> bool:
+    return os.getenv(name, "").strip().lower() in _TRUTHY
+
+
+def _allowed_delivery_hosts() -> list[str]:
+    raw = os.getenv(ALLOWED_DELIVERY_HOSTS_ENV, "")
+    return [item.strip().lower() for item in raw.split(",") if item.strip()]
+
+
+def _host_matches_allowlist(host: str, allowlist: list[str]) -> bool:
+    for entry in allowlist:
+        if entry.startswith("."):
+            if host == entry[1:] or host.endswith(entry):
+                return True
+        elif host == entry:
+            return True
+    return False
+
+
+def _is_blocked_address(address: str) -> bool:
+    try:
+        ip = ipaddress.ip_address(address)
+    except ValueError:
+        return False
+    if ip.is_loopback or ip.is_private or ip.is_link_local or ip.is_reserved:
+        return True
+    return ip.is_multicast or ip.is_unspecified
+
+
+def _resolved_addresses(host: str) -> list[str]:
+    """Best-effort DNS resolution.
+
+    A host that does not resolve cannot be reached, so an unresolvable name is
+    not a bypass -- it is left to fail as an ordinary connection error rather
+    than being reported as a blocked endpoint.
+    """
+    try:
+        infos = socket.getaddrinfo(host, None, type=socket.SOCK_STREAM)
+    except (OSError, UnicodeError):
+        return []
+    return [info[4][0] for info in infos]
+
+
+def assert_delivery_endpoint_allowed(endpoint: str) -> None:
+    """Reject endpoints that are not permitted egress destinations.
+
+    Raises BlockedDeliveryEndpointError (a ValueError) before any request is
+    built, so no credential header is ever constructed for a blocked host.
+    """
+    parsed = urlparse(endpoint)
+    if parsed.scheme not in {"http", "https"}:
+        raise BlockedDeliveryEndpointError(
+            "Delivery endpoint must be an http(s) URL."
+        )
+    host = (parsed.hostname or "").strip().lower().rstrip(".")
+    if not host:
+        raise BlockedDeliveryEndpointError("Delivery endpoint must include a host.")
+
+    allowlist = _allowed_delivery_hosts()
+    if allowlist and not _host_matches_allowlist(host, allowlist):
+        raise BlockedDeliveryEndpointError(
+            f"Delivery endpoint host {host!r} is not in {ALLOWED_DELIVERY_HOSTS_ENV}."
+        )
+
+    if _env_flag(ALLOW_PRIVATE_DELIVERY_ENV):
+        return
+
+    if host in _BLOCKED_HOSTNAMES or host.endswith(_BLOCKED_HOST_SUFFIXES):
+        raise BlockedDeliveryEndpointError(
+            f"Delivery endpoint host {host!r} resolves to a local/internal "
+            "destination. Set "
+            f"{ALLOW_PRIVATE_DELIVERY_ENV}=1 only for a trusted local stack."
+        )
+
+    literal = host.strip("[]")
+    if _is_blocked_address(literal):
+        raise BlockedDeliveryEndpointError(
+            f"Delivery endpoint address {literal} is loopback/private/link-local "
+            "and is not an allowed destination. Set "
+            f"{ALLOW_PRIVATE_DELIVERY_ENV}=1 only for a trusted local stack."
+        )
+    try:
+        ipaddress.ip_address(literal)
+    except ValueError:
+        pass
+    else:
+        return  # Literal address already checked; nothing to resolve.
+
+    if os.getenv(DELIVERY_DNS_GUARD_ENV, "1").strip().lower() not in _TRUTHY:
+        return
+    for address in _resolved_addresses(host):
+        if _is_blocked_address(address):
+            raise BlockedDeliveryEndpointError(
+                f"Delivery endpoint host {host!r} resolves to {address}, which is "
+                "loopback/private/link-local and is not an allowed destination."
+            )
+
+
+def _response_error_detail(response: httpx.Response) -> str:
+    """RegEngine's error body as a short string, JSON or not.
+
+    Never raises: a non-JSON body degrades to raw text, and an unreadable body
+    degrades to an empty string.
+    """
+    try:
+        payload = response.json()
+    except Exception:  # noqa: BLE001 - any decode failure falls back to text
+        payload = None
+    if payload is not None:
+        if isinstance(payload, dict):
+            for key in ("detail", "message", "error"):
+                value = payload.get(key)
+                if isinstance(value, str) and value.strip():
+                    return value.strip()[:1000]
+        try:
+            return json.dumps(payload, separators=(",", ":"))[:1000]
+        except (TypeError, ValueError):
+            pass
+    try:
+        return (response.text or "").strip()[:1000]
+    except Exception:  # noqa: BLE001 - body already consumed/undecodable
+        return ""
 
 
 @dataclass(frozen=True, slots=True)
@@ -76,6 +239,8 @@ class LiveRegEngineClient:
         tenant_id = config.delivery.tenant_id
         if not api_key or not tenant_id:
             raise ValueError("Live delivery requires both api_key and tenant_id")
+        # Validate before any credential header is built.
+        assert_delivery_endpoint_allowed(endpoint)
 
         idempotency_key = idempotency_key or uuid.uuid4().hex
         # Serialize the body exactly once so the bytes we sign are the same
@@ -114,7 +279,13 @@ class LiveRegEngineClient:
         try:
             response.raise_for_status()
         except httpx.HTTPStatusError as exc:
-            raise LiveRegEngineDeliveryError(str(exc), metadata) from exc
+            # Keep RegEngine's own explanation (subscription status, rate-limit
+            # window, key scope) instead of httpx's bare status-line text.
+            detail = _response_error_detail(exc.response)
+            if detail:
+                metadata = metadata | {"error_body": detail}
+            message = f"{exc}: {detail}" if detail else str(exc)
+            raise LiveRegEngineDeliveryError(message, metadata) from exc
         return LiveIngestResult(response=response.json(), metadata=metadata)
 
     async def check_connection(self, config: SimulationConfig) -> ConnectionCheckResult:
@@ -130,6 +301,15 @@ class LiveRegEngineClient:
         tenant_id = config.delivery.tenant_id
         parsed = urlparse(endpoint)
         host = parsed.netloc
+        try:
+            assert_delivery_endpoint_allowed(endpoint)
+        except BlockedDeliveryEndpointError as exc:
+            # Refuse before credentials are placed in any header.
+            return ConnectionCheckResult(
+                verdict=BLOCKED_ENDPOINT_VERDICT,
+                detail=str(exc),
+                endpoint_host=host,
+            )
         if not api_key or not tenant_id:
             return ConnectionCheckResult(
                 verdict="not_configured",

