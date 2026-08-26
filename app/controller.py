@@ -149,19 +149,54 @@ class SimulationController:
             if not self.running and _engine_shaping_fields_changed(previous_config, config):
                 self.engine.reset(config.seed, scenario=config.scenario, scale=config.scale)
             if not self.running:
-                self._stop_event = asyncio.Event()
-                self._task = asyncio.create_task(self._run_loop())
+                stop_event = asyncio.Event()
+                self._stop_event = stop_event
+                self._task = asyncio.create_task(self._run_loop(stop_event))
         await self._publish_update()
 
     async def stop(self) -> None:
-        if not self.running:
-            return
-        self._stop_event.set()
-        task = self._task
-        if task is None:
-            return
+        # #156: the _task/_stop_event mutation below must happen under
+        # self._lock -- the same lock start() uses -- or a concurrent
+        # start() can land in the gap this used to leave open. The old
+        # body read self.running, set self._stop_event, and unconditionally
+        # cleared self._task with no lock at all, so a start() landing
+        # between "the awaited task finished" and "this coroutine resumed"
+        # would install its own task/event and then have both silently
+        # discarded by this method's own `self._task = None` -- orphaning
+        # a live run loop that nothing could ever reach again.
+        async with self._lock:
+            task = self._task
+            if task is None or task.done():
+                return
+            # Captured under the same lock as `task`, from the same read of
+            # self._task's generation -- start() always assigns
+            # self._stop_event and self._task together (see above), so this
+            # is guaranteed to be the event *this* task is actually waiting
+            # on, never a later start()'s fresh replacement.
+            stop_event = self._stop_event
+            stop_event.set()
+        # await the task OUTSIDE the lock. _run_loop calls self.step(),
+        # which itself does `async with self._lock` -- holding the lock
+        # here while awaiting the loop's own task would deadlock stop()
+        # against itself the instant the loop is mid-step (or about to
+        # start its next one): step() would block forever on a lock stop()
+        # is holding, while stop() blocks forever on a task that can now
+        # never finish stepping.
         await task
-        self._task = None
+        async with self._lock:
+            # The other half of #156's fix. While the lock was open across
+            # the `await task` above, a concurrent start() could have
+            # observed `running is False` (this task had just finished) and
+            # installed a fresh task + event of its own -- exactly the race
+            # this issue is about. Only clear self._task if it is still
+            # this exact task object: if start() already replaced it,
+            # self._task now names a different, live run loop, and clearing
+            # it here would orphan that loop the same way the original bug
+            # did. A mismatch makes this call a no-op for that new loop --
+            # left running and referenced, for a later stop() to reach.
+            if self._task is not task:
+                return
+            self._task = None
         await self._publish_update()
 
     async def shutdown(self) -> None:
@@ -774,14 +809,27 @@ class SimulationController:
                 metadata=metadata,
             )
 
-    async def _run_loop(self) -> None:
-        while not self._stop_event.is_set():
+    async def _run_loop(self, stop_event: asyncio.Event) -> None:
+        # Takes stop_event as a parameter, captured once, rather than
+        # re-reading self._stop_event on every iteration (#156, trap 2).
+        # start() assigns a fresh asyncio.Event to self._stop_event every
+        # time it launches a new loop; a loop that instead kept reading
+        # that attribute could have its stop signal swapped out from under
+        # it -- if this loop is still draining (finishing a step, or about
+        # to re-check this condition) when a *new* start() installs its own
+        # fresh, unset event, self._stop_event would no longer be the event
+        # this loop was actually told to stop with, and it would see
+        # "not asked to stop" again and keep going, resurrected by a
+        # start() call that has nothing to do with it. Capturing the one
+        # event this loop was created with, once, makes it deaf to any
+        # later generation's event by construction.
+        while not stop_event.is_set():
             await self.step(self.config.batch_size)
             if self.config.interval_seconds <= 0:
                 await asyncio.sleep(0)
             else:
                 try:
-                    await asyncio.wait_for(self._stop_event.wait(), timeout=self.config.interval_seconds)
+                    await asyncio.wait_for(stop_event.wait(), timeout=self.config.interval_seconds)
                 except asyncio.TimeoutError:
                     continue
 
