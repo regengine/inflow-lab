@@ -8,7 +8,7 @@
   --border-strong: #bcc9c0;
   --text: #101820;
   --muted: #52677a;
-  --accent: #059669;
+  --accent: #046b52;
   --accent-strong: #047857;
   --accent-soft: #dcfce7;
   --info: #2563eb;
@@ -56,7 +56,9 @@ a:focus-visible,
 input:focus-visible,
 select:focus-visible,
 summary:focus-visible {
-  outline: 3px solid rgba(0, 127, 115, 0.25);
+  /* Solid (not translucent) so the ring clears 3:1 against both light
+     panels and the dark header — see #176. */
+  outline: 3px solid #007f73;
   outline-offset: 2px;
 }
 
@@ -1485,7 +1487,7 @@ ol.go-live-steps {
 }
 
 .guide-steps li:focus-visible {
-  outline: 3px solid rgba(0, 127, 115, 0.25);
+  outline: 3px solid #007f73;
   outline-offset: 2px;
   border-color: #12805c;
 }

@@ -184,11 +184,14 @@ function renderGuide(status = state.status, events = state.events) {
     const key = step.dataset.guideStep;
     if (done[key]) {
       step.dataset.state = 'done';
+      step.removeAttribute('aria-current');
     } else if (!currentAssigned) {
       step.dataset.state = 'current';
+      step.setAttribute('aria-current', 'step');
       currentAssigned = true;
     } else {
       step.dataset.state = '';
+      step.removeAttribute('aria-current');
     }
   });
 }
@@ -351,7 +354,12 @@ function goToNextAction() {
 }
 
 function setStatus(message, tone = 'neutral', holdMs = 0) {
-  ids.statusMessage.textContent = message;
+  // #statusMessage is a live region (see index.html), so only touch its text
+  // when the message actually changes — renderSnapshot() calls this on every
+  // poll/stream tick, and re-writing identical text would re-announce it.
+  if (ids.statusMessage.textContent !== message) {
+    ids.statusMessage.textContent = message;
+  }
   ids.statusMessage.dataset.tone = tone;
   state.statusHoldUntil = holdMs > 0 ? Date.now() + holdMs : 0;
 }

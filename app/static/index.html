@@ -72,27 +72,27 @@
           <button class="button secondary guide-tour-btn" id="tourBtn" type="button">Take the tour</button>
         </header>
         <ol class="guide-steps">
-          <li data-guide-step="setup" data-guide-target=".compact-panel" data-state="current" tabindex="0">
+          <li data-guide-step="setup" data-guide-target=".compact-panel" data-state="current" role="button" aria-current="step" tabindex="0">
             <span class="guide-num">1</span>
             <strong>Set up the line</strong>
             <small>Pick an operation type and line profile — or just keep the defaults.</small>
           </li>
-          <li data-guide-step="data" data-guide-target=".run-panel" tabindex="0">
+          <li data-guide-step="data" data-guide-target=".run-panel" role="button" tabindex="0">
             <span class="guide-num">2</span>
             <strong>Bring in data</strong>
             <small>Click <em>Load today's line data</em> for a ready-made shift, or <em>Start line</em> to record live.</small>
           </li>
-          <li data-guide-step="delivery" data-guide-target=".delivery-monitor" tabindex="0">
+          <li data-guide-step="delivery" data-guide-target=".delivery-monitor" role="button" tabindex="0">
             <span class="guide-num">3</span>
             <strong>Watch delivery</strong>
             <small>Every event posts to RegEngine (sandbox until you connect). Failures show how to recover.</small>
           </li>
-          <li data-guide-step="trace" data-guide-target=".lineage-panel" tabindex="0">
+          <li data-guide-step="trace" data-guide-target=".lineage-panel" role="button" tabindex="0">
             <span class="guide-num">4</span>
             <strong>Trace a lot</strong>
             <small>Click any lot code in the shift log to follow it through the plant.</small>
           </li>
-          <li data-guide-step="export" data-guide-target=".evidence-panel" tabindex="0">
+          <li data-guide-step="export" data-guide-target=".evidence-panel" role="button" tabindex="0">
             <span class="guide-num">5</span>
             <strong>Export evidence</strong>
             <small>Download the FDA CSV or EPCIS package from the Evidence panel.</small>
@@ -106,7 +106,7 @@
           <h2>Watch the line, trace lots through the plant, and keep compliance records current.</h2>
         </div>
         <div class="quick-trace">
-          <input id="lotLookup" placeholder="Traceability Lot Code" />
+          <input id="lotLookup" aria-label="Traceability Lot Code" placeholder="Traceability Lot Code" />
           <button class="button secondary" type="button" onclick="document.getElementById('lineageBtn').click()">Trace lot</button>
         </div>
       </section>
@@ -175,7 +175,7 @@
               <span class="status-pill" id="runStatePill">Idle</span>
             </div>
             <p class="panel-help"><strong>Start line</strong> records events continuously; <strong>Record next batch</strong> (up top) does one batch at a time. <strong>Clear shift</strong> wipes this workspace's records so you can start fresh.</p>
-            <p class="note status-message" id="statusMessage">Ready.</p>
+            <p class="note status-message" id="statusMessage" role="status" aria-live="polite">Ready.</p>
             <div class="action-row">
               <button class="button" id="startBtn" type="button">Start line</button>
               <button class="button secondary" id="stopBtn" type="button">Pause line</button>
@@ -226,7 +226,7 @@
               <button class="button secondary" id="testConnectionBtn" type="button">Test connection</button>
               <button class="button secondary" id="saveIntegrationBtn" type="button">Save settings</button>
             </div>
-            <div id="connectionResult" class="connection-result"></div>
+            <div id="connectionResult" class="connection-result" role="status" aria-live="polite"></div>
             <details class="friction-details">
               <summary>Rehearse failure modes (sandbox only)</summary>
               <div class="friction-row">
@@ -406,7 +406,7 @@
             <div class="action-row">
               <button class="button secondary" id="importCsvBtn" type="button">Import CSV</button>
             </div>
-            <div id="importResults" class="import-results"></div>
+            <div id="importResults" class="import-results" role="status" aria-live="polite"></div>
           </section>
 
           <nav class="resource-links" aria-label="Resources">
