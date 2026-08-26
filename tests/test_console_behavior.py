@@ -29,7 +29,12 @@ client = TestClient(app)
 
 STATIC = Path(__file__).resolve().parents[1] / "app" / "static"
 INDEX_HTML = (STATIC / "index.html").read_text(encoding="utf-8")
-APP_JS = (STATIC / "app.js").read_text(encoding="utf-8")
+# The console ships as several ES modules (see issue #154). These assertions pin
+# console *behavior*, not file layout, so read every script as one corpus —
+# otherwise splitting app.js would silently stop enforcing them.
+APP_JS = "\n".join(
+    path.read_text(encoding="utf-8") for path in sorted(STATIC.glob("*.js"))
+)
 STYLES_CSS = (STATIC / "styles.css").read_text(encoding="utf-8")
 
 
