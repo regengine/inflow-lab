@@ -13,7 +13,7 @@ import httpx
 
 from .contract import INFLOW_CONTRACT_VERSION
 from .schemas.ingestion import IngestPayload
-from .schemas.simulation import SimulationConfig
+from .schemas.simulation import SimulationConfig, validate_egress_endpoint
 
 
 DEFAULT_LIVE_INGEST_ENDPOINT = "https://www.regengine.co/api/v1/webhooks/ingest"
@@ -76,6 +76,11 @@ class LiveRegEngineClient:
         tenant_id = config.delivery.tenant_id
         if not api_key or not tenant_id:
             raise ValueError("Live delivery requires both api_key and tenant_id")
+        # SSRF/credential-exfiltration guard — see validate_egress_endpoint's
+        # docstring. This is the enforcement point: the check has to sit
+        # immediately before the request, where the address it resolves is
+        # the address actually dialed.
+        validate_egress_endpoint(config.delivery.endpoint)
 
         idempotency_key = idempotency_key or uuid.uuid4().hex
         # Serialize the body exactly once so the bytes we sign are the same
@@ -136,6 +141,12 @@ class LiveRegEngineClient:
                 detail="Both an API key and a tenant id are required before testing the connection.",
                 endpoint_host=host,
             )
+        # SSRF/credential-exfiltration guard — see validate_egress_endpoint's
+        # docstring. Enforced here, immediately before the probe goes out, so
+        # the address checked is the address dialed. The caller (the /test
+        # route) turns a raised EgressBlockedError into a clean 4xx rather
+        # than letting it become an unhandled 500.
+        validate_egress_endpoint(config.delivery.endpoint)
 
         probe_url = f"{parsed.scheme}://{parsed.netloc}/api/v1/webhooks/recent"
         headers = {
