@@ -21,6 +21,17 @@ MIN_BATCH_EVENTS = 1
 MAX_BATCH_EVENTS = 500
 # Mirrors RegEngine's Pydantic timestamp validator: >24h in the future is rejected.
 MAX_FUTURE_HOURS = 24
+# Mirrors RegEngine's replay-window floor (webhook_router_v2/security.py's
+# _validate_event_timestamp_window, WEBHOOK_MAX_EVENT_AGE_DAYS, default 90):
+# an event timestamped further in the past than this is rejected with
+# "replay window exceeded" (#102). Unlike MAX_FUTURE_HOURS -- a Pydantic
+# field_validator that 422s the whole request (#101) -- live RegEngine
+# checks this per event *inside* the route handler, so a stale timestamp
+# only rejects that one event; the rest of the batch still succeeds. See
+# validate_event_like_regengine's `now` parameter and
+# MockRegEngineService's `enforce_event_age_window` for how the mock
+# applies it.
+MAX_EVENT_AGE_DAYS = 90
 # Mirrors RegEngine's idempotency-replay window: a repeated Idempotency-Key
 # within this many hours replays the stored response; once an entry ages
 # out it is treated as unseen rather than replayed (#120).
@@ -150,10 +161,12 @@ class MockRegEngineService:
 
     Unlike the original always-accept mock, this mirrors the live webhook's
     validation so the demo experience matches what a customer hits in the
-    wild: batch-size bounds, strict per-CTE KDE checks (exact key lookup,
-    no aliasing), the location-identifier requirement, in-batch duplicate
-    rejection, future-timestamp rejection, 24h idempotency replays, and
-    (when a shared secret is configured) HMAC-SHA256 signature verification.
+    wild: batch-size bounds, request-fatal field constraints that 422 the
+    whole batch (#101), strict per-CTE KDE checks (exact key lookup, no
+    aliasing), the location-identifier requirement, in-batch duplicate
+    rejection, an opt-in 90-day replay-window floor (#102), 24h idempotency
+    replays, and (when a shared secret is configured) HMAC-SHA256 signature
+    verification.
 
     ``chain_hash`` and the idempotency cache otherwise live only in process
     memory. Construct with ``store=`` to seed ``chain_hash`` from a
@@ -171,6 +184,7 @@ class MockRegEngineService:
         *,
         idempotency_ttl: timedelta = timedelta(hours=IDEMPOTENCY_TTL_HOURS),
         clock: Callable[[], datetime] = lambda: datetime.now(UTC),
+        enforce_event_age_window: bool = False,
     ) -> None:
         self._chain_hash = _resume_chain_hash(store) if store is not None else ""
         self._idempotency_cache: OrderedDict[str, _CachedIdempotencyEntry] = OrderedDict()
@@ -180,6 +194,23 @@ class MockRegEngineService:
         # (#120). Production callers get the real 24h window and wall clock.
         self.idempotency_ttl = idempotency_ttl
         self._clock = clock
+        # Off by default -- deliberately, not an oversight (#102). Turning
+        # this on unconditionally against the *default* wall-clock `clock`
+        # would reject every one of this repo's own fixed-date fixtures the
+        # instant real time drifts past them by more than
+        # MAX_EVENT_AGE_DAYS: app/demo_fixtures.py's three shipped
+        # DemoFixture entries, and the "2026-02-05"-style timestamp dozens
+        # of existing tests across the suite use as their canonical valid
+        # event, are already >90 days stale as of this writing. That is
+        # exactly the "green demo, failing live post" failure this
+        # simulator exists to avoid -- just inverted (a demo that now fails
+        # on its own bundled data instead of passing data live would
+        # reject). The check itself is fully implemented and correct (see
+        # validate_event_like_regengine's `now` parameter); a caller that
+        # wants it live -- this test suite, or a future caller with a
+        # source of non-stale demo data -- opts in explicitly here and
+        # supplies `clock=` to control what "now" means for it.
+        self._enforce_event_age_window = enforce_event_age_window
 
     def reset(self) -> None:
         self._chain_hash = ""
@@ -219,6 +250,25 @@ class MockRegEngineService:
                 f"events accepts at most {MAX_BATCH_EVENTS} items per batch",
             )
 
+        # #101: traceability_lot_code/product_description/quantity length
+        # and range, and the future-timestamp ceiling, are Pydantic
+        # Field()/field_validator constraints on RegEngine's real
+        # IngestEvent model -- FastAPI evaluates them while parsing the
+        # request body, before the route handler (and thus before any
+        # idempotency-key or per-event handling) ever runs. A violation
+        # anywhere in the batch 422s the ENTIRE request live, not just the
+        # offending event, so scan the whole batch up front and fail the
+        # same way -- these must never fall into the per-event
+        # accepted/rejected split below, which would show the "N accepted,
+        # 1 rejected" partial success live loses the whole batch instead.
+        field_errors = [
+            f"events[{index}]: {message}"
+            for index, event in enumerate(payload.events)
+            for message in _field_constraint_errors(event)
+        ]
+        if field_errors:
+            raise MockRegEngineHTTPError(422, "; ".join(field_errors))
+
         now = self._clock()
         if idempotency_key and idempotency_key in self._idempotency_cache:
             cached = self._idempotency_cache[idempotency_key]
@@ -230,12 +280,22 @@ class MockRegEngineService:
             # through to ingest normally -- a fresh entry is cached below.
             del self._idempotency_cache[idempotency_key]
 
+        # #102: the replay-window floor is handler-level in live RegEngine
+        # (checked per event, inside the route, after the request body has
+        # already passed Pydantic validation above) -- it rejects only the
+        # stale event, not the batch. Only fed a real `now` when this
+        # instance opted into enforce_event_age_window (reusing the same
+        # `now` this call already resolved above, rather than calling
+        # self._clock() again); see __init__ for why that is off by
+        # default.
+        age_check_now = now if self._enforce_event_age_window else None
+
         response_events: list[IngestResponseEvent] = []
         accepted = 0
         rejected = 0
         seen_batch_keys: set[str] = set()
         for event in payload.events:
-            errors = validate_event_like_regengine(event)
+            errors = _handler_level_errors(event, now=age_check_now)
             batch_key = "|".join(
                 (
                     event.cte_type.value,
@@ -292,14 +352,54 @@ class MockRegEngineService:
         return response
 
 
-def validate_event_like_regengine(event: RegEngineEvent) -> list[str]:
-    """Per-event checks mirroring RegEngine's webhook validation.
+def validate_event_like_regengine(
+    event: RegEngineEvent, *, now: datetime | None = None
+) -> list[str]:
+    """Every check mirroring RegEngine's webhook validation for one event.
+
+    Combines two tiers that live RegEngine draws a hard line between (see
+    _field_constraint_errors and _handler_level_errors below) into the one
+    flat list this function has always returned, so existing callers that
+    just want "is this event valid" for a single event in isolation see no
+    change. MockRegEngineService.ingest() itself does NOT call this
+    directly -- #101 means it needs the two tiers kept apart (a field
+    constraint 422s the whole batch; a handler-level issue rejects only
+    this event), so it calls the two halves separately instead.
 
     Uses the same merged namespace RegEngine builds (top-level fields plus
     the kdes dict) with strict string lookup — deliberately NOT the lenient
     aliasing in cte_rules.merged_event_values, because the live validator
     does not alias (e.g. reference_document_type never satisfies
     reference_document).
+
+    ``now`` is the #102 replay-window floor's reference clock, forwarded
+    to _handler_level_errors -- see that function's docstring. Defaults to
+    None (age check skipped) so every pre-existing direct caller of this
+    function keeps its exact current behavior.
+    """
+    return _field_constraint_errors(event) + _handler_level_errors(event, now=now)
+
+
+def _field_constraint_errors(event: RegEngineEvent) -> list[str]:
+    """The four checks that are Pydantic Field()/field_validator constraints
+    on RegEngine's real IngestEvent model, not application/handler logic --
+    traceability_lot_code and product_description length, quantity's
+    positivity, and the future-timestamp ceiling (#101). FastAPI evaluates
+    these while parsing the request body, before RegEngine's route handler
+    runs at all, so live rejects the ENTIRE batch with 422 the instant any
+    one event trips one of these -- never a per-event "rejected" result
+    alongside other events accepted. MockRegEngineService.ingest() scans
+    every event in the batch with this function up front for exactly that
+    reason; see its docstring there.
+
+    No `now` parameter, unlike _handler_level_errors: the future-timestamp
+    ceiling always compares against the real wall clock, matching this
+    function's behavior before #102 split it out. Do not change this to
+    accept an injectable `now` without first checking
+    tests/test_mock_parity.py's #120 TTL-boundary test, which injects a
+    clock deliberately far from its events' fixed timestamps for
+    idempotency purposes only and would misfire against this check if it
+    started honoring that same clock.
     """
     errors: list[str] = []
 
@@ -315,6 +415,35 @@ def validate_event_like_regengine(event: RegEngineEvent) -> list[str]:
         timestamp = timestamp.replace(tzinfo=UTC)
     if timestamp > datetime.now(UTC) + timedelta(hours=MAX_FUTURE_HOURS):
         errors.append(f"timestamp is more than {MAX_FUTURE_HOURS} hours in the future")
+    return errors
+
+
+def _handler_level_errors(event: RegEngineEvent, *, now: datetime | None = None) -> list[str]:
+    """Checks RegEngine applies per event, inside the route handler, after
+    the request body as a whole has already passed Pydantic validation: the
+    location-identifier requirement, required KDEs per CTE type, and
+    (#102) the 90-day replay-window floor. A violation here rejects only
+    this one event -- unlike _field_constraint_errors, the rest of the
+    batch is unaffected.
+
+    ``now`` gates the replay-window floor specifically: when None (the
+    default), the age check is skipped entirely, matching this codebase's
+    behavior before #102. A caller that wants it enforced passes the
+    reference time to compare against -- MockRegEngineService.ingest()
+    does this only when constructed with enforce_event_age_window=True,
+    using its own injectable clock (#120's pattern) rather than a bare
+    datetime.now(UTC) call, so a test can cross the boundary deterministically.
+    """
+    errors: list[str] = []
+
+    timestamp = event.timestamp
+    if timestamp.tzinfo is None:
+        timestamp = timestamp.replace(tzinfo=UTC)
+    if now is not None and timestamp < now - timedelta(days=MAX_EVENT_AGE_DAYS):
+        errors.append(
+            f"timestamp is older than WEBHOOK_MAX_EVENT_AGE_DAYS={MAX_EVENT_AGE_DAYS} "
+            "— replay window exceeded"
+        )
 
     available = _strict_merged_values(event)
     has_location = any(
