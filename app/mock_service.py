@@ -4,18 +4,24 @@ import hashlib
 import json
 from collections import OrderedDict
 from datetime import UTC, datetime, timedelta
-from typing import Any
+from typing import Any, Callable, NamedTuple
 from uuid import uuid4
 
 from .cte_rules import REQUIRED_KDES
-from .schemas.domain import RegEngineEvent
+from .schemas.domain import DestinationMode, RegEngineEvent
 from .schemas.ingestion import IngestPayload, IngestResponseEvent, MockIngestResponse
+from .store import EventStore
 
 
 # Mirrors RegEngine's WebhookPayload constraint: events accepts 1-500 items.
+MIN_BATCH_EVENTS = 1
 MAX_BATCH_EVENTS = 500
 # Mirrors RegEngine's Pydantic timestamp validator: >24h in the future is rejected.
 MAX_FUTURE_HOURS = 24
+# Mirrors RegEngine's idempotency-replay window: a repeated Idempotency-Key
+# within this many hours replays the stored response; once an entry ages
+# out it is treated as unseen rather than replayed (#120).
+IDEMPOTENCY_TTL_HOURS = 24
 # Mirrors RegEngine's model-level location validator: at least one of these
 # must be present (top-level or KDE) for the event to be accepted.
 LOCATION_KDE_FIELDS = (
@@ -53,19 +59,74 @@ class MockRegEngineHTTPError(Exception):
         self.detail = detail
 
 
+class _CachedIdempotencyEntry(NamedTuple):
+    """One idempotency-cache slot: the response to replay and when it landed.
+
+    ``inserted_at`` is stamped from the service's injectable clock rather
+    than a bare ``datetime.now(UTC)`` call, so a test can advance time
+    deterministically to exercise the 24h boundary instead of sleeping
+    through it (#120).
+    """
+
+    response: MockIngestResponse
+    inserted_at: datetime
+
+
+def _resume_chain_hash(store: EventStore) -> str:
+    """Reconstruct the mock's chain_hash lineage from the store's persisted log.
+
+    Mirrors EventStore._load_from_disk's own resume-from-disk pattern (see
+    app/store.py) so a process restart continues the same hash chain
+    instead of forking a fresh one from "" (#122). Records are walked
+    newest-first by sequence_no; the first one that is both mock-delivered
+    and accepted wins its chain_hash -- live-delivered records carry
+    RegEngine's own unrelated chain, and rejected records carry none, so
+    neither can stand in for the mock's own lineage tip.
+    """
+    records = sorted(store.read_persisted_records(), key=lambda record: record.sequence_no)
+    for record in reversed(records):
+        if record.destination_mode != DestinationMode.MOCK:
+            continue
+        chain_hash = (record.delivery_response or {}).get("chain_hash")
+        if isinstance(chain_hash, str) and chain_hash:
+            return chain_hash
+    return ""
+
+
 class MockRegEngineService:
     """In-process stand-in for RegEngine's POST /api/v1/webhooks/ingest.
 
     Unlike the original always-accept mock, this mirrors the live webhook's
     validation so the demo experience matches what a customer hits in the
-    wild: strict per-CTE KDE checks (exact key lookup, no aliasing), the
-    location-identifier requirement, batch caps, in-batch duplicate
+    wild: batch-size bounds, strict per-CTE KDE checks (exact key lookup,
+    no aliasing), the location-identifier requirement, in-batch duplicate
     rejection, future-timestamp rejection, and 24h idempotency replays.
+
+    ``chain_hash`` and the idempotency cache otherwise live only in process
+    memory. Construct with ``store=`` to seed ``chain_hash`` from a
+    persisted event log so a restart resumes the same lineage instead of
+    forking a new one from "" (#122). The idempotency cache is
+    deliberately NOT reloaded from disk: it is a best-effort, per-process
+    replay guard, and losing a few hours of it on restart just means one
+    retry re-ingests as new -- far cheaper than persisting every
+    idempotency key indefinitely.
     """
 
-    def __init__(self) -> None:
-        self._chain_hash = ""
-        self._idempotency_cache: OrderedDict[str, MockIngestResponse] = OrderedDict()
+    def __init__(
+        self,
+        store: EventStore | None = None,
+        *,
+        idempotency_ttl: timedelta = timedelta(hours=IDEMPOTENCY_TTL_HOURS),
+        clock: Callable[[], datetime] = lambda: datetime.now(UTC),
+    ) -> None:
+        self._chain_hash = _resume_chain_hash(store) if store is not None else ""
+        self._idempotency_cache: OrderedDict[str, _CachedIdempotencyEntry] = OrderedDict()
+        # Plain instance attributes (not module constants captured at import
+        # time) so a test can inject a short TTL and/or a controllable clock
+        # to cross the replay boundary deterministically, without sleeping
+        # (#120). Production callers get the real 24h window and wall clock.
+        self.idempotency_ttl = idempotency_ttl
+        self._clock = clock
 
     def reset(self) -> None:
         self._chain_hash = ""
@@ -82,15 +143,27 @@ class MockRegEngineService:
             if failure is not None:
                 raise MockRegEngineHTTPError(*failure)
 
+        if len(payload.events) < MIN_BATCH_EVENTS:
+            raise MockRegEngineHTTPError(
+                422,
+                f"events accepts at least {MIN_BATCH_EVENTS} item per batch",
+            )
         if len(payload.events) > MAX_BATCH_EVENTS:
             raise MockRegEngineHTTPError(
                 422,
                 f"events accepts at most {MAX_BATCH_EVENTS} items per batch",
             )
 
+        now = self._clock()
         if idempotency_key and idempotency_key in self._idempotency_cache:
-            self._idempotency_cache.move_to_end(idempotency_key)
-            return self._idempotency_cache[idempotency_key]
+            cached = self._idempotency_cache[idempotency_key]
+            if now - cached.inserted_at < self.idempotency_ttl:
+                self._idempotency_cache.move_to_end(idempotency_key)
+                return cached.response
+            # Past the replay window: RegEngine treats the key as unseen
+            # rather than replaying a stale result, so drop it and fall
+            # through to ingest normally -- a fresh entry is cached below.
+            del self._idempotency_cache[idempotency_key]
 
         response_events: list[IngestResponseEvent] = []
         accepted = 0
@@ -143,10 +216,12 @@ class MockRegEngineService:
             rejected=rejected,
             total=accepted + rejected,
             events=response_events,
-            ingestion_timestamp=datetime.now(UTC),
+            ingestion_timestamp=now,
         )
         if idempotency_key:
-            self._idempotency_cache[idempotency_key] = response
+            self._idempotency_cache[idempotency_key] = _CachedIdempotencyEntry(
+                response=response, inserted_at=now
+            )
             while len(self._idempotency_cache) > _IDEMPOTENCY_CACHE_LIMIT:
                 self._idempotency_cache.popitem(last=False)
         return response

@@ -25,7 +25,9 @@ TENANT_DATA_ROOT = DATA_ROOT / "tenants"
 engine = LegitFlowEngine(seed=204)
 store = EventStore(persist_path=str(DATA_ROOT / "events.jsonl"))
 scenario_saves = ScenarioSaveStore(save_dir=str(DATA_ROOT / "scenario_saves"))
-mock_service = MockRegEngineService()
+# Seed the mock's hash chain from what is already persisted, so a restart
+# continues the chain instead of forking a second one from an empty hash.
+mock_service = MockRegEngineService(store=store)
 controller = SimulationController(
     engine=engine,
     store=store,
@@ -223,6 +225,6 @@ def _create_tenant_controller(tenant_id: str) -> SimulationController:
         engine=tenant_engine,
         store=tenant_store,
         scenario_saves=tenant_saves,
-        mock_service=MockRegEngineService(),
+        mock_service=MockRegEngineService(store=tenant_store),
         live_client=LiveRegEngineClient(),
     )

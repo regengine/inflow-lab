@@ -17,6 +17,7 @@ from ..fda_export import (
     list_fda_export_preset_summaries,
     render_fda_request_csv,
 )
+from ..mock_service import MockRegEngineHTTPError
 from ..schemas.domain import FDAExportPreset
 from ..schemas.exports import FDAExportPresetListResponse, FDAExportPresetSummary
 from ..schemas.ingestion import IngestPayload, MockIngestResponse
@@ -30,7 +31,17 @@ async def mock_regengine_ingest(
     payload: IngestPayload,
     active_controller: SimulationController = Depends(get_active_controller),
 ) -> MockIngestResponse:
-    return active_controller.mock_service.ingest(payload)
+    # mock_service.ingest() raises MockRegEngineHTTPError for request-level
+    # rejections (e.g. a >500-event batch) that mirror a live non-2xx
+    # RegEngine response. Nothing else in the app registers a handler for
+    # that exception type, so left uncaught it becomes an unhandled 500
+    # instead of the descriptive 4xx a real caller gets (#142). Other
+    # callers of ingest() (step/replay/csv-import/fixtures, via
+    # SimulationController._deliver_payload) already catch it themselves.
+    try:
+        return active_controller.mock_service.ingest(payload)
+    except MockRegEngineHTTPError as exc:
+        raise HTTPException(status_code=exc.status_code, detail=exc.detail) from exc
 
 
 @router.get("/export/presets", response_model=FDAExportPresetListResponse)
