@@ -26,6 +26,18 @@ def _scrub_secrets(value: Any) -> Any:
     return value
 
 
+def _serialize_record(record: StoredEventRecord) -> str:
+    """Render one record as the JSONL line that goes on disk.
+
+    This is the single choke point every persisted-record write path funnels
+    through (append in ``add_many``, rewrite in ``update_many``/
+    ``replace_all``). Routing them all through the same function is what
+    keeps the ``_scrub_secrets`` pass from drifting out of sync between an
+    append and a rewrite of the same record.
+    """
+    return json.dumps(_scrub_secrets(record.model_dump(mode="json")))
+
+
 def mask_secret_in_string(message: str | None, secret: str | None) -> str | None:
     if message is None or not secret:
         return message
@@ -117,15 +129,45 @@ class EventStore:
                 self.persist_path.unlink()
             self.persist_path.parent.mkdir(parents=True, exist_ok=True)
 
+    def _write_records(self, records_oldest_first: Iterable[StoredEventRecord]) -> None:
+        """Rewrite ``persist_path`` atomically from a full oldest-first list.
+
+        Shared by ``update_many``/``replace_all`` so a rewrite always goes
+        through ``_serialize_record`` — the scrub can't be forgotten on one
+        path and not the other. The write itself lands via a ``.tmp`` +
+        ``replace`` swap, so ``persist_path`` on disk is always either the
+        old file or the fully-written new one, never a half-written file,
+        no matter where in the loop a write failure happens.
+
+        Private, and assumes the caller already holds ``self._lock`` for the
+        surrounding read-modify-write — it does not take the lock itself, so
+        callers can invoke it without any reentrant-locking hazard. It says
+        nothing about in-memory state: this only guarantees the file: each
+        caller is responsible for its own ordering of ``_set_records``/
+        ``_counter`` around the call.
+        """
+        self.persist_path.parent.mkdir(parents=True, exist_ok=True)
+        tmp_path = self.persist_path.with_suffix(f"{self.persist_path.suffix}.tmp")
+        with tmp_path.open("w", encoding="utf-8") as handle:
+            for record in records_oldest_first:
+                handle.write(_serialize_record(record) + "\n")
+        tmp_path.replace(self.persist_path)
+
     def add_many(self, records: Iterable[StoredEventRecord]) -> list[StoredEventRecord]:
         stored: list[StoredEventRecord] = []
         with self._lock:
             with self.persist_path.open("a", encoding="utf-8") as handle:
                 for record in records:
-                    self._counter += 1
-                    record.sequence_no = self._counter
+                    next_sequence_no = self._counter + 1
+                    record.sequence_no = next_sequence_no
+                    handle.write(_serialize_record(record) + "\n")
+                    # Commit to memory only once the line is actually on disk.
+                    # A write that fails partway through a batch (full disk,
+                    # detached volume, permission change) must not leave a
+                    # phantom record that recent()/stats() report until the
+                    # next reload silently drops it again.
+                    self._counter = next_sequence_no
                     self._records.appendleft(record)
-                    handle.write(json.dumps(_scrub_secrets(record.model_dump(mode="json"))) + "\n")
                     stored.append(record)
         return stored
 
@@ -147,11 +189,7 @@ class EventStore:
 
             self._set_records(updated_records)
             persisted_records = sorted(updated_records, key=lambda record: record.sequence_no)
-            tmp_path = self.persist_path.with_suffix(f"{self.persist_path.suffix}.tmp")
-            with tmp_path.open("w", encoding="utf-8") as handle:
-                for record in persisted_records:
-                    handle.write(json.dumps(record.model_dump(mode="json")) + "\n")
-            tmp_path.replace(self.persist_path)
+            self._write_records(persisted_records)
             self._counter = max((record.sequence_no for record in persisted_records), default=0)
 
         return [record for record in updated_records if record.record_id in replacements]
@@ -159,12 +197,7 @@ class EventStore:
     def replace_all(self, records: Iterable[StoredEventRecord]) -> list[StoredEventRecord]:
         persisted_records = sorted(list(records), key=lambda record: record.sequence_no)
         with self._lock:
-            self.persist_path.parent.mkdir(parents=True, exist_ok=True)
-            tmp_path = self.persist_path.with_suffix(f"{self.persist_path.suffix}.tmp")
-            with tmp_path.open("w", encoding="utf-8") as handle:
-                for record in persisted_records:
-                    handle.write(json.dumps(record.model_dump(mode="json")) + "\n")
-            tmp_path.replace(self.persist_path)
+            self._write_records(persisted_records)
             self._set_records(persisted_records)
             self._counter = max((record.sequence_no for record in persisted_records), default=0)
         return persisted_records
