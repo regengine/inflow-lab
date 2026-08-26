@@ -14,10 +14,22 @@ import httpx
 from .contract import INFLOW_CONTRACT_VERSION
 from .schemas.ingestion import IngestPayload
 from .schemas.simulation import SimulationConfig, validate_egress_endpoint
+# Same masking convention store.py persists with and controller.py logs
+# with -- see _extract_error_body below (#138).
+from .store import mask_secret_in_payload, mask_secret_in_string
 
 
 DEFAULT_LIVE_INGEST_ENDPOINT = "https://www.regengine.co/api/v1/webhooks/ingest"
 DEFAULT_LIVE_TIMEOUT_SECONDS = 30.0
+
+# Cap on how much of a failed live ingest's response body (#138) is kept
+# in the raised error / delivery_metadata. RegEngine's real validation
+# errors are compact per-event JSON, comfortably under this; the cap is
+# for the pathological case -- an HTML error page from a misconfigured
+# proxy, or an oversized body some other layer streams back -- so one bad
+# response can't bloat the stored event record or the console log without
+# limit.
+_MAX_ERROR_BODY_CHARS = 4000
 
 # Env var used to share an HMAC secret with the RegEngine ingest service.
 # When set, every live ingest request is signed with HMAC-SHA256 over the
@@ -119,7 +131,16 @@ class LiveRegEngineClient:
         try:
             response.raise_for_status()
         except httpx.HTTPStatusError as exc:
-            raise LiveRegEngineDeliveryError(str(exc), metadata) from exc
+            # #138: str(exc) alone is only httpx's generic status-line text
+            # (e.g. "Client error '402 Payment Required' for url ...") --
+            # RegEngine's actual per-event rejection reason lives in the
+            # response body, which used to be discarded here. Attach it
+            # (masked and bounded -- see _extract_error_body) to both the
+            # raised message and the metadata so the console and the
+            # stored delivery record show *why*, not just the status code.
+            error_body = _extract_error_body(exc.response, api_key)
+            message = f"{exc} | RegEngine response: {error_body}" if error_body else str(exc)
+            raise LiveRegEngineDeliveryError(message, metadata | {"error_body": error_body}) from exc
         return LiveIngestResult(response=response.json(), metadata=metadata)
 
     async def check_connection(self, config: SimulationConfig) -> ConnectionCheckResult:
@@ -204,6 +225,52 @@ async def _fetch_remote_contract_version(client: httpx.AsyncClient, parsed) -> s
         return None
     value = payload.get("inflow_contract_version")
     return str(value) if value is not None else None
+
+
+def _extract_error_body(response: httpx.Response, api_key: str | None) -> str:
+    """Best-effort, masked, bounded rendering of RegEngine's error body.
+
+    RegEngine's real validation failures come back as JSON carrying
+    per-event rejection reasons (see the webhook contract this pins
+    against) -- that detail is what an operator actually needs to fix a
+    failed live delivery, and #138 is exactly that it used to be thrown
+    away in favor of httpx's generic status-line text.
+
+    Two hard constraints this enforces before the text goes anywhere:
+    - Masked. RegEngine's body can echo request details back inside free
+      text (e.g. an "invalid key <value>" detail message), so this cannot
+      rely on store.py's _scrub_secrets alone -- that only redacts a
+      secret sitting in a field literally named api_key/authorization/etc
+      at persistence time, not one embedded in prose anywhere else. This
+      uses the same mask_secret_in_payload/mask_secret_in_string store.py
+      and controller.py already mask with, which strip the configured key
+      by value, wherever it appears, before this ever leaves the client.
+    - Bounded. A non-JSON error body (an HTML error page from a
+      misconfigured proxy, for instance) could be arbitrarily large;
+      _MAX_ERROR_BODY_CHARS caps what is kept so a pathological response
+      can't bloat the raised message or the stored delivery record.
+
+    Never raises: a body that is not JSON and cannot be decoded as text
+    degrades to a placeholder rather than masking the original
+    HTTPStatusError behind a secondary exception.
+    """
+    try:
+        parsed: Any = response.json()
+    except ValueError:
+        parsed = None
+
+    if parsed is not None:
+        text = json.dumps(mask_secret_in_payload(parsed, api_key), sort_keys=True)
+    else:
+        try:
+            text = mask_secret_in_string(response.text, api_key) or ""
+        except Exception:
+            return "<error body unavailable>"
+
+    if len(text) > _MAX_ERROR_BODY_CHARS:
+        omitted = len(text) - _MAX_ERROR_BODY_CHARS
+        text = f"{text[:_MAX_ERROR_BODY_CHARS]}... [truncated, {omitted} more chars]"
+    return text
 
 
 def _build_signature_header(body_bytes: bytes) -> str | None:
