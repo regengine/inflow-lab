@@ -13,7 +13,9 @@ from .contract import INFLOW_CONTRACT_VERSION
 from .csv_importer import parse_csv_import
 from .delivery import (
     DeliveryOutcome,
+    aggregate_outcomes,
     build_stored_records,
+    chunk_events,
     deliver_payload,
     event_delivery_fields,
     pair_event_responses,
@@ -171,20 +173,45 @@ class SimulationController:
         return self._revision
 
     async def start(self, config: SimulationConfig) -> None:
+        """Apply `config` and make sure a run loop is running under it.
+
+        Starting an already-running simulation with a different scenario,
+        seed, scale or persist path used to assign the new config while
+        leaving the old engine running: `status()` reported the new scenario
+        (and audited accumulated events against it) while
+        `stats.engine.scenario` still reported the old one, so one payload
+        contradicted itself (#96). The engine-shaping fields are now applied
+        the same way `load_demo_fixture` applies them -- stop the loop, swap
+        the config, reset the engine, restart -- so the two halves of a
+        status response can never disagree.
+
+        `batch_size` and `interval_seconds` stay live-adjustable: they shape
+        the loop's pacing, not the events it generates, so changing them does
+        not restart anything.
+        """
         async with self._lifecycle_lock:
-            was_running = self.running
             async with self._lock:
+                config = self._preserve_delivery_credentials(config)
                 _validate_live_delivery(config.delivery)
                 previous_config = self.config
+            engine_changed = (
+                config.seed != previous_config.seed
+                or config.scenario != previous_config.scenario
+                or config.scale != previous_config.scale
+            )
+            storage_changed = config.persist_path != previous_config.persist_path
+            was_running = self.running
+            if was_running and (engine_changed or storage_changed):
+                # Stopping happens outside `_lock` on purpose: the run loop
+                # takes `_lock` in `step()`, so awaiting it while holding the
+                # lock would deadlock.
+                await self._stop_run_loop()
+            async with self._lock:
                 self.config = config
                 self.store.configure(config.persist_path)
-                if not was_running and (
-                    config.seed != previous_config.seed
-                    or config.scenario != previous_config.scenario
-                    or config.scale != previous_config.scale
-                ):
+                if engine_changed:
                     self.engine.reset(config.seed, scenario=config.scenario, scale=config.scale)
-            if not was_running:
+            if not self.running:
                 self._launch_run_loop()
         await self._publish_update()
 
@@ -225,7 +252,7 @@ class SimulationController:
             await self._stop_run_loop()
             async with self._lock:
                 if config is not None:
-                    self.config = config
+                    self.config = self._preserve_delivery_credentials(config)
                 self.store.configure(self.config.persist_path)
                 self.engine.reset(self.config.seed, scenario=self.config.scenario, scale=self.config.scale)
                 self.store.reset()
@@ -311,9 +338,15 @@ class SimulationController:
             )
         else:
             # Delivery happens outside the controller lock; a slow live
-            # endpoint must not block start/stop/status.
-            payload = IngestPayload(source=source, events=events)
-            outcome = await self._deliver_payload(payload, replay_config)
+            # endpoint must not block start/stop/status. Replaying a store
+            # that has grown past the 500-event batch cap is the steady state
+            # on a volume-backed deployment, so the read is delivered in
+            # slices rather than as one oversized payload (#103).
+            chunk_outcomes = []
+            for chunk in chunk_events(events):
+                chunk_payload = IngestPayload(source=source, events=chunk)
+                chunk_outcomes.append(await self._deliver_payload(chunk_payload, replay_config))
+            outcome = aggregate_outcomes(chunk_outcomes)
             replay_status = {
                 "posted": "posted",
                 "failed": "failed",
@@ -359,16 +392,28 @@ class SimulationController:
         outcome = DeliveryOutcome()
         stored_records: list[StoredEventRecord] = []
         if parsed.events:
-            # Delivery runs without the controller lock held.
-            payload = IngestPayload(source=source, events=parsed.events)
-            outcome = await self._deliver_payload(payload, import_config)
-            stored_records = build_stored_records(
-                source=source,
-                events=parsed.events,
-                parent_lot_codes=parsed.parent_lot_codes,
-                delivery_mode=delivery.mode,
-                outcome=outcome,
-            )
+            # Delivery runs without the controller lock held, and in slices
+            # RegEngine will accept: a single payload above the 500-event cap
+            # used to 422 and lose the entire import (#103).
+            chunk_outcomes: list[DeliveryOutcome] = []
+            offset = 0
+            for chunk in chunk_events(parsed.events):
+                payload = IngestPayload(source=source, events=chunk)
+                chunk_outcome = await self._deliver_payload(payload, import_config)
+                chunk_outcomes.append(chunk_outcome)
+                # Records are built from the chunk that carried them, so each
+                # keeps its own idempotency key and its own per-event verdict.
+                stored_records.extend(
+                    build_stored_records(
+                        source=source,
+                        events=chunk,
+                        parent_lot_codes=parsed.parent_lot_codes[offset : offset + len(chunk)],
+                        delivery_mode=delivery.mode,
+                        outcome=chunk_outcome,
+                    )
+                )
+                offset += len(chunk)
+            outcome = aggregate_outcomes(chunk_outcomes)
             async with self._lock:
                 await self._persist_new_records(stored_records)
 
@@ -418,7 +463,7 @@ class SimulationController:
             await self._stop_run_loop()
             async with self._lock:
                 source = request.source or self.config.source
-                delivery = request.delivery or self.config.delivery
+                delivery = self._merge_delivery_credentials(request.delivery)
                 _validate_live_delivery(delivery)
                 self.config = self.config.model_copy(
                     update={
@@ -532,7 +577,7 @@ class SimulationController:
     ) -> DeliveryRetryResponse:
         request = request or DeliveryRetryRequest()
         async with self._lock:
-            delivery = request.delivery or self.config.delivery
+            delivery = self._merge_delivery_credentials(request.delivery)
             base_config = self.config.model_copy(deep=True)
             candidates = self.store.failed_delivery_records(request.record_ids, limit=request.limit)
             requested = len(request.record_ids) if request.record_ids else len(candidates)
@@ -573,7 +618,7 @@ class SimulationController:
             for record in candidates:
                 source = request.source or record.payload_source
                 idempotency_key = (
-                    _stored_idempotency_key(record)
+                    _retry_idempotency_key(record)
                     if delivery.mode != DestinationMode.NONE
                     else None
                 )
@@ -640,6 +685,46 @@ class SimulationController:
             )
         await self._publish_update()
         return result
+
+    def _preserve_delivery_credentials(self, config: SimulationConfig) -> SimulationConfig:
+        """Fill in credentials the caller did not send from the stored config.
+
+        `status()` scrubs `api_key` (and, in live mode, `tenant_id`) before
+        it leaves the process, so a console tab that loaded after the
+        credentials were configured has never seen them and cannot echo them
+        back. Treating their absence as "clear them" meant Start, Reset and
+        Retry silently downgraded a live integration (#148). An omitted or
+        null credential therefore keeps the stored one, exactly as
+        `/api/integration/configure` already behaves; clearing one is done
+        there, explicitly.
+        """
+        delivery = self._merge_delivery_credentials(config.delivery)
+        if delivery is config.delivery:
+            return config
+        return config.model_copy(update={"delivery": delivery}, deep=True)
+
+    def _merge_delivery_credentials(self, delivery: DeliveryConfig | None) -> DeliveryConfig:
+        """One delivery config with the caller's fields over the stored secrets.
+
+        Scoped to live delivery, which is the only mode that uses
+        credentials. Pointing the simulator back at the sandbox is also how
+        an operator stops using a live tenant, so a mock/off config is taken
+        at face value and drops the stored secret rather than keeping a live
+        credential alive in a config that no longer sends to it.
+        """
+        stored = self.config.delivery
+        if delivery is None:
+            return stored
+        if delivery.mode != DestinationMode.LIVE:
+            return delivery
+        updates: dict[str, Any] = {}
+        if delivery.api_key is None and stored.api_key:
+            updates["api_key"] = stored.api_key
+        if delivery.tenant_id is None and stored.tenant_id:
+            updates["tenant_id"] = stored.tenant_id
+        if not updates:
+            return delivery
+        return delivery.model_copy(update=updates, deep=True)
 
     async def _persist_new_records(self, records: list[StoredEventRecord]) -> None:
         """Append records to the store without blocking the event loop.
@@ -793,6 +878,27 @@ class SimulationController:
 def _validate_live_delivery(delivery: DeliveryConfig) -> None:
     if delivery.mode == DestinationMode.LIVE and (not delivery.api_key or not delivery.tenant_id):
         raise ValueError("Live delivery requires both api_key and tenant_id")
+
+
+def _retry_idempotency_key(record: StoredEventRecord) -> str | None:
+    """The key a retry of `record` should carry, or None to mint a fresh one.
+
+    A reused `Idempotency-Key` is answered from RegEngine's 24h cache
+    without revalidation, so replaying the original key can never redeliver
+    an event the server rejected per-event on a 2xx response -- the record
+    stays `failed` however many times an operator clicks retry, and the
+    cached batch's `accepted` count is folded into the retry's total (#95).
+
+    The key is therefore reused only for the case it exists to protect: an
+    attempt that produced no per-event verdict at all (a transport failure,
+    where the original request may or may not have reached the server, and
+    replay-safety is what stops a double ingest). A record carrying a
+    verdict was answered, so its retry is a genuinely new request and gets
+    a new key.
+    """
+    if record.delivery_response is not None:
+        return None
+    return _stored_idempotency_key(record)
 
 
 def _stored_idempotency_key(record: StoredEventRecord) -> str | None:

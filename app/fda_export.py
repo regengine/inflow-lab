@@ -13,8 +13,8 @@ from .schemas.domain import CTEType, FDAExportPreset, RegEngineEvent, StoredEven
 # The first eleven columns mirror RegEngine's documented FDA request export
 # shape and must keep their order. The trailing columns are additive and carry
 # the FSMA 204 KDEs the eleven-column shape has no home for: the second
-# location description Shipping/Receiving records each require, and the
-# traceability lot code source reference.
+# location description Shipping/Receiving records each require, the
+# traceability lot code source reference, and the event's CTE.
 FDA_EXPORT_COLUMNS = [
     "Traceability Lot Code",
     "Traceability Lot Code Description",
@@ -30,6 +30,7 @@ FDA_EXPORT_COLUMNS = [
     "Immediate Subsequent Recipient Location",
     "Immediate Previous Source Location",
     "Traceability Lot Code Source Reference",
+    "Event Type (CTE)",
 ]
 
 # Per-CTE primary "Location Description" KDE. Falls back to
@@ -44,6 +45,16 @@ _PRIMARY_LOCATION_KDES: dict[CTEType, tuple[str, ...]] = {
 _SUBSEQUENT_RECIPIENT_KDES = ("ship_to_location", "immediate_subsequent_recipient")
 _PREVIOUS_SOURCE_KDES = ("immediate_previous_source", "ship_from_location", "vessel_name")
 _TLC_SOURCE_KDES = ("tlc_source_reference", "traceability_lot_code_source_reference")
+# What the lot *is*, not what happened to it. Every row used to carry the CTE
+# under "Traceability Lot Code Description" (#94), so a human reading the
+# exported sheet saw "shipping" where a food description belongs. The CTE now
+# has its own column and this one describes the lot, falling back to the food
+# description when no dedicated KDE was supplied.
+_TLC_DESCRIPTION_KDES = (
+    "traceability_lot_code_description",
+    "lot_description",
+    "tlc_description",
+)
 
 
 def _first_text(values: dict[str, Any], keys: Iterable[str]) -> str:
@@ -158,7 +169,9 @@ def render_fda_request_csv(
         writer.writerow(
             {
                 "Traceability Lot Code": event.traceability_lot_code,
-                "Traceability Lot Code Description": event.cte_type.value,
+                "Traceability Lot Code Description": (
+                    _first_text(values, _TLC_DESCRIPTION_KDES) or event.product_description
+                ),
                 "Product Description": event.product_description,
                 "Quantity": event.quantity,
                 "Unit of Measure": event.unit_of_measure,
@@ -173,6 +186,7 @@ def render_fda_request_csv(
                 ),
                 "Immediate Previous Source Location": previous_source,
                 "Traceability Lot Code Source Reference": _first_text(values, _TLC_SOURCE_KDES),
+                "Event Type (CTE)": event.cte_type.value,
             }
         )
     return output.getvalue()

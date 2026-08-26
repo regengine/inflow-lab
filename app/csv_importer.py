@@ -3,6 +3,7 @@ from __future__ import annotations
 import csv
 import io
 import json
+import math
 import re
 from dataclasses import dataclass
 from datetime import UTC, datetime
@@ -200,7 +201,12 @@ def _parse_seed_lot(
         quantity=quantity,
         timestamp=timestamp,
         kdes=kdes,
-        parent_lot_codes=[],
+        # `parent_lot_codes` is a control column for *both* import types, so it
+        # is excluded from the catch-all KDE sweep. Hard-coding [] here meant a
+        # seed-lot row carrying lineage had it dropped with no error and no
+        # warning (#99). Seed lots are usually parentless, but when a caller
+        # supplies parents they are honored exactly as for scheduled events.
+        parent_lot_codes=_derive_parent_lot_codes(row, kdes),
     )
 
 
@@ -316,6 +322,18 @@ def _parse_quantity(value: str, row_number: int, errors: list[CSVImportError]) -
         quantity = float(value)
     except ValueError:
         errors.append(CSVImportError(row=row_number, field="quantity", message="Quantity must be numeric"))
+        return None
+
+    # ``float()`` happily parses "nan", "inf" and "1e400", and none of those
+    # trip the ``<= 0`` check below (``nan <= 0`` is False). They used to sail
+    # through every validator and land in the durable JSONL as a bare
+    # ``NaN``/``Infinity`` token that is not valid JSON, and on the signed
+    # live wire (#98). Rejected here, at the only caller-controlled entry
+    # point that can introduce one.
+    if not math.isfinite(quantity):
+        errors.append(
+            CSVImportError(row=row_number, field="quantity", message="Quantity must be a finite number")
+        )
         return None
 
     if quantity <= 0:

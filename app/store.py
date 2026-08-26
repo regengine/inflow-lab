@@ -4,6 +4,7 @@ import json
 import logging
 import os
 from collections import Counter, deque
+from datetime import datetime
 from pathlib import Path
 from threading import RLock
 from typing import Any, Iterable
@@ -13,6 +14,13 @@ from .schemas.domain import LineageEdge, LineageNode, StoredEventRecord
 
 logger = logging.getLogger(__name__)
 
+
+# Stand-in description for a lot that other records name as a parent but
+# which has no stored record of its own. The console renders a node's
+# `product_description` verbatim, and such a node also reports
+# `event_count == 0`, so the gap is visible in the graph instead of silently
+# absent from it (see #97).
+LINEAGE_PLACEHOLDER_DESCRIPTION = "Unknown lot (no stored record)"
 
 # Sentinel that replaces secrets in scrubbed output. Not a credential.
 MASKED_SECRET = "***MASKED***"  # nosec B105
@@ -65,7 +73,12 @@ def _serialize_record(record: StoredEventRecord) -> str:
     previously a record written masked by ``add_many`` was rewritten in
     clear by the next retry or scenario load.
     """
-    return json.dumps(_scrub_secrets(record.model_dump(mode="json")))
+    # ``allow_nan=False`` keeps the log strict RFC 8259 JSON. A non-finite
+    # quantity would otherwise be written as a bare ``NaN``/``Infinity``
+    # token that Python happily reads back but every strict parser (and the
+    # exports built on top of them) rejects -- see #98. Failing here means a
+    # bad value never reaches disk in the first place.
+    return json.dumps(_scrub_secrets(record.model_dump(mode="json")), allow_nan=False)
 
 
 class EventStore:
@@ -75,6 +88,9 @@ class EventStore:
         self._records: deque[StoredEventRecord] = deque(maxlen=max_records)
         self._counter = 0
         self._lock = RLock()
+        # Lines the most recent read could not parse; see
+        # ``read_persisted_records``.
+        self.last_read_skipped = 0
         self._load_from_disk()
 
     def configure(self, persist_path: str) -> None:
@@ -111,8 +127,25 @@ class EventStore:
         self._counter = counter
 
     def read_persisted_records(self, persist_path: str | None = None) -> list[StoredEventRecord]:
+        """Every readable record in the log, skipping lines that will not parse.
+
+        One unparseable line used to abort the whole read, which took out
+        every reader for that tenant (status, lineage, stats, exports,
+        ``/api/health``) and -- because the default store is built at import
+        time -- could stop the app from starting at all (#93). A torn final
+        line from an interrupted append, or a line written by an older
+        ``StoredEventRecord`` shape that survived a deploy, is not a reason
+        to lose the rest of the history.
+
+        Skipping is never silent: each bad line is logged with its line
+        number and copied verbatim to a ``.quarantine`` sidecar next to the
+        store, and the count is exposed via :attr:`last_read_skipped` so
+        callers can surface "N unreadable lines" without re-reading the
+        file. The original line is left in place; nothing is rewritten here.
+        """
         path = Path(persist_path) if persist_path else self.persist_path
         records: list[StoredEventRecord] = []
+        malformed: list[tuple[int, str]] = []
 
         with self._lock:
             if path.exists():
@@ -122,11 +155,40 @@ class EventStore:
                             continue
                         try:
                             records.append(StoredEventRecord.model_validate_json(line))
-                        except ValueError as exc:
-                            raise ValueError(
-                                f"Could not load stored event record from {path}:{line_number}"
-                            ) from exc
+                        except ValueError:
+                            malformed.append((line_number, line))
+            if malformed:
+                self._quarantine_lines(path, malformed)
+            self.last_read_skipped = len(malformed)
         return records
+
+    def _quarantine_lines(self, path: Path, malformed: list[tuple[int, str]]) -> None:
+        """Log and set aside lines that could not be parsed.
+
+        Best effort by design: a store whose directory is read-only must
+        still serve the records it *could* read, so a failure to write the
+        sidecar is logged and swallowed rather than resurrecting the very
+        outage this method exists to prevent.
+        """
+        for line_number, _line in malformed:
+            logger.error(
+                "event store skipped unreadable record",
+                extra={"persist_path": str(path), "line_number": line_number},
+            )
+        quarantine_path = path.with_suffix(f"{path.suffix}.quarantine")
+        try:
+            # Truncating rather than appending: every read of the same file
+            # finds the same bad lines, so appending would grow the sidecar
+            # without bound on a hot read path.
+            with quarantine_path.open("w", encoding="utf-8") as handle:
+                for line_number, line in malformed:
+                    handle.write(f"{line_number}\t{line.rstrip()}\n")
+        except OSError as exc:  # pragma: no cover - depends on the failure mode
+            logger.error(
+                "event store could not quarantine unreadable record(s)",
+                extra={"persist_path": str(path), "record_count": len(malformed)},
+                exc_info=exc,
+            )
 
     def reset(self) -> None:
         with self._lock:
@@ -135,6 +197,17 @@ class EventStore:
             if self.persist_path.exists():
                 self.persist_path.unlink()
             self.persist_path.parent.mkdir(parents=True, exist_ok=True)
+
+    def _ends_with_newline(self, size: int) -> bool:
+        """Whether the persist file is newline-terminated (empty counts)."""
+        if size <= 0:
+            return True
+        try:
+            with self.persist_path.open("rb") as handle:
+                handle.seek(-1, os.SEEK_END)
+                return handle.read(1) == b"\n"
+        except OSError:  # pragma: no cover - depends on the failure mode
+            return True
 
     def _file_size(self) -> int:
         try:
@@ -177,9 +250,15 @@ class EventStore:
                 lines.append(_serialize_record(record))
 
             original_size = self._file_size()
+            # A previous append that was cut short leaves a line with no
+            # terminating newline. Appending straight onto it would splice the
+            # torn remains into the first new record, turning one unreadable
+            # line into two; a separator keeps the damage contained to the
+            # line that was already lost (#93).
+            separator = "" if self._ends_with_newline(original_size) else "\n"
             try:
                 with self.persist_path.open("a", encoding="utf-8") as handle:
-                    handle.write("\n".join(lines) + "\n")
+                    handle.write(separator + "\n".join(lines) + "\n")
                     handle.flush()
                     os.fsync(handle.fileno())
             except OSError as exc:
@@ -412,8 +491,9 @@ class EventStore:
         return matched
 
     def lineage_nodes(self, records: Iterable[StoredEventRecord]) -> list[LineageNode]:
+        records_list = list(records)
         lots: dict[str, list[StoredEventRecord]] = {}
-        for record in records:
+        for record in records_list:
             lots.setdefault(record.event.traceability_lot_code, []).append(record)
 
         nodes: list[LineageNode] = []
@@ -439,19 +519,66 @@ class EventStore:
                     locations=locations,
                 )
             )
+        for lot_code, first_reference in self._unbacked_parent_lot_codes(records_list).items():
+            nodes.append(
+                LineageNode(
+                    lot_code=lot_code,
+                    product_description=LINEAGE_PLACEHOLDER_DESCRIPTION,
+                    # Zero events is the honest count and the signal the
+                    # console already renders ("0 event(s)"): this lot is
+                    # named by another record's lineage but nothing in the
+                    # store describes it.
+                    event_count=0,
+                    cte_types=[],
+                    first_seen=first_reference,
+                    last_seen=first_reference,
+                    locations=[],
+                )
+            )
         nodes.sort(key=lambda node: (node.first_seen, node.lot_code))
         return nodes
 
+    def _unbacked_parent_lot_codes(
+        self, records: list[StoredEventRecord]
+    ) -> dict[str, datetime]:
+        """Parent lots named by these records that have no record of their own.
+
+        Maps each such lot code to the earliest timestamp that references it,
+        which is where its placeholder node sorts into the graph.
+        """
+        present = {record.event.traceability_lot_code for record in records}
+        missing: dict[str, datetime] = {}
+        for record in records:
+            child_lot_code = record.event.traceability_lot_code
+            for parent_lot_code in self._parent_lot_codes(record):
+                if parent_lot_code == child_lot_code or parent_lot_code in present:
+                    continue
+                timestamp = record.event.timestamp
+                earliest = missing.get(parent_lot_code)
+                if earliest is None or timestamp < earliest:
+                    missing[parent_lot_code] = timestamp
+        return missing
+
     def lineage_edges(self, records: Iterable[StoredEventRecord]) -> list[LineageEdge]:
+        """Every declared parent link, including ones with no backing record.
+
+        A parent lot with no record of its own used to be skipped outright,
+        so an input that *was* declared on the wire simply vanished from the
+        rendered graph -- which is what kept the rework-lot gap (#97)
+        invisible until it was found by reading payloads. The producer gap is
+        fixed at the source, but the swallow is not a safe default for the
+        next one: the edge is now emitted and `lineage_nodes` gives it a
+        placeholder node, so a missing producer shows up as a hole in the
+        graph rather than as a graph that quietly agrees with itself.
+        """
         record_list = list(records)
-        related_lot_codes = {record.event.traceability_lot_code for record in record_list}
         edges: list[LineageEdge] = []
         seen_edges: set[tuple[str, str, int]] = set()
 
         for record in sorted(record_list, key=lambda item: (item.event.timestamp, item.sequence_no)):
             target_lot_code = record.event.traceability_lot_code
             for source_lot_code in sorted(self._parent_lot_codes(record)):
-                if source_lot_code == target_lot_code or source_lot_code not in related_lot_codes:
+                if source_lot_code == target_lot_code:
                     continue
                 edge_key = (source_lot_code, target_lot_code, record.sequence_no)
                 if edge_key in seen_edges:

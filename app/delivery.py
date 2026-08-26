@@ -20,7 +20,7 @@ from dataclasses import dataclass
 from datetime import UTC, datetime
 from typing import Any, Sequence
 
-from .mock_service import MockRegEngineHTTPError
+from .mock_service import MAX_BATCH_EVENTS, MockRegEngineHTTPError
 from .regengine_client import LiveRegEngineDeliveryError
 from .schemas.domain import DestinationMode, StoredEventRecord
 from .schemas.ingestion import IngestPayload
@@ -199,6 +199,142 @@ def rebuild_retried_records(
     return updated
 
 
+def chunk_events(events: Sequence[Any], size: int = MAX_BATCH_EVENTS) -> list[list[Any]]:
+    """Split a batch into slices RegEngine will accept.
+
+    ``WebhookPayload.events`` is capped at 500 on both the live receiver and
+    the mock, and the bulk senders (CSV import, replay) build one payload
+    from every row. Above the cap the whole batch used to 422 and every row
+    was recorded failed (#103). Each slice is delivered as its own request
+    with its own idempotency key.
+    """
+    if size < 1:
+        raise ValueError("chunk size must be at least 1")
+    return [list(events[index : index + size]) for index in range(0, len(events), size)]
+
+
+def aggregate_outcomes(outcomes: Sequence[DeliveryOutcome]) -> DeliveryOutcome:
+    """Fold per-chunk outcomes into the one a caller reports.
+
+    Only the *summary* is aggregated. Stored records are always built from
+    the chunk that actually carried them, so each record keeps its own
+    idempotency key and its own per-event verdict; merging those here would
+    re-introduce exactly the cross-batch confusion #95 is about.
+    """
+    if not outcomes:
+        return DeliveryOutcome()
+    if len(outcomes) == 1:
+        return outcomes[0]
+
+    statuses = {outcome.delivery_status for outcome in outcomes}
+    if statuses == {"generated"}:
+        status = "generated"
+    elif "failed" in statuses:
+        status = "failed"
+    else:
+        status = "posted"
+
+    responses = [outcome.response for outcome in outcomes if outcome.response]
+    merged_response: dict[str, Any] | None = None
+    if responses:
+        merged_events: list[Any] = []
+        for response in responses:
+            merged_events.extend(response.get("events", []))
+        merged_response = {
+            "accepted": sum(int(response.get("accepted", 0) or 0) for response in responses),
+            "rejected": sum(int(response.get("rejected", 0) or 0) for response in responses),
+            "total": sum(int(response.get("total", 0) or 0) for response in responses),
+            "events": merged_events,
+            "chunks": len(outcomes),
+        }
+
+    return DeliveryOutcome(
+        response=merged_response,
+        delivery_status=status,
+        posted=sum(outcome.posted for outcome in outcomes),
+        failed=sum(outcome.failed for outcome in outcomes),
+        delivery_attempts=sum(outcome.delivery_attempts for outcome in outcomes),
+        attempted_at=next(
+            (outcome.attempted_at for outcome in outcomes if outcome.attempted_at), None
+        ),
+        completed_at=next(
+            (outcome.completed_at for outcome in reversed(outcomes) if outcome.completed_at),
+            None,
+        ),
+        error_message=next(
+            (outcome.error_message for outcome in outcomes if outcome.error_message), None
+        ),
+        metadata={
+            "chunk_count": len(outcomes),
+            "idempotency_keys": [
+                (outcome.metadata or {}).get("idempotency_key") for outcome in outcomes
+            ],
+        },
+    )
+
+
+IDEMPOTENCY_REPLAY_ERROR = (
+    "RegEngine answered this request from its idempotency cache: the response "
+    "describes the original batch, so nothing was re-validated or re-ingested."
+)
+
+
+def _is_idempotency_replay(
+    response: dict[str, Any], payload: IngestPayload, *, reused_key: bool
+) -> bool:
+    """Whether a response describes a different batch than the one just sent.
+
+    A reused ``Idempotency-Key`` is answered from cache verbatim, without
+    revalidation, for 24h on both the mock and live RegEngine. Counting that
+    cached answer as a fresh delivery credits one batch's ``accepted`` total
+    to another request (#95). The event count is the tell: a genuine
+    response carries one verdict per event sent.
+
+    Two deliberate narrowings keep this from firing on honest responses. A
+    freshly minted key cannot hit any cache, so only a key the caller
+    supplied is checked at all; and a response carrying *no* per-event
+    verdicts is a shape some receivers legitimately return, not evidence of
+    a replay.
+    """
+    if not reused_key:
+        return False
+    events = response.get("events")
+    if not isinstance(events, list) or not events:
+        return False
+    return len(events) != len(payload.events)
+
+
+def _replayed_outcome(
+    *,
+    payload: IngestPayload,
+    response: dict[str, Any],
+    delivery_mode: str,
+    idempotency_key: str | None,
+    attempted_at: datetime,
+    extra_metadata: dict[str, Any] | None = None,
+) -> DeliveryOutcome:
+    """A replay is a non-delivery: reported, never counted as posted."""
+    metadata: dict[str, Any] = {
+        "delivery_mode": delivery_mode,
+        "attempted_event_count": len(payload.events),
+        "idempotency_key": idempotency_key,
+        "idempotency_replay": True,
+    }
+    if extra_metadata:
+        metadata = {**extra_metadata, **metadata}
+    return DeliveryOutcome(
+        response=response,
+        delivery_status="failed",
+        posted=0,
+        failed=len(payload.events),
+        delivery_attempts=1,
+        attempted_at=attempted_at,
+        completed_at=datetime.now(UTC),
+        error_message=IDEMPOTENCY_REPLAY_ERROR,
+        metadata=metadata,
+    )
+
+
 async def deliver_payload(
     payload: IngestPayload,
     config: SimulationConfig,
@@ -229,6 +365,14 @@ async def deliver_payload(
                 idempotency_key=delivery_idempotency_key,
                 friction=tuple(config.delivery.mock_friction),
             ).model_dump(mode="json")
+            if _is_idempotency_replay(response, payload, reused_key=idempotency_key is not None):
+                return _replayed_outcome(
+                    payload=payload,
+                    response=mask_secret_in_payload(response, api_key),
+                    delivery_mode="mock",
+                    idempotency_key=delivery_idempotency_key,
+                    attempted_at=attempted_at,
+                )
             return DeliveryOutcome(
                 response=mask_secret_in_payload(response, api_key),
                 delivery_status="posted",
@@ -249,6 +393,17 @@ async def deliver_payload(
                 config,
                 idempotency_key=delivery_idempotency_key,
             )
+            if _is_idempotency_replay(
+                result.response, payload, reused_key=idempotency_key is not None
+            ):
+                return _replayed_outcome(
+                    payload=payload,
+                    response=mask_secret_in_payload(result.response, api_key),
+                    delivery_mode="live",
+                    idempotency_key=delivery_idempotency_key,
+                    attempted_at=attempted_at,
+                    extra_metadata=dict(result.metadata),
+                )
             return DeliveryOutcome(
                 response=mask_secret_in_payload(result.response, api_key),
                 delivery_status="posted",
