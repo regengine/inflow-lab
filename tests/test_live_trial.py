@@ -73,7 +73,7 @@ def test_live_trial_confirm_live_runs_mock_then_exactly_one_live_batch(capsys):
     assert "live-api-secret" not in captured.out
     assert "live-tenant-secret" not in captured.out
     assert server.live_step_count == 1
-    assert [body["delivery"]["mode"] for body in server.reset_bodies] == ["mock", "live"]
+    assert [body["delivery"]["mode"] for body in server.reset_bodies] == ["mock", "live", "mock"]
     assert server.reset_bodies[1]["delivery"] == {
         "mode": "live",
         "endpoint": LIVE_ENV["REGENGINE_LIVE_ENDPOINT"],

@@ -179,7 +179,22 @@ def run_live_trial(
             )
         return summary
     finally:
+        # Both calls below run on every exit from the try block above --
+        # normal return, a LiveTrialFailure from a failed assertion, any
+        # other exception (e.g. a dropped connection mid-batch), or a
+        # KeyboardInterrupt -- because they live in this `finally`, not
+        # after a `return` on the happy path (#105).
         stop_simulation(client, config)
+        if confirm_live:
+            # Only --confirm-live can arm live delivery, so only that path
+            # needs to disarm it again. A dry run never leaves delivery on
+            # anything but mock, and run_mock_dry_run's own reset already
+            # proves that. Guarded on the flag rather than on whether this
+            # run actually reached run_one_live_batch: the tenant may
+            # already have been armed by an earlier run (that is the exact
+            # failure mode #105 reports), so --confirm-live always tries to
+            # disarm it, even if this run's own mock dry-run failed first.
+            revert_delivery_to_mock(client, config)
 
 
 def run_mock_dry_run(client: httpx.Client, config: LiveTrialConfig) -> dict[str, Any]:
@@ -258,6 +273,52 @@ def stop_simulation(client: httpx.Client, config: LiveTrialConfig) -> None:
             "Failed to stop simulation loop: "
             f"HTTP {response.status_code}: {config.redact(response.text[:300])}"
         )
+
+
+def revert_delivery_to_mock(client: httpx.Client, config: LiveTrialConfig) -> None:
+    """Disarm live delivery for config.demo_tenant by resetting it to mock.
+
+    This is the safety-critical call #105 is about: skip it, or let it fail
+    silently, and the tenant controller keeps the customer's live endpoint,
+    API key and tenant id cached with delivery.mode == "live" for the
+    lifetime of the process -- so the next Start or Step click posts
+    simulated CTEs into a customer's production RegEngine.
+
+    Unlike stop_simulation() above, this must never swallow a failure: it
+    does not catch httpx.HTTPError (a dropped connection here is exactly as
+    dangerous as a bad status code), and it treats any non-200 response as
+    fatal rather than only status_code >= 500. A revert that failed silently
+    is indistinguishable from no revert at all, so this always raises
+    loudly instead -- carrying forward whatever trial failure was already in
+    flight, if any, so a single printed line captures both facts.
+    """
+    prior_failure = sys.exc_info()[1]
+    try:
+        request_json(
+            client,
+            config,
+            "POST",
+            "/api/simulate/reset",
+            json={
+                "delivery": {
+                    "mode": "mock",
+                    "endpoint": None,
+                    "api_key": None,
+                    "tenant_id": None,
+                }
+            },
+        )
+    except (LiveTrialFailure, httpx.HTTPError) as exc:
+        message = (
+            f"CRITICAL: failed to revert tenant {config.demo_tenant!r} delivery to mock "
+            f"after the trial ({config.base_url}). The tenant may still be armed for live "
+            "delivery -- verify GET /api/simulate/status by hand before anyone else uses "
+            f"this demo. Underlying error: {exc}"
+        )
+        if prior_failure is not None and prior_failure is not exc:
+            message += f" (the trial itself had already failed: {prior_failure})"
+        raise LiveTrialFailure(message) from exc
+    print(f"delivery reverted to mock for tenant {config.demo_tenant}")
 
 
 def request_json(
