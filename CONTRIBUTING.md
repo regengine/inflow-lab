@@ -1,5 +1,45 @@
 # Contributing to Inflow Lab
 
+## Running the lint and type gates locally
+
+CI's `lint` job (`.github/workflows/ci.yml`) runs exactly three commands. Run
+the same three before pushing and the job cannot tell you anything new:
+
+```bash
+uvx ruff@0.15.8 check .
+uvx mypy@1.19.1
+for file in app/static/*.js; do node --check "$file"; done
+```
+
+Notes on why each is shaped the way it is:
+
+- **The tool versions are pinned, and pinned in two places.** `ruff` and `mypy`
+  run through `uvx <tool>@<version>` rather than as dependency-group entries:
+  neither is imported by the app, and keeping them out of `uv.lock` leaves
+  `uv pip check` and `pip-audit` reasoning about runtime dependencies only.
+  Pinning also means an upstream release cannot turn CI red on its own. The
+  pins live in `.github/workflows/ci.yml` and are repeated in the comment
+  above `[tool.ruff]` in `pyproject.toml`; if you bump one, bump both, or local
+  runs and CI stop agreeing.
+- **Rule selection and scope live in `pyproject.toml`, not on the command
+  line.** `[tool.ruff.lint]` selects `E4`, `E7`, `E9`, `F`, `W` — close to
+  ruff's defaults, deliberately without `E501`, since the existing code has
+  long lines throughout and reflowing them would be churn rather than a fix.
+  `[tool.mypy]` sets `files = ["scripts"]`: `app/` still has real annotation
+  gaps, and a gate that lands red is a gate everyone learns to ignore. Widen
+  `files` once those are cleared. Because the config carries the scope, `uvx
+  mypy@1.19.1` takes no path argument.
+- **There is no `package.json` and no ESLint.** The operator console is
+  vanilla ES modules served straight out of `app/static`, so `node --check` is
+  the gate that needs no toolchain and no config, and it catches the failure
+  that actually breaks the dashboard — a syntax error that only surfaces when a
+  browser parses the file. Check every file in `app/static/*.js`, not just
+  `app.js`: the console was split into modules, so a single-file check misses
+  most of it.
+
+CI also runs the test suite separately (`uv run --frozen --group dev pytest`,
+on both 3.11 and 3.12). Run `uv run pytest` after changing Python code.
+
 ## Developer Certificate of Origin (DCO)
 
 By contributing to this repository, you certify the following for each commit

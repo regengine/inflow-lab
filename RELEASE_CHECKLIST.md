@@ -8,7 +8,7 @@ Use this checklist before tagging a demo-ready build or handing the simulator to
 - [ ] `uv run python scripts/smoke_regression.py` (safe to run with `REGENGINE_DATA_DIR` exported; it derives its paths from that root and cleans up under it)
 - [ ] `uv run python scripts/contract_pin_check.py` — RegEngine contract pin freshness and the documented wire shape
 - [ ] `uv run --no-dev --group browser python scripts/browser_smoke.py`
-- [ ] `node --check app/static/app.js`
+- [ ] `for f in app/static/*.js; do node --check "$f"; done` — the console is ES modules now, so checking `app.js` alone leaves most of it unparsed (CI's `lint` job runs the same loop)
 - [ ] `python3 -m compileall app scripts`
 - [ ] `uv pip check`
 - [ ] `uv run pip-audit`
@@ -20,7 +20,7 @@ Use this checklist before tagging a demo-ready build or handing the simulator to
 - [ ] Mock and live ingest payloads still use top-level `source` plus `events[]`.
 - [ ] Each event still includes `cte_type`, `traceability_lot_code`, `product_description`, `quantity`, `unit_of_measure`, `location_name`, `timestamp`, and `kdes`.
 - [ ] Mock mode remains the default delivery mode.
-- [ ] The mock FDA request export still emits the fourteen `FDA_EXPORT_COLUMNS`, with the documented eleven first and in order.
+- [ ] The mock FDA request export still emits the fifteen `FDA_EXPORT_COLUMNS` (`app/fda_export.py`), with RegEngine's documented eleven first and in order.
 - [ ] Mock ingest still rejects an empty batch and an over-500 batch with `422`, and replays `Idempotency-Key` for 24 hours.
 - [ ] Live delivery still requires `api_key` and `tenant_id`.
 - [ ] Live-trial tooling refuses live traffic without `--confirm-live` and mock mode remains the dry-run/default safety path.
@@ -39,6 +39,24 @@ Use this checklist before tagging a demo-ready build or handing the simulator to
 - [ ] `REGENGINE_ALLOW_PRIVATE_DELIVERY_HOSTS` is unset on any shared or deployed profile.
 - [ ] Creating tenants past `REGENGINE_MAX_TENANTS` returns `429` instead of materializing unbounded tenant scopes.
 - [ ] Demo fixture loading resets to a known event log.
+- [ ] The shipped demo fixtures still fall inside RegEngine's replay window. RegEngine rejects an event older than `WEBHOOK_MAX_EVENT_AGE_DAYS` (default 90; mirrored as `MAX_EVENT_AGE_DAYS` in `app/mock_service.py`, readable via `max_event_age_days()`), so a fixture that ages past it makes the design-partner demo unreplayable against a live tenant. Check the oldest timestamp actually shipped, not the date the fixture bodies were authored against:
+
+    ```bash
+    uv run python -c "
+    from datetime import UTC, datetime
+    from app.demo_fixtures import DEMO_FIXTURES
+    from app.mock_service import max_event_age_days
+    oldest = min(e.event.timestamp for f in DEMO_FIXTURES.values() for e in f.events)
+    age = (datetime.now(UTC) - oldest.astimezone(UTC)).days
+    window = max_event_age_days()
+    print(f'oldest shipped fixture event is {age}d old; replay window is {window}d')
+    raise SystemExit(age >= window)
+    "
+    ```
+
+  Insist on real margin rather than a pass at 89 days: an event one day inside the window is one slipped release from being outside it. Treat anything past roughly two-thirds of the window as a release blocker.
+
+  Note that nothing else in a green run will tell you: `REGENGINE_MOCK_EVENT_AGE_MODE` defaults to `warn`, so the mock stand-in logs an out-of-window event and still accepts it, and every fixture-based test, smoke and export keeps passing. Load one fixture with `REGENGINE_MOCK_EVENT_AGE_MODE=reject` to see what a live tenant would actually do with it. If the check trips, re-date the fixtures — do not ship a demo whose first live batch comes back "replay window exceeded".
 - [ ] Start, stop, single-step, and reset work from the dashboard.
 - [ ] Scenario save/load restores both config and event records.
 - [ ] Lot lineage for `TLC-DEMO-FC-OUT-001` includes upstream harvested and packed lots.

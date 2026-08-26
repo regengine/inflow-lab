@@ -24,6 +24,7 @@ Inflow Lab plays the role of **a RegEngine customer's own software**: a fictiona
 - [Demo fixtures](#demo-fixtures)
 - [FDA export presets](#fda-export-presets)
 - [EPCIS 2.0 export scaffolding](#epcis-20-export-scaffolding)
+- [Export record caps and truncation](#export-record-caps-and-truncation)
 - [Full FSMA simulation](#full-fsma-simulation)
 - [Design-partner demo script](#design-partner-demo-script)
 - [Deployment profiles](#deployment-profiles)
@@ -179,6 +180,71 @@ uv run --no-dev python scripts/remote_smoke.py
 GitHub also has manual and nightly **Remote Smoke** and **Remote Browser Smoke** workflows for deployed demo validation. Configure repository secrets `REGENGINE_REMOTE_USERNAME` and `REGENGINE_REMOTE_PASSWORD`, then run `.github/workflows/remote-smoke.yml` for API/export checks or `.github/workflows/remote-browser-smoke.yml` for authenticated dashboard checks with optional `base_url` and `tenant` inputs. Scheduled runs target the Railway shared-demo URL with dedicated nightly tenants and compare `/api/healthz` build metadata to the workflow commit.
 
 Use `RELEASE_CHECKLIST.md` as the full demo-ready gate. Use `DESIGN_PARTNER_DEMO_SCRIPT.md` for the call flow, expected talking points, fixture reset commands, and recovery steps.
+
+## Export record caps and truncation
+
+Both evidence exports walk whole lot graphs or whole date ranges, so like
+`/api/lineage` they are bounded rather than unbounded. `GET
+/api/mock/regengine/export/fda-request` and `GET
+/api/mock/regengine/export/epcis` each take a `limit` query parameter:
+
+- **default `10000`, maximum `100000`** (`EXPORT_DEFAULT_LIMIT` /
+  `EXPORT_MAX_LIMIT` in `app/routers/mock_regengine.py`). Values outside
+  `1..100000` are rejected with `422`.
+- Records are kept **oldest event first**, so a truncated export is the head of
+  the record set rather than an arbitrary window.
+
+The cap is far more generous than the lineage one on purpose: an FDA request
+export is a compliance artifact, and the failure mode that matters is an
+operator handing a regulator a file that quietly stopped short. So the default
+only bites on genuinely huge exports — and when it bites, it is impossible to
+miss.
+
+**Every export response**, truncated or not, carries these headers so a client
+can assert on them unconditionally instead of inferring completeness from a row
+count:
+
+| Header | Meaning |
+|---|---|
+| `X-Export-Total-Records` | Records that matched the filters *before* `limit` was applied |
+| `X-Export-Returned-Records` | Records actually written to the file |
+| `X-Export-Limit` | The `limit` in effect for this request |
+| `X-Export-Truncated` | `true` or `false` |
+| `X-Export-Warning` | Human-readable truncation notice — **present only when truncated** |
+
+They are listed in `Access-Control-Expose-Headers` (with `X-Export-Warning`
+appended when truncated), because browsers only expose whitelisted headers to
+`fetch()` and the dashboard downloads these links directly.
+
+When an export *is* truncated, three more things happen:
+
+- The download filename is prefixed **`PARTIAL-`** (e.g.
+  `PARTIAL-fda_request_lot_trace.csv`, `PARTIAL-epcis_events.jsonld`).
+- The CSV gets a banner line written **above the header row** — the first thing
+  any reader or spreadsheet import sees — starting `# PARTIAL EXPORT - NOT A
+  COMPLETE RECORD SET`, followed by the returned/total counts, the limit in
+  effect, an explicit statement that later records are missing from the file,
+  and the suggestion to narrow the date range or lot code or re-request with a
+  higher limit. Note that this banner makes the file a valid CSV only if the
+  reader tolerates a leading comment line; that is the deliberate trade against
+  a partial file that looks complete.
+- The EPCIS document has no room for a comment banner, so the same numbers ride
+  along as a `regengine:exportSummary` member (`total_records`,
+  `returned_records`, `limit`, `truncated`, plus `warning` when truncated).
+  That member is present on **every** EPCIS export, so a consumer that checks it
+  once can trust it every time.
+
+```bash
+curl -sD - -o /dev/null \
+  "http://127.0.0.1:8000/api/mock/regengine/export/fda-request?limit=50"
+# ...
+# x-export-total-records: 1200
+# x-export-returned-records: 50
+# x-export-limit: 50
+# x-export-truncated: true
+# x-export-warning: PARTIAL EXPORT - NOT A COMPLETE RECORD SET: 50 of 1200 ...
+# content-disposition: attachment; filename=PARTIAL-fda_request_all_records.csv
+```
 
 ## Full FSMA simulation
 
@@ -474,19 +540,46 @@ The service wrapper examples below can be used with any profile; keep the profil
 | `POST` | `/api/simulate/stop` | Stop the loop |
 | `POST` | `/api/simulate/step` | Emit one batch synchronously |
 | `POST` | `/api/simulate/replay` | Replay persisted JSONL events through the configured delivery mode |
-| `POST` | `/api/simulate/reset` | Clear state and persisted events |
+| `POST` | `/api/simulate/reset` | Clear state and persisted events (accepts a wrapped `{"config": {...}}` body or a flat config body) |
 | `GET` | `/api/simulate/stream` | Server-Sent Events snapshots for live dashboard updates |
 | `POST` | `/api/import/csv` | Bulk import scheduled events or seed lots from CSV text |
 | `POST` | `/api/delivery/retry` | Retry failed stored deliveries with the current or supplied delivery config |
 
 All routes accept optional `X-RegEngine-Tenant` for tenant-scoped storage. If Basic Auth is enabled, include standard HTTP Basic credentials.
 
+`POST /api/simulate/reset` accepts **both body shapes**: `/start`'s wrapped `{"config": {...}}` and the flat `SimulationConfig` object this route has always taken. The two used to disagree — posting one endpoint's body to the other parsed cleanly and applied nothing — so both are accepted now, the wrapped one so the endpoints agree and the flat one because the console and existing integrations send it. An empty body (or no body at all) clears state and persisted events while keeping the config already in effect. Anything that is neither shape, including a misnested or unrecognized field, is rejected with `422` rather than silently resetting to defaults with a `200`.
+
+```bash
+# flat
+curl -X POST http://127.0.0.1:8000/api/simulate/reset \
+  -H 'Content-Type: application/json' \
+  -d '{"scenario":"fresh_cut_processor","batch_size":1,"delivery":{"mode":"mock"}}'
+
+# wrapped — equivalent
+curl -X POST http://127.0.0.1:8000/api/simulate/reset \
+  -H 'Content-Type: application/json' \
+  -d '{"config":{"scenario":"fresh_cut_processor","batch_size":1,"delivery":{"mode":"mock"}}}'
+```
+
 ### Inspection
 
 | Method | Path | Purpose |
 |---|---|---|
 | `GET` | `/api/events` | List persisted events |
-| `GET` | `/api/lineage/{traceability_lot_code}` | Full lineage graph for a lot |
+| `GET` | `/api/lineage/{traceability_lot_code}` | Lineage graph for a lot, bounded by `limit` (default 500, max 5000) and reporting `total_records` / `returned_records` / `truncated` |
+
+`GET /api/events` takes `limit` (default `100`, max `500`).
+
+`GET /api/lineage/{traceability_lot_code}` walks a whole connected lot graph, so a single wide trace can match far more records than the paged `/api/events` feed ever returns. It is bounded like every other list endpoint here:
+
+- `limit` — maximum lineage records to return, **oldest event first**, so a clipped trace keeps the head of the chain (the part that explains where the lot came from). Default `500`, maximum `5000` (`LINEAGE_DEFAULT_LIMIT` / `LINEAGE_MAX_LIMIT` in `app/routers/events.py`); anything outside `1..5000` is a `422`.
+- The response reports the bound back so a caller can tell a complete trace from a clipped one instead of guessing: `total_records` (matches before the limit), `returned_records`, `limit`, and `truncated`.
+- `nodes` and `edges` are derived from exactly the records returned, never from records the caller cannot see, so a truncated graph is internally consistent rather than dangling.
+- An unknown lot code is a `404`.
+
+```bash
+curl "http://127.0.0.1:8000/api/lineage/TLC-DEMO-FC-OUT-001?limit=50"
+```
 
 ### RegEngine integration
 
@@ -502,8 +595,8 @@ All routes accept optional `X-RegEngine-Tenant` for tenant-scoped storage. If Ba
 |---|---|---|
 | `POST` | `/api/mock/regengine/ingest` | RegEngine-shaped ingest mirroring the live webhook's validation (per-event accept/reject) |
 | `GET` | `/api/mock/regengine/export/presets` | List FDA request export presets |
-| `GET` | `/api/mock/regengine/export/fda-request` | Mock 14-column FDA request CSV (11 documented columns plus three FSMA 204 KDE columns) |
-| `GET` | `/api/mock/regengine/export/epcis` | Scaffolded EPCIS 2.0 JSON-LD export |
+| `GET` | `/api/mock/regengine/export/fda-request` | Mock 15-column FDA request CSV (11 documented columns plus four FSMA 204 KDE columns); `limit` bounded, truncation reported |
+| `GET` | `/api/mock/regengine/export/epcis` | Scaffolded EPCIS 2.0 JSON-LD export; `limit` bounded, truncation reported |
 
 ### Example: start the simulator in live mode
 
@@ -664,7 +757,7 @@ The live delivery client targets the current RegEngine webhook shape:
 
 Required KDEs per CTE are mirrored in `app/cte_rules.py` and pinned to RegEngine's `REQUIRED_KDES_BY_CTE` by `tests/test_regengine_contract_pin.py`; the detailed contract reference lives in `.agents/skills/regengine-api-contract/references/contract.md`.
 
-**Contract version handshake.** Both sides advertise an ingest contract version (`app/contract.py` here, `webhook_models.INFLOW_CONTRACT_VERSION` in RegEngine) — inflow-lab via `/api/healthz`, `/api/health`, and `/api/integration/status`; RegEngine via `/health`. The test-connection probe compares them and reports a `contract_mismatch` verdict when deployed instances have skewed (one side running an older deploy), so version drift is a visible, named state instead of a silent live-post failure. Bump the version in both repos together whenever the wire contract changes. The mock FDA export keeps RegEngine's documented eleven request-export columns, in name and order, as its first eleven columns, and appends three FSMA 204 KDE columns (`Immediate Subsequent Recipient Location`, `Immediate Previous Source Location`, `Traceability Lot Code Source Reference`) for fourteen in total. The EPCIS 2.0 export is a separate derived JSON-LD scaffold and does not change this webhook contract.
+**Contract version handshake.** Both sides advertise an ingest contract version (`app/contract.py` here, `webhook_models.INFLOW_CONTRACT_VERSION` in RegEngine) — inflow-lab via `/api/healthz`, `/api/health`, and `/api/integration/status`; RegEngine via `/health`. The test-connection probe compares them and reports a `contract_mismatch` verdict when deployed instances have skewed (one side running an older deploy), so version drift is a visible, named state instead of a silent live-post failure. Bump the version in both repos together whenever the wire contract changes. The mock FDA export keeps RegEngine's documented eleven request-export columns, in name and order, as its first eleven columns, and appends four FSMA 204 KDE columns (`Immediate Subsequent Recipient Location`, `Immediate Previous Source Location`, `Traceability Lot Code Source Reference`, `Event Type (CTE)`) for fifteen in total. The EPCIS 2.0 export is a separate derived JSON-LD scaffold and does not change this webhook contract.
 
 ## Deployment
 

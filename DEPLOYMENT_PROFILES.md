@@ -191,6 +191,26 @@ uv run python scripts/live_trial.py --confirm-live
 
 The script refuses to run without either `--dry-run-only` or `--confirm-live`. It never prints the Basic Auth password, live API key, or live tenant id. Stop after the first live result and review the posted/failed status before any further volume.
 
+**`--confirm-live` always disarms the tenant again.** The revert runs from a
+`finally` in `run_live_trial`, so it happens on the failure path too — if the
+arming POST, the live batch, or any assertion after it raises, the tenant is
+still put back. It posts `/api/simulate/reset` with `delivery: {"mode":
+"mock"}`, which replaces the controller's whole config and therefore drops the
+stored endpoint, API key and tenant id along with the live mode. It then
+*verifies* the revert by reading `/api/integration/status` back — the only
+endpoint that reports `api_key_configured`, since `/api/simulate/status`
+sanitizes the key out and so cannot tell an armed tenant from a disarmed one —
+and fails the run if that status is not `mode: mock` with both
+`api_key_configured` and `tenant_configured` false. A successful disarm prints
+`Delivery reverted to mock for tenant <id>.`
+
+Treat a run that ends without that line, or that fails with "Delivery did not
+revert to mock" / "Live credentials are still configured", as a demo left
+armed: disarm it by hand before anyone touches the console, because the next
+Start or Step click posts simulated CTEs into the customer's production ingest.
+The revert is only attempted on the `--confirm-live` path — `--dry-run-only`
+never arms live delivery in the first place.
+
 Dry-run the exact scenario without live traffic:
 
 ```bash
@@ -353,24 +373,64 @@ next one starts.
 > days after the cutover PR merged — with the failure attributed to the wrong
 > cause until the allowlist was probed directly.
 
-`scripts/cutover_preflight.sh <old-url> <new-url>` mechanises what steps 1 and
-3 can be checked from outside: every read-only path in the dashboard's proxy
-contract answering alike on both services, the new service reporting
-GitHub-injected build identity rather than a stale `REGENGINE_BUILD_SHA`, and
-the new service trusting its own origin. It is read-only — the demo is shared,
-and the POST routes the dashboard proxies mutate its state.
+`scripts/cutover_preflight.sh <old-url> <new-url>` mechanises what steps 1, 3
+and part of 4 can be checked from outside: every read-only path in the
+dashboard's proxy contract answering alike on both services, the new service
+not serving an empty store, the new service reporting GitHub-injected build
+identity rather than a stale `REGENGINE_BUILD_SHA`, and the new service
+trusting its own origin. It is read-only — the demo is shared, and the POST
+routes the dashboard proxies mutate its state.
 
-It deliberately cannot check steps 2 or 4, and says so on success rather than
-implying a clean bill of health. Both are invisible from outside: a service
-with the wrong credentials and a service with the right ones both answer 401,
-and a service with no volume is indistinguishable from one with a volume until
-the next redeploy discards the data. The Basic-auth credentials live as secrets on
-two different platforms, so from outside a service with the *wrong* credentials
-is indistinguishable from one with the right ones — both answer 401 to an
-unauthenticated probe. Vercel's `INFLOW_LAB_BASIC_AUTH_USERNAME` / `_PASSWORD`
-must equal the new service's `REGENGINE_BASIC_AUTH_USERNAME` / `_PASSWORD`, as
-concrete values. If they differ, every proxied call answers 401 the moment
-`INFLOW_LAB_SERVICE_URL` is flipped.
+**It authenticates, and refuses to run unauthenticated.** Export the OLD
+service's `REGENGINE_BASIC_AUTH_USERNAME` / `_PASSWORD` as
+`REGENGINE_REMOTE_USERNAME` / `REGENGINE_REMOTE_PASSWORD` (the same pair must
+work on both services) or the script exits 2 without probing anything:
+
+```bash
+REGENGINE_REMOTE_USERNAME=demo REGENGINE_REMOTE_PASSWORD='<shared-demo-password>' \
+  scripts/cutover_preflight.sh https://<old-domain> https://<new-domain>
+```
+
+`app/auth_middleware.py` exempts only `OPTIONS` and `/api/healthz`, so a
+credential-less probe gets `401 application/json` from every other `/api` path
+on *both* services. Comparing 401 against 401 is not evidence of an identical
+contract — a new service on a different build, with an empty store, or with a
+broken export path answers 401 the same way — so an unauthenticated run would
+have printed `ok` for every path and rolled up to `PRE-FLIGHT PASSED`. Set
+`REGENGINE_PREFLIGHT_NO_AUTH=1` only for an instance that genuinely has Basic
+Auth disabled. For the same reason a **matching non-2xx status is now a
+failure, not an `ok`**: every probed path is meant to serve content, so two
+identical 404s (or 401s, or 500s) mean the comparison proved nothing.
+
+What it still cannot check, and says so on success rather than implying a clean
+bill of health:
+
+1. **Step 2 — the credentials Vercel holds.** The Basic-auth credentials live
+   as secrets on two different platforms. The script probes both services with
+   *one* pair, so it proves that pair works against both, not that Vercel holds
+   it. Vercel's `INFLOW_LAB_BASIC_AUTH_USERNAME` / `_PASSWORD` must equal the
+   new service's `REGENGINE_BASIC_AUTH_USERNAME` / `_PASSWORD`, as concrete
+   values rather than references to the old service. If they differ, every
+   proxied call answers 401 the moment `INFLOW_LAB_SERVICE_URL` is flipped.
+2. **Step 4 — whether the store survives a *redeploy*.** The store-contents
+   check reads `stats.total_records` from `/api/simulate/status` on both
+   services and fails when the old one has history and the new one has none, so
+   a replacement service serving the whole contract correctly from zero events
+   no longer passes silently. That is a check on the store *today*: persistence
+   across redeploys comes solely from a volume mounted at
+   `REGENGINE_DATA_DIR`, which is only visible in the Railway config.
+
+**Path coverage.** The probe list covers only read-only paths that resolve to a
+router actually mounted in `app/main.py`. RegEngine's
+`frontend/src/app/api/inflow-lab/[...path]/route.ts` also allows
+`/api/regengine/export/fda-request` and `/api/regengine/export/epcis` as a
+"live-export" boundary, but no router in this repo mounts an `/api/regengine`
+prefix — the mock exports live under `/api/mock/regengine` — so probing those
+two only ever compared two 404s, and they were dropped from `PATHS`. **This
+needs reconciling across the two repos:** either RegEngine's proxy allowlist
+drops the `/api/regengine/export/*` entries, or this repo mounts them; until
+one of those happens, the allowlist names a boundary the demo does not serve.
+Add them back to `PATHS` once they resolve here.
 
 Verify the flip on `/api/simulate/status`, not `/api/healthz`: the proxy
 answers HTTP 200 with `{"offline":true}` when the backend is unreachable
