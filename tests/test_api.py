@@ -933,7 +933,7 @@ transformation,TLC-FDA-OUT,Fresh Cut Salad Mix,95,cases,ReadyFresh Processing Pl
     handoff_response = client.get("/api/mock/regengine/export/fda-request?preset=shipment_handoff")
     assert handoff_response.status_code == 200
     handoff_rows = parse_export_rows(handoff_response.text)
-    assert [row["Traceability Lot Code Description"] for row in handoff_rows] == [
+    assert [row["Event Type (CTE)"] for row in handoff_rows] == [
         "shipping",
         "receiving",
     ]
@@ -958,7 +958,7 @@ transformation,TLC-FDA-OUT,Fresh Cut Salad Mix,95,cases,ReadyFresh Processing Pl
     receiving_response = client.get("/api/mock/regengine/export/fda-request?preset=receiving_log")
     assert receiving_response.status_code == 200
     receiving_rows = parse_export_rows(receiving_response.text)
-    assert [row["Traceability Lot Code Description"] for row in receiving_rows] == ["receiving"]
+    assert [row["Event Type (CTE)"] for row in receiving_rows] == ["receiving"]
 
     transformation_response = client.get(
         "/api/mock/regengine/export/fda-request?preset=transformation_batches"

@@ -196,15 +196,44 @@ def _parse_seed_lot(
     kdes.setdefault("tlc_source_reference", f"CSV-SEED-{row['traceability_lot_code']}")
     kdes.setdefault("traceability_lot_code_source_reference", f"CSV-SEED-{row['traceability_lot_code']}")
 
-    return _build_event(
+    event, parents, build_errors, warnings = _build_event(
         row=row,
         row_number=row_number,
         cte_type=CTEType.HARVESTING,
         quantity=quantity,
         timestamp=timestamp,
         kdes=kdes,
+        # Deliberately not _derive_parent_lot_codes(row, kdes) here, unlike
+        # _parse_scheduled_event -- seed lots always become `harvesting`
+        # events (README "CSV import" section), and Harvesting is the CTE
+        # where a traceability lot code is first established (21 CFR
+        # 1.1330 lists commodity/variety, farm location, and harvester name
+        # as its KDEs -- no source/parent lot). DEMO_FIXTURES follows the
+        # same rule: every HARVESTING fixture event leaves parent_lot_codes
+        # at its default empty tuple; only downstream CTEs set it. So a
+        # `parent_lot_codes` value on a seed-lot row isn't a value this
+        # import type failed to honor -- it's an input that doesn't apply.
         parent_lot_codes=[],
     )
+    if event is not None and row.get("parent_lot_codes"):
+        # CONTROL_FIELDS still excludes this column from the catch-all KDE
+        # sweep in _parse_kdes, so without this the value above vanishes
+        # with no trace: not stored, not a KDE, not reported (#99). Make
+        # the drop visible instead of silent, same as any other column this
+        # import type can't use.
+        warnings = [
+            *warnings,
+            CSVImportWarning(
+                row=row_number,
+                field="parent_lot_codes",
+                message=(
+                    "parent_lot_codes is ignored for seed_lots imports: seed lots "
+                    "become harvesting events, which establish a traceability lot "
+                    "code rather than descend from one"
+                ),
+            ),
+        ]
+    return event, parents, build_errors, warnings
 
 
 def _build_event(
