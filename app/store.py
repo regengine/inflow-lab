@@ -1,12 +1,19 @@
 from __future__ import annotations
 
 import json
+import logging
 from collections import Counter, deque
 from pathlib import Path
 from threading import RLock
 from typing import Any, Iterable
 
 from .schemas.domain import LineageEdge, LineageNode, StoredEventRecord
+
+
+# Same name-keyed singleton logger main.py configures. A write that never
+# reaches disk is the one failure this store cannot recover from, so it must
+# not be silent even though the exception propagates (#182).
+logger = logging.getLogger("inflow_lab")
 
 
 # Sentinel that replaces secrets in scrubbed output. Not a credential.
@@ -148,13 +155,30 @@ class EventStore:
         """
         self.persist_path.parent.mkdir(parents=True, exist_ok=True)
         tmp_path = self.persist_path.with_suffix(f"{self.persist_path.suffix}.tmp")
-        with tmp_path.open("w", encoding="utf-8") as handle:
-            for record in records_oldest_first:
-                handle.write(_serialize_record(record) + "\n")
-        tmp_path.replace(self.persist_path)
+        try:
+            with tmp_path.open("w", encoding="utf-8") as handle:
+                for record in records_oldest_first:
+                    handle.write(_serialize_record(record) + "\n")
+            tmp_path.replace(self.persist_path)
+        except OSError:
+            # Re-raised, never swallowed: callers order their in-memory
+            # commit around this and depend on the failure propagating.
+            logger.exception("event store rewrite failed for %s", self.persist_path)
+            raise
 
     def add_many(self, records: Iterable[StoredEventRecord]) -> list[StoredEventRecord]:
         stored: list[StoredEventRecord] = []
+        try:
+            return self._append_many(records, stored)
+        except OSError:
+            # Re-raised: the caller must see the failure, and the in-memory
+            # rollback below the append depends on it propagating.
+            logger.exception("event store append failed for %s", self.persist_path)
+            raise
+
+    def _append_many(
+        self, records: Iterable[StoredEventRecord], stored: list[StoredEventRecord]
+    ) -> list[StoredEventRecord]:
         with self._lock:
             with self.persist_path.open("a", encoding="utf-8") as handle:
                 for record in records:

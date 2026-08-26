@@ -15,6 +15,7 @@ Inflow Lab is a simulator. Its security boundary is designed for safe demos, tes
 - Shared-demo or remote deployments must enable Basic Auth.
 - Browser-origin state-changing requests must come from trusted origins when credentials are enabled.
 - Health endpoints may expose non-secret build and status metadata only.
+- Concurrently active tenant controllers are capped (`REGENGINE_MAX_TENANT_CONTROLLERS`, default 50). Choosing a tenant is a single unauthenticated header, and honoring one commits memory and disk, so the ceiling is enforced whether or not Basic Auth is on. The shared `local-demo` tenant is exempt. Freeing a slot requires an authenticated operator reset/delete or a process restart; there is no idle eviction.
 
 ## Delivery Boundary
 

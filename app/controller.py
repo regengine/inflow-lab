@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 import os
 import uuid
 from collections import defaultdict, deque
@@ -50,6 +51,11 @@ from .schemas.integration import IntegrationConfigureRequest, IntegrationStatusR
 from .scenario_saves import ScenarioSaveStore
 from .scenarios import ScenarioId, get_scenario
 from .store import EventStore, mask_secret_in_payload, mask_secret_in_string
+
+
+# Same name-keyed singleton logger main.py configures, so delivery
+# failures land in the stream operators already watch (#182).
+logger = logging.getLogger("inflow_lab")
 
 
 @dataclass(slots=True)
@@ -616,6 +622,12 @@ class SimulationController:
                 )
             return DeliveryOutcome()
         except MockRegEngineHTTPError as exc:
+            logger.error(
+                "mock delivery failed: %s events rejected with HTTP %s (%s)",
+                len(payload.events),
+                exc.status_code,
+                exc,
+            )
             return DeliveryOutcome(
                 delivery_status="failed",
                 failed=len(payload.events),
@@ -630,6 +642,14 @@ class SimulationController:
                 },
             )
         except LiveRegEngineDeliveryError as exc:
+            # Masked: the raw exception can quote the request, and the API key
+            # rides in a header. Host, not full URL, for the same reason.
+            logger.error(
+                "live delivery to %s failed: %s events not posted (%s)",
+                urlparse(str(config.delivery.endpoint or "")).hostname or "unknown host",
+                len(payload.events),
+                mask_secret_in_string(str(exc), api_key),
+            )
             metadata = exc.metadata | {"attempted_event_count": len(payload.events)}
             if delivery_idempotency_key and "idempotency_key" not in metadata:
                 metadata["idempotency_key"] = delivery_idempotency_key
@@ -642,6 +662,12 @@ class SimulationController:
                 metadata=metadata,
             )
         except Exception as exc:  # pragma: no cover - exercised by live integration, not unit tests
+            logger.exception(
+                "unexpected %s delivery failure: %s events not posted (%s)",
+                config.delivery.mode.value,
+                len(payload.events),
+                mask_secret_in_string(str(exc), api_key),
+            )
             metadata = {
                 "delivery_mode": config.delivery.mode.value,
                 "attempted_event_count": len(payload.events),

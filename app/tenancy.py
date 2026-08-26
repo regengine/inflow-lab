@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import logging
 import os
 from pathlib import Path
 from threading import RLock
@@ -17,6 +18,12 @@ from .schemas.ingestion import ReplayRequest
 from .schemas.scenarios import ScenarioSaveRequest
 from .schemas.simulation import SimulationConfig
 from .store import EventStore
+
+
+# Same name-keyed singleton logger main.py configures. Tenant creation is
+# the moment disk and memory get committed on a caller's say-so, so it is
+# worth a line an operator can correlate against (#182).
+logger = logging.getLogger("inflow_lab")
 
 
 DATA_ROOT = Path(os.getenv("REGENGINE_DATA_DIR", "data"))
@@ -287,6 +294,9 @@ def _count_scenario_saves(path: Path) -> int:
 
 
 def _create_tenant_controller(tenant_id: str) -> SimulationController:
+    # Tenant id only -- never the caller's credentials, which the auth layer
+    # has already discarded by this point.
+    logger.info("creating tenant controller for %s", tenant_id)
     persist_path = tenant_events_path(tenant_id)
     tenant_engine = LegitFlowEngine(seed=204)
     tenant_store = EventStore(persist_path=str(persist_path))
