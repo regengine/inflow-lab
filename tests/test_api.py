@@ -1659,6 +1659,7 @@ receiving,TLC-CSV-BAD,Romaine Lettuce,,cases,Distribution Center #4,2026-02-05T1
     assert events[0]["parent_lot_codes"] == ["TLC-CSV-HARVEST"]
     assert set(events[0]["event"]) == {
         "cte_type",
+        "input_traceability_lot_codes",
         "traceability_lot_code",
         "product_description",
         "quantity",

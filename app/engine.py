@@ -105,6 +105,11 @@ class LegitFlowEngine:
         self.dc_inventory: list[Lot] = []
         self.retail_inventory: list[Lot] = []
         self.in_transit: list[Shipment] = []
+        # Events minted alongside another action's return value but not yet
+        # handed back to a caller -- currently just rework lots' own CTE
+        # records (#97). next_event() drains this before choosing a new
+        # action; see _transform.
+        self._pending_events: list[tuple[RegEngineEvent, list[str]]] = []
 
         self.location_index = {loc.name: loc for loc in self.all_locations}
 
@@ -113,6 +118,13 @@ class LegitFlowEngine:
         return [*self.farms, *self.coolers, *self.packers, *self.processors, *self.dcs, *self.retailers]
 
     def next_event(self) -> tuple[RegEngineEvent, list[str]]:
+        if self._pending_events:
+            # #97: flush any CTE record queued by an earlier action (e.g. a
+            # rework lot's own transformation-output event, see _transform)
+            # before choosing a new one. This never touches self.rng, so it
+            # cannot reorder or add an RNG draw relative to the unqueued
+            # path.
+            return self._pending_events.pop(0)
         action = self._choose_action()
         if action == "harvest":
             return self._harvest()
@@ -427,6 +439,8 @@ class LegitFlowEngine:
             outputs.append(output_lot)
             self.transformed.append(output_lot)
 
+        input_lot_codes = [lot.lot_code for lot in inputs]
+
         if rework_qty > 0:
             rework_lot = Lot(
                 lot_code=self._make_lot_code(prefix="TLC"),
@@ -445,6 +459,19 @@ class LegitFlowEngine:
             rework_lots.append(rework_lot)
             self.processor_inventory.append(rework_lot)
 
+        kdes = self.adapter.transformation_kdes(
+            engine=self,
+            inputs=inputs,
+            outputs=outputs,
+            rework_lots=rework_lots,
+            processor=processor,
+            timestamp=timestamp,
+            reference_type=outputs[0].current_reference_type or "Batch Record",
+            reference_number=reference_number,
+            total_input_qty=total_input_qty,
+            total_output_qty=gross_output_qty,
+        )
+
         event = RegEngineEvent(
             cte_type=CTEType.TRANSFORMATION,
             traceability_lot_code=outputs[0].lot_code,
@@ -454,20 +481,67 @@ class LegitFlowEngine:
             location_name=processor.name,
             location_gln=self._location_gln_or_none(processor.name),
             timestamp=timestamp,
-            kdes=self.adapter.transformation_kdes(
-                engine=self,
-                inputs=inputs,
-                outputs=outputs,
-                rework_lots=rework_lots,
-                processor=processor,
-                timestamp=timestamp,
-                reference_type=outputs[0].current_reference_type or "Batch Record",
-                reference_number=reference_number,
-                total_input_qty=total_input_qty,
-                total_output_qty=gross_output_qty,
-            ),
+            # #91: RegEngine's live ingest reads transformation input-lot
+            # linkage only from this top-level field, never from
+            # kdes["input_traceability_lot_codes"] (which stays populated
+            # below for local lineage/exports/mock validation). Sourced
+            # straight from `inputs` rather than read back out of `kdes`,
+            # so it can never drift from what this transformation actually
+            # consumed even if an industry adapter's kdes shape changes.
+            input_traceability_lot_codes=input_lot_codes,
+            kdes=kdes,
         )
-        return event, [lot.lot_code for lot in inputs]
+
+        for rework_lot in rework_lots:
+            # #97: a rework lot enters processor_inventory and can later be
+            # sampled as another transformation's input (see the `inputs`
+            # sampling at the top of this method), where it appears in
+            # parent_lot_codes and input_traceability_lot_codes -- but
+            # without a CTE record of its own, EventStore.lineage_edges
+            # (app/store.py) silently drops that edge, since it only keeps
+            # edges whose source lot code has a record of its own. Emit the
+            # rework lot's own record here, at creation time: another
+            # transformation-output event for the same batch/inputs/
+            # location/reference, differing only in the identity fields
+            # (lot code, description, quantity, its own reference/source
+            # tags) that distinguish it from `outputs[0]`.
+            #
+            # Queued rather than returned as a second event from this call
+            # so next_event()'s (event, parent_lot_codes) return type never
+            # changes, and drained (see next_event()) before any new action
+            # is chosen -- so it costs no extra `self.rng` draw and cannot
+            # reorder or shift any later seeded value. The timestamp is
+            # nudged forward by the smallest representable step, the same
+            # non-collapsing idiom `_advance_time` uses at the live-window
+            # ceiling (#119), rather than reusing `timestamp` outright,
+            # since two events sharing one timestamp is exactly what that
+            # fix exists to prevent.
+            rework_timestamp = self._time_cursor + timedelta(microseconds=1)
+            self._time_cursor = rework_timestamp
+            rework_kdes = dict(kdes)
+            rework_kdes["tlc_source_reference"] = rework_lot.tlc_source_reference
+            rework_kdes["traceability_lot_code_source_reference"] = rework_lot.tlc_source_reference
+            rework_kdes["reference_document"] = self._reference_document(
+                rework_lot.current_reference_type,
+                rework_lot.current_reference_number,
+            )
+            rework_kdes["reference_document_type"] = rework_lot.current_reference_type
+            rework_kdes["reference_document_number"] = rework_lot.current_reference_number
+            rework_event = RegEngineEvent(
+                cte_type=CTEType.TRANSFORMATION,
+                traceability_lot_code=rework_lot.lot_code,
+                product_description=rework_lot.product_description,
+                quantity=rework_lot.quantity,
+                unit_of_measure=rework_lot.unit_of_measure,
+                location_name=processor.name,
+                location_gln=self._location_gln_or_none(processor.name),
+                timestamp=rework_timestamp,
+                input_traceability_lot_codes=input_lot_codes,
+                kdes=rework_kdes,
+            )
+            self._pending_events.append((rework_event, input_lot_codes))
+
+        return event, input_lot_codes
 
     def location_gln(self, location_name: str) -> str:
         location = self.location_index.get(location_name)

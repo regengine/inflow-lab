@@ -74,6 +74,21 @@ class RegEngineEvent(BaseModel):
     location_gln: str | None = None
     timestamp: datetime
     kdes: dict[str, Any] = Field(default_factory=dict)
+    # Top-level transformation input-lot linkage, mirroring the location_gln
+    # precedent above. RegEngine's own IngestEvent
+    # (services/ingestion/app/webhook_models.py) declares
+    # input_traceability_lot_codes as a top-level field, and
+    # canonical_event.py's only writer of kdes["input_lot_codes"] gates
+    # entirely on that top-level field -- it never reads
+    # kdes["input_traceability_lot_codes"], which is the only place
+    # inflow-lab used to put it (issue #91). Populated in addition to, not
+    # instead of, the existing kdes["input_traceability_lot_codes"] copy:
+    # this repo's own lineage view (app/store.py), EPCIS export
+    # (app/epcis_export.py), and the mock ingest validator
+    # (app/mock_service.py) all still read the kdes copy, so removing it
+    # would break local behavior for a field that exists purely to reach
+    # RegEngine's live ingest, which the kdes copy never does.
+    input_traceability_lot_codes: list[str] | None = None
 
 
 class StoredEventRecord(BaseModel):

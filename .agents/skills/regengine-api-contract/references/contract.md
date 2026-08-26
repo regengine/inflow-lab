@@ -85,9 +85,12 @@ RegEngine's `WebhookCTEType` (services/ingestion/app/webhook_models.py line 41):
 - `timestamp` — ISO 8601 string. Must not be more than 24h in the future.
   Older than 90 days accepted but flagged with `_historical_warning`.
 - `input_traceability_lot_codes` — Optional first-class field on RegEngine's
-  `IngestEvent` for transformation CTEs. RegEngine actually reads this from
-  the `kdes` dict in practice, so the simulator passes the value via
-  `kdes["input_traceability_lot_codes"]` and that works on both sides.
+  `IngestEvent` for transformation CTEs. **RegEngine reads it from the
+  top-level field, not from `kdes`.** This document previously claimed the
+  opposite, and the simulator sent the value only inside `kdes`, so live
+  ingest accepted every transformation event and silently dropped its
+  input-lot lineage link (#91). The simulator now emits it top-level and
+  keeps the `kdes` copy for the local validator, audit checks and exports.
 
 ## Required KDEs per CTE (RegEngine `REQUIRED_KDES_BY_CTE`)
 
