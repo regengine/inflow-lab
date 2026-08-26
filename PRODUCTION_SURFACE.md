@@ -22,7 +22,9 @@ The simulator exposes API and dashboard surfaces for:
 - Live delivery must require explicit configuration and confirmation.
 - Credentials and API keys must never be returned by API responses or rendered in the dashboard.
 - Tenant-scoped demo data must remain isolated when Basic Auth or tenant headers are used.
-- Remote/shared-demo deployments must enforce Basic Auth and explicit CORS origins.
+- Remote/shared-demo deployments must enforce Basic Auth and explicit CORS origins, and must fail to start when `REGENGINE_REQUIRE_AUTH` is set without both Basic Auth variables.
+- Live delivery endpoints must be validated as allowed egress destinations before any credential is sent.
+- Tenant creation must stay bounded (`REGENGINE_MAX_TENANTS`), and the platform healthcheck (`/api/healthz`) must fail with `503` when the event store cannot be written.
 
 ## Not Production Evidence
 

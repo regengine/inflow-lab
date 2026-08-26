@@ -124,19 +124,46 @@ when present and group failed records by `(source, idempotency_key)` so
 RegEngine can identify the retry and return the cached 2xx response.
 Records without prior idempotency metadata fall back to a fresh key.
 
+## Mock ingest parity (`POST /api/mock/regengine/ingest`)
+
+The built-in stand-in mirrors the live webhook's request handling so a
+client that passes here passes in production:
+
+- Batch size is 1-500 events. An empty `events[]` and an oversized batch
+  are both `422`, matching live RegEngine.
+- `Idempotency-Key` is honored over HTTP and replays the cached response
+  for 24 hours (`IDEMPOTENCY_TTL`), then falls out of the cache.
+- `X-Webhook-Signature` is verified as HMAC-SHA256 over the exact request
+  body bytes when `REGENGINE_WEBHOOK_HMAC_SECRET` is set (`401` on
+  mismatch), and is a no-op when the secret is unset.
+- `X-Mock-Friction` injects the simulated failures (`invalid_key` 401,
+  `subscription_inactive` 402, `rate_limit` 429).
+
 ## Mock export columns expected by this repo
 
 (Used by the simulator's mock RegEngine endpoint for dashboard / FDA
 preset rendering — does NOT affect live ingest.)
 
-- Traceability Lot Code
-- Traceability Lot Code Description
-- Product Description
-- Quantity
-- Unit of Measure
-- Location Description
-- Location Identifier (GLN)
-- Date
-- Time
-- Reference Document Type
-- Reference Document Number
+Fourteen columns. The first eleven mirror RegEngine's documented FDA
+request export shape and must keep these names and this order; the
+trailing three are additive and carry FSMA 204 KDEs the eleven-column
+shape has no home for (the second location description that Shipping and
+Receiving each require, and the traceability lot code source reference).
+
+1. Traceability Lot Code
+2. Traceability Lot Code Description
+3. Product Description
+4. Quantity
+5. Unit of Measure
+6. Location Description
+7. Location Identifier (GLN)
+8. Date
+9. Time
+10. Reference Document Type
+11. Reference Document Number
+12. Immediate Subsequent Recipient Location
+13. Immediate Previous Source Location
+14. Traceability Lot Code Source Reference
+
+`Date` and `Time` are split from the event timestamp normalized to UTC.
+The column list lives in `app/fda_export.py` (`FDA_EXPORT_COLUMNS`).

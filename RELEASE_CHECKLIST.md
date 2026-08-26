@@ -19,6 +19,8 @@ Use this checklist before tagging a demo-ready build or handing the simulator to
 - [ ] Mock and live ingest payloads still use top-level `source` plus `events[]`.
 - [ ] Each event still includes `cte_type`, `traceability_lot_code`, `product_description`, `quantity`, `unit_of_measure`, `location_name`, `timestamp`, and `kdes`.
 - [ ] Mock mode remains the default delivery mode.
+- [ ] The mock FDA request export still emits the fourteen `FDA_EXPORT_COLUMNS`, with the documented eleven first and in order.
+- [ ] Mock ingest still rejects an empty batch and an over-500 batch with `422`, and replays `Idempotency-Key` for 24 hours.
 - [ ] Live delivery still requires `api_key` and `tenant_id`.
 - [ ] Live-trial tooling refuses live traffic without `--confirm-live` and mock mode remains the dry-run/default safety path.
 - [ ] New export or dashboard behavior is derived from stored records and does not mutate the ingest contract.
@@ -26,11 +28,14 @@ Use this checklist before tagging a demo-ready build or handing the simulator to
 ## Operator Flow Checks
 
 - [ ] Dashboard loads without credentials when Basic Auth env vars are unset.
-- [ ] `/api/healthz` remains available without credentials for container/platform healthchecks and reports the expected `build.commit_sha_short`.
+- [ ] `/api/healthz` remains available without credentials for container/platform healthchecks, returns 200 with the expected `build.commit_sha_short`, and returns `503` with `"ok": false` when the event store is not writable.
 - [ ] Basic Auth returns `401` without valid credentials when env vars are set.
 - [ ] Shared-demo or live-trial deployments set explicit `REGENGINE_CORS_ORIGINS` values instead of wildcard CORS.
 - [ ] Dashboard simulator actions do not return `403`; if they do, confirm the browser origin exactly matches `REGENGINE_CORS_ORIGINS`.
 - [ ] Shared-demo or live-trial deployments set `REGENGINE_DATA_DIR` to mounted persistent storage.
+- [ ] Shared-demo or live-trial deployments run with `REGENGINE_REQUIRE_AUTH=1` and both Basic Auth variables set; a deploy missing them fails to start rather than serving open.
+- [ ] `REGENGINE_ALLOW_PRIVATE_DELIVERY_HOSTS` is unset on any shared or deployed profile.
+- [ ] Creating tenants past `REGENGINE_MAX_TENANTS` returns `429` instead of materializing unbounded tenant scopes.
 - [ ] Demo fixture loading resets to a known event log.
 - [ ] Start, stop, single-step, and reset work from the dashboard.
 - [ ] Scenario save/load restores both config and event records.
@@ -48,7 +53,7 @@ Use this checklist before tagging a demo-ready build or handing the simulator to
 ## Handoff Notes
 
 - [ ] README has the current API surface and setup instructions.
-- [ ] `DESIGN_PARTNER_DEMO_SCRIPT.md` matches the current fixture names, lot codes, expected exports, and reset flow.
+- [ ] `DESIGN_PARTNER_DEMO_SCRIPT.md` matches the current fixture names, lot codes, expected exports, and reset flow, and every button or link it names by text still appears with that exact text in `app/static/index.html`.
 - [ ] `DESIGN_PARTNER_DEMO_SCRIPT.md` remote operator runbook uses env vars and mock delivery for shared-demo commands.
 - [ ] `DEPLOYMENT_PROFILES.md` matches the intended local, shared-demo, and live-ingest operating modes.
 - [ ] `AUTOPILOT_TASKS.md` reflects the current backlog state.
