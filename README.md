@@ -395,7 +395,7 @@ The dashboard fixture loader resets the current event log before loading the sel
 
 ## FDA export presets
 
-`GET /api/mock/regengine/export/fda-request` returns a 14-column FDA request CSV and remains backward compatible with optional `start_date` and `end_date` filters. The first eleven columns keep RegEngine's documented request-export names and order; the last three are additive FSMA 204 KDE columns that the eleven-column shape has no home for:
+`GET /api/mock/regengine/export/fda-request` returns a 15-column FDA request CSV and remains backward compatible with optional `start_date` and `end_date` filters. The first eleven columns keep RegEngine's documented request-export names and order; the last four are additive FSMA 204 KDE columns that the eleven-column shape has no home for:
 
 | # | Column |
 |---|---|
@@ -413,6 +413,7 @@ The dashboard fixture loader resets the current event log before loading the sel
 | 12 | `Immediate Subsequent Recipient Location` |
 | 13 | `Immediate Previous Source Location` |
 | 14 | `Traceability Lot Code Source Reference` |
+| 15 | `Event Type (CTE)` |
 
 Date filters must be valid inclusive `YYYY-MM-DD` dates, and `start_date` must not be later than `end_date`. The endpoint also accepts:
 
@@ -769,7 +770,31 @@ docker run --rm \
 
 `railway.json` uses the same Dockerfile and healthcheck for Railway deployments. Mount persistent storage at `/data` and keep `REGENGINE_DATA_DIR=/data`.
 
-Expose non-secret build metadata so stale shared-demo deployments are obvious from `/api/healthz` and remote smoke failures:
+#### Build identity: which variable owns it
+
+`/api/healthz` reports `build.commit_source`, naming the environment variable it
+read the commit from. `app/build_info.py` checks them in order, and
+`REGENGINE_BUILD_SHA` outranks Railway's injected `RAILWAY_GIT_COMMIT_SHA`.
+
+**On the GitHub-connected demo service, `REGENGINE_BUILD_SHA` must be absent.**
+Railway injects `RAILWAY_GIT_COMMIT_SHA` on every auto-deploy, so leaving the
+manual variable set makes `/api/healthz` report whatever SHA someone last typed
+instead of what is actually running — and the nightly drift check, which
+compares against the real head commit, then reports green on a demo that is
+three commits behind. `scripts/cutover_preflight.sh` treats
+`commit_source != RAILWAY_GIT_COMMIT_SHA` as a failure for this reason. If the
+variable is set on that service, delete it:
+
+```bash
+railway variables --unset REGENGINE_BUILD_SHA --unset REGENGINE_BUILD_BRANCH
+```
+
+##### Manual CLI deploy (fallback only)
+
+Set these two variables **only** on a service you deploy by hand with
+`railway up`, where nothing injects `RAILWAY_GIT_COMMIT_SHA`. Delete them again
+if that service is later switched to Railway's GitHub integration
+(`DEPLOYMENT_PROFILES.md`).
 
 ```bash
 railway variable set --skip-deploys REGENGINE_BUILD_SHA="$(git rev-parse HEAD)" \
@@ -821,7 +846,7 @@ Common failure patterns:
 - Auth failures: request logs show `status=401` on `/api/...`; confirm `REGENGINE_BASIC_AUTH_USERNAME` and `REGENGINE_BASIC_AUTH_PASSWORD` are set as intended.
 - CORS failures: Railway HTTP logs may show successful `OPTIONS` but the browser blocks a follow-up request; confirm `REGENGINE_CORS_ORIGINS` is the exact HTTPS dashboard origin.
 - Volume/storage failures: `/api/health` should report tenant-scoped paths under `REGENGINE_DATA_DIR`; confirm Railway has a volume mounted at `/data` and `REGENGINE_DATA_DIR=/data`.
-- Stale deployment failures: `/api/healthz` should report the expected `build.commit_sha_short`; if it does not, redeploy current `main` and update `REGENGINE_BUILD_SHA`.
+- Stale deployment failures: `/api/healthz` should report the expected `build.commit_sha_short`. On the GitHub-connected demo, first confirm `build.commit_source` is `RAILWAY_GIT_COMMIT_SHA`; if it is `REGENGINE_BUILD_SHA`, the reported commit is a hand-entered constant that masks the real one, so delete that variable rather than refreshing it. Then redeploy current `main`. Only a manual CLI-deployed service should have `REGENGINE_BUILD_SHA` set at all.
 - Health check failures with a running process: `/api/healthz` answers `503` with `"ok": false` and a `store` block when the default tenant's event store cannot be written (full disk, unmounted or read-only volume, permission change). `/api/health` reports the same `store` block but stays `200` so the console still renders. Check the mount at `REGENGINE_DATA_DIR` before redeploying.
 - Startup failures with `REGENGINE_REQUIRE_AUTH is set but ...`: the deployment requires Basic Auth and is missing `REGENGINE_BASIC_AUTH_USERNAME`/`REGENGINE_BASIC_AUTH_PASSWORD`. Set both, or set `REGENGINE_REQUIRE_AUTH=0` for a local loopback demo.
 - `429` with `Tenant capacity reached`: the process is already serving `REGENGINE_MAX_TENANTS` distinct tenants. Delete unused tenant scopes or raise the cap.

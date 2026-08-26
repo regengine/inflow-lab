@@ -40,6 +40,7 @@ import argparse
 import asyncio
 import os
 import socket
+import ssl
 import sys
 import uuid
 from dataclasses import dataclass, field
@@ -114,32 +115,112 @@ def resp_command(*parts: str) -> bytes:
     return b"".join(encoded)
 
 
+class RedisReplyError(RuntimeError):
+    """A Redis reply that was absent, an error, or the wrong RESP type."""
+
+
+def read_reply(conn_file: Any, label: str) -> tuple[str, bytes | None]:
+    """Read one RESP reply, raising on anything that is not a real reply.
+
+    The previous version treated every reply that did not start with ``-`` as
+    success, which silently accepted the two failure shapes that actually
+    happen: an empty read (the peer closed the connection) and raw TLS alert
+    bytes from a server that expected a handshake. ``label`` rather than the
+    command itself goes into the messages, because the AUTH command carries
+    the password.
+    """
+    line = conn_file.readline()
+    if not line:
+        raise RedisReplyError(
+            f"Redis closed the connection without replying to {label}. If this "
+            "server speaks TLS, use a rediss:// URL."
+        )
+    if not line.endswith(b"\r\n"):
+        raise RedisReplyError(
+            f"Truncated or non-RESP reply to {label}: {line[:40]!r}. Raw bytes "
+            "like this usually mean the server answered a plaintext command "
+            "with a TLS alert."
+        )
+    prefix, payload = line[:1], line[:-2][1:]
+    if prefix == b"-":
+        raise RedisReplyError(f"Redis error on {label}: {payload.decode(errors='replace')}")
+    if prefix == b"+":
+        return "status", payload
+    if prefix == b":":
+        return "integer", payload
+    if prefix == b"$":
+        try:
+            length = int(payload)
+        except ValueError as exc:
+            raise RedisReplyError(f"Malformed bulk length in reply to {label}: {payload!r}") from exc
+        if length < 0:
+            return "bulk", None
+        body = conn_file.read(length + 2)
+        if len(body) < length + 2:
+            raise RedisReplyError(f"Truncated bulk reply to {label}")
+        return "bulk", body[:-2]
+    raise RedisReplyError(
+        f"Unexpected RESP reply type {prefix!r} for {label}: {line[:40]!r}"
+    )
+
+
+def redis_command(
+    conn: Any, conn_file: Any, label: str, expected: str, *parts: str
+) -> bytes | None:
+    """Send one command and require the RESP type it is documented to return.
+
+    ``expected`` is ``"status"`` for the ``+OK`` commands, ``"integer"`` for
+    HSET, and ``"bulk"`` for HGET. A reply of the wrong type is a failure even
+    when it is not an error reply -- that is the whole point.
+    """
+    conn.sendall(resp_command(*parts))
+    kind, reply = read_reply(conn_file, label)
+    if kind != expected:
+        raise RedisReplyError(
+            f"{label} returned a {kind} reply, expected {expected} ({reply!r})"
+        )
+    if expected == "status" and reply != b"OK":
+        raise RedisReplyError(f"{label} did not return +OK (got {reply!r})")
+    return reply
+
+
 def seed_billing_status(redis_url: str, tenant_id: str, status: str = "trialing") -> None:
     """HSET billing:tenant:{tenant_id} status <status> via a raw socket.
 
     Uses a minimal RESP client so the journey script needs no Redis
-    dependency. Raises on any non-success reply.
+    dependency. This is the one prerequisite the journey cannot recover from
+    -- without it every later ingest is rejected by the subscription gate --
+    so success is not inferred from the absence of an error: each reply is
+    checked for the RESP type its command is supposed to return, and the
+    seeded value is read back before this returns.
     """
+    scheme = urlparse(redis_url).scheme
     host, port, db, password = parse_redis_url(redis_url)
-    with socket.create_connection((host, port), timeout=5) as conn:
+    key = f"billing:tenant:{tenant_id}"
+
+    with socket.create_connection((host, port), timeout=5) as raw_conn:
+        conn: Any = raw_conn
+        if scheme == "rediss":
+            # Wrapped before anything is sent. Writing AUTH to a raw socket
+            # here put the Redis password on the wire in clear and *then*
+            # failed the handshake.
+            conn = ssl.create_default_context().wrap_socket(
+                raw_conn, server_hostname=host
+            )
         conn_file = conn.makefile("rb")
 
-        def send(*parts: str) -> bytes:
-            conn.sendall(resp_command(*parts))
-            reply = conn_file.readline()
-            if reply.startswith(b"-"):
-                raise RuntimeError(f"Redis error: {reply.decode().strip()}")
-            if reply.startswith(b"$"):
-                length = int(reply[1:].strip())
-                if length >= 0:
-                    conn_file.read(length + 2)
-            return reply
-
         if password:
-            send("AUTH", password)
+            redis_command(conn, conn_file, "AUTH", "status", "AUTH", password)
         if db:
-            send("SELECT", str(db))
-        send("HSET", f"billing:tenant:{tenant_id}", "status", status)
+            redis_command(conn, conn_file, "SELECT", "status", "SELECT", str(db))
+        redis_command(conn, conn_file, "HSET", "integer", "HSET", key, "status", status)
+
+        seeded = redis_command(conn, conn_file, "HGET", "bulk", "HGET", key, "status")
+        if seeded != status.encode("utf-8"):
+            raise RedisReplyError(
+                f"Read-back of {key} status returned {seeded!r}, expected "
+                f"{status!r}; the billing seed did not take effect."
+            )
 
 
 @dataclass(slots=True)

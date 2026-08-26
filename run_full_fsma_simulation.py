@@ -4,7 +4,6 @@ import base64
 import shutil
 import sys
 from collections import Counter
-from pathlib import Path
 from typing import Any
 
 from fastapi.testclient import TestClient
@@ -12,9 +11,9 @@ from fastapi.testclient import TestClient
 from app.cte_rules import validate_event_kdes
 from app.main import app
 from app.schemas.domain import RegEngineEvent
+from app.tenancy import tenant_dir
 
 
-REPO_ROOT = Path(__file__).resolve().parent
 TENANT_ID = "golden-path-demo"
 LOT_CODE = "TLC-DEMO-FC-OUT-001"
 
@@ -202,7 +201,13 @@ def print_report(
 
 
 def cleanup_demo_tenant() -> None:
-    shutil.rmtree(REPO_ROOT / "data" / "tenants" / TENANT_ID, ignore_errors=True)
+    """Remove the demo tenant from the configured data root, not from ./data.
+
+    ``app.tenancy`` resolves its root from REGENGINE_DATA_DIR, so a hardcoded
+    repo-relative path deleted a directory the run never wrote to and left the
+    real ``golden-path-demo`` tenant behind on a mounted volume.
+    """
+    shutil.rmtree(tenant_dir(TENANT_ID), ignore_errors=True)
 
 
 def assert_json(response, expected_status: int) -> dict[str, Any]:

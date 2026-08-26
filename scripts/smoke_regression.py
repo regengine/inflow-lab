@@ -16,6 +16,7 @@ sys.path.insert(0, str(REPO_ROOT))
 # `python scripts/smoke_regression.py` works from a clean checkout; hence the
 # E402 waivers.
 from app.main import app  # noqa: E402
+from app.tenancy import tenant_dir, tenant_events_path  # noqa: E402
 from scripts import _smoke_common as smoke  # noqa: E402
 
 
@@ -74,9 +75,14 @@ def run_smoke(client: TestClient) -> None:
 
     status = assert_json(client.get("/api/simulate/status", headers=main_headers), 200)
     assert_equal(status["stats"]["total_records"], 13, "fixture status total")
+    # Derived from app.tenancy rather than written out, because the app
+    # resolves the data root from REGENGINE_DATA_DIR at import time. A literal
+    # made this assertion fail -- on a cosmetic path string, saying nothing
+    # about correctness -- for any operator whose shell exports that variable,
+    # which DEPLOYMENT_PROFILES.md tells them to do.
     assert_equal(
         status["config"]["persist_path"],
-        "data/tenants/release-smoke-main/events.jsonl",
+        str(tenant_events_path(TENANTS[0])),
         "tenant persist path",
     )
 
@@ -173,8 +179,15 @@ def request_headers(tenant_id: str) -> dict[str, str]:
 
 
 def cleanup_smoke_tenants() -> None:
+    """Remove the smoke tenants from the data root the app actually used.
+
+    Hardcoding ``data/`` deleted the wrong directory whenever
+    REGENGINE_DATA_DIR pointed elsewhere, leaving release-smoke-main and
+    release-smoke-other in the shared demo's persistent store, where
+    ``known_tenant_ids()`` then surfaced them in /api/operator/tenants forever.
+    """
     for tenant_id in TENANTS:
-        shutil.rmtree(Path("data") / "tenants" / tenant_id, ignore_errors=True)
+        shutil.rmtree(tenant_dir(tenant_id), ignore_errors=True)
 
 
 def assert_json(response, expected_status: int) -> dict[str, Any]:

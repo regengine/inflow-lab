@@ -68,8 +68,7 @@ RegEngine's `WebhookCTEType` (services/ingestion/app/webhook_models.py line 41):
   "location_name": "Valley Fresh Farms",
   "location_gln": "0850000001001",
   "timestamp": "2026-04-27T08:30:00Z",
-  "kdes": { "...": "..." },
-  "input_traceability_lot_codes": null
+  "kdes": { "...": "..." }
 }
 ```
 
@@ -84,10 +83,26 @@ RegEngine's `WebhookCTEType` (services/ingestion/app/webhook_models.py line 41):
   The simulator currently emits `location_name` only.
 - `timestamp` — ISO 8601 string. Must not be more than 24h in the future.
   Older than 90 days accepted but flagged with `_historical_warning`.
-- `input_traceability_lot_codes` — Optional first-class field on RegEngine's
-  `IngestEvent` for transformation CTEs. RegEngine actually reads this from
-  the `kdes` dict in practice, so the simulator passes the value via
-  `kdes["input_traceability_lot_codes"]` and that works on both sides.
+- `input_traceability_lot_codes` — Optional **top-level** field on RegEngine's
+  `IngestEvent`, used by transformation CTEs to link inputs to outputs.
+  RegEngine's ingest path reads input lots from **that top-level field only**;
+  it does not look inside `kdes`. An earlier version of this document claimed
+  the opposite, and the simulator sent the value in `kdes` alone — so every
+  transformation lineage link was silently dropped on live ingest while the
+  demo looked correct (#91).
+
+  The simulator now sends it in **both** places, and both are load-bearing:
+  `app/regengine_client.build_wire_body` hoists
+  `kdes["input_traceability_lot_codes"]` to the top level for the wire, and
+  leaves the copy inside `kdes` in place because this repo reads it from there
+  everywhere else: lineage (`app/store.py`), the EPCIS export
+  (`app/epcis_export.py`), the CSV importer (`app/csv_importer.py`) and the
+  recommended-KDE check the mock applies (`app/cte_rules.py`).
+
+  An event that declares no input lots omits the top-level key entirely rather
+  than sending an explicit `null` — the field is optional and defaults to
+  `None` on RegEngine, so omitting it keeps every non-transformation event's
+  wire shape byte-for-byte unchanged.
 
 ## Required KDEs per CTE (RegEngine `REQUIRED_KDES_BY_CTE`)
 
@@ -144,11 +159,12 @@ client that passes here passes in production:
 (Used by the simulator's mock RegEngine endpoint for dashboard / FDA
 preset rendering — does NOT affect live ingest.)
 
-Fourteen columns. The first eleven mirror RegEngine's documented FDA
+Fifteen columns. The first eleven mirror RegEngine's documented FDA
 request export shape and must keep these names and this order; the
-trailing three are additive and carry FSMA 204 KDEs the eleven-column
+trailing four are additive and carry FSMA 204 KDEs the eleven-column
 shape has no home for (the second location description that Shipping and
-Receiving each require, and the traceability lot code source reference).
+Receiving each require, the traceability lot code source reference, and
+the event's CTE).
 
 1. Traceability Lot Code
 2. Traceability Lot Code Description
@@ -164,6 +180,7 @@ Receiving each require, and the traceability lot code source reference).
 12. Immediate Subsequent Recipient Location
 13. Immediate Previous Source Location
 14. Traceability Lot Code Source Reference
+15. Event Type (CTE)
 
 `Date` and `Time` are split from the event timestamp normalized to UTC.
 The column list lives in `app/fda_export.py` (`FDA_EXPORT_COLUMNS`).

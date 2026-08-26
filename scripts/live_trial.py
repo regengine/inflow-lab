@@ -176,6 +176,14 @@ def run_live_trial(
             verify=True,
         )
 
+    # Set the moment we are about to arm live delivery, so the finally below
+    # disarms even when the arming POST itself, the live step, or one of the
+    # assertions after it raises. Without this the tenant controller keeps the
+    # customer's endpoint + API key with delivery.mode=live for the lifetime of
+    # the server process, and the next Start/Step click posts simulated CTEs
+    # into their production ingest.
+    armed_live = False
+
     try:
         mock_step = run_mock_dry_run(client, config)
         summary = {
@@ -186,6 +194,9 @@ def run_live_trial(
         }
 
         if confirm_live:
+            require_live_credentials(config)
+            armed_live = True
+            arm_live_delivery(client, config)
             live_step = run_one_live_batch(client, config)
             summary.update(
                 {
@@ -200,9 +211,13 @@ def run_live_trial(
         try:
             stop_simulation(client, config)
         finally:
-            # A caller-supplied client stays open -- it owns its own lifetime.
-            if owns_client:
-                client.close()
+            try:
+                if armed_live:
+                    disarm_live_delivery(client, config)
+            finally:
+                # A caller-supplied client stays open -- it owns its own lifetime.
+                if owns_client:
+                    client.close()
 
 
 def run_mock_dry_run(client: httpx.Client, config: LiveTrialConfig) -> dict[str, Any]:
@@ -236,10 +251,17 @@ def run_mock_dry_run(client: httpx.Client, config: LiveTrialConfig) -> dict[str,
     return step
 
 
-def run_one_live_batch(client: httpx.Client, config: LiveTrialConfig) -> dict[str, Any]:
+def require_live_credentials(config: LiveTrialConfig) -> None:
     if not (config.live_endpoint and config.live_api_key and config.live_tenant_id):
         raise LiveTrialFailure("Live endpoint, API key, and tenant id are required for --confirm-live.")
 
+
+def arm_live_delivery(client: httpx.Client, config: LiveTrialConfig) -> None:
+    """Point the demo tenant at the customer's live ingest for one batch.
+
+    Always paired with :func:`disarm_live_delivery` in ``run_live_trial``'s
+    ``finally``.
+    """
     request_json(
         client,
         config,
@@ -258,6 +280,50 @@ def run_one_live_batch(client: httpx.Client, config: LiveTrialConfig) -> dict[st
             },
         },
     )
+
+
+def disarm_live_delivery(client: httpx.Client, config: LiveTrialConfig) -> None:
+    """Reset the demo tenant back to mock delivery and prove it took effect.
+
+    ``/api/simulate/reset`` replaces the controller's whole config, so a body
+    carrying ``delivery: {"mode": "mock"}`` drops the stored endpoint, API key
+    and tenant id along with the live mode -- ``DeliveryConfig`` defaults them
+    all to ``None``. The read-back through ``/api/integration/status`` is the
+    part that matters: it is the only endpoint that reports
+    ``api_key_configured``, because ``/api/simulate/status`` sanitizes the key
+    out of its response and so cannot distinguish a disarmed tenant from an
+    armed one.
+    """
+    request_json(
+        client,
+        config,
+        "POST",
+        "/api/simulate/reset",
+        json={
+            "source": "live-trial-disarm",
+            "scenario": TRIAL_SCENARIO,
+            "batch_size": 1,
+            "seed": 204,
+            "delivery": {"mode": "mock"},
+        },
+    )
+    integration = request_json(client, config, "GET", "/api/integration/status")
+    mode = integration.get("mode")
+    if mode != "mock":
+        raise LiveTrialFailure(
+            f"Delivery did not revert to mock for tenant {config.demo_tenant!r}: "
+            f"/api/integration/status still reports mode={mode!r}. Disarm it by "
+            "hand before anyone uses this demo."
+        )
+    if integration.get("api_key_configured") or integration.get("tenant_configured"):
+        raise LiveTrialFailure(
+            f"Live credentials are still configured for tenant {config.demo_tenant!r} "
+            "after the revert. Disarm it by hand before anyone uses this demo."
+        )
+    print(f"Delivery reverted to mock for tenant {config.demo_tenant}.")
+
+
+def run_one_live_batch(client: httpx.Client, config: LiveTrialConfig) -> dict[str, Any]:
     step = request_json(
         client,
         config,

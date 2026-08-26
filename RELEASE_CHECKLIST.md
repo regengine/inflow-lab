@@ -5,7 +5,8 @@ Use this checklist before tagging a demo-ready build or handing the simulator to
 ## Required Verification
 
 - [ ] `uv run pytest`
-- [ ] `uv run python scripts/smoke_regression.py`
+- [ ] `uv run python scripts/smoke_regression.py` (safe to run with `REGENGINE_DATA_DIR` exported; it derives its paths from that root and cleans up under it)
+- [ ] `uv run python scripts/contract_pin_check.py` — RegEngine contract pin freshness and the documented wire shape
 - [ ] `uv run --no-dev --group browser python scripts/browser_smoke.py`
 - [ ] `node --check app/static/app.js`
 - [ ] `python3 -m compileall app scripts`
@@ -23,6 +24,7 @@ Use this checklist before tagging a demo-ready build or handing the simulator to
 - [ ] Mock ingest still rejects an empty batch and an over-500 batch with `422`, and replays `Idempotency-Key` for 24 hours.
 - [ ] Live delivery still requires `api_key` and `tenant_id`.
 - [ ] Live-trial tooling refuses live traffic without `--confirm-live` and mock mode remains the dry-run/default safety path.
+- [ ] `scripts/live_trial.py --confirm-live` disarms the demo tenant when it finishes, on the failure path too: it prints `Delivery reverted to mock for tenant <id>` and fails the run if `/api/integration/status` does not then report `mode: mock` with `api_key_configured: false`. After any live trial, confirm that yourself before leaving the demo — an armed tenant means the next Start or Step click posts simulated CTEs into a customer's production ingest.
 - [ ] New export or dashboard behavior is derived from stored records and does not mutate the ingest contract.
 
 ## Operator Flow Checks
@@ -47,7 +49,8 @@ Use this checklist before tagging a demo-ready build or handing the simulator to
 - [ ] For shared-demo releases, `uv run --no-dev python scripts/remote_smoke.py` passes against the deployed HTTPS URL.
 - [ ] For shared-demo releases, the manual GitHub **Remote Smoke** workflow passes with repository secrets `REGENGINE_REMOTE_USERNAME` and `REGENGINE_REMOTE_PASSWORD`.
 - [ ] For shared-demo releases, the manual GitHub **Remote Browser Smoke** workflow passes with repository secrets `REGENGINE_REMOTE_USERNAME` and `REGENGINE_REMOTE_PASSWORD`.
-- [ ] For shared-demo releases, nightly GitHub **Remote Smoke** and **Remote Browser Smoke** schedules are enabled after those repository secrets are configured and `REGENGINE_BUILD_SHA` is kept current on Railway.
+- [ ] For shared-demo releases, nightly GitHub **Remote Smoke** and **Remote Browser Smoke** schedules are enabled after those repository secrets are configured.
+- [ ] The shared demo's `/api/healthz` reports `build.commit_source: RAILWAY_GIT_COMMIT_SHA`. That service is GitHub-connected, so `REGENGINE_BUILD_SHA` must be **absent**: it outranks Railway's injected SHA (`app/build_info.py`), and leaving it set makes the deploy-freshness check compare the real head commit against a hand-typed constant — a demo stuck several commits behind then reports green. Only a manual CLI-deployed service should set it.
 - [ ] For live-trial prep, `uv run python scripts/live_trial.py --dry-run-only` passes before any confirmed live batch.
 
 ## Handoff Notes
