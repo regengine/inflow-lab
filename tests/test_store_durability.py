@@ -225,3 +225,32 @@ def test_all_three_write_paths_route_through_the_shared_serializer(tmp_path, mon
 
     store.replace_all(stored)
     assert len(calls) == 2
+
+
+def test_update_many_does_not_publish_a_rewrite_that_failed_to_persist(tmp_path, monkeypatch):
+    """A failed rewrite must leave memory matching disk, not a half-applied update.
+
+    Same guarantee add_many gives: update_many persists the whole file before
+    it publishes the new records to the in-memory deque, so a rewrite that
+    raises leaves recent() reporting exactly what is still on disk.
+    """
+    from app import store as store_mod
+
+    store = EventStore(persist_path=tmp_path / "events.jsonl")
+    (stored,) = store.add_many([make_record(lot_code="LOT-ORIGINAL")])
+
+    retried = stored.model_copy(deep=True)
+    retried.event.traceability_lot_code = "LOT-RETRIED"
+
+    def explode(_record):
+        raise OSError(28, "No space left on device")
+
+    monkeypatch.setattr(store_mod, "_serialize_record", explode)
+    with pytest.raises(OSError):
+        store.update_many([retried])
+    monkeypatch.undo()
+
+    assert [r.event.traceability_lot_code for r in store.recent()] == ["LOT-ORIGINAL"]
+    on_disk = [json.loads(line) for line in
+               (tmp_path / "events.jsonl").read_text(encoding="utf-8").splitlines() if line.strip()]
+    assert [r["event"]["traceability_lot_code"] for r in on_disk] == ["LOT-ORIGINAL"]

@@ -195,9 +195,13 @@ class EventStore:
                 else:
                     updated_records.append(record)
 
-            self._set_records(updated_records)
+            # Persist before publishing, for the same reason as add_many: a
+            # rewrite that fails here must leave the store matching the disk
+            # rather than a half-applied update that recent()/stats() report
+            # until the next reload silently drops it.
             persisted_records = sorted(updated_records, key=lambda record: record.sequence_no)
             self._write_records(persisted_records)
+            self._set_records(updated_records)
             self._counter = max((record.sequence_no for record in persisted_records), default=0)
 
         return [record for record in updated_records if record.record_id in replacements]
