@@ -13,7 +13,7 @@ from . import tenancy
 from .auth import basic_auth_config_from_env
 from .auth_middleware import auth_and_tenant_middleware
 from .build_info import APP_VERSION
-from .cors import cors_origins_from_env
+from .cors import cors_origins_for_app, cors_origins_from_env  # noqa: F401  (re-exported for tests)
 from .exceptions import handle_value_error
 from .routers import events, health, ingestion, integration, mock_regengine, operator, scenarios, simulation
 from .tenancy import controller, scenario_saves
@@ -46,7 +46,7 @@ def create_app() -> FastAPI:
     )
     fastapi_app.add_middleware(
         CORSMiddleware,
-        allow_origins=cors_origins_from_env(),
+        allow_origins=cors_origins_for_app(),
         allow_credentials=True,
         allow_methods=["*"],
         allow_headers=["*"],

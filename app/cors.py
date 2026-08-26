@@ -1,8 +1,11 @@
 from __future__ import annotations
 
+import logging
 import os
 from urllib.parse import urlparse
 
+
+logger = logging.getLogger(__name__)
 
 DEFAULT_CORS_ORIGINS = ("http://127.0.0.1:8000", "http://localhost:8000")
 
@@ -28,6 +31,35 @@ def cors_origins_from_env() -> list[str]:
     # "Moving the demo to a new service"). Trusting RAILWAY_PUBLIC_DOMAIN is
     # safe because whoever controls that variable controls the deployment
     # itself; it widens nothing beyond the service's own canonical origin.
+    platform_origin = _platform_origin()
+    if platform_origin and platform_origin not in origins:
+        origins.append(platform_origin)
+    return origins
+
+
+def cors_origins_for_app() -> list[str]:
+    """CORS allowlist for app construction — never raises.
+
+    ``cors_origins_from_env`` deliberately raises on a malformed entry so
+    direct callers (and tests) see the error. ``create_app`` runs at import
+    time, though, so letting that raise escape turns one mistyped entry in the
+    hand-edited ``REGENGINE_CORS_ORIGINS`` list into a full outage: the process
+    never binds a port, and every tenant and endpoint goes down rather than
+    just cross-origin browser calls. Degrade to the built-in defaults (plus the
+    platform origin) and log a loud warning naming the rejected value, the same
+    way ``_platform_origin`` already degrades for RAILWAY_PUBLIC_DOMAIN.
+    """
+    try:
+        return cors_origins_from_env()
+    except ValueError as exc:
+        logger.warning(
+            "Ignoring malformed REGENGINE_CORS_ORIGINS=%r (%s); falling back to the default "
+            "CORS allowlist. Fix the value to restore the configured origins.",
+            os.getenv("REGENGINE_CORS_ORIGINS"),
+            exc,
+        )
+
+    origins = list(DEFAULT_CORS_ORIGINS)
     platform_origin = _platform_origin()
     if platform_origin and platform_origin not in origins:
         origins.append(platform_origin)

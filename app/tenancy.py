@@ -1,6 +1,9 @@
 from __future__ import annotations
 
+import logging
 import os
+import shutil
+import time
 from pathlib import Path
 from threading import RLock
 from typing import Any
@@ -19,8 +22,32 @@ from .schemas.simulation import SimulationConfig
 from .store import EventStore
 
 
+logger = logging.getLogger(__name__)
+
 DATA_ROOT = Path(os.getenv("REGENGINE_DATA_DIR", "data"))
 TENANT_DATA_ROOT = DATA_ROOT / "tenants"
+
+# Selecting a tenant with ``X-RegEngine-Tenant`` lazily materializes a whole
+# controller (engine, event store, scenario saves, clients) plus an on-disk
+# directory. That header is honored even when Basic Auth is disabled — the
+# documented default for a local demo — so without a bound an unauthenticated
+# caller cycling the header value once per request could grow memory and disk
+# without limit, and on a no-auth deployment the operator cleanup routes that
+# could reclaim it are themselves unreachable. The cap below therefore applies
+# regardless of auth state: a process serves at most this many distinct
+# tenants (cached controllers plus tenant directories already on disk),
+# excluding the built-in default tenant. Requests for a *new* tenant beyond
+# the cap are refused with HTTP 429; existing tenants keep working.
+DEFAULT_MAX_TENANTS = 100
+
+# A tenant delete is pop-controller -> shutdown -> rmtree. Between the pop and
+# the rmtree a concurrent request used to re-create and re-register a fresh
+# controller, which the rmtree then left pointing at a missing directory (a
+# "zombie" tenant that 500s on its next write). While a delete is in flight the
+# tenant is quarantined: re-creation is refused rather than silently zombied.
+# The quarantine clears as soon as the directory is gone (delete finished), and
+# expires on its own so a failed rmtree cannot wedge a tenant permanently.
+_DELETE_QUARANTINE_SECONDS = 30.0
 
 engine = LegitFlowEngine(seed=204)
 store = EventStore(persist_path=str(DATA_ROOT / "events.jsonl"))
@@ -35,6 +62,7 @@ controller = SimulationController(
 )
 
 _tenant_controllers: dict[str, SimulationController] = {DEFAULT_TENANT_ID: controller}
+_tenants_being_deleted: dict[str, float] = {}
 _tenant_lock = RLock()
 
 
@@ -52,18 +80,110 @@ def active_controller_for_context(context: TenantContext) -> SimulationControlle
 
 def get_tenant_controller_for_id(tenant_id: str) -> SimulationController:
     with _tenant_lock:
+        _reject_while_delete_in_progress(tenant_id)
         existing_controller = _tenant_controllers.get(tenant_id)
         if existing_controller is not None:
             return existing_controller
 
+        _enforce_tenant_capacity(tenant_id)
         tenant_controller = _create_tenant_controller(tenant_id)
         _tenant_controllers[tenant_id] = tenant_controller
         return tenant_controller
 
 
+def max_tenant_count() -> int:
+    """Maximum number of distinct non-default tenants this process will serve."""
+    raw_limit = os.getenv("REGENGINE_MAX_TENANTS", "").strip()
+    if not raw_limit:
+        return DEFAULT_MAX_TENANTS
+    try:
+        limit = int(raw_limit)
+    except ValueError:
+        logger.warning(
+            "Ignoring malformed REGENGINE_MAX_TENANTS=%r; using default %s",
+            raw_limit,
+            DEFAULT_MAX_TENANTS,
+        )
+        return DEFAULT_MAX_TENANTS
+    if limit <= 0:
+        logger.warning(
+            "Ignoring non-positive REGENGINE_MAX_TENANTS=%r; using default %s",
+            raw_limit,
+            DEFAULT_MAX_TENANTS,
+        )
+        return DEFAULT_MAX_TENANTS
+    return limit
+
+
+def _enforce_tenant_capacity(tenant_id: str) -> None:
+    """Refuse to materialize a brand-new tenant once the cap is reached.
+
+    Counts cached controllers *and* tenant directories already on disk, so the
+    bound holds across restarts and covers both memory and disk growth.
+    """
+    limit = max_tenant_count()
+    known_tenants = set(known_tenant_ids())
+    if tenant_id in known_tenants or len(known_tenants) < limit:
+        return
+    logger.warning(
+        "Refusing to create tenant %r: tenant capacity of %s reached", tenant_id, limit
+    )
+    raise HTTPException(
+        status_code=429,
+        detail=(
+            f"Tenant capacity reached ({limit} tenants). Delete unused tenants or raise "
+            "REGENGINE_MAX_TENANTS before creating a new one."
+        ),
+    )
+
+
+def _reject_while_delete_in_progress(tenant_id: str) -> None:
+    """Block re-creating a tenant whose delete is mid-flight (see #175)."""
+    started_at = _tenants_being_deleted.get(tenant_id)
+    if started_at is None:
+        return
+    delete_finished = not tenant_dir(tenant_id).exists()
+    quarantine_expired = (time.monotonic() - started_at) > _DELETE_QUARANTINE_SECONDS
+    if delete_finished or quarantine_expired:
+        _tenants_being_deleted.pop(tenant_id, None)
+        return
+    raise HTTPException(
+        status_code=409,
+        detail="Tenant delete in progress; retry shortly",
+    )
+
+
 def pop_tenant_controller(tenant_id: str) -> SimulationController | None:
+    """Remove a tenant's controller and quarantine the tenant against re-creation.
+
+    The quarantine is what makes the caller's pop -> shutdown -> rmtree
+    sequence atomic with respect to concurrent traffic for the same tenant.
+    ``delete_tenant`` below clears it explicitly; callers that still run the
+    sequence by hand get it cleared as soon as the directory is gone.
+    """
     with _tenant_lock:
+        _tenants_being_deleted[tenant_id] = time.monotonic()
         return _tenant_controllers.pop(tenant_id, None)
+
+
+async def delete_tenant(tenant_id: str) -> tuple[bool, bool]:
+    """Delete a tenant atomically with respect to concurrent traffic.
+
+    Returns ``(removed_cached_controller, removed_data)``. Safe to call twice
+    and safe to follow with a reset: once the directory is gone the tenant is
+    no longer quarantined, so the next request creates a clean controller.
+    """
+    directory = tenant_dir(tenant_id)
+    removed_data = directory.exists()
+    tenant_controller = pop_tenant_controller(tenant_id)
+    try:
+        if tenant_controller is not None:
+            await tenant_controller.shutdown()
+        shutil.rmtree(directory, ignore_errors=True)
+    finally:
+        with _tenant_lock:
+            _tenants_being_deleted.pop(tenant_id, None)
+    return tenant_controller is not None, removed_data
 
 
 def operator_tenant_id(raw_tenant_id: str) -> str:
