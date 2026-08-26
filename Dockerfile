@@ -31,4 +31,4 @@ HEALTHCHECK --interval=30s --timeout=5s --start-period=15s --retries=3 \
   CMD python -c "import json, os, urllib.request; port=os.getenv('PORT', '8000'); json.load(urllib.request.urlopen(f'http://127.0.0.1:{port}/api/healthz', timeout=3))"
 
 ENTRYPOINT ["docker-entrypoint.sh"]
-CMD ["sh", "-c", "uvicorn app.main:app --host 0.0.0.0 --port ${PORT:-8000}"]
+CMD ["sh", "-c", "exec uvicorn app.main:app --host 0.0.0.0 --port ${PORT:-8000}"]
