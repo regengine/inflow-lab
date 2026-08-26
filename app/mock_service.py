@@ -1,18 +1,23 @@
 from __future__ import annotations
 
 import hashlib
+import hmac
 import json
+import os
 from collections import OrderedDict
+from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
-from typing import Any
+from typing import Any, Callable, Iterable, Protocol
 from uuid import uuid4
 
 from .cte_rules import REQUIRED_KDES
-from .schemas.domain import RegEngineEvent
+from .regengine_client import WEBHOOK_HMAC_SECRET_ENV
+from .schemas.domain import RegEngineEvent, StoredEventRecord
 from .schemas.ingestion import IngestPayload, IngestResponseEvent, MockIngestResponse
 
 
 # Mirrors RegEngine's WebhookPayload constraint: events accepts 1-500 items.
+MIN_BATCH_EVENTS = 1
 MAX_BATCH_EVENTS = 500
 # Mirrors RegEngine's Pydantic timestamp validator: >24h in the future is rejected.
 MAX_FUTURE_HOURS = 24
@@ -26,6 +31,9 @@ LOCATION_KDE_FIELDS = (
     "ship_to_gln",
 )
 _IDEMPOTENCY_CACHE_LIMIT = 1024
+# Mirrors RegEngine's documented replay window: a cached response for a given
+# Idempotency-Key is replayed for 24 hours and is a cache miss after that.
+IDEMPOTENCY_TTL = timedelta(hours=24)
 
 # Friction injection codes -> the HTTP failure a real customer hits. Keyed by
 # the DeliveryConfig.mock_friction values so operators can rehearse each
@@ -53,23 +61,108 @@ class MockRegEngineHTTPError(Exception):
         self.detail = detail
 
 
+class PersistedEventSource(Protocol):
+    """The slice of ``EventStore`` the mock needs to resume its chain hash."""
+
+    def read_persisted_records(self, persist_path: str | None = ...) -> list[StoredEventRecord]:
+        ...
+
+
+@dataclass(slots=True)
+class _CachedResponse:
+    response: MockIngestResponse
+    stored_at: datetime
+
+
 class MockRegEngineService:
     """In-process stand-in for RegEngine's POST /api/v1/webhooks/ingest.
 
     Unlike the original always-accept mock, this mirrors the live webhook's
     validation so the demo experience matches what a customer hits in the
     wild: strict per-CTE KDE checks (exact key lookup, no aliasing), the
-    location-identifier requirement, batch caps, in-batch duplicate
-    rejection, future-timestamp rejection, and 24h idempotency replays.
+    location-identifier requirement, batch caps (1-500 events), in-batch
+    duplicate rejection, future-timestamp rejection, optional HMAC signature
+    verification, and 24h idempotency replays.
+
+    The chain hash is resumed from the persisted event log when an event
+    source is attached (see :meth:`attach_event_source`), so a restart of a
+    volume-backed deployment continues the existing chain instead of forking
+    a new one from "".
+
+    The idempotency cache is per-process and best-effort: it is bounded both
+    by ``IDEMPOTENCY_TTL`` (24h, matching the documented replay window) and
+    by ``_IDEMPOTENCY_CACHE_LIMIT`` entries, and it is not persisted.
     """
 
-    def __init__(self) -> None:
+    def __init__(self, event_source: PersistedEventSource | None = None) -> None:
         self._chain_hash = ""
-        self._idempotency_cache: OrderedDict[str, MockIngestResponse] = OrderedDict()
+        self._idempotency_cache: OrderedDict[str, _CachedResponse] = OrderedDict()
+        self._event_source: PersistedEventSource | None = None
+        self._chain_resumed = True
+        self.time_source: Callable[[], datetime] = lambda: datetime.now(UTC)
+        if event_source is not None:
+            self.attach_event_source(event_source)
+
+    @property
+    def chain_hash(self) -> str:
+        """The current head of the mock's hash chain ("" before any event)."""
+        return self._chain_hash
+
+    def attach_event_source(self, event_source: PersistedEventSource | None) -> None:
+        """Point the mock at the persisted event log it should resume from.
+
+        Resumption is lazy: the chain hash is rebuilt from disk on the next
+        ingest, so attaching costs nothing at import/startup time.
+        """
+        self._event_source = event_source
+        self._chain_resumed = event_source is None
+
+    def resume_chain_from_records(self, records: Iterable[StoredEventRecord]) -> str:
+        """Seed the chain hash from already-loaded persisted records."""
+        self._chain_hash = chain_hash_from_records(records)
+        self._chain_resumed = True
+        return self._chain_hash
+
+    def _ensure_chain_resumed(self) -> None:
+        if self._chain_resumed:
+            return
+        source = self._event_source
+        # Mark resumed first: a source that cannot be read (missing file,
+        # unreadable line) must not retry on every single ingest.
+        self._chain_resumed = True
+        if source is None:
+            return
+        try:
+            records = source.read_persisted_records()
+        except (OSError, ValueError):
+            return
+        self._chain_hash = chain_hash_from_records(records)
 
     def reset(self) -> None:
         self._chain_hash = ""
         self._idempotency_cache.clear()
+        # A reset clears the persisted log too, so there is nothing to resume.
+        self._chain_resumed = True
+
+    def verify_signature(self, body_bytes: bytes, signature: str | None) -> None:
+        """Mirror RegEngine's ``_verify_webhook_signature``.
+
+        No-ops when ``REGENGINE_WEBHOOK_HMAC_SECRET`` is unset (the default,
+        and the pre-signing migration ramp on both sides). When the secret is
+        configured, a missing or non-matching ``X-Webhook-Signature`` raises a
+        401 exactly as the live webhook does, so body-bytes drift in the
+        client's signer is caught locally instead of in production.
+        """
+        expected = expected_signature(body_bytes)
+        if expected is None:
+            return
+        if not signature:
+            raise MockRegEngineHTTPError(401, "Missing X-Webhook-Signature header")
+        candidate = signature.strip()
+        if candidate.startswith("sha256="):
+            candidate = candidate[len("sha256=") :]
+        if not hmac.compare_digest(candidate, expected.removeprefix("sha256=")):
+            raise MockRegEngineHTTPError(401, "Invalid webhook signature")
 
     def ingest(
         self,
@@ -82,15 +175,25 @@ class MockRegEngineService:
             if failure is not None:
                 raise MockRegEngineHTTPError(*failure)
 
+        if not payload.events:
+            raise MockRegEngineHTTPError(
+                422,
+                f"events accepts {MIN_BATCH_EVENTS}-{MAX_BATCH_EVENTS} items per batch",
+            )
         if len(payload.events) > MAX_BATCH_EVENTS:
             raise MockRegEngineHTTPError(
                 422,
                 f"events accepts at most {MAX_BATCH_EVENTS} items per batch",
             )
 
-        if idempotency_key and idempotency_key in self._idempotency_cache:
+        now = self.time_source()
+        self._expire_idempotency_entries(now)
+        cached = self._idempotency_cache.get(idempotency_key) if idempotency_key else None
+        if cached is not None:
             self._idempotency_cache.move_to_end(idempotency_key)
-            return self._idempotency_cache[idempotency_key]
+            return cached.response
+
+        self._ensure_chain_resumed()
 
         response_events: list[IngestResponseEvent] = []
         accepted = 0
@@ -146,10 +249,65 @@ class MockRegEngineService:
             ingestion_timestamp=datetime.now(UTC),
         )
         if idempotency_key:
-            self._idempotency_cache[idempotency_key] = response
+            self._idempotency_cache[idempotency_key] = _CachedResponse(
+                response=response,
+                stored_at=now,
+            )
+            self._idempotency_cache.move_to_end(idempotency_key)
             while len(self._idempotency_cache) > _IDEMPOTENCY_CACHE_LIMIT:
                 self._idempotency_cache.popitem(last=False)
         return response
+
+    def _expire_idempotency_entries(self, now: datetime) -> None:
+        """Drop entries older than the documented 24h replay window.
+
+        Entries are inserted in time order, so this stops at the first live
+        entry instead of scanning the whole cache.
+        """
+        cutoff = now - IDEMPOTENCY_TTL
+        while self._idempotency_cache:
+            key, entry = next(iter(self._idempotency_cache.items()))
+            if entry.stored_at > cutoff:
+                return
+            del self._idempotency_cache[key]
+
+
+def chain_hash_from_records(records: Iterable[StoredEventRecord]) -> str:
+    """Return the newest persisted ``chain_hash``, or "" when there is none.
+
+    ``EventStore.read_persisted_records`` returns records oldest-first, but
+    replayed/retried records can be appended out of order, so the head of the
+    chain is the record with the highest ``sequence_no`` that carries an
+    accepted delivery response. File order breaks ties.
+    """
+    head = ""
+    head_key: tuple[int, int] | None = None
+    for index, record in enumerate(records):
+        response = record.delivery_response
+        if not isinstance(response, dict):
+            continue
+        chain_hash = response.get("chain_hash")
+        if not isinstance(chain_hash, str) or not chain_hash:
+            continue
+        key = (record.sequence_no, index)
+        if head_key is None or key > head_key:
+            head_key = key
+            head = chain_hash
+    return head
+
+
+def expected_signature(body_bytes: bytes) -> str | None:
+    """The ``X-Webhook-Signature`` value these bytes must carry, or None.
+
+    Returns None when ``REGENGINE_WEBHOOK_HMAC_SECRET`` is unset, matching
+    ``regengine_client._build_signature_header`` so the mock and the live
+    client agree on both the secret source and the digest format.
+    """
+    secret = os.getenv(WEBHOOK_HMAC_SECRET_ENV, "").strip()
+    if not secret:
+        return None
+    digest = hmac.new(secret.encode("utf-8"), body_bytes, hashlib.sha256).hexdigest()
+    return f"sha256={digest}"
 
 
 def validate_event_like_regengine(event: RegEngineEvent) -> list[str]:

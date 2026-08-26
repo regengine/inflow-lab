@@ -4,12 +4,13 @@ import re
 from datetime import date
 from typing import Any
 
-from fastapi import APIRouter, Depends, HTTPException, Query
+from fastapi import APIRouter, Depends, Header, HTTPException, Query, Request
 from fastapi.responses import JSONResponse, PlainTextResponse
 
 from ..controller import SimulationController
 from ..dependencies import get_active_controller
 from ..epcis_export import epcis_filename, render_epcis_document
+from ..mock_service import MockRegEngineHTTPError
 from ..fda_export import (
     FDA_EXPORT_PRESETS,
     apply_fda_export_preset,
@@ -27,10 +28,43 @@ router = APIRouter(prefix="/api/mock/regengine", tags=["Mock RegEngine"])
 
 @router.post("/ingest", response_model=MockIngestResponse)
 async def mock_regengine_ingest(
+    request: Request,
     payload: IngestPayload,
     active_controller: SimulationController = Depends(get_active_controller),
+    idempotency_key: str | None = Header(default=None, alias="Idempotency-Key"),
+    webhook_signature: str | None = Header(default=None, alias="X-Webhook-Signature"),
+    mock_friction: str | None = Header(
+        default=None,
+        alias="X-Mock-Friction",
+        description="Comma-separated mock friction codes (invalid_key, subscription_inactive, rate_limit).",
+    ),
 ) -> MockIngestResponse:
-    return active_controller.mock_service.ingest(payload)
+    """Mock RegEngine ingest, honouring the same headers the live webhook does.
+
+    ``Idempotency-Key`` and friction codes are threaded through so a customer
+    testing their own client against this route sees the same deduping and the
+    same failure modes as the in-process simulator path. Signature
+    verification is a no-op unless REGENGINE_WEBHOOK_HMAC_SECRET is set.
+    """
+    service = active_controller.mock_service
+    try:
+        # Starlette caches the body FastAPI already read, so this is the exact
+        # byte sequence the client signed — the point of verifying at all.
+        service.verify_signature(await request.body(), webhook_signature)
+        return service.ingest(
+            payload,
+            idempotency_key=idempotency_key,
+            friction=_parse_mock_friction(mock_friction),
+        )
+    except MockRegEngineHTTPError as exc:
+        # Without this the mock's own 401/402/422/429 escape as an unhandled 500.
+        raise HTTPException(status_code=exc.status_code, detail=exc.detail) from exc
+
+
+def _parse_mock_friction(raw: str | None) -> tuple[str, ...]:
+    if not raw:
+        return ()
+    return tuple(code.strip() for code in raw.split(",") if code.strip())
 
 
 @router.get("/export/presets", response_model=FDAExportPresetListResponse)
