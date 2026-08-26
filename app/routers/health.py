@@ -13,6 +13,7 @@ from ..build_info import current_build_info
 from ..contract import INFLOW_CONTRACT_VERSION
 from ..controller import SimulationController
 from ..dependencies import get_active_controller, get_tenant_context
+from ..schemas.health import HealthResponse, HealthzResponse
 
 
 logger = logging.getLogger(__name__)
@@ -42,7 +43,7 @@ def _store_probe(store: Any) -> dict[str, Any]:
     return probe
 
 
-@router.get("/health")
+@router.get("/health", response_model=HealthResponse)
 async def health(
     context: TenantContext = Depends(get_tenant_context),
     active_controller: SimulationController = Depends(get_active_controller),
@@ -65,7 +66,7 @@ async def health(
     }
 
 
-@router.get("/healthz")
+@router.get("/healthz", response_model=HealthzResponse)
 async def healthz() -> JSONResponse:
     """Liveness/readiness probe for Railway and Docker.
 
@@ -75,6 +76,10 @@ async def healthz() -> JSONResponse:
     write to its persist path (a blank line appended and truncated away),
     which is the failure mode — full disk, detached volume, permission
     change — a health check exists to catch.
+
+    Returned as a raw ``JSONResponse`` because the status code has to vary
+    with ``ok``; ``response_model`` is declared purely so the OpenAPI
+    document describes the body instead of an untyped object.
     """
     store_probe = _store_probe(tenancy.store)
     body: dict[str, Any] = {

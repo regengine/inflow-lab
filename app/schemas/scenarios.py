@@ -7,7 +7,7 @@ from pydantic import BaseModel, Field
 
 from ..scenarios import ScenarioId
 from .domain import DemoFixtureId, DestinationMode, StoredEventRecord
-from .simulation import DeliveryConfig, SimulationConfig
+from .simulation import STRICT_REQUEST, DeliveryConfig, SimulationConfig
 
 
 class ScenarioSummary(BaseModel):
@@ -47,6 +47,8 @@ class ScenarioSaveListResponse(BaseModel):
 
 
 class ScenarioSaveRequest(BaseModel):
+    model_config = STRICT_REQUEST
+
     config: SimulationConfig | None = None
 
 
@@ -77,6 +79,8 @@ class DemoFixtureListResponse(BaseModel):
 
 
 class DemoFixtureLoadRequest(BaseModel):
+    model_config = STRICT_REQUEST
+
     reset: bool = True
     source: str | None = None
     delivery: DeliveryConfig | None = None

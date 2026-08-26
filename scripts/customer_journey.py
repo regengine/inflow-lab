@@ -25,7 +25,7 @@ Local mode (default):
 
 Deployed mode (never provisions, never touches Redis, small batch):
 
-    export REGENGINE_LIVE_ENDPOINT=https://www.regengine.co/api/v1/webhooks/ingest
+    export REGENGINE_LIVE_ENDPOINT={DEFAULT_LIVE_INGEST_ENDPOINT}
     export REGENGINE_LIVE_API_KEY=...
     export REGENGINE_LIVE_TENANT_ID=...
     uv run python scripts/customer_journey.py --confirm-live
@@ -51,10 +51,21 @@ import httpx
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from app.engine import LegitFlowEngine  # noqa: E402
-from app.regengine_client import LiveRegEngineClient, LiveRegEngineDeliveryError  # noqa: E402
+from app.regengine_client import (  # noqa: E402
+    DEFAULT_LIVE_INGEST_ENDPOINT,
+    LiveRegEngineClient,
+    LiveRegEngineDeliveryError,
+)
 from app.schemas.ingestion import IngestPayload  # noqa: E402
 from app.schemas.simulation import DeliveryConfig, SimulationConfig  # noqa: E402
 from app.scenarios import ScenarioId  # noqa: E402
+
+
+# The example URL in the usage text above is filled in from the single
+# Python definition of the default ingest endpoint, so the docs a user
+# copy-pastes cannot drift from where the client actually posts.
+if __doc__:  # pragma: no branch - only false under `python -OO`
+    __doc__ = __doc__.replace("{DEFAULT_LIVE_INGEST_ENDPOINT}", DEFAULT_LIVE_INGEST_ENDPOINT)
 
 
 DEFAULT_BASE_URL = "http://localhost:8000"

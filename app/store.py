@@ -54,6 +54,20 @@ def mask_secret_in_payload(value: Any, secret: str | None = None) -> Any:
     return value
 
 
+def _serialize_record(record: StoredEventRecord) -> str:
+    """The one and only on-disk serialization for a stored record.
+
+    Every persistence path -- ``add_many`` (append) and the two rewrite
+    paths, ``update_many`` and ``replace_all`` -- goes through here so the
+    secret scrub cannot be applied on one path and silently skipped on
+    another. ``SECURITY_BOUNDARIES.md`` states the redaction guarantee
+    unconditionally, and one shared serializer is what keeps it that way:
+    previously a record written masked by ``add_many`` was rewritten in
+    clear by the next retry or scenario load.
+    """
+    return json.dumps(_scrub_secrets(record.model_dump(mode="json")))
+
+
 class EventStore:
     def __init__(self, persist_path: str = "data/events.jsonl", max_records: int = 5000) -> None:
         self.persist_path = Path(persist_path)
@@ -160,7 +174,7 @@ class EventStore:
             lines: list[str] = []
             for offset, record in enumerate(record_list, start=1):
                 record.sequence_no = start_counter + offset
-                lines.append(json.dumps(_scrub_secrets(record.model_dump(mode="json"))))
+                lines.append(_serialize_record(record))
 
             original_size = self._file_size()
             try:
@@ -231,6 +245,44 @@ class EventStore:
                 return {"ok": False, "persist_path": str(path), "error": f"{type(exc).__name__}: {exc}"}
         return {"ok": True, "persist_path": str(path), "error": None}
 
+    def _fsync_dir(self) -> None:
+        """Best-effort fsync of the persist directory so a rename is durable."""
+        try:
+            dir_fd = os.open(str(self.persist_path.parent), os.O_RDONLY)
+        except OSError:  # pragma: no cover - platform dependent
+            return
+        try:
+            os.fsync(dir_fd)
+        except OSError:  # pragma: no cover - platform dependent
+            pass
+        finally:
+            os.close(dir_fd)
+
+    def _rewrite_persisted(self, persisted_records: list[StoredEventRecord]) -> None:
+        """Durably replace the persist file with ``persisted_records``.
+
+        Shared by the two rewrite paths. Records are serialized through
+        ``_serialize_record`` (so the secret scrub applies to rewrites as
+        well as appends), the temp file is fsynced before the atomic
+        rename, and the containing directory is fsynced after it so the
+        rename itself survives a crash. A failed write leaves the previous
+        file untouched -- the temp file is removed and the error raised
+        before anything is committed to memory.
+        """
+        self.persist_path.parent.mkdir(parents=True, exist_ok=True)
+        tmp_path = self.persist_path.with_suffix(f"{self.persist_path.suffix}.tmp")
+        try:
+            with tmp_path.open("w", encoding="utf-8") as handle:
+                for record in persisted_records:
+                    handle.write(_serialize_record(record) + "\n")
+                handle.flush()
+                os.fsync(handle.fileno())
+            tmp_path.replace(self.persist_path)
+        except OSError:
+            tmp_path.unlink(missing_ok=True)
+            raise
+        self._fsync_dir()
+
     def update_many(self, records: Iterable[StoredEventRecord]) -> list[StoredEventRecord]:
         replacements = {record.record_id: record for record in records}
         if not replacements:
@@ -247,13 +299,9 @@ class EventStore:
                 else:
                     updated_records.append(record)
 
-            self._set_records(updated_records)
             persisted_records = sorted(updated_records, key=lambda record: record.sequence_no)
-            tmp_path = self.persist_path.with_suffix(f"{self.persist_path.suffix}.tmp")
-            with tmp_path.open("w", encoding="utf-8") as handle:
-                for record in persisted_records:
-                    handle.write(json.dumps(record.model_dump(mode="json")) + "\n")
-            tmp_path.replace(self.persist_path)
+            self._rewrite_persisted(persisted_records)
+            self._set_records(persisted_records)
             self._counter = max((record.sequence_no for record in persisted_records), default=0)
 
         return [record for record in updated_records if record.record_id in replacements]
@@ -261,12 +309,7 @@ class EventStore:
     def replace_all(self, records: Iterable[StoredEventRecord]) -> list[StoredEventRecord]:
         persisted_records = sorted(list(records), key=lambda record: record.sequence_no)
         with self._lock:
-            self.persist_path.parent.mkdir(parents=True, exist_ok=True)
-            tmp_path = self.persist_path.with_suffix(f"{self.persist_path.suffix}.tmp")
-            with tmp_path.open("w", encoding="utf-8") as handle:
-                for record in persisted_records:
-                    handle.write(json.dumps(record.model_dump(mode="json")) + "\n")
-            tmp_path.replace(self.persist_path)
+            self._rewrite_persisted(persisted_records)
             self._set_records(persisted_records)
             self._counter = max((record.sequence_no for record in persisted_records), default=0)
         return persisted_records
@@ -280,13 +323,19 @@ class EventStore:
         record_ids: list[str] | None = None,
         limit: int = 50,
     ) -> list[StoredEventRecord]:
-        record_id_filter = set(record_ids or [])
+        # `record_ids is None` (filter omitted) and `record_ids == []`
+        # (filter naming zero records) are different requests. Testing
+        # truthiness conflates them and turns an explicitly empty selection
+        # into "retry everything".
+        record_id_filter = None if record_ids is None else set(record_ids)
+        if record_id_filter is not None and not record_id_filter:
+            return []
         records = self._all_records()
         failed_records = [
             record
             for record in records
             if record.delivery_status == "failed"
-            and (not record_id_filter or record.record_id in record_id_filter)
+            and (record_id_filter is None or record.record_id in record_id_filter)
         ]
         return failed_records[:limit]
 

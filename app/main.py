@@ -16,7 +16,12 @@ from .build_info import APP_VERSION
 from .cors import cors_origins_for_app, cors_origins_from_env  # noqa: F401  (re-exported for tests)
 from .exceptions import handle_value_error
 from .routers import events, health, ingestion, integration, mock_regengine, operator, scenarios, simulation
-from .tenancy import controller, scenario_saves
+
+# Not used by this module: routers resolve a per-tenant controller through
+# `dependencies.get_active_controller`, never these module-level singletons.
+# They stay as an explicit re-export because the test-suite imports them
+# from `app.main` — marked so nobody reads them as live wiring here.
+from .tenancy import controller, scenario_saves  # noqa: F401  (re-exported for tests)
 
 
 static_dir = Path(__file__).parent / "static"

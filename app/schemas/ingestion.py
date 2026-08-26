@@ -6,10 +6,13 @@ from typing import Any, Literal
 from pydantic import BaseModel, Field, field_validator
 
 from .domain import CSVImportType, CTEType, DestinationMode, RegEngineEvent
-from .simulation import DeliveryConfig
+from .simulation import STRICT_REQUEST, DeliveryConfig
 
 
 class IngestPayload(BaseModel):
+    # Deliberately NOT strict: this is the mock stand-in for RegEngine's own
+    # webhook receiver, and a receiver that 422s on an additive field a
+    # newer producer sends would misrepresent live behaviour.
     source: str = "codex-simulator"
     events: list[RegEngineEvent]
 
@@ -35,6 +38,8 @@ class MockIngestResponse(BaseModel):
 
 
 class DeliveryRetryRequest(BaseModel):
+    model_config = STRICT_REQUEST
+
     record_ids: list[str] | None = None
     limit: int = 50
     source: str | None = None
@@ -63,6 +68,8 @@ class DeliveryRetryResponse(BaseModel):
 
 
 class ReplayRequest(BaseModel):
+    model_config = STRICT_REQUEST
+
     persist_path: str | None = None
     source: str | None = None
     delivery: DeliveryConfig | None = None
@@ -83,6 +90,8 @@ class ReplayResponse(BaseModel):
 
 
 class CSVImportRequest(BaseModel):
+    model_config = STRICT_REQUEST
+
     import_type: CSVImportType
     csv_text: str
     source: str | None = None
