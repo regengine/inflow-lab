@@ -1271,12 +1271,16 @@ function renderSnapshot(status, events, health = state.health) {
 }
 
 async function refresh() {
-  const [health, status, events] = await Promise.all([
-    api('/api/health'),
-    api('/api/simulate/status'),
-    api('/api/events?limit=100'),
-  ]);
-  renderSnapshot(status, events.events, health);
+  try {
+    const [health, status, events] = await Promise.all([
+      api('/api/health'),
+      api('/api/simulate/status'),
+      api('/api/events?limit=100'),
+    ]);
+    renderSnapshot(status, events.events, health);
+  } catch (error) {
+    setStatus(error.message, 'error', 5000);
+  }
 }
 
 function stopFallbackPolling() {
