@@ -3,11 +3,18 @@ from __future__ import annotations
 import csv
 import io
 from dataclasses import dataclass
-from typing import Callable, Iterable
+from datetime import UTC
+from typing import Any, Callable, Iterable
 
-from .schemas.domain import CTEType, FDAExportPreset, StoredEventRecord
+from .cte_rules import merged_event_values
+from .schemas.domain import CTEType, FDAExportPreset, RegEngineEvent, StoredEventRecord
 
 
+# The first eleven columns mirror RegEngine's documented FDA request export
+# shape and must keep their order. The trailing columns are additive and carry
+# the FSMA 204 KDEs the eleven-column shape has no home for: the second
+# location description Shipping/Receiving records each require, and the
+# traceability lot code source reference.
 FDA_EXPORT_COLUMNS = [
     "Traceability Lot Code",
     "Traceability Lot Code Description",
@@ -20,7 +27,40 @@ FDA_EXPORT_COLUMNS = [
     "Time",
     "Reference Document Type",
     "Reference Document Number",
+    "Immediate Subsequent Recipient Location",
+    "Immediate Previous Source Location",
+    "Traceability Lot Code Source Reference",
 ]
+
+# Per-CTE primary "Location Description" KDE. Falls back to
+# ``event.location_name`` when the KDE is absent.
+_PRIMARY_LOCATION_KDES: dict[CTEType, tuple[str, ...]] = {
+    CTEType.SHIPPING: ("ship_from_location",),
+    CTEType.RECEIVING: ("receiving_location",),
+    CTEType.FIRST_LAND_BASED_RECEIVING: ("receiving_location",),
+    CTEType.TRANSFORMATION: ("transformation_location", "location_name"),
+}
+
+_SUBSEQUENT_RECIPIENT_KDES = ("ship_to_location", "immediate_subsequent_recipient")
+_PREVIOUS_SOURCE_KDES = ("immediate_previous_source", "ship_from_location", "vessel_name")
+_TLC_SOURCE_KDES = ("tlc_source_reference", "traceability_lot_code_source_reference")
+
+
+def _first_text(values: dict[str, Any], keys: Iterable[str]) -> str:
+    for key in keys:
+        value = values.get(key)
+        if isinstance(value, str) and value.strip():
+            return value
+        if value is not None and not isinstance(value, (str, list, dict)):
+            return str(value)
+    return ""
+
+
+def _primary_location(event: RegEngineEvent, values: dict[str, Any]) -> str:
+    return (
+        _first_text(values, _PRIMARY_LOCATION_KDES.get(event.cte_type, ()))
+        or event.location_name
+    )
 
 
 @dataclass(frozen=True, slots=True)
@@ -105,6 +145,16 @@ def render_fda_request_csv(
     writer.writeheader()
     for record in records:
         event = record.event
+        values = merged_event_values(event)
+        # Normalize to UTC so two events at different absolute instants never
+        # render the same Date/Time pair (the export carries no offset column).
+        timestamp = event.timestamp
+        timestamp = (
+            timestamp.replace(tzinfo=UTC) if timestamp.tzinfo is None else timestamp.astimezone(UTC)
+        )
+        previous_source = ""
+        if event.cte_type in (CTEType.RECEIVING, CTEType.FIRST_LAND_BASED_RECEIVING):
+            previous_source = _first_text(values, _PREVIOUS_SOURCE_KDES)
         writer.writerow(
             {
                 "Traceability Lot Code": event.traceability_lot_code,
@@ -112,12 +162,17 @@ def render_fda_request_csv(
                 "Product Description": event.product_description,
                 "Quantity": event.quantity,
                 "Unit of Measure": event.unit_of_measure,
-                "Location Description": event.location_name,
+                "Location Description": _primary_location(event, values),
                 "Location Identifier (GLN)": location_gln(event.location_name),
-                "Date": event.timestamp.date().isoformat(),
-                "Time": event.timestamp.time().isoformat(timespec="seconds"),
+                "Date": timestamp.date().isoformat(),
+                "Time": timestamp.time().isoformat(timespec="seconds"),
                 "Reference Document Type": event.kdes.get("reference_document_type", ""),
                 "Reference Document Number": event.kdes.get("reference_document_number", ""),
+                "Immediate Subsequent Recipient Location": _first_text(
+                    values, _SUBSEQUENT_RECIPIENT_KDES
+                ),
+                "Immediate Previous Source Location": previous_source,
+                "Traceability Lot Code Source Reference": _first_text(values, _TLC_SOURCE_KDES),
             }
         )
     return output.getvalue()
