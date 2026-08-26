@@ -36,7 +36,14 @@ CONTROL_FIELDS = {
     "parent_lot_codes",
     "import_type",
 }
-TOP_LEVEL_EVENT_FIELDS = set(EVENT_REQUIRED_FIELDS)
+TOP_LEVEL_EVENT_FIELDS = set(EVENT_REQUIRED_FIELDS) | {
+    # location_gln is a dedicated RegEngineEvent field (schemas/domain.py)
+    # but optional, so it isn't in EVENT_REQUIRED_FIELDS. It still has to be
+    # excluded from the generic KDE mapping in _parse_kdes -- otherwise a
+    # `location_gln` column falls through into kdes["location_gln"], where
+    # neither exporter's location_gln(name) callback ever looks (#162).
+    "location_gln",
+}
 LIST_KDE_FIELDS = {
     "input_traceability_lot_codes",
     "input_products",
@@ -79,6 +86,25 @@ def parse_csv_import(
     warnings: list[CSVImportWarning] = []
 
     for row_number, raw_row in enumerate(reader, start=2):
+        # Checked before normalization/blank-filtering so a row can never be
+        # silently treated as "blank" just because its mapped columns are
+        # empty while it also carries unmapped overflow data (#160).
+        overflow = _row_overflow(raw_row)
+        if overflow:
+            total += 1
+            errors.append(
+                CSVImportError(
+                    row=row_number,
+                    field="row",
+                    message=(
+                        f"Row has {len(overflow)} more column(s) than the header "
+                        f"(unmatched value(s): {', '.join(overflow)}); check for an "
+                        "unescaped comma inside a field"
+                    ),
+                )
+            )
+            continue
+
         row = _normalize_row(raw_row)
         if _is_blank(row):
             continue
@@ -202,6 +228,11 @@ def _build_event(
             quantity=quantity,
             unit_of_measure=row["unit_of_measure"],
             location_name=row["location_name"],
+            # Threaded through explicitly, like the other top-level fields
+            # above -- _parse_kdes excludes "location_gln" from the generic
+            # KDE mapping (see TOP_LEVEL_EVENT_FIELDS) specifically so it
+            # lands here instead of in kdes (#162).
+            location_gln=row.get("location_gln") or None,
             timestamp=timestamp,
             kdes=kdes,
         )
@@ -241,13 +272,27 @@ def _header_errors(fieldnames: list[str] | None) -> list[CSVImportError]:
     return []
 
 
-def _normalize_row(raw_row: dict[str | None, str | None]) -> dict[str, str]:
+def _normalize_row(raw_row: dict[str | None, Any]) -> dict[str, str]:
     normalized: dict[str, str] = {}
     for key, value in raw_row.items():
         if key is None:
             continue
         normalized[_normalize_header(key)] = (value or "").strip()
     return normalized
+
+
+def _row_overflow(raw_row: dict[str | None, Any]) -> list[str]:
+    """Non-empty values csv.DictReader couldn't match to a header column.
+
+    When a row has more fields than the header, DictReader doesn't raise --
+    it collects the surplus into a list under the `None` restkey, which
+    `_normalize_row` above then quietly drops. That surplus is almost always
+    a real authoring mistake (e.g. an unescaped comma inside a free-text
+    value shifting every later column), so callers must treat it as an
+    error instead of discarding it with no record it ever existed (#160).
+    """
+    overflow = raw_row.get(None) or []
+    return [value.strip() for value in overflow if value and value.strip()]
 
 
 def _normalize_header(header: str) -> str:
@@ -336,13 +381,32 @@ def _parse_kdes(
                 kdes.update(parsed)
 
     excluded_fields = TOP_LEVEL_EVENT_FIELDS | CONTROL_FIELDS | {"kdes", "timestamp"}
+    # Two differently-named columns can target the same KDE key -- a bare
+    # column (e.g. "vessel_identifier") and its kde_-prefixed twin
+    # ("kde_vessel_identifier") both strip down to "vessel_identifier".
+    # Track which column claimed each target key so a second column
+    # mapping to the same key is reported instead of silently overwriting
+    # the first one in row/header order (#162).
+    claimed_by: dict[str, str] = {}
     for field, value in row.items():
         if not value or field in excluded_fields:
             continue
-        if field.startswith("kde_"):
-            kdes[field.removeprefix("kde_")] = _coerce_kde_value(field.removeprefix("kde_"), value)
-        else:
-            kdes[field] = _coerce_kde_value(field, value)
+        target = field.removeprefix("kde_") if field.startswith("kde_") else field
+        claiming_field = claimed_by.get(target)
+        if claiming_field is not None:
+            errors.append(
+                CSVImportError(
+                    row=row_number,
+                    field=field,
+                    message=(
+                        f"Columns '{claiming_field}' and '{field}' both map to KDE "
+                        f"'{target}'; rename one so the mapping is unambiguous"
+                    ),
+                )
+            )
+            continue
+        claimed_by[target] = field
+        kdes[target] = _coerce_kde_value(target, value)
     return kdes
 
 
