@@ -161,11 +161,19 @@ class EventStore:
                     next_sequence_no = self._counter + 1
                     record.sequence_no = next_sequence_no
                     handle.write(_serialize_record(record) + "\n")
-                    # Commit to memory only once the line is actually on disk.
-                    # A write that fails partway through a batch (full disk,
-                    # detached volume, permission change) must not leave a
-                    # phantom record that recent()/stats() report until the
-                    # next reload silently drops it again.
+                    # write() only stages bytes in a userspace buffer --
+                    # flush() forces the OS-level write so a full disk (or
+                    # any other write failure) raises here, synchronously,
+                    # instead of being deferred to a later write's flush or
+                    # to the handle's close, by which point we could have
+                    # already committed more records to memory than ever
+                    # reached disk.
+                    handle.flush()
+                    # Commit to memory only once the line is confirmed on
+                    # disk. A write that fails partway through a batch (full
+                    # disk, detached volume, permission change) must not
+                    # leave a phantom record that recent()/stats() report
+                    # until the next reload silently drops it again.
                     self._counter = next_sequence_no
                     self._records.appendleft(record)
                     stored.append(record)
