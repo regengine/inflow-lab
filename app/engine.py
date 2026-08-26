@@ -499,10 +499,17 @@ class LegitFlowEngine:
         return reference_number or reference_type or ""
 
     def _advance_time(self, min_minutes: int, max_minutes: int) -> datetime:
-        self._time_cursor += timedelta(minutes=self.rng.randint(min_minutes, max_minutes))
+        candidate = self._time_cursor + timedelta(minutes=self.rng.randint(min_minutes, max_minutes))
         live_window_ceiling = datetime.now(UTC) + timedelta(hours=_max_future_hours())
-        if self._time_cursor > live_window_ceiling:
-            self._time_cursor = live_window_ceiling
+        if candidate > live_window_ceiling:
+            # Once the simulated clock has caught up to the live cap,
+            # clamping straight to `live_window_ceiling` would repeat that
+            # same instant for every event generated within one wall-clock
+            # tick. Ride the ceiling forward as it creeps ahead of real
+            # time, and when it hasn't moved yet, nudge the cursor by the
+            # smallest representable step so ordering never collapses.
+            candidate = live_window_ceiling if live_window_ceiling > self._time_cursor else self._time_cursor + timedelta(microseconds=1)
+        self._time_cursor = candidate
         return self._time_cursor
 
     def _quantity(self, low: float, high: float) -> float:
@@ -562,7 +569,14 @@ class LegitFlowEngine:
     def _make_sscc(self) -> str:
         company_prefix = "8500000"
         serial = next(self._ref_counter)
-        base = f"0{company_prefix}{self._time_cursor.strftime('%j')}{serial:07d}"[:17]
+        # SSCC payload is extension digit (1) + company prefix (7) +
+        # day-of-year (3) + serial reference, summing to exactly 17 digits
+        # ahead of the check digit. Wrap the serial into the 6 digits that
+        # leaves rather than building an 18-character string and slicing it
+        # — slicing silently dropped the serial's last digit and made
+        # distinct lots collide on the same SSCC.
+        serial_component = f"{serial % 1_000_000:06d}"
+        base = f"0{company_prefix}{self._time_cursor.strftime('%j')}{serial_component}"
         return f"{base}{self._gs1_check_digit(base)}"
 
     def _gs1_check_digit(self, digits: str) -> int:
