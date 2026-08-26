@@ -5,7 +5,7 @@ import os
 import socket
 from typing import Any, Literal
 
-from pydantic import BaseModel, Field, HttpUrl, field_validator
+from pydantic import BaseModel, ConfigDict, Field, HttpUrl, field_validator
 
 from ..scenarios import ScenarioId
 from .domain import DestinationMode, OperationScale
@@ -128,6 +128,13 @@ def validate_egress_endpoint(url: HttpUrl | None) -> None:
 
 
 class DeliveryConfig(BaseModel):
+    # extra="forbid" (#143): this arrives inline in request bodies (the
+    # integration routes, and the `delivery` block on CSV-import, replay and
+    # demo-fixture requests). A misspelled key here silently keeps the stored
+    # default -- including leaving delivery on mock when the caller meant to
+    # point it somewhere else -- so it must be a 422, not a quiet no-op.
+    model_config = ConfigDict(extra="forbid")
+
     mode: DestinationMode = DestinationMode.MOCK
     endpoint: HttpUrl | None = None
     api_key: str | None = None
@@ -138,6 +145,13 @@ class DeliveryConfig(BaseModel):
 
 
 class SimulationConfig(BaseModel):
+    # extra="forbid" (#143): POST /api/simulate/reset validates the raw body
+    # directly as this model, so a caller who wrapped it as {"config": {...}}
+    # -- the shape /start takes -- got a 200 and a silently unchanged
+    # scenario. There is no field named "config" here, so forbidding extras
+    # turns that mistake into the 422 it always should have been.
+    model_config = ConfigDict(extra="forbid")
+
     source: str = "codex-simulator"
     scenario: ScenarioId = ScenarioId.LEAFY_GREENS_SUPPLIER
     scale: OperationScale = OperationScale.MIDSIZE

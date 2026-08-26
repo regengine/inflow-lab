@@ -340,3 +340,24 @@ def test_events_endpoint_limit_still_refuses_past_its_existing_maximum() -> None
     response = client.get("/api/events?limit=501")
 
     assert response.status_code == 422
+
+
+def test_wrapped_reset_body_is_rejected_instead_of_silently_ignored() -> None:
+    """#143's headline repro: /api/simulate/reset validates the raw body as
+    SimulationConfig, so a caller who wrapped it the way /start expects used
+    to get a 200 and an unchanged scenario. It must be a 422."""
+    response = client.post(
+        "/api/simulate/reset",
+        json={"config": {"scenario": "dairy_continuous_flow"}},
+    )
+    assert response.status_code == 422
+
+
+def test_unknown_key_inside_inline_delivery_block_is_rejected() -> None:
+    """DeliveryConfig arrives nested inside other request bodies, so a typo
+    there has to fail too -- not just an unknown key at the top level."""
+    response = client.post(
+        "/api/simulate/reset",
+        json={"delivery": {"mode": "mock", "endpiont": "https://example.test"}},
+    )
+    assert response.status_code == 422
