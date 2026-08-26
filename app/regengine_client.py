@@ -59,9 +59,47 @@ class ConnectionCheckResult:
 # These mirror the failure modes RegEngine's webhook surface actually
 # returns, so the settings page can give recovery guidance instead of a
 # bare status code.
+#
+# #100 -- this maps GET /api/v1/webhooks/recent's status code, NOT
+# POST /api/v1/webhooks/ingest's. The two routes' dependency chains
+# differ: /recent authenticates the caller and checks a read-scope
+# permission, but never touches the tenant's subscription status, the
+# separate webhooks.ingest permission scope, or (when configured) the
+# HMAC request signature -- all three are gates on /ingest alone. A
+# credential that gets HTTP 200 here can still fail an actual ingest
+# with 401 (signature), 402 (subscription) or 403 (wrong scope).
+#
+# The verdict string for HTTP 200 deliberately stays "connected":
+# tests/test_integration_settings.py, tests/test_egress_guard.py and
+# tests/test_client_diagnostics.py all pin it there (as does
+# scripts/customer_journey.py's live smoke check), and none of those
+# files are this change's to edit. So the fix for the false-assurance
+# report below is in the DETAIL text, not the verdict: say plainly what
+# a green read proves and what it does not, instead of implying ingest
+# is safe. A verdict that actually named the gap (e.g. "read_only") was
+# considered and rejected for exactly that reason -- see
+# tests/test_connection_probe.py for the full reasoning, including what
+# a RegEngine-side change would need to add for a verdict-level fix.
 _CONNECTION_VERDICTS: dict[int, tuple[str, str]] = {
-    200: ("connected", "Authenticated read succeeded. Credentials and tenant are valid."),
+    200: (
+        "connected",
+        "Authenticated read succeeded: this API key and tenant can read "
+        "RegEngine's webhook surface. This does not confirm that POST "
+        "/api/v1/webhooks/ingest will accept events -- that route gates on "
+        "three things a read-only probe cannot reach: the tenant's "
+        "subscription status, the separate webhooks.ingest permission "
+        "scope (a read-only key passes this probe and then gets HTTP 403 "
+        "on ingest), and -- if RegEngine requires it -- the HMAC request "
+        "signature. If live ingests fail after this reports connected, "
+        "check those three first.",
+    ),
     401: ("unauthorized", "RegEngine rejected the API key (HTTP 401). Check the key value and that it has not expired or been revoked."),
+    # #100: per the issue's route audit, RegEngine's subscription gate
+    # (require_active_subscription) sits on /ingest only, so this probe
+    # returning 402 is not currently expected. Kept rather than deleted:
+    # it is the correct verdict if that ever changes, an unreachable
+    # entry costs nothing, and it is already pinned by
+    # tests/test_client_diagnostics.py and tests/test_integration_settings.py.
     402: ("subscription_inactive", "The tenant's subscription is not active (HTTP 402). Billing status must be active or trialing before ingestion resumes."),
     403: ("forbidden", "RegEngine refused the request (HTTP 403). The key may be missing the webhooks.read scope, or the tenant does not match the key."),
     404: ("tenant_mismatch", "RegEngine returned HTTP 404. Webhook reads return 404 when the tenant does not match the API key's tenant."),
@@ -147,9 +185,21 @@ class LiveRegEngineClient:
         """Probe RegEngine with the configured credentials without ingesting.
 
         Uses GET /api/v1/webhooks/recent?limit=1 — the cheapest authenticated
-        read on the webhook surface — and maps the response to the same
-        failure vocabulary a live integrator sees (bad key, wrong tenant,
-        lapsed subscription, rate limit).
+        read on the webhook surface — and maps the response to a failure
+        vocabulary keyed by HTTP status (bad key, wrong tenant, rate limit).
+
+        #100: this is deliberately a read, never a write -- posting a
+        synthetic event into a customer's production RegEngine to "test"
+        the connection is not acceptable for a button labelled Test
+        connection. The tradeoff that buys is real: /recent's dependency
+        chain is weaker than /ingest's, so this cannot observe the
+        tenant's subscription status, the webhooks.ingest permission scope,
+        or (when configured) the HMAC signature requirement -- three gates
+        that live only on the write path and can each independently fail
+        an ingest a passing probe here said nothing about. See
+        _CONNECTION_VERDICTS' comment and tests/test_connection_probe.py
+        for how the HTTP-200 case is worded to reflect that gap instead of
+        implying ingest is safe.
         """
         endpoint = str(config.delivery.endpoint) if config.delivery.endpoint else DEFAULT_LIVE_INGEST_ENDPOINT
         api_key = config.delivery.api_key
