@@ -479,28 +479,28 @@ SCENARIO_PRESETS[ScenarioId.COPACKER_NUT_BUTTER] = ScenarioPreset(
     label="Co-packer (nut butters)",
     description="Contract manufacturer receiving ingredient nut lots from grower partners and transforming them into branded and private-label nut butters (FTL: nut butters).",
     farms=(
-        Location("Central Valley Almond Ranch", "farm", _gln(1101), {"gps": "36.7378,-119.7871"}),
-        Location("Georgia Grove Peanut Farm", "farm", _gln(1102), {"gps": "31.5785,-84.1557"}),
-        Location("Sunland Pecan Orchards", "farm", _gln(1103), {"gps": "32.3199,-106.7637"}),
+        Location("Central Valley Almond Ranch", "farm", _gln(1141), {"gps": "36.7378,-119.7871"}),
+        Location("Georgia Grove Peanut Farm", "farm", _gln(1142), {"gps": "31.5785,-84.1557"}),
+        Location("Sunland Pecan Orchards", "farm", _gln(1143), {"gps": "32.3199,-106.7637"}),
     ),
     coolers=(
-        Location("Hulling & Conditioning Station", "cooler", _gln(2101)),
+        Location("Hulling & Conditioning Station", "cooler", _gln(2141)),
     ),
     packers=(
-        Location("Ingredient Intake Dock", "packer", _gln(3101)),
-        Location("Roastline Staging", "packer", _gln(3102)),
+        Location("Ingredient Intake Dock", "packer", _gln(3141)),
+        Location("Roastline Staging", "packer", _gln(3142)),
     ),
     processors=(
-        Location("MillRight Contract Manufacturing — Line 1", "processor", _gln(4101)),
-        Location("MillRight Contract Manufacturing — Line 2", "processor", _gln(4102)),
+        Location("MillRight Contract Manufacturing — Line 1", "processor", _gln(4141)),
+        Location("MillRight Contract Manufacturing — Line 2", "processor", _gln(4142)),
     ),
     dcs=(
-        Location("Brand Fulfillment DC", "dc", _gln(5101)),
-        Location("Private Label DC East", "dc", _gln(5102)),
+        Location("Brand Fulfillment DC", "dc", _gln(5141)),
+        Location("Private Label DC East", "dc", _gln(5142)),
     ),
     retailers=(
-        Location("Retail Store #2210", "retail", _gln(6101)),
-        Location("Grocer Chain DC Receipt", "retail", _gln(6102)),
+        Location("Retail Store #2210", "retail", _gln(6141)),
+        Location("Grocer Chain DC Receipt", "retail", _gln(6142)),
     ),
     products=(
         ProductSpec("Raw Almonds", "totes", "tree_nuts", {"plu": "3339"}),
