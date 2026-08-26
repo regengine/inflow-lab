@@ -1,20 +1,27 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 import os
 import uuid
-from collections import defaultdict, deque
-from dataclasses import dataclass
 from datetime import UTC, datetime
-from typing import Any
+from typing import Any, Mapping
 from urllib.parse import urlparse
 
 from .audit import summarize_scenario_audit
 from .contract import INFLOW_CONTRACT_VERSION
 from .csv_importer import parse_csv_import
+from .delivery import (
+    DeliveryOutcome,
+    build_stored_records,
+    deliver_payload,
+    event_delivery_fields,
+    pair_event_responses,
+    rebuild_retried_records,
+)
 from .demo_fixtures import get_demo_fixture
 from .engine import LegitFlowEngine
-from .mock_service import MockRegEngineHTTPError, MockRegEngineService
+from .mock_service import MockRegEngineService
 from .schemas.domain import DemoFixtureId, DestinationMode, StoredEventRecord
 from .schemas.ingestion import (
     CSVImportRequest,
@@ -44,25 +51,82 @@ from .regengine_client import (
     DEFAULT_LIVE_INGEST_ENDPOINT,
     WEBHOOK_HMAC_SECRET_ENV,
     LiveRegEngineClient,
-    LiveRegEngineDeliveryError,
 )
 from .schemas.integration import IntegrationConfigureRequest, IntegrationStatusResponse
 from .scenario_saves import ScenarioSaveStore
 from .scenarios import ScenarioId, get_scenario
-from .store import EventStore, mask_secret_in_payload, mask_secret_in_string
+from .store import EventStore
 
 
-@dataclass(slots=True)
-class DeliveryOutcome:
-    response: dict[str, Any] | None = None
-    delivery_status: str = "generated"
-    posted: int = 0
-    failed: int = 0
-    delivery_attempts: int = 0
-    attempted_at: datetime | None = None
-    completed_at: datetime | None = None
-    error_message: str | None = None
-    metadata: dict[str, Any] | None = None
+logger = logging.getLogger(__name__)
+
+
+# Simulation run state -- `running`, `_task`, `_stop_event` -- and the tenant
+# controller registry in `tenancy.py` live in one process's memory. There is no
+# shared coordination point, so under two or more workers each request lands on
+# an arbitrary process: a Stop can return 200 while a *different* worker's run
+# loop keeps generating and delivering events, including live traffic.
+#
+# Single-process is therefore a hard requirement, not a coincidence of the
+# current Dockerfile CMD happening to omit `--workers`. Rather than leave it as
+# an accident that a later `WEB_CONCURRENCY=4` or a Railway replica bump would
+# silently break, the invariant is enforced here: a controller refuses to exist
+# in a process that was told to run alongside siblings. See
+# DEPLOYMENT_PROFILES.md ("Single-process requirement").
+#
+# Moving run/stop state to a shared coordination point (so Stop works from any
+# worker) is the larger fix and remains open; this makes the current limit
+# loud instead of silent.
+WORKER_COUNT_ENV_VARS = ("WEB_CONCURRENCY", "UVICORN_WORKERS", "GUNICORN_WORKERS")
+REPLICA_COUNT_ENV_VARS = ("RAILWAY_REPLICA_COUNT", "WEB_REPLICAS")
+
+
+class MultiProcessRuntimeError(RuntimeError):
+    """Raised when the process is configured to run alongside sibling workers."""
+
+
+def _configured_process_count(name: str, environ: Mapping[str, str]) -> int | None:
+    """Parse a worker/replica count env var, ignoring unset or malformed values."""
+    raw_value = (environ.get(name) or "").strip()
+    if not raw_value:
+        return None
+    try:
+        return int(raw_value)
+    except ValueError:
+        logger.warning("Ignoring malformed %s=%r when checking worker count", name, raw_value)
+        return None
+
+
+def enforce_single_process_runtime(environ: Mapping[str, str] | None = None) -> None:
+    """Refuse to run in a process configured for multi-worker/multi-replica.
+
+    Only an *explicit* count above 1 trips this: an unset or malformed value
+    is the single-process default and is allowed through, so the documented
+    local and Railway profiles keep working untouched.
+    """
+    environ = os.environ if environ is None else environ
+    for name in (*WORKER_COUNT_ENV_VARS, *REPLICA_COUNT_ENV_VARS):
+        count = _configured_process_count(name, environ)
+        if count is not None and count > 1:
+            raise MultiProcessRuntimeError(
+                f"{name}={count} would run the simulator in more than one process, but "
+                "simulation run/stop state is per-process: a Stop request could return "
+                "200 while another process keeps delivering events. Run a single worker "
+                "and a single replica (see DEPLOYMENT_PROFILES.md)."
+            )
+
+
+# Delivery mechanics now live in ``app.delivery``. These names stay importable
+# from ``app.controller`` because tests and older callers reach for them here.
+_pair_event_responses = pair_event_responses
+_event_delivery_fields = event_delivery_fields
+
+__all__ = [
+    "DeliveryOutcome",
+    "MultiProcessRuntimeError",
+    "SimulationController",
+    "enforce_single_process_runtime",
+]
 
 
 class SimulationController:
@@ -74,6 +138,9 @@ class SimulationController:
         mock_service: MockRegEngineService,
         live_client: LiveRegEngineClient,
     ) -> None:
+        # Checked here rather than in an entrypoint so it holds for every way
+        # the app is started -- uvicorn, gunicorn, a script, a test harness.
+        enforce_single_process_runtime()
         self.engine = engine
         self.store = store
         self.scenario_saves = scenario_saves
@@ -186,26 +253,16 @@ class SimulationController:
             idempotency_key=uuid.uuid4().hex,
         )
 
+        stored_records = build_stored_records(
+            source=step_config.source,
+            events=events,
+            parent_lot_codes=lineages,
+            delivery_mode=step_config.delivery.mode,
+            outcome=outcome,
+        )
+
         async with self._lock:
-            stored_records: list[StoredEventRecord] = []
-            response_events = (outcome.response or {}).get("events", []) if outcome.response else []
-            paired_responses = _pair_event_responses(events, response_events)
-            for index, event in enumerate(events):
-                event_response = paired_responses[index]
-                stored_records.append(
-                    StoredEventRecord(
-                        payload_source=step_config.source,
-                        event=event,
-                        parent_lot_codes=lineages[index],
-                        destination_mode=step_config.delivery.mode,
-                        delivery_attempts=outcome.delivery_attempts,
-                        last_delivery_attempt_at=outcome.attempted_at,
-                        delivery_response=event_response,
-                        delivery_metadata=outcome.metadata,
-                        **_event_delivery_fields(outcome, event_response),
-                    )
-                )
-            self.store.add_many(stored_records)
+            await self._persist_new_records(stored_records)
 
             result = StepResponse(
                 generated=len(events),
@@ -290,7 +347,10 @@ class SimulationController:
                 },
                 deep=True,
             )
-            parsed = parse_csv_import(
+            # Parsing is CPU-bound over a caller-supplied body, so it runs on a
+            # worker thread rather than stalling the single event loop.
+            parsed = await asyncio.to_thread(
+                parse_csv_import,
                 request.import_type,
                 request.csv_text,
                 default_timestamp=datetime.now(UTC),
@@ -302,25 +362,15 @@ class SimulationController:
             # Delivery runs without the controller lock held.
             payload = IngestPayload(source=source, events=parsed.events)
             outcome = await self._deliver_payload(payload, import_config)
-            response_events = (outcome.response or {}).get("events", []) if outcome.response else []
-            paired_responses = _pair_event_responses(parsed.events, response_events)
-            for index, event in enumerate(parsed.events):
-                event_response = paired_responses[index]
-                stored_records.append(
-                    StoredEventRecord(
-                        payload_source=source,
-                        event=event,
-                        parent_lot_codes=parsed.parent_lot_codes[index],
-                        destination_mode=delivery.mode,
-                        delivery_attempts=outcome.delivery_attempts,
-                        last_delivery_attempt_at=outcome.attempted_at,
-                        delivery_response=event_response,
-                        delivery_metadata=outcome.metadata,
-                        **_event_delivery_fields(outcome, event_response),
-                    )
-                )
+            stored_records = build_stored_records(
+                source=source,
+                events=parsed.events,
+                parent_lot_codes=parsed.parent_lot_codes,
+                delivery_mode=delivery.mode,
+                outcome=outcome,
+            )
             async with self._lock:
-                self.store.add_many(stored_records)
+                await self._persist_new_records(stored_records)
 
         async with self._lock:
             rejected = parsed.total - len(parsed.events)
@@ -390,26 +440,18 @@ class SimulationController:
         payload = IngestPayload(source=source, events=events)
         outcome = await self._deliver_payload(payload, fixture_config)
 
+        stored_records = build_stored_records(
+            source=source,
+            events=events,
+            parent_lot_codes=[
+                list(fixture_event.parent_lot_codes) for fixture_event in fixture.events
+            ],
+            delivery_mode=delivery.mode,
+            outcome=outcome,
+        )
+
         async with self._lock:
-            response_events = (outcome.response or {}).get("events", []) if outcome.response else []
-            paired_responses = _pair_event_responses(events, response_events)
-            stored_records = []
-            for index, fixture_event in enumerate(fixture.events):
-                event_response = paired_responses[index]
-                stored_records.append(
-                    StoredEventRecord(
-                        payload_source=source,
-                        event=fixture_event.event,
-                        parent_lot_codes=list(fixture_event.parent_lot_codes),
-                        destination_mode=delivery.mode,
-                        delivery_attempts=outcome.delivery_attempts,
-                        last_delivery_attempt_at=outcome.attempted_at,
-                        delivery_response=event_response,
-                        delivery_metadata=outcome.metadata,
-                        **_event_delivery_fields(outcome, event_response),
-                    )
-                )
-            self.store.add_many(stored_records)
+            await self._persist_new_records(stored_records)
             result = DemoFixtureLoadResponse(
                 status="delivery_failed" if outcome.delivery_status == "failed" else "loaded",
                 fixture_id=fixture.id,
@@ -469,7 +511,9 @@ class SimulationController:
             async with self._lock:
                 self.config = snapshot.config
                 self.store.configure(self.config.persist_path)
-                loaded_records = self.store.replace_all(snapshot.records)
+                loaded_records = await asyncio.to_thread(
+                    self.store.replace_all, snapshot.records
+                )
                 self.engine.reset(
                     self.config.seed, scenario=self.config.scenario, scale=self.config.scale
                 )
@@ -551,7 +595,6 @@ class SimulationController:
                     retry_config,
                     idempotency_key=idempotency_key,
                 )
-                response_events = (outcome.response or {}).get("events", []) if outcome.response else []
                 responses.append(
                     {
                         "source": source,
@@ -563,36 +606,19 @@ class SimulationController:
                     }
                 )
 
-                paired_responses = _pair_event_responses(
-                    [record.event for record in records], response_events
-                )
-                for index, record in enumerate(records):
-                    event_response = paired_responses[index]
-                    next_attempts = record.delivery_attempts + outcome.delivery_attempts
-                    fields = _event_delivery_fields(outcome, event_response)
-                    if fields["delivery_status"] == "posted":
-                        fields["error"] = None
-                    else:
-                        fields["last_delivery_success_at"] = record.last_delivery_success_at
-                    updated_records.append(
-                        record.model_copy(
-                            update={
-                                "destination_mode": delivery.mode,
-                                "delivery_attempts": next_attempts,
-                                "last_delivery_attempt_at": outcome.attempted_at
-                                or record.last_delivery_attempt_at,
-                                "delivery_response": event_response,
-                                "delivery_metadata": outcome.metadata,
-                                **fields,
-                            },
-                            deep=True,
-                        )
+                updated_records.extend(
+                    rebuild_retried_records(
+                        records=records,
+                        delivery_mode=delivery.mode,
+                        outcome=outcome,
                     )
+                )
                 posted += outcome.posted
                 failed += outcome.failed
 
             async with self._lock:
-                self.store.update_many(updated_records)
+                # Rewrites the whole persisted log; off the event loop.
+                await asyncio.to_thread(self.store.update_many, updated_records)
             if posted and failed:
                 status = "partial"
             elif failed:
@@ -615,99 +641,36 @@ class SimulationController:
         await self._publish_update()
         return result
 
+    async def _persist_new_records(self, records: list[StoredEventRecord]) -> None:
+        """Append records to the store without blocking the event loop.
+
+        `EventStore.add_many` fsyncs the batch before exposing it in memory
+        and rolls back a partial write, so it must keep running exactly as
+        written -- it is simply moved onto a worker thread. Durability is
+        the store's job; keeping the single event loop responsive is ours.
+        """
+        await asyncio.to_thread(self.store.add_many, records)
+
     async def _deliver_payload(
         self,
         payload: IngestPayload,
         config: SimulationConfig,
         idempotency_key: str | None = None,
     ) -> DeliveryOutcome:
-        if config.delivery.mode == DestinationMode.NONE:
-            return DeliveryOutcome()
+        """Send one payload to the configured destination.
 
-        api_key = config.delivery.api_key
-        attempted_at = datetime.now(UTC)
-        delivery_idempotency_key = idempotency_key
-        if config.delivery.mode != DestinationMode.NONE and delivery_idempotency_key is None:
-            delivery_idempotency_key = uuid.uuid4().hex
-        try:
-            if config.delivery.mode == DestinationMode.MOCK:
-                response = self.mock_service.ingest(
-                    payload,
-                    idempotency_key=delivery_idempotency_key,
-                    friction=tuple(config.delivery.mock_friction),
-                ).model_dump(mode="json")
-                return DeliveryOutcome(
-                    response=mask_secret_in_payload(response, api_key),
-                    delivery_status="posted",
-                    posted=response.get("accepted", len(payload.events)),
-                    failed=response.get("rejected", 0),
-                    delivery_attempts=1,
-                    attempted_at=attempted_at,
-                    completed_at=datetime.now(UTC),
-                    metadata={
-                        "delivery_mode": "mock",
-                        "attempted_event_count": len(payload.events),
-                        "idempotency_key": delivery_idempotency_key,
-                    },
-                )
-            if config.delivery.mode == DestinationMode.LIVE:
-                result = await self.live_client.ingest(
-                    payload,
-                    config,
-                    idempotency_key=delivery_idempotency_key,
-                )
-                return DeliveryOutcome(
-                    response=mask_secret_in_payload(result.response, api_key),
-                    delivery_status="posted",
-                    posted=result.response.get("accepted", len(payload.events)),
-                    failed=result.response.get("rejected", 0),
-                    delivery_attempts=1,
-                    attempted_at=attempted_at,
-                    completed_at=datetime.now(UTC),
-                    metadata=result.metadata | {"attempted_event_count": len(payload.events)},
-                )
-            return DeliveryOutcome()
-        except MockRegEngineHTTPError as exc:
-            return DeliveryOutcome(
-                delivery_status="failed",
-                failed=len(payload.events),
-                delivery_attempts=1,
-                attempted_at=attempted_at,
-                error_message=str(exc),
-                metadata={
-                    "delivery_mode": "mock",
-                    "attempted_event_count": len(payload.events),
-                    "status_code": exc.status_code,
-                    "idempotency_key": delivery_idempotency_key,
-                },
-            )
-        except LiveRegEngineDeliveryError as exc:
-            metadata = exc.metadata | {"attempted_event_count": len(payload.events)}
-            if delivery_idempotency_key and "idempotency_key" not in metadata:
-                metadata["idempotency_key"] = delivery_idempotency_key
-            return DeliveryOutcome(
-                delivery_status="failed",
-                failed=len(payload.events),
-                delivery_attempts=1,
-                attempted_at=attempted_at,
-                error_message=mask_secret_in_string(str(exc), api_key),
-                metadata=metadata,
-            )
-        except Exception as exc:  # pragma: no cover - exercised by live integration, not unit tests
-            metadata = {
-                "delivery_mode": config.delivery.mode.value,
-                "attempted_event_count": len(payload.events),
-            }
-            if delivery_idempotency_key:
-                metadata["idempotency_key"] = delivery_idempotency_key
-            return DeliveryOutcome(
-                delivery_status="failed",
-                failed=len(payload.events),
-                delivery_attempts=1,
-                attempted_at=attempted_at,
-                error_message=mask_secret_in_string(str(exc), api_key),
-                metadata=metadata,
-            )
+        Thin delegation to `app.delivery.deliver_payload`: the mechanics of
+        talking to mock/live and turning success or failure into a
+        `DeliveryOutcome` are not controller state. Kept as a method because
+        it is the seam tests replace to simulate slow or failing delivery.
+        """
+        return await deliver_payload(
+            payload,
+            config,
+            mock_service=self.mock_service,
+            live_client=self.live_client,
+            idempotency_key=idempotency_key,
+        )
 
     async def _run_loop(self, stop_event: asyncio.Event) -> None:
         while not stop_event.is_set():
@@ -825,78 +788,6 @@ class SimulationController:
             persist_path=snapshot.config.persist_path,
             delivery_mode=snapshot.config.delivery.mode,
         )
-
-
-def _pair_event_responses(
-    events: list[Any],
-    response_events: list[Any],
-) -> list[dict[str, Any] | None]:
-    """Match each sent event to its own verdict, keyed on identity.
-
-    RegEngine does not answer in request order. Its webhook route builds
-    the response in phases — replay-window and KDE rejections first, then
-    rules-enforcement rejections, then every acceptance — so the response
-    list is partitioned rejected-first. Zipping it against the request by
-    array index therefore attaches one event's verdict to a different
-    event whenever a rejection follows an acceptance: a valid lot is
-    stored as ``failed`` carrying another lot's validation errors, and the
-    ``event_id``/``sha256_hash``/``chain_hash`` of a real accepted event
-    are copied onto the wrong record. Those hashes are the evidence.
-
-    ``(traceability_lot_code, cte_type)`` is on the wire on both sides and
-    is the join key. A key can legitimately repeat inside one batch — the
-    same lot and CTE at two different timestamps — so responses are held
-    in a per-key queue and consumed in order rather than collapsed into a
-    dict. Within a partition RegEngine preserves request order, so the
-    Nth event with a given key gets the Nth response with that key.
-
-    A key with no response left is ``None``: no verdict. Callers must
-    treat that as "unknown", never fall back to positional matching —
-    a wrong verdict is worse than an absent one.
-
-    Note this is invisible to the unit suite by construction:
-    ``mock_service`` appends accepted and rejected in a single pass, so
-    the mock's response *is* in request order.
-    """
-    by_key: dict[tuple[str, str], deque[dict[str, Any]]] = defaultdict(deque)
-    for response in response_events:
-        if not isinstance(response, dict):
-            continue
-        lot_code = response.get("traceability_lot_code")
-        cte_type = response.get("cte_type")
-        if lot_code is None or cte_type is None:
-            continue
-        by_key[(str(lot_code), str(cte_type))].append(response)
-
-    paired: list[dict[str, Any] | None] = []
-    for event in events:
-        cte_type = getattr(event.cte_type, "value", event.cte_type)
-        queue = by_key.get((str(event.traceability_lot_code), str(cte_type)))
-        paired.append(queue.popleft() if queue else None)
-    return paired
-
-def _event_delivery_fields(outcome: DeliveryOutcome, event_response: dict[str, Any] | None) -> dict[str, Any]:
-    """Per-record delivery fields honoring per-event rejection.
-
-    RegEngine (and the mock mirroring it) returns HTTP 2xx with per-event
-    accepted/rejected statuses; a rejected event was not ingested, so its
-    stored record must read as failed with the validator's errors.
-    """
-    status = outcome.delivery_status
-    error = outcome.error_message
-    if (
-        status == "posted"
-        and isinstance(event_response, dict)
-        and event_response.get("status") == "rejected"
-    ):
-        status = "failed"
-        errors = event_response.get("errors") or []
-        error = "; ".join(str(item) for item in errors) or "Event rejected by ingest validation"
-    return {
-        "delivery_status": status,
-        "last_delivery_success_at": outcome.completed_at if status == "posted" else None,
-        "error": error,
-    }
 
 
 def _validate_live_delivery(delivery: DeliveryConfig) -> None:

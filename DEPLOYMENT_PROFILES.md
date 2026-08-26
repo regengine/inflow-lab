@@ -10,6 +10,16 @@ This guide gives concrete run profiles for local development, shared design-part
 | Shared demo | `0.0.0.0` behind TLS/proxy | Basic Auth on | `data/tenants/{tenant_id}/` | `mock` | Design partners, multiple tenants, non-live workshops |
 | Live ingest trial | Prefer private host or VPN | Basic Auth on | Tenant-scoped | `mock`; switch request to `live` | Controlled RegEngine workspace validation |
 
+## Single-process requirement
+
+Every profile below runs the simulator as **one process with one worker and one replica**. This is a hard requirement, not a default worth tuning.
+
+Simulation run state (whether a run loop is active, and the per-tenant controller registry) lives in a single process's memory with no shared coordination point. With two or more workers each request lands on an arbitrary process, so a Stop request can return `200` from a process whose loop was already idle while a *different* process keeps generating and delivering events — including live RegEngine traffic.
+
+The app enforces this at startup: if any of `WEB_CONCURRENCY`, `UVICORN_WORKERS`, `GUNICORN_WORKERS`, `RAILWAY_REPLICA_COUNT`, or `WEB_REPLICAS` is set above `1`, startup fails with a `MultiProcessRuntimeError` naming the offending variable rather than booting into a state where Stop silently does nothing. Leaving these unset is the supported configuration.
+
+Do not add `--workers` to the `uvicorn` command, and do not scale Railway replicas above 1. If the demo needs more throughput, raise `batch_size`/lower `interval_seconds` on a single process, or run separate instances against separate data roots.
+
 ## Common Prerequisites
 
 ```bash
