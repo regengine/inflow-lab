@@ -22,6 +22,20 @@ from .store import EventStore
 DATA_ROOT = Path(os.getenv("REGENGINE_DATA_DIR", "data"))
 TENANT_DATA_ROOT = DATA_ROOT / "tenants"
 
+# Hard ceiling on concurrently active tenant controllers (#174). Picking a
+# tenant is a single request header, and honoring one lazily mints a full
+# SimulationController (engine, store, scenario-save store, HTTP clients)
+# plus an on-disk directory -- with no auth required to choose an id, an
+# unbounded version of that lets any anonymous caller drive unbounded
+# memory/disk growth for free (25 headers -> 25 controllers, verified). A
+# fixed cap keeps the "try it with your own tenant id" no-auth demo
+# affordance (SECURITY_BOUNDARIES.md's local-mock-demo boundary) working
+# while bounding the damage; it is enforced regardless of auth state, since
+# the operator cleanup routes that could otherwise reclaim capacity require
+# Basic Auth and are unreachable on exactly the deployments most at risk.
+# Freeing a slot needs an operator reset/delete, or a process restart.
+MAX_TENANT_CONTROLLERS = int(os.getenv("REGENGINE_MAX_TENANT_CONTROLLERS", "50"))
+
 engine = LegitFlowEngine(seed=204)
 store = EventStore(persist_path=str(DATA_ROOT / "events.jsonl"))
 scenario_saves = ScenarioSaveStore(save_dir=str(DATA_ROOT / "scenario_saves"))
@@ -39,6 +53,19 @@ controller = SimulationController(
 _tenant_controllers: dict[str, SimulationController] = {DEFAULT_TENANT_ID: controller}
 _tenant_lock = RLock()
 
+# Tenant ids with a delete in progress -- guards the window between
+# pop_tenant_controller removing a controller from _tenant_controllers and
+# the operator route finishing shutil.rmtree on its directory (#175).
+# Without this, a request for the same tenant id landing in that window
+# recreates the controller (and its directory) via
+# get_tenant_controller_for_id, and the delete's still-pending rmtree then
+# deletes that directory out from under it: the tenant stays "cached" in
+# memory pointing at a path that no longer exists, and its next write
+# crashes with an unhandled FileNotFoundError. Mutated only under
+# _tenant_lock, alongside _tenant_controllers, so the two can never
+# disagree about a tenant's state.
+_tenants_being_deleted: set[str] = set()
+
 
 async def shutdown_tenant_controllers() -> None:
     for tenant_controller in set(_tenant_controllers.values()):
@@ -54,9 +81,36 @@ def active_controller_for_context(context: TenantContext) -> SimulationControlle
 
 def get_tenant_controller_for_id(tenant_id: str) -> SimulationController:
     with _tenant_lock:
+        if tenant_id in _tenants_being_deleted:
+            # A delete for this tenant is mid-flight (#175): its directory
+            # has just been popped from the registry and is about to be (or
+            # already has been) rmtree'd by that delete. Creating a fresh
+            # controller now would either get its directory pulled out from
+            # under it by the pending rmtree, or resurrect a tenant the
+            # caller just asked to delete. 409 tells the caller this is a
+            # transient conflict to retry, instead of the unhandled
+            # FileNotFoundError this used to crash with on the next write.
+            raise HTTPException(
+                status_code=409,
+                detail=f"Tenant '{tenant_id}' delete is in progress; retry shortly",
+            )
+
         existing_controller = _tenant_controllers.get(tenant_id)
         if existing_controller is not None:
             return existing_controller
+
+        if len(_tenant_controllers) >= MAX_TENANT_CONTROLLERS:
+            # #174: refuse rather than grow once the cap is hit. An
+            # operator (Basic Auth required) can always make room via
+            # reset/delete on an existing tenant.
+            raise HTTPException(
+                status_code=429,
+                detail=(
+                    f"Tenant capacity reached ({MAX_TENANT_CONTROLLERS} active); "
+                    "an operator must reset or delete an existing tenant before "
+                    "a new one can be created"
+                ),
+            )
 
         tenant_controller = _create_tenant_controller(tenant_id)
         _tenant_controllers[tenant_id] = tenant_controller
@@ -64,8 +118,24 @@ def get_tenant_controller_for_id(tenant_id: str) -> SimulationController:
 
 
 def pop_tenant_controller(tenant_id: str) -> SimulationController | None:
+    """Remove tenant_id's controller and open a delete-in-progress window.
+
+    Callers MUST pair this with finish_tenant_delete(tenant_id) once the
+    tenant's directory has actually been removed -- typically in a
+    try/finally, so the window still closes if shutdown or the rmtree
+    raises. Until that call, get_tenant_controller_for_id refuses to
+    re-create a controller for this tenant id instead of racing the
+    in-flight delete (#175).
+    """
     with _tenant_lock:
+        _tenants_being_deleted.add(tenant_id)
         return _tenant_controllers.pop(tenant_id, None)
+
+
+def finish_tenant_delete(tenant_id: str) -> None:
+    """Close the delete-in-progress window opened by pop_tenant_controller."""
+    with _tenant_lock:
+        _tenants_being_deleted.discard(tenant_id)
 
 
 def operator_tenant_id(raw_tenant_id: str) -> str:
