@@ -14,6 +14,17 @@ class IngestPayload(BaseModel):
     # webhook receiver, and a receiver that 422s on an additive field a
     # newer producer sends would misrepresent live behaviour.
     source: str = "codex-simulator"
+    # NOT max_length=500, deliberately -- see tests/test_schema_bounds.py.
+    # RegEngine's own WebhookPayload does bound `events` at 1-500, and this
+    # model is the request body for the mock's /api/mock/regengine/ingest
+    # route, so a pydantic constraint here would be rejected by FastAPI as a
+    # RequestValidationError whose `detail` is a list of error dicts. The mock
+    # instead enforces the cap in MockRegEngineService.ingest so it can return
+    # RegEngine's own wording ("events accepts at most 500 items per batch")
+    # as a plain string detail, which tests/test_mock_parity.py pins. Adding
+    # the constraint here changes that response body and breaks the pin.
+    # Producers are already bounded: every bulk send goes through
+    # `delivery.chunk_events`, which chunks at MAX_BATCH_EVENTS (#103).
     events: list[RegEngineEvent]
 
 

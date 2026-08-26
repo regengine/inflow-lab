@@ -68,7 +68,20 @@ class RegEngineEvent(BaseModel):
     cte_type: CTEType
     traceability_lot_code: str
     product_description: str
-    quantity: float
+    # `allow_inf_nan=False` closes #98 at the model: NaN/inf used to be
+    # rejected only at the CSV boundary (`_parse_quantity`) and at the
+    # persistence boundary (`EventStore` writes with `allow_nan=False`), so
+    # anything constructing a RegEngineEvent directly -- the engine, a demo
+    # fixture, a hand-built payload -- could carry a non-finite quantity into
+    # a signed live request. Now every producer goes through this check.
+    #
+    # NOT gt=0, deliberately, even though RegEngine's IngestEvent declares it:
+    # tests/test_mock_rejection_parity.py builds quantity=0/-5 events through
+    # this model on purpose, to pin that the mock classifies the constraint as
+    # request-fatal rather than per-event. A gt=0 here makes those events
+    # unconstructible. Non-positive quantities stay blocked at the CSV
+    # importer and in MockRegEngineService. See tests/test_schema_bounds.py.
+    quantity: float = Field(allow_inf_nan=False)
     unit_of_measure: str
     location_name: str
     location_gln: str | None = None

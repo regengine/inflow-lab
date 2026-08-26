@@ -334,10 +334,18 @@ class LiveRegEngineClient:
         # to httpx, it would re-serialize and any whitespace/key-order drift
         # between our HMAC input and the wire body would cause RegEngine's
         # signature check to 401 on every request.
+        #
+        # `allow_nan=False` is not cosmetic: json.dumps defaults to emitting
+        # the bare tokens NaN/Infinity/-Infinity, which are not JSON. RegEngine's
+        # parser rejects them, so a non-finite quantity would be signed, sent,
+        # and only then fail -- burning the idempotency key and reporting as a
+        # remote error. Failing here raises ValueError before any credential
+        # header or signature exists (#98).
         body_bytes = json.dumps(
             build_wire_body(payload),
             separators=(",", ":"),
             sort_keys=True,
+            allow_nan=False,
         ).encode("utf-8")
 
         signature_header = _build_signature_header(body_bytes)
