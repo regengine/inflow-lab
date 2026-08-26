@@ -37,6 +37,24 @@ class LineageResponse(BaseModel):
     truncated: bool = False
 
 
+class ExportBoundsSummary(BaseModel):
+    """How a compliance export was bounded, mirroring ``LineageResponse``.
+
+    Carried inside the EPCIS document (and alongside it in the
+    ``X-Export-*`` response headers) so that a partial export can never be
+    mistaken for a complete record set.
+    """
+
+    total_records: int = 0
+    returned_records: int = 0
+    limit: int | None = None
+    truncated: bool = False
+    warning: str | None = Field(
+        default=None,
+        description="Human-readable truncation notice; set only when truncated.",
+    )
+
+
 class EpcisDocumentResponse(BaseModel):
     """Documented shape of the EPCIS 2.0 JSON-LD export.
 
@@ -54,7 +72,17 @@ class EpcisDocumentResponse(BaseModel):
     type: str | None = Field(default=None, alias="type")
     schemaVersion: str | None = None
     creationDate: str | None = None
+    sender: str | None = None
     epcisBody: dict[str, Any] | None = None
+    export_summary: ExportBoundsSummary | None = Field(
+        default=None,
+        alias="regengine:exportSummary",
+        description=(
+            "How the export was bounded. Always present on documents served by "
+            "/export/epcis; `truncated` true means events are missing from this "
+            "document."
+        ),
+    )
 
 
 class EventListResponse(BaseModel):
