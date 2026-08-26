@@ -4,13 +4,18 @@ import re
 from datetime import date
 from typing import Any, Callable
 
-from fastapi import APIRouter, Depends, Header, HTTPException, Query, Request
+from fastapi import APIRouter, Depends, Header, HTTPException, Query, Request, Response
 from fastapi.responses import JSONResponse, PlainTextResponse
 
 from ..controller import SimulationController
 from ..dependencies import get_active_controller
 from ..epcis_export import epcis_filename, render_epcis_document
-from ..mock_service import MockRegEngineHTTPError
+from ..mock_service import (
+    EVENT_AGE_MODE_WARN,
+    MockRegEngineHTTPError,
+    event_age_mode,
+    max_event_age_days,
+)
 from ..fda_export import (
     FDA_EXPORT_PRESETS,
     apply_fda_export_preset,
@@ -45,6 +50,7 @@ TRUNCATION_BANNER_PREFIX = "# PARTIAL EXPORT - NOT A COMPLETE RECORD SET"
 @router.post("/ingest", response_model=MockIngestResponse)
 async def mock_regengine_ingest(
     request: Request,
+    response: Response,
     payload: IngestPayload,
     active_controller: SimulationController = Depends(get_active_controller),
     idempotency_key: str | None = Header(default=None, alias="Idempotency-Key"),
@@ -67,14 +73,51 @@ async def mock_regengine_ingest(
         # Starlette caches the body FastAPI already read, so this is the exact
         # byte sequence the client signed — the point of verifying at all.
         service.verify_signature(await request.body(), webhook_signature)
-        return service.ingest(
+        body = service.ingest(
             payload,
             idempotency_key=idempotency_key,
             friction=_parse_mock_friction(mock_friction),
         )
+        _apply_event_age_headers(response, getattr(service, "last_age_window_warnings", ()))
+        return body
     except MockRegEngineHTTPError as exc:
         # Without this the mock's own 401/402/422/429 escape as an unhandled 500.
         raise HTTPException(status_code=exc.status_code, detail=exc.detail) from exc
+
+
+def _apply_event_age_headers(response: Response, warnings: tuple[str, ...]) -> None:
+    """Report the replay window on every ingest response.
+
+    The mock defaults to accepting events older than RegEngine's 90-day
+    window (the shipped demo fixtures predate it), so the fact that live
+    would reject them has to be visible somewhere a client can assert on.
+    These headers are always present, so a caller can check them
+    unconditionally instead of inferring parity from an accepted count.
+    """
+    mode = event_age_mode()
+    headers = {
+        "X-Mock-Event-Age-Window-Days": str(max_event_age_days()),
+        "X-Mock-Event-Age-Mode": mode,
+        "X-Mock-Out-Of-Window-Events": str(len(warnings)),
+        "Access-Control-Expose-Headers": (
+            "X-Mock-Event-Age-Window-Days, X-Mock-Event-Age-Mode, "
+            "X-Mock-Out-Of-Window-Events"
+        ),
+    }
+    if warnings and mode == EVENT_AGE_MODE_WARN:
+        # RegEngine's own wording carries an em dash; HTTP header values are
+        # latin-1 only, so the header gets an ASCII-safe rendering while the
+        # log line and the mock's own error strings keep the exact text.
+        headers["X-Mock-Event-Age-Warning"] = _header_safe(
+            f"{len(warnings)} event(s) accepted here would be rejected by live "
+            f"RegEngine with 'replay window exceeded'. First: {warnings[0]}"
+        )
+        headers["Access-Control-Expose-Headers"] += ", X-Mock-Event-Age-Warning"
+    response.headers.update(headers)
+
+
+def _header_safe(value: str) -> str:
+    return value.replace("\u2014", "-").encode("latin-1", "replace").decode("latin-1")
 
 
 def _parse_mock_friction(raw: str | None) -> tuple[str, ...]:

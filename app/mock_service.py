@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import hmac
 import json
+import logging
 import os
 from collections import OrderedDict
 from dataclasses import dataclass
@@ -16,11 +17,52 @@ from .schemas.domain import RegEngineEvent, StoredEventRecord
 from .schemas.ingestion import IngestPayload, IngestResponseEvent, MockIngestResponse
 
 
+logger = logging.getLogger(__name__)
+
 # Mirrors RegEngine's WebhookPayload constraint: events accepts 1-500 items.
 MIN_BATCH_EVENTS = 1
 MAX_BATCH_EVENTS = 500
 # Mirrors RegEngine's Pydantic timestamp validator: >24h in the future is rejected.
 MAX_FUTURE_HOURS = 24
+# Mirrors RegEngine's handler-level replay guard
+# (webhook_router_v2/security.py::_validate_event_timestamp_window):
+# WEBHOOK_MAX_EVENT_AGE_DAYS, default "90". No RegEngine deployment config
+# overrides it, so 90 days is what a live tenant actually enforces.
+MAX_EVENT_AGE_DAYS = 90
+MAX_EVENT_AGE_DAYS_ENV = "REGENGINE_MOCK_MAX_EVENT_AGE_DAYS"
+EVENT_AGE_MODE_ENV = "REGENGINE_MOCK_EVENT_AGE_MODE"
+# The shipped demo fixtures carry fixed 2026-02 timestamps, so enforcing the
+# floor by default would reject every fixture event and take the dashboard
+# demo and the browser smoke down with it. Default to "warn": the mock still
+# accepts, but every out-of-window event is logged at WARNING and counted on
+# the response headers, so the drift is impossible to miss. Set
+# REGENGINE_MOCK_EVENT_AGE_MODE=reject for true live parity.
+EVENT_AGE_MODE_WARN = "warn"
+EVENT_AGE_MODE_REJECT = "reject"
+EVENT_AGE_MODE_OFF = "off"
+EVENT_AGE_MODES = (EVENT_AGE_MODE_WARN, EVENT_AGE_MODE_REJECT, EVENT_AGE_MODE_OFF)
+DEFAULT_EVENT_AGE_MODE = EVENT_AGE_MODE_WARN
+
+# Where RegEngine draws the line between Pydantic request-body validation and
+# handler logic. Anything in BATCH_FATAL_FIELD_CHECKS is a field constraint on
+# RegEngine's ``IngestEvent``: FastAPI 422s the WHOLE request before the route
+# handler runs, so no event in the batch is stored. Anything in
+# PER_EVENT_HANDLER_CHECKS runs inside the handler and rejects only the
+# offending event inside an HTTP 200 response. Pinned by
+# tests/test_mock_rejection_parity.py so a new RegEngine constraint that lands
+# on the wrong side of this line is caught here rather than in production.
+BATCH_FATAL_FIELD_CHECKS = (
+    "traceability_lot_code",
+    "product_description",
+    "quantity",
+    "timestamp",
+)
+PER_EVENT_HANDLER_CHECKS = (
+    "location",
+    "required_kdes",
+    "event_age",
+    "duplicate_in_batch",
+)
 # Mirrors RegEngine's model-level location validator: at least one of these
 # must be present (top-level or KDE) for the event to be accepted.
 LOCATION_KDE_FIELDS = (
@@ -81,8 +123,24 @@ class MockRegEngineService:
     validation so the demo experience matches what a customer hits in the
     wild: strict per-CTE KDE checks (exact key lookup, no aliasing), the
     location-identifier requirement, batch caps (1-500 events), in-batch
-    duplicate rejection, future-timestamp rejection, optional HMAC signature
-    verification, and 24h idempotency replays.
+    duplicate rejection, future-timestamp rejection, the 90-day replay
+    window, optional HMAC signature verification, and 24h idempotency
+    replays.
+
+    It also mirrors *where* each check bites. RegEngine enforces the four
+    ``IngestEvent`` field constraints (lot-code length, description length,
+    positive quantity, 24h future ceiling) as Pydantic request-body
+    validation, so FastAPI 422s the whole request and the batch is lost;
+    those raise :class:`MockRegEngineHTTPError` here rather than appearing as
+    a per-event rejection in a 200. Location, required-KDE, replay-window and
+    in-batch-duplicate checks run in RegEngine's handler and reject a single
+    event inside a 200. See ``BATCH_FATAL_FIELD_CHECKS`` /
+    ``PER_EVENT_HANDLER_CHECKS`` and #101.
+
+    The replay-window floor is configurable via
+    ``REGENGINE_MOCK_EVENT_AGE_MODE`` (warn/reject/off, default warn) and
+    ``REGENGINE_MOCK_MAX_EVENT_AGE_DAYS`` (default 90) because the shipped
+    demo fixtures predate the window; see the constant comments and #102.
 
     The chain hash is resumed from the persisted event log when an event
     source is attached (see :meth:`attach_event_source`), so a restart of a
@@ -100,6 +158,10 @@ class MockRegEngineService:
         self._event_source: PersistedEventSource | None = None
         self._chain_resumed = True
         self.time_source: Callable[[], datetime] = lambda: datetime.now(UTC)
+        # Out-of-window events accepted by the most recent ingest because the
+        # age mode is "warn". Read by the mock router to surface them on the
+        # response headers; empty in "reject"/"off" mode.
+        self.last_age_window_warnings: tuple[str, ...] = ()
         if event_source is not None:
             self.attach_event_source(event_source)
 
@@ -141,6 +203,7 @@ class MockRegEngineService:
     def reset(self) -> None:
         self._chain_hash = ""
         self._idempotency_cache.clear()
+        self.last_age_window_warnings = ()
         # A reset clears the persisted log too, so there is nothing to resume.
         self._chain_resumed = True
 
@@ -170,6 +233,10 @@ class MockRegEngineService:
         idempotency_key: str | None = None,
         friction: tuple[str, ...] = (),
     ) -> MockIngestResponse:
+        # Per-ingest, so a 422 or an idempotency replay never reports the
+        # previous batch's out-of-window events.
+        self.last_age_window_warnings = ()
+
         for code in friction:
             failure = FRICTION_RESPONSES.get(code)
             if failure is not None:
@@ -187,6 +254,19 @@ class MockRegEngineService:
             )
 
         now = self.time_source()
+        # Field constraints are request-body validation on RegEngine's side:
+        # FastAPI 422s before the handler (and before any idempotency
+        # bookkeeping) runs, so ONE bad event loses the whole batch. Scanning
+        # every event first means the 422 names them all, the way a real
+        # FastAPI validation error does.
+        fatal = [
+            f"events.{index}.{field}: {message}"
+            for index, event in enumerate(payload.events)
+            for field, message in field_constraint_errors(event, now=now)
+        ]
+        if fatal:
+            raise MockRegEngineHTTPError(422, _batch_fatal_detail(fatal, len(payload.events)))
+
         self._expire_idempotency_entries(now)
         cached = self._idempotency_cache.get(idempotency_key) if idempotency_key else None
         if cached is not None:
@@ -199,8 +279,28 @@ class MockRegEngineService:
         accepted = 0
         rejected = 0
         seen_batch_keys: set[str] = set()
+        age_mode = event_age_mode()
+        age_warnings: list[str] = []
         for event in payload.events:
-            errors = validate_event_like_regengine(event)
+            errors = handler_rejection_errors(event, now=now)
+            if age_mode != EVENT_AGE_MODE_REJECT:
+                # Demote (warn) or drop (off) the replay-window verdict, but
+                # never silently: a warn-mode violation is logged and counted
+                # so the demo cannot look clean while live would reject.
+                out_of_window = replay_window_errors(event, now=now)
+                errors = [error for error in errors if error not in out_of_window]
+                if out_of_window and age_mode == EVENT_AGE_MODE_WARN:
+                    warning = (
+                        f"{event.traceability_lot_code} ({event.cte_type.value}): "
+                        f"{out_of_window[0]}"
+                    )
+                    age_warnings.append(warning)
+                    logger.warning(
+                        "Mock accepted an event live RegEngine would reject "
+                        "(REGENGINE_MOCK_EVENT_AGE_MODE=%s): %s",
+                        age_mode,
+                        warning,
+                    )
             batch_key = "|".join(
                 (
                     event.cte_type.value,
@@ -241,6 +341,7 @@ class MockRegEngineService:
                 )
             )
 
+        self.last_age_window_warnings = tuple(age_warnings)
         response = MockIngestResponse(
             accepted=accepted,
             rejected=rejected,
@@ -270,6 +371,21 @@ class MockRegEngineService:
             if entry.stored_at > cutoff:
                 return
             del self._idempotency_cache[key]
+
+
+def _batch_fatal_detail(failures: list[str], total_events: int) -> str:
+    """The 422 body RegEngine's FastAPI layer produces for a bad request body.
+
+    Spelling out that nothing was stored matters: the whole point of #101 is
+    that an operator must not read a field-constraint failure as "one row
+    bounced".
+    """
+    return (
+        "Request body failed validation before ingest: "
+        f"{len(failures)} field constraint violation(s). The entire batch of "
+        f"{total_events} event(s) was rejected and nothing was stored. "
+        + "; ".join(failures)
+    )
 
 
 def chain_hash_from_records(records: Iterable[StoredEventRecord]) -> str:
@@ -310,29 +426,88 @@ def expected_signature(body_bytes: bytes) -> str | None:
     return f"sha256={digest}"
 
 
-def validate_event_like_regengine(event: RegEngineEvent) -> list[str]:
-    """Per-event checks mirroring RegEngine's webhook validation.
+def max_event_age_days() -> int:
+    """The configured replay-window floor in days (RegEngine default: 90)."""
+    raw = os.getenv(MAX_EVENT_AGE_DAYS_ENV, "").strip()
+    if not raw:
+        return MAX_EVENT_AGE_DAYS
+    try:
+        days = int(raw)
+    except ValueError:
+        return MAX_EVENT_AGE_DAYS
+    return days if days > 0 else MAX_EVENT_AGE_DAYS
+
+
+def event_age_mode() -> str:
+    """How the mock treats out-of-window events: warn (default), reject, off."""
+    mode = os.getenv(EVENT_AGE_MODE_ENV, "").strip().lower()
+    return mode if mode in EVENT_AGE_MODES else DEFAULT_EVENT_AGE_MODE
+
+
+def _aware(timestamp: datetime) -> datetime:
+    return timestamp if timestamp.tzinfo is not None else timestamp.replace(tzinfo=UTC)
+
+
+def field_constraint_errors(
+    event: RegEngineEvent, now: datetime | None = None
+) -> list[tuple[str, str]]:
+    """The checks RegEngine enforces as ``IngestEvent`` Pydantic constraints.
+
+    Returns ``(field, message)`` pairs. Every one of these is a field-level
+    constraint (``min_length``/``max_length``/``gt`` or a
+    ``@field_validator``) on RegEngine's request body, so FastAPI 422s the
+    ENTIRE request before the ingest handler runs — no event in the batch is
+    stored. Reporting any of these as a per-event rejection inside an HTTP
+    200 is the "green demo, failing live post" drift #101 describes.
+    """
+    moment = now or datetime.now(UTC)
+    errors: list[tuple[str, str]] = []
+    if len(event.traceability_lot_code) < 3:
+        errors.append(
+            ("traceability_lot_code", "traceability_lot_code must be at least 3 characters")
+        )
+    if not 1 <= len(event.product_description) <= 500:
+        errors.append(("product_description", "product_description must be 1-500 characters"))
+    if event.quantity <= 0:
+        errors.append(("quantity", "quantity must be greater than 0"))
+    if _aware(event.timestamp) > moment + timedelta(hours=MAX_FUTURE_HOURS):
+        errors.append(
+            ("timestamp", f"timestamp is more than {MAX_FUTURE_HOURS} hours in the future")
+        )
+    return errors
+
+
+def replay_window_errors(event: RegEngineEvent, now: datetime | None = None) -> list[str]:
+    """The age-floor check RegEngine runs per event inside the handler.
+
+    Mirrors ``_validate_event_timestamp_window``: anything older than
+    ``WEBHOOK_MAX_EVENT_AGE_DAYS`` (default 90) is rejected with "replay
+    window exceeded" — a per-event rejection inside an HTTP 200, not a
+    request-fatal 422. See #102.
+    """
+    moment = now or datetime.now(UTC)
+    days = max_event_age_days()
+    if _aware(event.timestamp) < moment - timedelta(days=days):
+        return [
+            f"Event timestamp {_aware(event.timestamp).isoformat()} is older than "
+            f"WEBHOOK_MAX_EVENT_AGE_DAYS={days} — replay window exceeded"
+        ]
+    return []
+
+
+def handler_rejection_errors(event: RegEngineEvent, now: datetime | None = None) -> list[str]:
+    """The checks RegEngine runs inside the handler, rejecting one event only.
 
     Uses the same merged namespace RegEngine builds (top-level fields plus
     the kdes dict) with strict string lookup — deliberately NOT the lenient
     aliasing in cte_rules.merged_event_values, because the live validator
     does not alias (e.g. reference_document_type never satisfies
     reference_document).
+
+    In-batch duplicate detection is the remaining per-event check and lives
+    in :meth:`MockRegEngineService.ingest`, because it needs the batch.
     """
-    errors: list[str] = []
-
-    if len(event.traceability_lot_code) < 3:
-        errors.append("traceability_lot_code must be at least 3 characters")
-    if not 1 <= len(event.product_description) <= 500:
-        errors.append("product_description must be 1-500 characters")
-    if event.quantity <= 0:
-        errors.append("quantity must be greater than 0")
-
-    timestamp = event.timestamp
-    if timestamp.tzinfo is None:
-        timestamp = timestamp.replace(tzinfo=UTC)
-    if timestamp > datetime.now(UTC) + timedelta(hours=MAX_FUTURE_HOURS):
-        errors.append(f"timestamp is more than {MAX_FUTURE_HOURS} hours in the future")
+    errors: list[str] = replay_window_errors(event, now=now)
 
     available = _strict_merged_values(event)
     has_location = any(
@@ -352,6 +527,23 @@ def validate_event_like_regengine(event: RegEngineEvent) -> list[str]:
             f"Missing required KDEs for {event.cte_type.value}: {', '.join(missing)}"
         )
     return errors
+
+
+def validate_event_like_regengine(
+    event: RegEngineEvent, now: datetime | None = None
+) -> list[str]:
+    """Every reason live RegEngine would refuse this event, in one list.
+
+    This is the full-parity view and deliberately does NOT distinguish
+    batch-fatal field constraints from per-event handler rejections, nor
+    honour ``REGENGINE_MOCK_EVENT_AGE_MODE`` — callers wanting the boundary
+    should use :func:`field_constraint_errors` and
+    :func:`handler_rejection_errors`, which is what
+    :meth:`MockRegEngineService.ingest` does.
+    """
+    return [message for _field, message in field_constraint_errors(event, now=now)] + (
+        handler_rejection_errors(event, now=now)
+    )
 
 
 def _strict_merged_values(event: RegEngineEvent) -> dict[str, Any]:
