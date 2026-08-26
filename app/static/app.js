@@ -67,6 +67,8 @@ const ids = {
   exportEndDate: document.getElementById('exportEndDate'),
   exportDownloadLink: document.getElementById('exportDownloadLink'),
   epcisDownloadLink: document.getElementById('epcisDownloadLink'),
+  navExportLink: document.getElementById('navExportLink'),
+  exportLotHint: document.getElementById('exportLotHint'),
   exportPresetDescription: document.getElementById('exportPresetDescription'),
   statusMessage: document.getElementById('statusMessage'),
   nextActionText: document.getElementById('nextActionText'),
@@ -133,8 +135,15 @@ async function runWithBusy(button, handler) {
   }
 }
 
+// Every bound handler reports its own failures, but refresh() (and any
+// future handler that forgets) must not leak an unhandled rejection: the
+// operator would see a button spin and then silence.
 function bindAsyncClick(button, handler) {
-  button?.addEventListener('click', () => runWithBusy(button, handler));
+  button?.addEventListener('click', () => {
+    runWithBusy(button, handler).catch((error) => {
+      setStatus(error?.message || 'Action failed.', 'error', 5000);
+    });
+  });
 }
 
 const DELIVERY_MODE_LABELS = {
@@ -184,11 +193,16 @@ function renderGuide(status = state.status, events = state.events) {
     const key = step.dataset.guideStep;
     if (done[key]) {
       step.dataset.state = 'done';
+      step.removeAttribute('aria-current');
     } else if (!currentAssigned) {
       step.dataset.state = 'current';
+      // Progress state was CSS-only; expose it so assistive tech hears
+      // "you are here" the same way sighted users see it.
+      step.setAttribute('aria-current', 'step');
       currentAssigned = true;
     } else {
       step.dataset.state = '';
+      step.removeAttribute('aria-current');
     }
   });
 }
@@ -320,8 +334,46 @@ const welcomeEls = {
   skip: document.getElementById('welcomeSkipBtn'),
 };
 
+// The overlay declares role="dialog" aria-modal="true", so it has to behave
+// like one: Tab and Shift+Tab cycle inside the card instead of wandering into
+// the form hidden behind the backdrop. (The background is deliberately left
+// out of `inert`/`aria-hidden` — aria-modal already conveys modality, and
+// hiding the whole page from the accessibility tree would take the console's
+// own landmarks with it.)
+function welcomeFocusables() {
+  return [welcomeEls.tour, welcomeEls.sample, welcomeEls.skip].filter(
+    (node) => node && !node.disabled && !node.hidden,
+  );
+}
+
+function trapWelcomeFocus(event) {
+  if (event.key !== 'Tab' || welcomeEls.overlay.hidden) {
+    return;
+  }
+  const focusables = welcomeFocusables();
+  if (!focusables.length) {
+    return;
+  }
+  const first = focusables[0];
+  const last = focusables[focusables.length - 1];
+  const active = document.activeElement;
+  if (!welcomeEls.overlay.contains(active)) {
+    event.preventDefault();
+    first.focus();
+    return;
+  }
+  if (event.shiftKey && active === first) {
+    event.preventDefault();
+    last.focus();
+  } else if (!event.shiftKey && active === last) {
+    event.preventDefault();
+    first.focus();
+  }
+}
+
 function hideWelcome() {
   welcomeEls.overlay.hidden = true;
+  document.removeEventListener('keydown', trapWelcomeFocus, true);
   markOnboarded();
 }
 
@@ -330,6 +382,7 @@ function maybeShowWelcome() {
     return;
   }
   welcomeEls.overlay.hidden = false;
+  document.addEventListener('keydown', trapWelcomeFocus, true);
   welcomeEls.tour.focus();
 }
 
@@ -350,14 +403,99 @@ function goToNextAction() {
   }
 }
 
+// #statusMessage is a live region (role="status" in index.html), so writing
+// its text is enough to announce it. Errors interrupt; everything else waits
+// for a pause in the screen reader's speech.
 function setStatus(message, tone = 'neutral', holdMs = 0) {
   ids.statusMessage.textContent = message;
   ids.statusMessage.dataset.tone = tone;
+  ids.statusMessage.setAttribute('aria-live', tone === 'error' ? 'assertive' : 'polite');
   state.statusHoldUntil = holdMs > 0 ? Date.now() + holdMs : 0;
 }
 
+// Which delivery fields the operator has edited in *this* tab. Server state
+// hydrates only the ones they have not touched, so a background refresh can
+// never stomp a field mid-edit.
+const deliveryFieldsTouched = { deliveryMode: false, endpoint: false, apiKey: false, tenantId: false };
+
+for (const field of ['deliveryMode', 'endpoint', 'apiKey', 'tenantId']) {
+  ids[field]?.addEventListener('input', () => {
+    deliveryFieldsTouched[field] = true;
+  });
+  ids[field]?.addEventListener('change', () => {
+    deliveryFieldsTouched[field] = true;
+  });
+}
+
+function hydrateField(field, value) {
+  const node = ids[field];
+  if (!node || deliveryFieldsTouched[field] || document.activeElement === node) {
+    return;
+  }
+  if (node.value !== value) {
+    node.value = value;
+  }
+}
+
+// A plain reload (or a second tab) used to leave these fields at their HTML
+// defaults — Sandbox, blank endpoint — while the server kept running live.
+// buildConfig() then resent that stale form on the next Start/Reset/Retry and
+// silently downgraded delivery. Hydrating from /api/simulate/status keeps the
+// form and the server in agreement.
+function hydrateDeliveryForm(status = state.status) {
+  const delivery = status?.config?.delivery;
+  if (!delivery) {
+    return;
+  }
+  state.serverDelivery = delivery;
+  hydrateField('deliveryMode', delivery.mode || 'mock');
+  hydrateField('endpoint', delivery.endpoint || '');
+  // status scrubs tenant_id in live mode; only hydrate what the server sent.
+  if (delivery.tenant_id) {
+    hydrateField('tenantId', delivery.tenant_id);
+  }
+  updateShellStatus();
+}
+
+async function hydrateIntegrationStatus() {
+  try {
+    const integration = await api('/api/integration/status');
+    state.integration = integration;
+    renderConnectionStatus(integration);
+  } catch (error) {
+    // Chip freshness is best-effort; the snapshot itself already rendered.
+  }
+}
+
+// The server holds credentials this tab was never given (status scrubs the
+// API key, and the tenant ID in live mode). Posting the blank form would
+// replace them with nothing, so a mutating action stops with an actionable
+// message instead of silently clearing the connection.
+function blockedByMissingCredentials() {
+  const integration = state.integration;
+  if (!integration) {
+    return false;
+  }
+  const missingKey = integration.api_key_configured && !ids.apiKey.value.trim();
+  const missingTenant = integration.tenant_configured && !ids.tenantId.value.trim();
+  if (!missingKey && !missingTenant) {
+    return false;
+  }
+  const missing = [missingKey ? 'API key' : '', missingTenant ? 'tenant ID' : ''].filter(Boolean).join(' and ');
+  setStatus(
+    `This tab does not hold the saved RegEngine ${missing}. Re-enter it in RegEngine connection settings (Save settings) before running this action — submitting now would clear it.`,
+    'error',
+    9000,
+  );
+  flashPanel('.integration-panel');
+  return true;
+}
+
 function buildConfig() {
-  const endpoint = ids.endpoint.value.trim() || DEFAULT_LIVE_INGEST_ENDPOINT;
+  // A blank endpoint used to mean the hard-coded production URL in *every*
+  // mode. Only live delivery falls back to it now; sandbox and off send null.
+  const endpoint =
+    ids.endpoint.value.trim() || (ids.deliveryMode.value === 'live' ? DEFAULT_LIVE_INGEST_ENDPOINT : '');
   const apiKey = ids.apiKey.value.trim();
   const tenantId = ids.tenantId.value.trim();
   const seedValue = ids.seed.value.trim();
@@ -379,14 +517,74 @@ function buildConfig() {
   };
 }
 
+// FastAPI answers a validation failure with `detail` as a *list of objects*.
+// Interpolating that into an Error stringifies it to "[object Object]" and
+// throws away the only actionable half of the response, so flatten it into
+// "field: message" sentences first. String details pass through unchanged.
+function formatErrorDetail(detail) {
+  if (typeof detail === 'string' && detail.trim()) {
+    return detail;
+  }
+  if (Array.isArray(detail)) {
+    const messages = detail
+      .map((item) => {
+        if (typeof item === 'string') {
+          return item;
+        }
+        if (!item || typeof item !== 'object') {
+          return '';
+        }
+        const location = Array.isArray(item.loc)
+          ? item.loc.filter((part) => part !== 'body').at(-1)
+          : null;
+        const message = typeof item.msg === 'string' ? item.msg : '';
+        if (!message) {
+          return '';
+        }
+        return location ? `${location}: ${message}` : message;
+      })
+      .filter(Boolean);
+    if (messages.length) {
+      return messages.join('; ');
+    }
+  }
+  if (detail && typeof detail === 'object') {
+    const message = typeof detail.msg === 'string' ? detail.msg : '';
+    if (message) {
+      return message;
+    }
+  }
+  return '';
+}
+
+// Error bodies are not always JSON — a proxy 502 is usually an HTML page, and
+// swallowing it left the operator with a bare status code. Fall back to the
+// HTTP status plus a short snippet of whatever text came back.
+async function errorMessageFor(response) {
+  const raw = await response.text().catch(() => '');
+  let detail = '';
+  if (raw) {
+    try {
+      detail = formatErrorDetail(JSON.parse(raw).detail);
+    } catch (error) {
+      detail = '';
+    }
+  }
+  const statusLine = `Request failed: ${response.status}${response.statusText ? ` ${response.statusText}` : ''}`;
+  if (detail) {
+    return `${statusLine} — ${detail}`;
+  }
+  const snippet = raw.replace(/\s+/g, ' ').trim().slice(0, 160);
+  return snippet ? `${statusLine} — ${snippet}` : statusLine;
+}
+
 async function api(path, options = {}) {
   const response = await fetch(path, {
     headers: { 'Content-Type': 'application/json' },
     ...options,
   });
   if (!response.ok) {
-    const payload = await response.json().catch(() => ({}));
-    throw new Error(payload.detail || `Request failed: ${response.status}`);
+    throw new Error(await errorMessageFor(response));
   }
   const contentType = response.headers.get('content-type') || '';
   if (contentType.includes('application/json')) {
@@ -564,6 +762,11 @@ function renderExportPresetOptions(presets) {
   state.exportPresetDescriptions = Object.fromEntries(
     presets.map((preset) => [preset.id, preset.description]),
   );
+  // The backend already advertises which presets need a Traceability Lot
+  // Code; the console used to ignore the flag and offer them anyway.
+  state.exportPresetRequiresLot = Object.fromEntries(
+    presets.map((preset) => [preset.id, Boolean(preset.requires_lot_code)]),
+  );
   ids.exportPreset.innerHTML = presets
     .map(
       (preset) => `
@@ -601,10 +804,94 @@ function updateExportLink() {
     epcisParams.set('end_date', endDate);
   }
   const epcisQuery = epcisParams.toString();
-  ids.exportDownloadLink.href = `/api/mock/regengine/export/fda-request?${csvParams.toString()}`;
+  const csvHref = `/api/mock/regengine/export/fda-request?${csvParams.toString()}`;
+  ids.exportDownloadLink.href = csvHref;
   ids.epcisDownloadLink.href = `/api/mock/regengine/export/epcis${epcisQuery ? `?${epcisQuery}` : ''}`;
+  // The nav "Download FDA export" link was a third, always-unfiltered entry
+  // point into the same export; keep it on the same filters and guard.
+  if (ids.navExportLink) {
+    ids.navExportLink.href = csvHref;
+  }
   const presetDescription = state.exportPresetDescriptions[preset] || 'FDA-request CSV export.';
   ids.exportPresetDescription.textContent = `${presetDescription} EPCIS uses the same lot and date filters.`;
+  updateExportAvailability();
+}
+
+// True when the selected preset needs a Traceability Lot Code the operator
+// has not supplied — the combination that used to open a raw JSON 400 page.
+function exportBlockedReason() {
+  const preset = ids.exportPreset.value || 'all_records';
+  const requiresLot = Boolean(state.exportPresetRequiresLot?.[preset]);
+  if (requiresLot && !ids.exportLot.value.trim()) {
+    return 'This export preset needs a Traceability Lot Code — enter one above, or pick a different preset.';
+  }
+  return '';
+}
+
+function updateExportAvailability() {
+  const reason = exportBlockedReason();
+  if (ids.exportLotHint) {
+    ids.exportLotHint.textContent = reason;
+    ids.exportLotHint.hidden = !reason;
+  }
+  // The CSV link is the preset-driven one; EPCIS takes lot/date filters only.
+  for (const link of [ids.exportDownloadLink, ids.navExportLink]) {
+    if (!link) {
+      continue;
+    }
+    link.classList.toggle('is-blocked', Boolean(reason));
+    if (reason) {
+      link.setAttribute('aria-disabled', 'true');
+    } else {
+      link.removeAttribute('aria-disabled');
+    }
+  }
+}
+
+// Exports used to be plain anchors: a 400/404 rendered as raw JSON in a new
+// tab, never reached #statusMessage, and the guide rail marked "Export
+// evidence" done regardless. Fetching them puts export failures on the same
+// error path as every other action, and the guided step is only marked
+// complete after a confirmed download.
+async function downloadExport(link, label) {
+  const reason = exportBlockedReason();
+  if (link !== ids.epcisDownloadLink && reason) {
+    setStatus(reason, 'error', 6000);
+    flashPanel('.evidence-panel');
+    return;
+  }
+  try {
+    const response = await fetch(link.href);
+    if (!response.ok) {
+      throw new Error(await errorMessageFor(response));
+    }
+    const blob = await response.blob();
+    const filename = exportFilename(response, label);
+    const objectUrl = URL.createObjectURL(blob);
+    const anchor = document.createElement('a');
+    anchor.href = objectUrl;
+    anchor.download = filename;
+    document.body.appendChild(anchor);
+    anchor.click();
+    anchor.remove();
+    URL.revokeObjectURL(objectUrl);
+    if (state.events.length) {
+      journey.exported = true;
+      renderGuide();
+    }
+    setStatus(`Downloaded ${label} (${filename}).`, 'success', 3500);
+  } catch (error) {
+    setStatus(`${label} export failed: ${error.message}`, 'error', 7000);
+  }
+}
+
+function exportFilename(response, label) {
+  const disposition = response.headers.get('content-disposition') || '';
+  const match = /filename\*?=(?:UTF-8'')?"?([^";]+)"?/i.exec(disposition);
+  if (match) {
+    return decodeURIComponent(match[1]);
+  }
+  return label === 'EPCIS JSON' ? 'epcis-export.json' : 'fda-request-export.csv';
 }
 
 function preferredTraceLot(lotCodes = []) {
@@ -680,18 +967,28 @@ function scenarioNarrative(summary) {
   return 'This flow should prove field-level origin, packout packaging changes, and downstream traceability through transformation and shipment.';
 }
 
-function pendingAuditModel(summary) {
+// Placeholder used until the backend audit for the *selected* scenario is
+// available. `pending` is the flag every verdict surface branches on: its
+// missing count is 0 because nothing was evaluated, which must never be
+// rendered as "no gaps found".
+function pendingAuditModel(summary, status = state.status) {
+  const ranScenario = status?.config?.scenario || null;
+  const mismatch = Boolean(summary && ranScenario && ranScenario !== summary.id);
   return {
+    pending: true,
+    mismatch,
     checks: [],
     score: 0,
     tone: 'watch',
-    label: 'Awaiting simulator audit',
+    label: mismatch ? 'Not scored for this line profile' : 'Awaiting simulator audit',
     passed: 0,
     total: 0,
     missing: 0,
-    detail: summary
-      ? `${summary.label} needs a simulator status refresh before audit scoring can be shown.`
-      : 'Run the simulator to load backend audit scoring.',
+    detail: mismatch
+      ? `Showing ${summary.label}, but the line last ran ${scenarioLabel(ranScenario)} — start the line to score this profile.`
+      : summary
+        ? `${summary.label} needs a simulator status refresh before audit scoring can be shown.`
+        : 'Run the simulator to load backend audit scoring.',
   };
 }
 
@@ -700,9 +997,9 @@ function renderReadinessBanner(summary, events, status = state.status) {
     ids.readinessBanner.innerHTML = '<p class="note">Readiness scoring will appear once scenario metadata loads.</p>';
     return;
   }
-  const readiness = backendAudit(status, summary) || pendingAuditModel(summary);
+  const readiness = backendAudit(status, summary) || pendingAuditModel(summary, status);
   ids.readinessBanner.innerHTML = `
-    <div class="readiness-banner-shell" data-tone="${readiness.tone}">
+    <div class="readiness-banner-shell" data-tone="${escapeHtml(readiness.tone)}">
       <div class="readiness-score">
         <span>Readiness</span>
         <strong>${escapeHtml(readiness.score)}</strong>
@@ -721,15 +1018,24 @@ function renderReadinessBanner(summary, events, status = state.status) {
   `;
 }
 
+// Returns {evaluated, messages}. When the backend audit does not cover the
+// selected scenario nothing was evaluated, and a row must say so rather than
+// render as clean.
 function recordWarnings(record, summary, status = state.status) {
   const audit = backendAudit(status, summary);
-  const warningPayload = audit?.warnings_by_record?.[record.record_id];
-  if (Array.isArray(warningPayload) && warningPayload.length) {
-    return warningPayload
-      .map((warning) => warning.message)
-      .filter((message) => typeof message === 'string' && message);
+  if (!audit) {
+    return { evaluated: false, messages: [] };
   }
-  return [];
+  const warningPayload = audit.warnings_by_record?.[record.record_id];
+  if (Array.isArray(warningPayload) && warningPayload.length) {
+    return {
+      evaluated: true,
+      messages: warningPayload
+        .map((warning) => warning.message)
+        .filter((message) => typeof message === 'string' && message),
+    };
+  }
+  return { evaluated: true, messages: [] };
 }
 
 function renderScenarioWorkbench(status = state.status, events = state.events) {
@@ -738,11 +1044,23 @@ function renderScenarioWorkbench(status = state.status, events = state.events) {
     ids.scenarioWorkbench.innerHTML = '<p class="note">Scenario metadata will appear here once presets load.</p>';
     return;
   }
-  const readiness = backendAudit(status, summary) || pendingAuditModel(summary);
+  const readiness = backendAudit(status, summary) || pendingAuditModel(summary, status);
   const checks = readiness.checks;
   const sourceCte = sourceCteForScenario(summary);
   const eventCount = (events || []).length;
   const warningCount = readiness.missing;
+  // "Signals visible" is a passing compliance verdict, so it may only be
+  // rendered when the backend actually scored this scenario. A pending or
+  // scenario-mismatched model reports missing = 0 because nothing was
+  // evaluated — not because nothing is missing.
+  const auditPending = Boolean(readiness.pending) || !readiness.total;
+  const verdict = auditPending
+    ? readiness.mismatch
+      ? 'Not scored for this line profile'
+      : 'Audit pending'
+    : warningCount
+      ? `${warningCount} signal(s) still missing`
+      : 'Signals visible';
   const transformCount = (events || []).filter((record) => record.event.cte_type === 'transformation').length;
   const cards = [
     ['Operation', operationTypeLabel(summary.operation_type)],
@@ -762,10 +1080,10 @@ function renderScenarioWorkbench(status = state.status, events = state.events) {
         <p>${escapeHtml(summary.description)}</p>
         <p class="note">${escapeHtml(scenarioNarrative(summary))}</p>
       </div>
-      <div class="scenario-alert${warningCount ? ' has-warning' : ''}">
+      <div class="scenario-alert${auditPending ? ' is-pending' : warningCount ? ' has-warning' : ''}">
         <span>Audit readiness</span>
-        <strong>${warningCount ? `${warningCount} signal(s) still missing` : 'Signals visible'}</strong>
-        <small>${escapeHtml(summary.reference_format)} references, ${escapeHtml(sourceCte)} source flow</small>
+        <strong>${escapeHtml(verdict)}</strong>
+        <small>${auditPending ? escapeHtml(readiness.detail) : `${escapeHtml(summary.reference_format)} references, ${escapeHtml(sourceCte)} source flow`}</small>
       </div>
     </div>
     <div class="scenario-signal-grid">
@@ -798,8 +1116,8 @@ function renderScenarioWorkbench(status = state.status, events = state.events) {
               .join('')
           : `<article class="audit-check is-watch">
               <header>
-                <strong>Backend audit pending</strong>
-                <span>Refresh needed</span>
+                <strong>${escapeHtml(readiness.mismatch ? 'Not scored for this line profile' : 'Backend audit pending')}</strong>
+                <span>${escapeHtml(readiness.mismatch ? 'Start the line' : 'Refresh needed')}</span>
               </header>
               <p>${escapeHtml(readiness.detail)}</p>
             </article>`
@@ -871,7 +1189,7 @@ function renderDeliverySummary(status) {
       ${cards
         .map(
           ([label, value, tone]) => `
-            <article class="delivery-card" data-tone="${tone}">
+            <article class="delivery-card" data-tone="${escapeHtml(tone)}">
               <span>${escapeHtml(label)}</span>
               <strong>${escapeHtml(value)}</strong>
             </article>
@@ -1057,47 +1375,103 @@ function formatKdeValue(value) {
 
 function renderEvents(events) {
   const summary = activeScenarioSummary();
+  const body = ids.eventsBody;
   if (!events.length) {
-    ids.eventsBody.innerHTML = `
+    body.innerHTML = `
       <tr>
         <td colspan="9" class="empty-state">No events yet. Load a fixture or run a single batch.</td>
       </tr>
     `;
+    state.eventRows = new Map();
     return;
   }
-  ids.eventsBody.innerHTML = events
-    .map((record) => {
-      const event = record.event;
-      const warnings = recordWarnings(record, summary);
-      return `
-        <tr class="${warnings.length ? 'has-audit-warning' : ''}">
-          <td>${record.sequence_no}</td>
-          <td><span class="pill">${escapeHtml(event.cte_type)}</span></td>
-          <td><button class="link-button" data-lot="${escapeHtml(event.traceability_lot_code)}">${escapeHtml(event.traceability_lot_code)}</button></td>
-          <td>${escapeHtml(event.product_description)}</td>
-          <td>${escapeHtml(event.location_name)}</td>
-          <td>${escapeHtml(new Date(event.timestamp).toLocaleString())}</td>
-          <td>${escapeHtml(record.destination_mode)}</td>
-          <td>
-            ${escapeHtml(record.delivery_attempts || 0)}
-            ${warnings.length ? `<small class="status-warning">${escapeHtml(warnings[0])}</small>` : ''}
-          </td>
-          <td>
-            <span class="status-pill" data-tone="${deliveryTone(record.delivery_status)}">${escapeHtml(record.delivery_status)}</span>
-            ${record.error ? `<small class="status-error">${escapeHtml(record.error)}</small>` : ''}
-          </td>
-        </tr>
-      `;
-    })
-    .join('');
 
-  ids.eventsBody.querySelectorAll('[data-lot]').forEach((button) => {
-    button.addEventListener('click', async () => {
-      ids.lotLookup.value = button.dataset.lot;
-      await lookupLineage();
-    });
+  // The shift log re-renders on every snapshot — about every 1.5s while the
+  // line runs. Rebuilding it with innerHTML destroyed the focused lot-code
+  // button and any text selection each tick, so rows are keyed by record_id
+  // and only the cells whose markup actually changed are rewritten.
+  const previousRows = state.eventRows instanceof Map ? state.eventRows : new Map();
+  const nextRows = new Map();
+  let anchor = body.firstElementChild;
+
+  events.forEach((record) => {
+    const event = record.event;
+    const audit = recordWarnings(record, summary);
+    const warnings = audit.messages;
+    const cells = [
+      escapeHtml(record.sequence_no),
+      `<span class="pill">${escapeHtml(event.cte_type)}</span>`,
+      `<button class="link-button" type="button" data-lot="${escapeHtml(event.traceability_lot_code)}">${escapeHtml(event.traceability_lot_code)}</button>`,
+      escapeHtml(event.product_description),
+      escapeHtml(event.location_name),
+      escapeHtml(new Date(event.timestamp).toLocaleString()),
+      escapeHtml(record.destination_mode),
+      `${escapeHtml(record.delivery_attempts || 0)}
+        ${warnings.length ? `<small class="status-warning">${escapeHtml(warnings[0])}</small>` : ''}
+        ${!audit.evaluated ? `<small class="status-unevaluated">Audit not evaluated</small>` : ''}`,
+      `<span class="status-pill" data-tone="${escapeHtml(deliveryTone(record.delivery_status))}">${escapeHtml(record.delivery_status)}</span>
+        ${record.error ? `<small class="status-error">${escapeHtml(record.error)}</small>` : ''}`,
+    ];
+    const rowClass = [warnings.length ? 'has-audit-warning' : '', audit.evaluated ? '' : 'audit-not-evaluated']
+      .filter(Boolean)
+      .join(' ');
+    const key = record.record_id || `seq-${record.sequence_no}`;
+    let entry = previousRows.get(key);
+    if (!entry) {
+      const row = document.createElement('tr');
+      cells.forEach((cellHtml) => {
+        const cell = document.createElement('td');
+        cell.innerHTML = cellHtml;
+        row.appendChild(cell);
+      });
+      entry = { row, cells };
+    } else {
+      const row = entry.row;
+      // Rewrite only the cells that changed; an untouched cell keeps the DOM
+      // node the operator may be focused in or selecting text from.
+      cells.forEach((cellHtml, index) => {
+        if (entry.cells[index] !== cellHtml) {
+          const cell = row.children[index];
+          if (cell) {
+            cell.innerHTML = cellHtml;
+          }
+        }
+      });
+      entry.cells = cells;
+    }
+    if (entry.row.className !== rowClass) {
+      entry.row.className = rowClass;
+    }
+    // Position without moving rows that are already in the right place —
+    // re-inserting a node blurs anything focused inside it.
+    if (anchor === entry.row) {
+      anchor = anchor.nextElementSibling;
+    } else {
+      body.insertBefore(entry.row, anchor);
+    }
+    nextRows.set(key, entry);
   });
+
+  while (anchor) {
+    const next = anchor.nextElementSibling;
+    anchor.remove();
+    anchor = next;
+  }
+  state.eventRows = nextRows;
 }
+
+// One delegated listener for the whole table instead of one per row rebound
+// on every snapshot.
+ids.eventsBody.addEventListener('click', (event) => {
+  const button = event.target.closest('[data-lot]');
+  if (!button || !ids.eventsBody.contains(button)) {
+    return;
+  }
+  ids.lotLookup.value = button.dataset.lot;
+  runWithBusy(ids.lineageBtn, lookupLineage).catch((error) => {
+    setStatus(error?.message || 'Lineage lookup failed.', 'error', 5000);
+  });
+});
 
 function renderLineage(payload, traceabilityLotCode) {
   const records = payload.records || [];
@@ -1180,7 +1554,8 @@ function renderLineage(payload, traceabilityLotCode) {
   const timelineMarkup = records
     .map((record) => {
       const event = record.event;
-      const warnings = recordWarnings(record, scenarioSummary);
+      const audit = recordWarnings(record, scenarioSummary);
+      const warnings = audit.messages;
       const kdes = Object.entries(event.kdes || {})
         .slice(0, 6)
         .map(([key, value]) => `<li><strong>${escapeHtml(key)}:</strong> ${escapeHtml(formatKdeValue(value))}</li>`)
@@ -1195,6 +1570,7 @@ function renderLineage(payload, traceabilityLotCode) {
           <p><strong>Product:</strong> ${escapeHtml(event.product_description)}</p>
           <p><strong>Location:</strong> ${escapeHtml(event.location_name)}</p>
           ${warnings.length ? `<p class="lineage-warning">${escapeHtml(warnings.join(' • '))}</p>` : ''}
+          ${!audit.evaluated ? `<p class="note">Audit not evaluated for this line profile.</p>` : ''}
           <ul>${kdes}</ul>
         </article>
       `;
@@ -1243,7 +1619,7 @@ function renderImportResult(result) {
     })
     .join('');
   ids.importResults.innerHTML = `
-    <div class="import-summary" data-tone="${tone}">
+    <div class="import-summary" data-tone="${escapeHtml(tone)}">
       Accepted ${escapeHtml(result.accepted)} of ${escapeHtml(result.total)} row(s).
       Stored ${escapeHtml(result.stored)}; posted ${escapeHtml(result.posted)}; rejected ${escapeHtml(result.rejected)}.
       ${result.error ? `<span>${escapeHtml(result.error)}</span>` : ''}
@@ -1270,13 +1646,30 @@ function renderSnapshot(status, events, health = state.health) {
   }
 }
 
+// Snapshot ordering: every render carries a sequence number so a slow
+// response can never repaint over a newer one, and failures are reported
+// instead of escaping as an unhandled rejection.
+let snapshotSeq = 0;
+
 async function refresh() {
-  const [health, status, events] = await Promise.all([
-    api('/api/health'),
-    api('/api/simulate/status'),
-    api('/api/events?limit=100'),
-  ]);
-  renderSnapshot(status, events.events, health);
+  const requestSeq = ++snapshotSeq;
+  try {
+    const [health, status, events] = await Promise.all([
+      api('/api/health'),
+      api('/api/simulate/status'),
+      api('/api/events?limit=100'),
+    ]);
+    if (requestSeq !== snapshotSeq) {
+      return;
+    }
+    renderSnapshot(status, events.events, health);
+    hydrateDeliveryForm(status);
+    await hydrateIntegrationStatus();
+    return true;
+  } catch (error) {
+    setStatus(error.message, 'error', 5000);
+    return false;
+  }
 }
 
 function stopFallbackPolling() {
@@ -1291,8 +1684,14 @@ function startFallbackPolling() {
     return;
   }
   state.fallbackTimer = setInterval(() => {
-    refresh().catch((error) => {
-      setStatus(error.message, 'error', 5000);
+    // refresh() reports its own failures; the in-flight guard keeps a slow
+    // poll from stacking up behind itself.
+    if (state.refreshInFlight) {
+      return;
+    }
+    state.refreshInFlight = true;
+    refresh().finally(() => {
+      state.refreshInFlight = false;
     });
   }, 2000);
 }
@@ -1301,6 +1700,16 @@ function applyStreamSnapshot(payload) {
   if (!payload || !payload.status || !Array.isArray(payload.events)) {
     return;
   }
+  // Stream snapshots carry the controller revision; an out-of-order or
+  // replayed one must not repaint over newer state.
+  const revision = Number(payload.revision);
+  if (Number.isFinite(revision)) {
+    if (revision < Number(state.lastRevision || 0)) {
+      return;
+    }
+    state.lastRevision = revision;
+  }
+  snapshotSeq += 1;
   renderSnapshot(payload.status, payload.events);
 }
 
@@ -1365,6 +1774,7 @@ function renderConnectionStatus(integration) {
   if (!ids.connectionChips || !integration) {
     return;
   }
+  state.integration = integration;
   const chips = [
     ['Endpoint', integration.endpoint_host || 'default'],
     ['API key', integration.api_key_configured ? 'Configured' : 'Not set'],
@@ -1450,7 +1860,7 @@ async function testConnection() {
     const statusLine = result.status_code ? ` (HTTP ${result.status_code})` : '';
     if (ids.connectionResult) {
       ids.connectionResult.innerHTML = `
-        <div class="connection-verdict" data-tone="${tone}">
+        <div class="connection-verdict" data-tone="${escapeHtml(tone)}">
           <strong>${escapeHtml(result.verdict.replaceAll('_', ' '))}${escapeHtml(statusLine)}</strong>
           <p>${escapeHtml(result.detail)}</p>
         </div>
@@ -1466,6 +1876,9 @@ async function testConnection() {
 }
 
 async function startLoop() {
+  if (blockedByMissingCredentials()) {
+    return;
+  }
   try {
     await api('/api/simulate/start', {
       method: 'POST',
@@ -1513,6 +1926,9 @@ async function stepOnce() {
 }
 
 async function retryFailedDeliveries() {
+  if (blockedByMissingCredentials()) {
+    return;
+  }
   try {
     const config = buildConfig();
     const result = await api('/api/delivery/retry', {
@@ -1574,6 +1990,9 @@ async function loadSavedScenario() {
 }
 
 async function loadSelectedDemoFixture() {
+  if (blockedByMissingCredentials()) {
+    return;
+  }
   try {
     const config = buildConfig();
     const fixtureId = ids.demoFixture.value || 'leafy_greens_trace';
@@ -1631,6 +2050,9 @@ async function replayCurrentLog() {
 }
 
 async function importCsv() {
+  if (blockedByMissingCredentials()) {
+    return;
+  }
   const file = ids.csvFile.files[0];
   if (!file) {
     setStatus('Choose a CSV file first.', 'error', 5000);
@@ -1664,12 +2086,20 @@ async function importCsv() {
 }
 
 async function resetState() {
+  if (blockedByMissingCredentials()) {
+    return;
+  }
   try {
     await api('/api/simulate/reset', {
       method: 'POST',
       body: JSON.stringify(buildConfig()),
     });
     ids.lineageResults.innerHTML = '';
+    // The records these filters pointed at are gone; leaving them applied
+    // makes the next export silently return nothing.
+    ids.lotLookup.value = '';
+    ids.exportLot.value = '';
+    updateExportLink();
     setStatus('Cleared line state and shift log.', 'success', 2500);
     await refresh();
   } catch (error) {
@@ -1677,19 +2107,31 @@ async function resetState() {
   }
 }
 
+// Rapid clicks on different lot codes used to race: whichever fetch resolved
+// last won the panel, regardless of which lot the operator picked last. Each
+// lookup takes a sequence number and a superseded response is dropped.
+let lineageRequestSeq = 0;
+
 async function lookupLineage() {
   const lotCode = ids.lotLookup.value.trim();
   if (!lotCode) {
     setStatus('Enter a lot code first.', 'error', 5000);
     return;
   }
+  const requestSeq = ++lineageRequestSeq;
   try {
     const payload = await api(`/api/lineage/${encodeURIComponent(lotCode)}`);
+    if (requestSeq !== lineageRequestSeq) {
+      return;
+    }
     renderLineage(payload, lotCode);
     journey.traced = true;
     renderGuide();
     setStatus(`Loaded lineage for ${lotCode}.`, 'success', 2500);
   } catch (error) {
+    if (requestSeq !== lineageRequestSeq) {
+      return;
+    }
     ids.lineageResults.innerHTML = `<p class="note">${escapeHtml(error.message)}</p>`;
     setStatus(error.message, 'error', 5000);
   }
@@ -1747,13 +2189,14 @@ ids.lotLookup.addEventListener('keydown', (event) => {
 });
 
 document.getElementById('nextActionGo')?.addEventListener('click', goToNextAction);
-for (const link of [ids.exportDownloadLink, ids.epcisDownloadLink]) {
-  link?.addEventListener('click', () => {
-    if (!state.events.length) {
-      return;
-    }
-    journey.exported = true;
-    renderGuide();
+for (const [link, label] of [
+  [ids.exportDownloadLink, 'Compliance export'],
+  [ids.epcisDownloadLink, 'EPCIS JSON'],
+  [ids.navExportLink, 'Compliance export'],
+]) {
+  link?.addEventListener('click', (event) => {
+    event.preventDefault();
+    downloadExport(link, label);
   });
 }
 document.querySelectorAll('#guideRail [data-guide-target]').forEach((step) => {
@@ -1823,8 +2266,9 @@ loadIntegrationStatus().catch((error) => {
   setStatus(error.message, 'error', 5000);
 });
 connectLiveUpdates();
-refresh().catch((error) => {
-  setStatus(error.message, 'error', 5000);
-  startFallbackPolling();
+refresh().then((ok) => {
+  if (!ok) {
+    startFallbackPolling();
+  }
 });
 maybeShowWelcome();
