@@ -4,7 +4,7 @@ import re
 from datetime import date
 from typing import Any
 
-from fastapi import APIRouter, Depends, HTTPException, Query
+from fastapi import APIRouter, Depends, Header, HTTPException, Query, Request
 from fastapi.responses import JSONResponse, PlainTextResponse
 
 from ..controller import SimulationController
@@ -29,17 +29,49 @@ router = APIRouter(prefix="/api/mock/regengine", tags=["Mock RegEngine"])
 @router.post("/ingest", response_model=MockIngestResponse)
 async def mock_regengine_ingest(
     payload: IngestPayload,
+    request: Request,
     active_controller: SimulationController = Depends(get_active_controller),
+    idempotency_key: str | None = Header(default=None, alias="Idempotency-Key"),
+    x_webhook_signature: str | None = Header(default=None, alias="X-Webhook-Signature"),
+    x_mock_friction: str | None = Header(default=None, alias="X-Mock-Friction"),
 ) -> MockIngestResponse:
+    # `request` gives us the exact raw wire bytes -- FastAPI already read
+    # and cached them while parsing `payload`, so this second read is free.
+    # HMAC verification needs those real bytes rather than a round-tripped
+    # re-serialization of the parsed model; see
+    # mock_service._verify_webhook_signature's docstring for why that
+    # distinction is the whole point of the check (#113).
+    raw_body = await request.body()
+
+    # X-Mock-Friction has no live-RegEngine equivalent. It is how a caller
+    # hitting this route directly -- "as a customer testing their own
+    # client integration would" (#116), rather than going through the
+    # simulator's own DeliveryConfig.mock_friction -- can still rehearse
+    # the same auth/billing/rate-limit failure modes the internal delivery
+    # path already exercises. Comma-separated so more than one code can be
+    # combined, same as DeliveryConfig.mock_friction being a list.
+    friction = (
+        tuple(code.strip() for code in x_mock_friction.split(",") if code.strip())
+        if x_mock_friction
+        else ()
+    )
+
     # mock_service.ingest() raises MockRegEngineHTTPError for request-level
-    # rejections (e.g. a >500-event batch) that mirror a live non-2xx
-    # RegEngine response. Nothing else in the app registers a handler for
-    # that exception type, so left uncaught it becomes an unhandled 500
-    # instead of the descriptive 4xx a real caller gets (#142). Other
-    # callers of ingest() (step/replay/csv-import/fixtures, via
+    # rejections (e.g. a >500-event batch, injected friction, or a bad/
+    # missing signature) that mirror a live non-2xx RegEngine response.
+    # Nothing else in the app registers a handler for that exception type,
+    # so left uncaught it becomes an unhandled 500 instead of the
+    # descriptive 4xx a real caller gets (#142). Other callers of ingest()
+    # (step/replay/csv-import/fixtures, via
     # SimulationController._deliver_payload) already catch it themselves.
     try:
-        return active_controller.mock_service.ingest(payload)
+        return active_controller.mock_service.ingest(
+            payload,
+            idempotency_key=idempotency_key,
+            friction=friction,
+            raw_body=raw_body,
+            signature_header=x_webhook_signature,
+        )
     except MockRegEngineHTTPError as exc:
         raise HTTPException(status_code=exc.status_code, detail=exc.detail) from exc
 

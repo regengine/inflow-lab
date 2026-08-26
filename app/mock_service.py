@@ -1,13 +1,16 @@
 from __future__ import annotations
 
 import hashlib
+import hmac
 import json
+import os
 from collections import OrderedDict
 from datetime import UTC, datetime, timedelta
 from typing import Any, Callable, NamedTuple
 from uuid import uuid4
 
 from .cte_rules import REQUIRED_KDES
+from .regengine_client import WEBHOOK_HMAC_SECRET_ENV
 from .schemas.domain import DestinationMode, RegEngineEvent
 from .schemas.ingestion import IngestPayload, IngestResponseEvent, MockIngestResponse
 from .store import EventStore
@@ -93,6 +96,55 @@ def _resume_chain_hash(store: EventStore) -> str:
     return ""
 
 
+def _verify_webhook_signature(body: bytes | None, signature_header: str | None) -> None:
+    """Reject a missing/incorrect X-Webhook-Signature the way live RegEngine does (#113).
+
+    Gated by REGENGINE_WEBHOOK_HMAC_SECRET -- the same env var
+    LiveRegEngineClient reads (see regengine_client.py's
+    _build_signature_header). The client is the source of truth for
+    exactly what gets signed: json.dumps(payload.model_dump(mode="json"),
+    separators=(",", ":"), sort_keys=True), sent via httpx content= so the
+    signed bytes equal the wire bytes. Verifying against caller-supplied
+    raw wire bytes here -- rather than re-serializing the already-parsed
+    payload -- is deliberate: re-deriving our own canonical bytes and
+    signing those would never catch a body-serialization drift bug in the
+    client's signer, which is the exact class of bug this check exists to
+    catch (docs/HMAC_STAGING_VALIDATION.md's "Body-Bytes Drift").
+
+    Two no-op cases, both matching live semantics rather than inventing
+    new ones:
+    - Unset/blank secret: RegEngine's own verifier no-ops in this mode
+      (see docs/HMAC_STAGING_VALIDATION.md, "RegEngine Secret Missing")
+      and the client skips signing entirely, so nothing is enforced here
+      either -- this is the pre-signing migration ramp on both sides.
+    - body=None: no wire bytes exist to check against. The HTTP route
+      always passes the exact bytes it received; the simulator's
+      in-process mock-delivery call (SimulationController._deliver_payload,
+      DestinationMode.MOCK) calls ingest() directly on an already-parsed
+      payload and never serializes or signs anything, so there is nothing
+      to verify on that path.
+    """
+    secret = os.getenv(WEBHOOK_HMAC_SECRET_ENV, "").strip()
+    if not secret or body is None:
+        return
+
+    if not signature_header:
+        raise MockRegEngineHTTPError(401, "Missing X-Webhook-Signature header")
+
+    scheme, _, provided_digest = signature_header.partition("=")
+    if scheme != "sha256" or not provided_digest:
+        raise MockRegEngineHTTPError(
+            401, "Unsupported X-Webhook-Signature scheme (expected 'sha256=<hex>')"
+        )
+
+    expected_digest = hmac.new(secret.encode("utf-8"), body, hashlib.sha256).hexdigest()
+    # hmac.compare_digest, never == -- a time-variable comparison leaks how
+    # many leading hex characters matched, letting an attacker recover a
+    # valid signature one byte at a time.
+    if not hmac.compare_digest(expected_digest, provided_digest):
+        raise MockRegEngineHTTPError(401, "Invalid X-Webhook-Signature")
+
+
 class MockRegEngineService:
     """In-process stand-in for RegEngine's POST /api/v1/webhooks/ingest.
 
@@ -100,7 +152,8 @@ class MockRegEngineService:
     validation so the demo experience matches what a customer hits in the
     wild: batch-size bounds, strict per-CTE KDE checks (exact key lookup,
     no aliasing), the location-identifier requirement, in-batch duplicate
-    rejection, future-timestamp rejection, and 24h idempotency replays.
+    rejection, future-timestamp rejection, 24h idempotency replays, and
+    (when a shared secret is configured) HMAC-SHA256 signature verification.
 
     ``chain_hash`` and the idempotency cache otherwise live only in process
     memory. Construct with ``store=`` to seed ``chain_hash`` from a
@@ -137,7 +190,19 @@ class MockRegEngineService:
         payload: IngestPayload,
         idempotency_key: str | None = None,
         friction: tuple[str, ...] = (),
+        *,
+        raw_body: bytes | None = None,
+        signature_header: str | None = None,
     ) -> MockIngestResponse:
+        # Signature verification is the outermost gate -- mirroring live
+        # RegEngine's own ordering, where a request is authenticated at
+        # the transport layer before any application-level handling (the
+        # friction codes below simulate *application* failures like a bad
+        # API key or an inactive subscription, which is a different
+        # concern from "is this request from the holder of the shared
+        # secret at all") (#113).
+        _verify_webhook_signature(raw_body, signature_header)
+
         for code in friction:
             failure = FRICTION_RESPONSES.get(code)
             if failure is not None:
