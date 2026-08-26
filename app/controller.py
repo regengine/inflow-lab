@@ -447,8 +447,23 @@ class SimulationController:
         request = request or DeliveryRetryRequest()
         async with self._lock:
             delivery = request.delivery or self.config.delivery
-            candidates = self.store.failed_delivery_records(request.record_ids, limit=request.limit)
-            requested = len(request.record_ids) if request.record_ids else len(candidates)
+            # record_ids distinguishes "omitted" (None -- no filter, retry
+            # every failed record up to limit) from "present but empty"
+            # ([] -- retry nothing). EventStore.failed_delivery_records()
+            # cannot make that distinction itself: it builds its filter as
+            # set(record_ids or []), which treats [] exactly like None and
+            # so retries everything for an explicitly empty list (#144).
+            # Short-circuiting the empty-list case here, before the store
+            # is ever consulted, fixes the caller-visible behavior without
+            # touching that store method's filtering logic.
+            if request.record_ids is not None and len(request.record_ids) == 0:
+                candidates: list[StoredEventRecord] = []
+            else:
+                candidates = self.store.failed_delivery_records(request.record_ids, limit=request.limit)
+            # Truthiness (`if request.record_ids`) would misreport this the
+            # same way: an explicitly empty list is falsy just like None, so
+            # `requested` must key off "was the field provided at all" too.
+            requested = len(request.record_ids) if request.record_ids is not None else len(candidates)
             skipped = max(0, requested - len(candidates))
 
             if not candidates:

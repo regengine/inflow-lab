@@ -3,13 +3,20 @@ from __future__ import annotations
 from datetime import datetime
 from typing import Any, Literal
 
-from pydantic import BaseModel, Field, field_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 from .domain import CSVImportType, CTEType, DestinationMode, RegEngineEvent
 from .simulation import DeliveryConfig
 
 
 class IngestPayload(BaseModel):
+    # extra="forbid" (#143): this is a request body (POST /api/mock/regengine/
+    # ingest), constructed internally elsewhere with known kwargs only. A
+    # caller who misspells "events" or nests the payload under an extra
+    # wrapper key would otherwise get a silent 200 that ingested nothing,
+    # which is the exact failure mode this simulator exists to catch.
+    model_config = ConfigDict(extra="forbid")
+
     source: str = "codex-simulator"
     events: list[RegEngineEvent]
 
@@ -17,6 +24,13 @@ class IngestPayload(BaseModel):
 class IngestResponseEvent(BaseModel):
     # Mirrors RegEngine's EventResult: rejected events carry errors and no
     # event_id/hashes, accepted events carry all three.
+    #
+    # Response-only model (nested in MockIngestResponse) -- left permissive
+    # (no extra="forbid") on purpose. #143 targets request bodies, where an
+    # unrecognized field is a caller mistake worth a 422; here it is built
+    # by our own mock_service.py from known kwargs, so there is nothing to
+    # guard against and forbidding would only add risk if this ever needs
+    # to mirror a new field RegEngine's real response starts sending.
     traceability_lot_code: str
     cte_type: CTEType
     status: Literal["accepted", "rejected"]
@@ -35,6 +49,17 @@ class MockIngestResponse(BaseModel):
 
 
 class DeliveryRetryRequest(BaseModel):
+    # extra="forbid" (#143): request body for POST /api/delivery/retry. A
+    # typo like "record_id" (singular) would otherwise be silently dropped,
+    # parsing as an empty request that retries every failed record instead
+    # of the caller's intended subset -- a destructive default for a typo.
+    model_config = ConfigDict(extra="forbid")
+
+    # None ("field omitted") means "no filter -- retry every failed record
+    # up to limit"; [] ("field present but empty") means "retry nothing".
+    # Pydantic already keeps these distinguishable at parse time; the fix
+    # for #144 is entirely in how SimulationController.retry_failed_delivery
+    # consumes this value -- see app/controller.py.
     record_ids: list[str] | None = None
     limit: int = 50
     source: str | None = None
@@ -63,6 +88,9 @@ class DeliveryRetryResponse(BaseModel):
 
 
 class ReplayRequest(BaseModel):
+    # extra="forbid" (#143): request body for POST /api/simulate/replay.
+    model_config = ConfigDict(extra="forbid")
+
     persist_path: str | None = None
     source: str | None = None
     delivery: DeliveryConfig | None = None
@@ -83,6 +111,9 @@ class ReplayResponse(BaseModel):
 
 
 class CSVImportRequest(BaseModel):
+    # extra="forbid" (#143): request body for POST /api/import/csv.
+    model_config = ConfigDict(extra="forbid")
+
     import_type: CSVImportType
     csv_text: str
     source: str | None = None
