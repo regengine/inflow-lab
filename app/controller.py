@@ -17,7 +17,7 @@ from .contract import INFLOW_CONTRACT_VERSION
 from .csv_importer import parse_csv_import
 from .demo_fixtures import get_demo_fixture
 from .engine import LegitFlowEngine
-from .mock_service import MockRegEngineHTTPError, MockRegEngineService
+from .mock_service import MAX_BATCH_EVENTS, MockRegEngineHTTPError, MockRegEngineService
 from .schemas.domain import DemoFixtureId, DestinationMode, RegEngineEvent, StoredEventRecord
 from .schemas.ingestion import (
     CSVImportRequest,
@@ -282,8 +282,18 @@ class SimulationController:
                     delivery_attempts=0,
                 )
             else:
-                payload = IngestPayload(source=source, events=events)
-                outcome = await self._deliver_payload(payload, replay_config)
+                # #103: RegEngine caps a batch at MAX_BATCH_EVENTS events and
+                # 422s the whole request past that -- a persisted store
+                # replayed here has no such bound, so once it grows past the
+                # cap a bare single _deliver_payload call would fail the
+                # entire replay every time (permanently, since the store
+                # only grows). _deliver_in_chunks splits `events` into
+                # slices at that same cap and posts each as its own
+                # request; _aggregate_outcomes rolls the per-chunk results
+                # back into one summary so an early chunk's posted events
+                # are still reported even if a later chunk fails.
+                chunks = await self._deliver_in_chunks(source, events, replay_config)
+                outcome = _aggregate_outcomes([chunk_outcome for _, chunk_outcome in chunks])
                 replay_status = {
                     "posted": "posted",
                     "failed": "failed",
@@ -331,12 +341,33 @@ class SimulationController:
             outcome = DeliveryOutcome()
             stored_records: list[StoredEventRecord] = []
             if parsed.events:
-                payload = IngestPayload(source=source, events=parsed.events)
-                outcome = await self._deliver_payload(payload, import_config)
-                stored_records = _build_stored_records(
-                    source, parsed.events, parsed.parent_lot_codes, delivery.mode, outcome
-                )
+                # #103: same MAX_BATCH_EVENTS cap as replay() -- a CSV
+                # import has no row-count bound of its own, so a batch
+                # parsed from a large file used to be posted as one
+                # oversized request and 422 in full. Chunk here and build
+                # stored records per chunk (each chunk keeps its own
+                # outcome, so a record's delivery_attempts reflects the one
+                # real POST it was actually part of, not the whole
+                # import's chunk count).
+                chunks = await self._deliver_in_chunks(source, parsed.events, import_config)
+                lineage_offset = 0
+                for chunk_events, chunk_outcome in chunks:
+                    chunk_len = len(chunk_events)
+                    stored_records.extend(
+                        _build_stored_records(
+                            source,
+                            chunk_events,
+                            parsed.parent_lot_codes[lineage_offset : lineage_offset + chunk_len],
+                            delivery.mode,
+                            chunk_outcome,
+                        )
+                    )
+                    lineage_offset += chunk_len
                 await self._store_add_many(stored_records)
+                # Response-level counts only, aggregated across every chunk
+                # (#103) -- per-record fields above already used each
+                # chunk's own outcome instead.
+                outcome = _aggregate_outcomes([chunk_outcome for _, chunk_outcome in chunks])
 
             rejected = parsed.total - len(parsed.events)
             if outcome.delivery_status == "failed":
@@ -551,10 +582,32 @@ class SimulationController:
                         deep=True,
                     )
                     payload = IngestPayload(source=source, events=[record.event for record in records])
+                    # #95: the stored key is only safe to reuse when the
+                    # original attempt produced no response at all --
+                    # record.delivery_response is None -- a pure transport
+                    # failure, where retrying under the same key is a
+                    # legitimate "did this already land" idempotency check.
+                    # A record carrying a per-event verdict (accepted or
+                    # rejected) already has an authoritative response on
+                    # file; reusing its key would have RegEngine's
+                    # idempotency cache answer this retry from that stale
+                    # response without ever revalidating the corrected
+                    # event -- exactly the bug #95 reports. `all(...)` over
+                    # the whole group, not a per-record check: every record
+                    # here shares this one original idempotency_key (that's
+                    # what grouped them together above), so if even one of
+                    # them did get a response, that key's original attempt
+                    # was not "no response at all" and nothing in the group
+                    # is safe to replay under it. Passing None makes
+                    # _deliver_payload mint a fresh key, same as a record
+                    # with no stored key at all already got before this fix.
+                    reuse_original_key = idempotency_key is not None and all(
+                        record.delivery_response is None for record in records
+                    )
                     outcome = await self._deliver_payload(
                         payload,
                         retry_config,
-                        idempotency_key=idempotency_key,
+                        idempotency_key=idempotency_key if reuse_original_key else None,
                     )
                     response_events = (outcome.response or {}).get("events", []) if outcome.response else []
                     responses.append(
@@ -716,37 +769,67 @@ class SimulationController:
                     idempotency_key=delivery_idempotency_key,
                     friction=tuple(config.delivery.mock_friction),
                 ).model_dump(mode="json")
-                return DeliveryOutcome(
-                    response=mask_secret_in_payload(response, api_key),
-                    delivery_status="posted",
-                    posted=response.get("accepted", len(payload.events)),
-                    failed=response.get("rejected", 0),
-                    delivery_attempts=1,
-                    attempted_at=attempted_at,
-                    completed_at=datetime.now(UTC),
-                    metadata={
-                        "delivery_mode": "mock",
-                        "attempted_event_count": len(payload.events),
-                        "idempotency_key": delivery_idempotency_key,
-                    },
-                )
-            if config.delivery.mode == DestinationMode.LIVE:
+                metadata = {
+                    "delivery_mode": "mock",
+                    "attempted_event_count": len(payload.events),
+                    "idempotency_key": delivery_idempotency_key,
+                }
+            elif config.delivery.mode == DestinationMode.LIVE:
                 result = await self.live_client.ingest(
                     payload,
                     config,
                     idempotency_key=delivery_idempotency_key,
                 )
+                response = result.response
+                metadata = result.metadata | {"attempted_event_count": len(payload.events)}
+            else:
+                return DeliveryOutcome()
+
+            # #95: a repeated Idempotency-Key makes both the mock and live
+            # RegEngine replay a cached response verbatim, without
+            # revalidating anything (app/mock_service.py's
+            # _idempotency_cache; live RegEngine's own idempotency store
+            # behaves the same, per the shared TTL cache both sides pin
+            # against). That is correct when the replayed request is the
+            # one that populated the cache entry -- but retry_failed_delivery
+            # can legitimately resend a *subset* of a larger original batch
+            # under that batch's key (see its reuse_original_key comment
+            # above), so the cached response can describe more events than
+            # this request actually sent. Every genuine (non-replayed)
+            # response carries exactly one verdict per requested event --
+            # the same invariant _pair_event_responses relies on -- so a
+            # mismatched count is the tell. Treat that as a replay rather
+            # than a delivery: folding a stale batch's accepted/rejected
+            # counts into this request's posted/failed would silently
+            # overstate what this retry actually accomplished (#95's
+            # second bug).
+            masked_response = mask_secret_in_payload(response, api_key)
+            if _is_idempotency_replay(response, payload):
                 return DeliveryOutcome(
-                    response=mask_secret_in_payload(result.response, api_key),
-                    delivery_status="posted",
-                    posted=result.response.get("accepted", len(payload.events)),
-                    failed=result.response.get("rejected", 0),
+                    response=masked_response,
+                    delivery_status="failed",
+                    posted=0,
+                    failed=len(payload.events),
                     delivery_attempts=1,
                     attempted_at=attempted_at,
                     completed_at=datetime.now(UTC),
-                    metadata=result.metadata | {"attempted_event_count": len(payload.events)},
+                    error_message=(
+                        "RegEngine replayed a cached idempotency response sized "
+                        "for a different request; none of this request's events "
+                        "were revalidated. Retry again to mint a fresh key."
+                    ),
+                    metadata=metadata | {"idempotency_replay": True},
                 )
-            return DeliveryOutcome()
+            return DeliveryOutcome(
+                response=masked_response,
+                delivery_status="posted",
+                posted=response.get("accepted", len(payload.events)),
+                failed=response.get("rejected", 0),
+                delivery_attempts=1,
+                attempted_at=attempted_at,
+                completed_at=datetime.now(UTC),
+                metadata=metadata,
+            )
         except MockRegEngineHTTPError as exc:
             logger.error(
                 "mock delivery failed: %s events rejected with HTTP %s (%s)",
@@ -808,6 +891,47 @@ class SimulationController:
                 error_message=mask_secret_in_string(str(exc), api_key),
                 metadata=metadata,
             )
+
+    async def _deliver_in_chunks(
+        self,
+        source: str,
+        events: list[RegEngineEvent],
+        config: SimulationConfig,
+    ) -> list[tuple[list[RegEngineEvent], DeliveryOutcome]]:
+        """POST *events* to RegEngine in slices of at most MAX_BATCH_EVENTS (#103).
+
+        RegEngine's real webhook route -- and the mock mirroring it, see
+        app/mock_service.py's MAX_BATCH_EVENTS -- rejects the entire
+        request with one 422 the instant a batch exceeds this cap.
+        import_csv and replay are the two callers that can hand this more
+        events than that: neither bounds how many CSV rows get parsed or
+        how large a persisted store has grown before building one
+        IngestPayload (step() cannot -- batch_size caps at 100 -- and
+        retry_failed_delivery cannot either, since DeliveryRetryRequest.limit
+        caps at 500, this same constant's value).
+
+        Each chunk goes out as its own request via _deliver_payload, which
+        mints it a fresh Idempotency-Key exactly as it already does for any
+        caller that passes none -- from RegEngine's side a chunk is a
+        wholly separate request, never a retry of another one.
+
+        Returns each chunk's own event slice paired with its own
+        DeliveryOutcome, in order, so a caller that must pair per-event
+        verdicts back onto records (import_csv, via _build_stored_records)
+        can zip each outcome against exactly the events that produced it
+        instead of re-deriving chunk boundaries a second time. A call with
+        `events` at or under the cap produces exactly one chunk covering
+        the whole list -- the common case, and _aggregate_outcomes passes
+        a single outcome straight through unchanged, so it behaves
+        identically to the unchunked call this replaces.
+        """
+        chunks: list[tuple[list[RegEngineEvent], DeliveryOutcome]] = []
+        for start in range(0, len(events), MAX_BATCH_EVENTS):
+            chunk_events = events[start : start + MAX_BATCH_EVENTS]
+            payload = IngestPayload(source=source, events=chunk_events)
+            outcome = await self._deliver_payload(payload, config)
+            chunks.append((chunk_events, outcome))
+        return chunks
 
     async def _run_loop(self, stop_event: asyncio.Event) -> None:
         # Takes stop_event as a parameter, captured once, rather than
@@ -1092,3 +1216,93 @@ def _stored_idempotency_key(record: StoredEventRecord) -> str | None:
     if isinstance(value, str) and value:
         return value
     return None
+
+
+def _is_idempotency_replay(response: dict[str, Any], payload: IngestPayload) -> bool:
+    """True when *response* answers a differently-sized request than *payload* (#95).
+
+    A genuinely fresh RegEngine response -- mock or live -- carries
+    exactly one verdict per submitted event (MockRegEngineService.ingest
+    appends one IngestResponseEvent per loop iteration over
+    payload.events; live RegEngine's contract is the same). A repeated
+    Idempotency-Key instead replays whatever response that key originally
+    cached, verbatim and without revalidating anything -- correct when
+    the replayed request is byte-for-byte the one that populated the
+    cache, but wrong when it is only a subset (retry_failed_delivery
+    resending fewer events than the original batch that owned the key).
+    The subset case is exactly what a mismatched event count catches:
+    nothing about a legitimate, matching replay ever trips it.
+    """
+    return len(response.get("events", [])) != len(payload.events)
+
+
+def _aggregate_outcomes(outcomes: list[DeliveryOutcome]) -> DeliveryOutcome:
+    """Roll up one DeliveryOutcome per chunk into the single summary
+    import_csv/replay's response schemas need (#103).
+
+    A single-chunk call -- everything at or under MAX_BATCH_EVENTS, still
+    the overwhelming common case -- passes its one outcome through
+    completely unchanged rather than rebuild it into a synthetic shape:
+    CSVImportResponse.response / ReplayResponse.response stays exactly
+    whatever mock_service/live_client actually returned (including
+    fields like "total"/"ingestion_timestamp" a merged dict would
+    otherwise drop), and every other field is that same single outcome's
+    own.
+
+    Multiple chunks combine by summing posted/failed/delivery_attempts,
+    so an early chunk succeeding is never erased by a later one failing
+    -- the concrete "partial failure mid-way through several chunks"
+    case #103 asks for. delivery_status collapses to "failed" if *any*
+    chunk failed outright (surfaced by callers as
+    status="delivery_failed"/"failed"), to "generated" only when every
+    chunk was (delivery mode NONE never calls RegEngine at all), and to
+    "posted" otherwise -- the exact three values ReplayResponse's own
+    ``{"posted": ..., "failed": ..., "generated": ...}[outcome.delivery_status]``
+    lookup requires; see replay().
+
+    This aggregate is for the one response object each caller returns,
+    never for per-record fields -- building StoredEventRecords must use
+    each chunk's own outcome instead (its own delivery_attempts, its own
+    response for verdict pairing), which is exactly why import_csv calls
+    _build_stored_records once per chunk rather than against this.
+    """
+    if not outcomes:
+        return DeliveryOutcome()
+    if len(outcomes) == 1:
+        return outcomes[0]
+
+    if any(outcome.delivery_status == "failed" for outcome in outcomes):
+        delivery_status = "failed"
+    elif all(outcome.delivery_status == "generated" for outcome in outcomes):
+        delivery_status = "generated"
+    else:
+        delivery_status = "posted"
+
+    error_messages = [outcome.error_message for outcome in outcomes if outcome.error_message]
+
+    response_events: list[Any] = []
+    any_response = False
+    for outcome in outcomes:
+        if outcome.response is not None:
+            any_response = True
+            response_events.extend(outcome.response.get("events", []))
+
+    posted = sum(outcome.posted for outcome in outcomes)
+    failed = sum(outcome.failed for outcome in outcomes)
+    return DeliveryOutcome(
+        response=(
+            {
+                "chunk_count": len(outcomes),
+                "accepted": posted,
+                "rejected": failed,
+                "events": response_events,
+            }
+            if any_response
+            else None
+        ),
+        delivery_status=delivery_status,
+        posted=posted,
+        failed=failed,
+        delivery_attempts=sum(outcome.delivery_attempts for outcome in outcomes),
+        error_message="; ".join(error_messages) or None,
+    )
