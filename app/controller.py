@@ -10,6 +10,8 @@ from datetime import UTC, datetime
 from typing import Any, Iterable
 from urllib.parse import urlparse
 
+from fastapi import HTTPException
+
 from .audit import summarize_scenario_audit
 from .contract import INFLOW_CONTRACT_VERSION
 from .csv_importer import parse_csv_import
@@ -104,13 +106,47 @@ class SimulationController:
         async with self._lock:
             _validate_live_delivery(config.delivery)
             previous_config = self.config
+            if self.running and (
+                _engine_shaping_fields_changed(previous_config, config)
+                or config.persist_path != previous_config.persist_path
+            ):
+                # #96: a running engine keeps generating events from
+                # previous_config's scenario/seed/scale no matter what
+                # self.config is reassigned to -- reset() is the only thing
+                # that actually changes what the engine produces, and below
+                # it only runs `if not self.running`. Applying the new
+                # config here anyway (as this method used to, unconditionally)
+                # left status() self-contradicting: config.scenario reports
+                # the new request while stats.engine.scenario -- and every
+                # event actually being emitted -- stays on the old one. A
+                # differing persist_path has its own version of the same
+                # problem: EventStore.configure() both repoints persist_path
+                # and reloads the in-memory ring from *that* file, so the
+                # still-running loop would keep writing this one run's
+                # events split across the old and new JSONL files.
+                #
+                # The console itself already treats "running" and "start" as
+                # mutually exclusive -- syncRunButtons() in
+                # app/static/app.js disables the Start button for the
+                # entire time status.running is true, and only re-enables it
+                # once Stop has completed -- so an operator can never reach
+                # this branch through the UI. Only a direct API call, or a
+                # second tab whose own "running" state has gone stale, can.
+                # A 409 tells that caller the same thing the UI already
+                # enforces by disabling the button, instead of silently
+                # discarding either the running engine's state or the
+                # caller's own request.
+                raise HTTPException(
+                    status_code=409,
+                    detail=(
+                        "Simulation is already running with a different scenario, "
+                        "seed, scale, or persist_path. POST /api/simulate/stop first, "
+                        "then start with the new config."
+                    ),
+                )
             self.config = config
             await self._store_configure(config.persist_path)
-            if not self.running and (
-                config.seed != previous_config.seed
-                or config.scenario != previous_config.scenario
-                or config.scale != previous_config.scale
-            ):
+            if not self.running and _engine_shaping_fields_changed(previous_config, config):
                 self.engine.reset(config.seed, scenario=config.scenario, scale=config.scale)
             if not self.running:
                 self._stop_event = asyncio.Event()
@@ -982,6 +1018,24 @@ def _build_stored_records(
 def _validate_live_delivery(delivery: DeliveryConfig) -> None:
     if delivery.mode == DestinationMode.LIVE and (not delivery.api_key or not delivery.tenant_id):
         raise ValueError("Live delivery requires both api_key and tenant_id")
+
+
+def _engine_shaping_fields_changed(previous: SimulationConfig, incoming: SimulationConfig) -> bool:
+    """True if *incoming* differs from *previous* in a field LegitFlowEngine.reset() takes.
+
+    ``seed``/``scenario``/``scale`` are the only three of SimulationConfig's
+    fields that actually reshape the engine -- everything else (source,
+    batch_size, interval_seconds, persist_path, delivery) is read fresh off
+    ``self.config`` by ``step()``/``_run_loop()`` on every call, so changing
+    those needs no reset to take effect. Shared by start()'s not-running
+    reset gate and its running-conflict guard (#96) below, so the two field
+    lists cannot drift apart if engine.reset()'s own parameters ever change.
+    """
+    return (
+        incoming.seed != previous.seed
+        or incoming.scenario != previous.scenario
+        or incoming.scale != previous.scale
+    )
 
 
 def _stored_idempotency_key(record: StoredEventRecord) -> str | None:
