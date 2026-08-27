@@ -18,6 +18,7 @@ from .cors import cors_origins_from_env, resolve_cors_origins
 from .exceptions import handle_value_error
 from .routers import events, health, ingestion, integration, mock_regengine, operator, scenarios, simulation
 from .tenancy import controller, scenario_saves
+from .worker_guard import enforce_single_process_startup
 
 
 # Explicit re-export surface (#137). `cors_origins_from_env`, `controller` and
@@ -44,6 +45,13 @@ logger = logging.getLogger("inflow_lab")
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    # First, before anything commits state: this app's simulation run/stop
+    # control plane is per-process memory, so a multi-worker deployment can
+    # answer Stop with a 200 while another worker keeps delivering (#161).
+    # Refuse that shape outright rather than serving a control plane that
+    # silently does not control everything it reports on.
+    enforce_single_process_startup()
+
     if not basic_auth_config_from_env().enabled:
         if _shared_deployment_requires_auth():
             # Fail closed (#88): the container binds 0.0.0.0 unconditionally,
