@@ -354,6 +354,18 @@ def merged_event_values(event: RegEngineEvent) -> dict[str, Any]:
         "product_description": event.product_description,
         "quantity": event.quantity,
         "unit_of_measure": event.unit_of_measure,
+        # Same treatment as location_gln above: this is a top-level field on
+        # RegEngineEvent, so merging only **kdes made it invisible here. The
+        # contract reference declares the top-level field authoritative and
+        # says "the simulator now emits it top-level" -- but only the engine
+        # path does; demo fixtures and CSV imports leave it None. So an
+        # integrator following the contract, sending the field where the
+        # contract says to send it, was flagged at required severity for a
+        # KDE they had in fact supplied.
+        #
+        # Listed BEFORE **event.kdes, so the kdes copy still wins when both
+        # are present -- additive, matching how the field was introduced.
+        "input_traceability_lot_codes": event.input_traceability_lot_codes,
         **event.kdes,
     }
     tlc_reference = available.get("tlc_source_reference") or available.get(

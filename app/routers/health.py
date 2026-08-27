@@ -8,6 +8,12 @@ from typing import Any
 from fastapi import APIRouter, Depends
 from fastapi.responses import JSONResponse
 
+from ..schemas.health import (
+    HealthResponse,
+    HealthUnavailableResponse,
+    HealthzResponse,
+    HealthzUnavailableResponse,
+)
 from ..auth import TenantContext
 from ..build_info import current_build_info
 from ..contract import INFLOW_CONTRACT_VERSION
@@ -58,6 +64,13 @@ def _store_write_error(store: EventStore) -> str | None:
     EOF, which would turn a health check into a hang rather than a fast,
     correct "unhealthy".
     """
+    if store.retired:
+        # The tenant was deleted while this request was in flight (#175). The
+        # probe mkdirs its parent, so probing here would recreate the tenant
+        # tree the delete just removed and put it back in the operator
+        # listing. Report unwritable, which is the truth.
+        return "tenant has been deleted"
+
     probe_path, mode = _write_probe_target(store)
     try:
         probe_path.parent.mkdir(parents=True, exist_ok=True)
@@ -94,7 +107,11 @@ def _write_probe_target(store: EventStore) -> tuple[Path, str]:
     return persist_path.parent / ".healthz-write-probe", "w"
 
 
-@router.get("/health", response_model=None)
+@router.get(
+    "/health",
+    response_model=HealthResponse,
+    responses={503: {"model": HealthUnavailableResponse}},
+)
 async def health(
     context: TenantContext = Depends(get_tenant_context),
     active_controller: SimulationController = Depends(get_active_controller),
@@ -136,7 +153,11 @@ async def health(
     }
 
 
-@router.get("/healthz", response_model=None)
+@router.get(
+    "/healthz",
+    response_model=HealthzResponse,
+    responses={503: {"model": HealthzUnavailableResponse}},
+)
 async def healthz(
     active_controller: SimulationController = Depends(get_active_controller),
 ) -> dict[str, Any] | JSONResponse:
