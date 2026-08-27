@@ -85,12 +85,29 @@ def validate_egress_endpoint(url: HttpUrl | None) -> None:
     regengine_client.py, immediately before the outbound call. Deliberately
     NOT a Pydantic field validator: resolving DNS during model construction
     would make building a DeliveryConfig depend on the network, so anywhere
-    without a resolver every endpoint would fail closed at once; and it would
-    not stop DNS rebinding anyway, since the address can change between
-    validation and the request. Guarding where the socket is actually opened
-    covers both, and covers every route carrying an inline `delivery` block
+    without a resolver every endpoint would fail closed at once. Checking at
+    request time also covers every route carrying an inline `delivery` block,
     as well as the model_copy(update=...) path /api/integration/test and
     /api/integration/configure use.
+
+    WHAT THIS DOES NOT STOP: DNS rebinding. This function performs its OWN
+    getaddrinfo() and then returns; httpx resolves the hostname a second time,
+    independently, when it actually dials. A hostile authoritative server can
+    answer the first lookup with a public address and the second with
+    127.0.0.1, and the request lands on loopback with the caller's credential
+    attached. An earlier version of this docstring claimed the opposite --
+    that guarding "where the socket is actually opened covers both" -- which
+    was wrong: this is one frame earlier than the dial, not at it.
+
+    So the guard raises the bar without closing the hole. It blocks a
+    statically hostile endpoint (someone typing http://127.0.0.1 or a
+    metadata IP), which is the common case; it does not block an attacker who
+    controls a DNS zone. Closing that needs the validated address pinned at
+    connect time -- resolving once, dialing the IP directly, and carrying the
+    original hostname through as the Host header and TLS SNI so certificate
+    verification still applies. Tracked separately; see the rebinding test in
+    tests/test_egress_guard.py, which documents the gap rather than asserting
+    it is closed.
 
     The documented RegEngine host is allowlisted outright, which is cheap
     and keeps this offline-safe for anything that already targets it. Every

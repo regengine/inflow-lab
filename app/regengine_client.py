@@ -77,9 +77,11 @@ class LiveRegEngineClient:
         if not api_key or not tenant_id:
             raise ValueError("Live delivery requires both api_key and tenant_id")
         # SSRF/credential-exfiltration guard — see validate_egress_endpoint's
-        # docstring. This is the enforcement point: the check has to sit
-        # immediately before the request, where the address it resolves is
-        # the address actually dialed.
+        # docstring. Checked here, immediately before the request, so it sees
+        # the endpoint every caller path actually ends up using. Note it does
+        # NOT see the address httpx dials: httpx resolves the hostname again
+        # on its own, so this stops a statically hostile endpoint but not DNS
+        # rebinding. The docstring explains what closing that would take.
         validate_egress_endpoint(config.delivery.endpoint)
 
         idempotency_key = idempotency_key or uuid.uuid4().hex
@@ -142,10 +144,12 @@ class LiveRegEngineClient:
                 endpoint_host=host,
             )
         # SSRF/credential-exfiltration guard — see validate_egress_endpoint's
-        # docstring. Enforced here, immediately before the probe goes out, so
-        # the address checked is the address dialed. The caller (the /test
-        # route) turns a raised EgressBlockedError into a clean 4xx rather
-        # than letting it become an unhandled 500.
+        # docstring. Checked immediately before the probe goes out. As in
+        # ingest() above, the address checked is NOT guaranteed to be the
+        # address dialed -- httpx resolves independently -- so this stops a
+        # statically hostile endpoint but not DNS rebinding. The caller (the
+        # /test route) turns a raised EgressBlockedError into a clean 4xx
+        # rather than letting it become an unhandled 500.
         validate_egress_endpoint(config.delivery.endpoint)
 
         probe_url = f"{parsed.scheme}://{parsed.netloc}/api/v1/webhooks/recent"

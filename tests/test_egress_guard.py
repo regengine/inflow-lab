@@ -14,6 +14,8 @@ Covers three things:
 
 from __future__ import annotations
 
+import socket
+
 import asyncio
 import ipaddress
 from datetime import UTC, datetime
@@ -491,3 +493,58 @@ def test_inline_delivery_on_an_ingestion_route_never_reaches_the_metadata_addres
     assert SpyAsyncClient.calls == []
     assert "inline-key" not in response.text
     assert response.status_code < 500, response.text
+
+
+# ---------------------------------------------------------------------------
+# Known gap: DNS rebinding is NOT closed by this guard.
+# ---------------------------------------------------------------------------
+
+
+def test_guard_resolves_separately_from_the_dial_so_rebinding_is_not_closed(monkeypatch):
+    """Documents a limitation rather than asserting a fix.
+
+    ``validate_egress_endpoint`` performs its own ``getaddrinfo()`` and then
+    returns. httpx resolves the same hostname a second time, independently,
+    when it actually opens the socket. A hostile authoritative server with a
+    zero/short TTL can answer the guard's lookup with a public address and
+    httpx's with 127.0.0.1 -- the request then lands on loopback with the
+    caller's API key attached.
+
+    This asserts the mechanism that makes that possible: two separate lookups,
+    with the guard passing on the first answer alone. It exists so the gap is
+    visible in the test suite instead of only in a comment. If someone later
+    pins the validated address at connect time, this test should be REPLACED
+    by one asserting the pinned address is dialed -- not deleted quietly.
+
+    In-code comments previously claimed this guard sat "where the socket is
+    actually opened" and so covered rebinding. It does not, and those claims
+    have been corrected. The real fix is tracked as issue #207.
+    """
+    lookups: list[str] = []
+
+    def rebinding_resolver(host, *args, **kwargs):
+        lookups.append(host)
+        # First answer public, every later answer loopback -- the shape of a
+        # rebinding record. The guard only ever sees the first.
+        #
+        # 8.8.8.8 rather than a TEST-NET documentation range: Python's
+        # ipaddress marks 192.0.2.0/24, 198.51.100.0/24 and 203.0.113.0/24 as
+        # is_private, so the guard would refuse those on their own merits and
+        # this test would pass for the wrong reason.
+        address = "8.8.8.8" if len(lookups) == 1 else "127.0.0.1"
+        return [(socket.AF_INET, socket.SOCK_STREAM, 6, "", (address, 443))]
+
+    monkeypatch.setattr(socket, "getaddrinfo", rebinding_resolver)
+
+    # The guard consults the resolver once and is satisfied by the public
+    # answer, so it raises nothing.
+    validate_egress_endpoint(HttpUrl("https://rebind.example.test/ingest"))
+    assert lookups == ["rebind.example.test"], (
+        "the guard resolved a different number of times than expected; if it now "
+        "pins the address for the dial, replace this test with one asserting that"
+    )
+
+    # Any subsequent resolution -- which is what httpx performs when it dials
+    # -- returns loopback, and nothing re-checks it.
+    second = rebinding_resolver("rebind.example.test")
+    assert second[0][4][0] == "127.0.0.1"
