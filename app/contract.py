@@ -37,7 +37,7 @@ import sys
 from dataclasses import dataclass
 from datetime import UTC, date, datetime
 from pathlib import Path
-from typing import Any, Mapping, Sequence
+from typing import Any, Callable, Mapping, Sequence
 
 import httpx
 
@@ -62,13 +62,23 @@ INFLOW_CONTRACT_VERSION = "1"
 # Two independent, separately testable mechanisms close that gap:
 #
 #  1. assert_contract_pin_is_fresh() -- a dated freshness guard. No network
-#     needed, so it runs *today*: tests/test_client_diagnostics.py calls it
-#     as an ordinary pytest test, which the existing `pytest` CI job
-#     already executes on every push -- no workflow changes required. It
-#     forces a human to look at this file and move CONTRACT_LAST_CONFIRMED
-#     forward at least every CONTRACT_STALENESS_WINDOW_DAYS, whether or not
-#     the contract actually changed. It cannot detect an actual drift by
-#     itself; it only guarantees a drift can't go unnoticed forever.
+#     needed. It forces a human to look at this file and move
+#     CONTRACT_LAST_CONFIRMED forward at least every
+#     CONTRACT_STALENESS_WINDOW_DAYS, whether or not the contract actually
+#     changed. It cannot detect an actual drift by itself; it only
+#     guarantees a drift can't go unnoticed forever.
+#
+#     Its wall-clock verdict is enforced by _main() -- `uv run python -m
+#     app.contract`, exit code 1 -- not by a pytest assertion. It used to
+#     be the latter, which meant the entire suite was scheduled to fail on
+#     a fixed calendar date (2026-10-28 for the pin as written) with
+#     nothing wrong and nothing to fix but the date itself: a test that
+#     fails on a calendar date teaches people to ignore it (#211). The
+#     pytest suite now drives the guard through an injected clock (see
+#     _contract_clock below) so it pins the mechanism deterministically,
+#     and tests/test_client_diagnostics.py additionally pins _main()'s
+#     stale-pin exit code, which is the check worth wiring into a
+#     scheduled workflow.
 #  2. check_remote_kde_contract() -- a seam for diffing REQUIRED_KDES
 #     against a real, machine-readable copy of RegEngine's
 #     REQUIRED_KDES_BY_CTE. This is the part #140's proposed fix actually
@@ -130,29 +140,72 @@ def contract_staleness_window_days() -> int:
     return window if window > 0 else DEFAULT_CONTRACT_STALENESS_WINDOW_DAYS
 
 
-def contract_pin_age_days(today: date | None = None) -> int:
+def wall_clock_today() -> date:
+    """The guard's production reference date: the current UTC calendar date.
+
+    UTC, not local -- matching the rest of the app's ``datetime.now(UTC)``
+    convention (controller.py, store.py) so a verdict doesn't depend on
+    the CI runner's timezone.
+    """
+    return datetime.now(UTC).date()
+
+
+# The clock the freshness guard reads when a caller passes neither
+# ``today`` nor ``clock`` -- #120's injectable-clock pattern from
+# app/mock_service.py (``clock: Callable[[], datetime]`` defaulting to the
+# wall clock), adapted to this module's plain functions.
+#
+# Deliberately looked up through this module-level name at call time
+# rather than captured as a default argument value: substituting it is how
+# a test simulates an entire run at a chosen date (#211), which is what
+# keeps tests/test_client_diagnostics.py's verdict a function of the pin
+# and the window rather than of what day the suite happens to run on.
+# Production callers -- _main() below, i.e. ``uv run python -m
+# app.contract`` -- never pass a clock and so always get the real one.
+_contract_clock: Callable[[], date] = wall_clock_today
+
+
+def contract_pin_age_days(
+    today: date | None = None,
+    *,
+    clock: Callable[[], date] | None = None,
+) -> int:
     """Days since CONTRACT_LAST_CONFIRMED, as of *today*.
 
-    Defaults to the current UTC calendar date -- matches the rest of the
-    app's ``datetime.now(UTC)`` convention (controller.py, store.py) so
-    this doesn't depend on the CI runner's local timezone. Accepts an
-    explicit ``today`` so tests can exercise the boundary without waiting
-    for the calendar or monkeypatching ``datetime``.
+    Three ways to say "now", most explicit first: an exact ``today`` date;
+    a ``clock`` callable to read one from; or neither, which reads the
+    module's ``_contract_clock`` (the wall clock, unless a test has
+    substituted it).
     """
-    resolved_today = today if today is not None else datetime.now(UTC).date()
+    resolved_clock = clock if clock is not None else _contract_clock
+    resolved_today = today if today is not None else resolved_clock()
     return (resolved_today - CONTRACT_LAST_CONFIRMED).days
 
 
-def assert_contract_pin_is_fresh(today: date | None = None) -> None:
+def assert_contract_pin_is_fresh(
+    today: date | None = None,
+    *,
+    clock: Callable[[], date] | None = None,
+) -> None:
     """Fail loudly once nobody has reconfirmed the KDE pin in too long.
 
-    This is the half of #140 that needs no network access, so it can run
-    as a plain pytest test (tests/test_client_diagnostics.py) inside the
-    existing `pytest` CI job -- no workflow changes required. It cannot
+    This is the half of #140 that needs no network access. It cannot
     detect an actual drift by itself (that's check_remote_kde_contract()'s
     job); it only guarantees drift can't silently go unnoticed forever.
+
+    Where the verdict is enforced (#211): against the real calendar it is
+    ``_main()`` below -- ``uv run python -m app.contract``, which exits 1
+    on a stale pin -- because that is a check an operator or a workflow
+    step runs deliberately, and its failure is about the pin. The pytest
+    suite drives this function through an injected clock instead
+    (tests/test_client_diagnostics.py). Asserting the wall-clock verdict
+    from a unit test, as that file used to, scheduled the whole suite to
+    go red on a fixed calendar date -- 2026-10-28 for the pin as written
+    -- with no code change and nothing an author of an unrelated PR could
+    do about it except move the date, which is exactly the reflex the
+    guard exists to prevent.
     """
-    age_days = contract_pin_age_days(today)
+    age_days = contract_pin_age_days(today, clock=clock)
     window_days = contract_staleness_window_days()
     if age_days > window_days:
         raise ContractPinStaleError(

@@ -21,6 +21,45 @@ from .scenarios import (
 
 DEFAULT_MAX_FUTURE_HOURS = 20
 
+# GS1 company prefix every identifier this simulator mints is built on --
+# SGTINs, SSCCs, and (in app/scenarios.py) location GLNs. Not a real
+# assignment: this is a simulator, and the prefix only has to be
+# structurally valid and consistent across the identifiers one run emits.
+GS1_COMPANY_PREFIX = "8500000"
+
+# An SSCC is exactly 18 digits: 17 of payload (extension digit + company
+# prefix + serial reference) closed by a mod-10 check digit.
+SSCC_PAYLOAD_DIGITS = 17
+
+
+def gs1_check_digit(digits: str) -> int:
+    """Standard GS1 mod-10 check digit for *digits* (SSCC, GTIN, GLN...).
+
+    Weights alternate 3, 1, 3, 1 ... reading right to left from the digit
+    that will sit immediately left of the check digit.
+    """
+    total = 0
+    for index, digit in enumerate(reversed(digits), start=1):
+        total += int(digit) * (3 if index % 2 else 1)
+    return (10 - (total % 10)) % 10
+
+
+def make_sscc(payload: str) -> str:
+    """Close a 17-digit SSCC payload with its check digit, making 18.
+
+    Module-level rather than a method so anything that has to *write* an
+    SSCC uses this one construction -- the engine's generated shipments
+    and app/demo_fixtures.py's hand-authored ones alike (#209). A
+    GS1-128 "(00)" reference that is not 18 digits with a valid check
+    digit is precisely the malformed identifier this simulator exists to
+    help people notice, so it must not ship inside the demo data.
+    """
+    if len(payload) != SSCC_PAYLOAD_DIGITS or not payload.isdigit():
+        raise ValueError(
+            f"an SSCC payload must be exactly {SSCC_PAYLOAD_DIGITS} digits, got {payload!r}"
+        )
+    return f"{payload}{gs1_check_digit(payload)}"
+
 
 @dataclass(slots=True)
 class Lot:
@@ -689,13 +728,12 @@ class LegitFlowEngine:
 
     def _make_sgtin(self) -> str:
         serial = next(self._lot_counter)
-        company_prefix = "8500000"
+        company_prefix = GS1_COMPANY_PREFIX
         item_reference = f"{10000 + (serial % 89999):05d}"
         serial_component = f"{self._time_cursor.strftime('%y%m%d')}{serial:06d}"
         return f"urn:epc:id:sgtin:{company_prefix}.{item_reference}.{serial_component}"
 
     def _make_sscc(self) -> str:
-        company_prefix = "8500000"
         serial = next(self._ref_counter)
         # SSCC payload is extension digit (1) + company prefix (7) +
         # day-of-year (3) + serial reference, summing to exactly 17 digits
@@ -704,14 +742,11 @@ class LegitFlowEngine:
         # — slicing silently dropped the serial's last digit and made
         # distinct lots collide on the same SSCC.
         serial_component = f"{serial % 1_000_000:06d}"
-        base = f"0{company_prefix}{self._time_cursor.strftime('%j')}{serial_component}"
-        return f"{base}{self._gs1_check_digit(base)}"
+        payload = f"0{GS1_COMPANY_PREFIX}{self._time_cursor.strftime('%j')}{serial_component}"
+        return make_sscc(payload)
 
     def _gs1_check_digit(self, digits: str) -> int:
-        total = 0
-        for index, digit in enumerate(reversed(digits), start=1):
-            total += int(digit) * (3 if index % 2 else 1)
-        return (10 - (total % 10)) % 10
+        return gs1_check_digit(digits)
 
     def _gps_coordinate(self) -> str:
         lat = round(self.rng.uniform(32.0, 39.5), 4)

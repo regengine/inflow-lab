@@ -69,6 +69,28 @@ STALE_COMMIT_MESSAGE = (
 )
 
 
+def _consume_finished_task_exception(task: asyncio.Task[Any]) -> None:
+    """Retrieve a finished task's exception so asyncio never has to log it.
+
+    An exception on a Task nobody ever calls ``.exception()`` on is
+    reported by asyncio itself, from ``Task.__del__``, as "Task exception
+    was never retrieved" -- at garbage-collection time, detached from the
+    request that caused it and outside this app's own logger (#211).
+    Retrieving it here both silences that and puts the traceback in the
+    "inflow_lab" stream with the run it belongs to.
+
+    Caller must have established ``task.done()``; ``exception()`` would
+    otherwise raise InvalidStateError. A cancelled task has no exception
+    to retrieve -- ``exception()`` re-raises the CancelledError instead --
+    so it is skipped.
+    """
+    if task.cancelled():
+        return
+    error = task.exception()
+    if error is not None:
+        logger.error("simulation run loop ended with an unretrieved error", exc_info=error)
+
+
 def _with_stale_commit_note(error_message: str | None) -> str:
     """Append the dropped-commit note to whatever the delivery itself reported."""
     if not error_message:
@@ -240,15 +262,36 @@ class SimulationController:
         # a live run loop that nothing could ever reach again.
         async with self._lifecycle_lock:
             task = self._task
-            if task is None or task.done():
+            if task is None:
                 return
-            # Captured under the same lock as `task`, from the same read of
-            # self._task's generation -- start() always assigns
-            # self._stop_event and self._task together (see above), so this
-            # is guaranteed to be the event *this* task is actually waiting
-            # on, never a later start()'s fresh replacement.
-            stop_event = self._stop_event
-            stop_event.set()
+            if task.done():
+                # #211: this used to be folded into the `task is None`
+                # early return, which meant a loop that had already ended
+                # on its own -- crashed, above all -- left self._task
+                # installed forever, with no revision bump to tell the
+                # console the run was over. Clear it here instead. Both
+                # calls below are synchronous and cannot block: the task
+                # is done(), so exception() returns immediately, and this
+                # is still the same _lifecycle_lock hold that read it, so
+                # no start() can slip in between the read and the clear.
+                self._task = None
+                _consume_finished_task_exception(task)
+                already_finished = True
+            else:
+                already_finished = False
+                # Captured under the same lock as `task`, from the same read
+                # of self._task's generation -- start() always assigns
+                # self._stop_event and self._task together (see above), so
+                # this is guaranteed to be the event *this* task is actually
+                # waiting on, never a later start()'s fresh replacement.
+                stop_event = self._stop_event
+                stop_event.set()
+        if already_finished:
+            # Nothing to await -- the task is done and its reference is
+            # already cleared. Publish outside the lock, exactly as the
+            # normal path below does, so the console learns the run ended.
+            await self._publish_update()
+            return
         # await the task OUTSIDE the lock. _run_loop calls self.step(),
         # which itself does `async with self._lock` -- holding the lock
         # here while awaiting the loop's own task would deadlock stop()
@@ -256,7 +299,18 @@ class SimulationController:
         # start its next one): step() would block forever on a lock stop()
         # is holding, while stop() blocks forever on a task that can now
         # never finish stepping.
-        await task
+        try:
+            await task
+        except Exception:
+            # _run_loop swallows and logs its own step failures (#211), so
+            # reaching here means the task died some other way -- e.g. an
+            # error inside its own finally. Either way the task is over,
+            # and stop()'s remaining job (clear the reference, publish)
+            # must still happen rather than the caller of POST
+            # /api/simulate/stop getting a 500 and a controller still
+            # holding a dead task. CancelledError is a BaseException and
+            # deliberately keeps propagating.
+            logger.exception("simulation run loop task ended with an unhandled error")
         async with self._lifecycle_lock:
             # The other half of #156's fix. While the lock was open across
             # the `await task` above, a concurrent start() could have
@@ -689,13 +743,17 @@ class SimulationController:
             delivery = request.delivery or base_config.delivery
             # record_ids distinguishes "omitted" (None -- no filter, retry
             # every failed record up to limit) from "present but empty"
-            # ([] -- retry nothing). EventStore.failed_delivery_records()
-            # cannot make that distinction itself: it builds its filter as
-            # set(record_ids or []), which treats [] exactly like None and
-            # so retries everything for an explicitly empty list (#144).
-            # Short-circuiting the empty-list case here, before the store
-            # is ever consulted, fixes the caller-visible behavior without
-            # touching that store method's filtering logic.
+            # ([] -- retry nothing) (#144). Short-circuited here, before
+            # the store is ever consulted, so the empty case answers
+            # without a read at all.
+            #
+            # EventStore.failed_delivery_records() makes the same
+            # distinction as of #211 -- it used to build its filter as
+            # set(record_ids or []), which treated [] exactly like None,
+            # so this short-circuit was the only thing standing between an
+            # explicitly empty list and "retry everything". Both layers
+            # now agree; this one stays because it is the caller-visible
+            # contract #144's tests pin, and because it saves the read.
             if request.record_ids is not None and len(request.record_ids) == 0:
                 candidates: list[StoredEventRecord] = []
             else:
@@ -1222,15 +1280,52 @@ class SimulationController:
         # start() call that has nothing to do with it. Capturing the one
         # event this loop was created with, once, makes it deaf to any
         # later generation's event by construction.
-        while not stop_event.is_set():
-            await self.step(self.config.batch_size)
-            if self.config.interval_seconds <= 0:
-                await asyncio.sleep(0)
-            else:
-                try:
-                    await asyncio.wait_for(stop_event.wait(), timeout=self.config.interval_seconds)
-                except asyncio.TimeoutError:
-                    continue
+        #
+        # The whole body is wrapped (#211): before this, the loop had no
+        # handler at all, so anything step() raised -- a retired store
+        # (#175), a full disk, a bug in a delivery path -- killed the run
+        # in total silence. `running` went False because the task was
+        # done, but self._task stayed installed and already-done, so
+        # stop() early-returned without clearing it and without
+        # publishing; no revision bump reached /api/stream, so every
+        # connected console went on rendering a run that no longer
+        # existed; and the traceback surfaced only as asyncio's "Task
+        # exception was never retrieved" at garbage-collection time, in
+        # no operator's log context.
+        try:
+            while not stop_event.is_set():
+                await self.step(self.config.batch_size)
+                if self.config.interval_seconds <= 0:
+                    await asyncio.sleep(0)
+                else:
+                    try:
+                        await asyncio.wait_for(stop_event.wait(), timeout=self.config.interval_seconds)
+                    except asyncio.TimeoutError:
+                        continue
+        except Exception:
+            # Exception, not BaseException: a cancelled task
+            # (asyncio.CancelledError) is a deliberate teardown, not a
+            # failure, and must keep propagating so the task ends up
+            # cancelled rather than silently "completed".
+            #
+            # Logged through the same name-keyed "inflow_lab" logger that
+            # delivery failures already use (#182), so a run that dies
+            # lands in the stream operators are already watching.
+            logger.exception("simulation run loop stopped: unhandled error during step")
+        finally:
+            # Published on EVERY exit -- crash or clean stop. This is the
+            # bump that tells /api/stream (and therefore the console) that
+            # the run's state changed; without it, a crashed loop leaves
+            # every connected client believing the run is still live until
+            # something unrelated happens to bump the revision.
+            #
+            # Takes only self._change_condition, never self._lock or
+            # self._lifecycle_lock: step() has already released the data-
+            # plane lock by the time this runs (its `async with` unwinds
+            # as the exception propagates), so this cannot deadlock
+            # against the step it just left, nor against a concurrent
+            # stop(), which takes only _lifecycle_lock.
+            await self._publish_update()
 
     async def _publish_update(self) -> None:
         async with self._change_condition:
