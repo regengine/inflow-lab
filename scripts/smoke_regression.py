@@ -12,7 +12,10 @@ from fastapi.testclient import TestClient
 REPO_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(REPO_ROOT))
 
-from app.main import app
+# Must follow the sys.path insert above: this script is run directly
+# (`python scripts/smoke_regression.py`), so the repo root is not on sys.path
+# until that line puts it there. Deliberate, not an ordering slip (#137).
+from app.main import app  # noqa: E402
 
 
 TENANTS = ["release-smoke-main", "release-smoke-other"]

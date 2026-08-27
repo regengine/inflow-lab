@@ -1,5 +1,19 @@
 # Contributing to Inflow Lab
 
+## Checks
+
+Run before opening a pull request:
+
+    uv run --frozen --group dev pytest -q
+    uvx ruff check .
+
+`ruff check .` currently exits clean, and the rule set it enforces is pinned in
+`pyproject.toml` under `[tool.ruff.lint]` (`select = ["E4", "E7", "E9", "F"]`)
+with a comment explaining why that slice and not a broader one. Keep it clean:
+the handful of legitimate exceptions carry an inline `# noqa` naming the reason,
+so a new finding is a real one. `ruff` is not yet in the `dev` dependency group
+and no workflow runs it — wiring that up is the remaining half of issue #137.
+
 ## Developer Certificate of Origin (DCO)
 
 By contributing to this repository, you certify the following for each commit

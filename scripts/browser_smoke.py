@@ -17,8 +17,13 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
-from app.build_info import APP_VERSION
-from scripts.remote_smoke import assert_base_url_allowed
+from app.build_info import APP_VERSION  # noqa: E402  (see note below)
+from scripts.remote_smoke import assert_base_url_allowed  # noqa: E402
+
+# Both imports above must follow the sys.path insert: these scripts are run
+# directly (`python scripts/browser_smoke.py`), so the repo root is not on
+# sys.path until that line puts it there. Deliberate, not an ordering slip
+# (#137).
 
 
 CSV_WITH_KDE_WARNINGS = """cte_type,traceability_lot_code,product_description,quantity,unit_of_measure,location_name,timestamp,kdes

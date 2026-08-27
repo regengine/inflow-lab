@@ -14,7 +14,10 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
-from app.build_info import APP_VERSION
+# Must follow the sys.path insert above: this script is run directly
+# (`python scripts/remote_smoke.py`), so the repo root is not on sys.path
+# until that line puts it there. Deliberate, not an ordering slip (#137).
+from app.build_info import APP_VERSION  # noqa: E402
 
 
 DEFAULT_TENANT = "remote-smoke"
@@ -391,10 +394,12 @@ def assert_build_info(config: RemoteSmokeConfig, build: Any) -> dict[str, Any]:
     if not isinstance(build, dict):
         raise RemoteSmokeFailure("healthz build: expected build metadata object")
     assert_equal(build.get("version"), APP_VERSION, "healthz build version")
-    for field in ("commit_sha", "commit_sha_short", "branch", "deployment_id"):
-        value = build.get(field)
+    # Not `field`: that shadows `dataclasses.field`, imported at the top of
+    # this module and used by RemoteSmokeConfig (#137).
+    for key in ("commit_sha", "commit_sha_short", "branch", "deployment_id"):
+        value = build.get(key)
         if value is not None and not isinstance(value, str):
-            raise RemoteSmokeFailure(f"healthz build {field}: expected string or null")
+            raise RemoteSmokeFailure(f"healthz build {key}: expected string or null")
     return build
 
 

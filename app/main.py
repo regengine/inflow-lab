@@ -20,6 +20,23 @@ from .routers import events, health, ingestion, integration, mock_regengine, ope
 from .tenancy import controller, scenario_saves
 
 
+# Explicit re-export surface (#137). `cors_origins_from_env`, `controller` and
+# `scenario_saves` are imported above but never referenced in this module --
+# ruff reports them as F401 "imported but unused", and they are not. They are
+# deliberate re-exports: the test suite reaches them through `app.main`
+# (`from app.main import app, controller, cors_origins_from_env,
+# scenario_saves`), and deleting them breaks collection across 11 test
+# modules. Naming them in __all__ is the form ruff accepts for that intent, and
+# it states the contract in code rather than leaving it to be rediscovered by
+# whoever next runs a linter.
+__all__ = [
+    "app",
+    "controller",
+    "cors_origins_from_env",
+    "create_app",
+    "scenario_saves",
+]
+
 static_dir = Path(__file__).parent / "static"
 
 logger = logging.getLogger("inflow_lab")
