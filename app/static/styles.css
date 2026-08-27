@@ -806,6 +806,26 @@ tbody tr.has-audit-warning {
   background: rgba(255, 251, 235, 0.58);
 }
 
+/* #193: a row nothing has audited must not read as a row that passed. */
+.status-muted {
+  display: block;
+  margin-top: 6px;
+  color: var(--muted);
+}
+
+tbody tr.audit-not-evaluated {
+  background: rgba(241, 245, 249, 0.6);
+}
+
+.lineage-card.audit-not-evaluated {
+  border-style: dashed;
+}
+
+.scenario-alert.is-pending {
+  border-color: rgba(100, 116, 139, 0.3);
+  background: rgba(241, 245, 249, 0.72);
+}
+
 .link-button {
   background: none;
   border: none;

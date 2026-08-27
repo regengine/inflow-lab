@@ -783,18 +783,29 @@ function scenarioNarrative(summary) {
   return 'This flow should prove field-level origin, packout packaging changes, and downstream traceability through transformation and shipment.';
 }
 
-function pendingAuditModel(summary) {
+// The stand-in used when backendAudit() has nothing to report. `missing: 0`
+// is literally true -- nothing was evaluated, so nothing is missing -- but
+// it is NOT the same fact as "the backend scored this profile and found no
+// gaps". `pending: true` is what callers must branch on so a not-computed
+// audit can never be rendered as a passing one (#193).
+function pendingAuditModel(summary, status = state.status) {
+  const scoredScenario = status?.config?.scenario || null;
+  const mismatched = Boolean(scoredScenario && summary && scoredScenario !== summary.id);
   return {
     checks: [],
     score: 0,
     tone: 'watch',
-    label: 'Awaiting simulator audit',
+    pending: true,
+    mismatched,
+    label: mismatched ? 'Not scored for this profile' : 'Awaiting simulator audit',
     passed: 0,
     total: 0,
     missing: 0,
-    detail: summary
-      ? `${summary.label} needs a simulator status refresh before audit scoring can be shown.`
-      : 'Run the simulator to load backend audit scoring.',
+    detail: mismatched
+      ? `Showing ${summary.label}, but the backend last scored ${scenarioLabel(scoredScenario)}. Start the line on this profile to score it.`
+      : summary
+        ? `${summary.label} needs a simulator status refresh before audit scoring can be shown.`
+        : 'Run the simulator to load backend audit scoring.',
   };
 }
 
@@ -803,7 +814,7 @@ function renderReadinessBanner(summary, events, status = state.status) {
     ids.readinessBanner.innerHTML = '<p class="note">Readiness scoring will appear once scenario metadata loads.</p>';
     return;
   }
-  const readiness = backendAudit(status, summary) || pendingAuditModel(summary);
+  const readiness = backendAudit(status, summary) || pendingAuditModel(summary, status);
   ids.readinessBanner.innerHTML = `
     <div class="readiness-banner-shell" data-tone="${readiness.tone}">
       <div class="readiness-score">
@@ -824,15 +835,24 @@ function renderReadinessBanner(summary, events, status = state.status) {
   `;
 }
 
-function recordWarnings(record, summary, status = state.status) {
+// Returns both the warnings AND whether an audit ran at all. The two used to
+// collapse into one empty array, so a row nothing had evaluated rendered
+// exactly like a row the backend had cleared (#193).
+function recordAudit(record, summary, status = state.status) {
   const audit = backendAudit(status, summary);
-  const warningPayload = audit?.warnings_by_record?.[record.record_id];
-  if (Array.isArray(warningPayload) && warningPayload.length) {
-    return warningPayload
-      .map((warning) => warning.message)
-      .filter((message) => typeof message === 'string' && message);
+  if (!audit) {
+    return { evaluated: false, messages: [] };
   }
-  return [];
+  const warningPayload = audit.warnings_by_record?.[record.record_id];
+  if (Array.isArray(warningPayload) && warningPayload.length) {
+    return {
+      evaluated: true,
+      messages: warningPayload
+        .map((warning) => warning.message)
+        .filter((message) => typeof message === 'string' && message),
+    };
+  }
+  return { evaluated: true, messages: [] };
 }
 
 function renderScenarioWorkbench(status = state.status, events = state.events) {
@@ -841,11 +861,26 @@ function renderScenarioWorkbench(status = state.status, events = state.events) {
     ids.scenarioWorkbench.innerHTML = '<p class="note">Scenario metadata will appear here once presets load.</p>';
     return;
   }
-  const readiness = backendAudit(status, summary) || pendingAuditModel(summary);
+  const readiness = backendAudit(status, summary) || pendingAuditModel(summary, status);
   const checks = readiness.checks;
   const sourceCte = sourceCteForScenario(summary);
   const eventCount = (events || []).length;
   const warningCount = readiness.missing;
+  // "No gaps out of N checks" and "no checks were run" are different facts.
+  // Only the first earns the reassuring copy; the readiness banner above
+  // already guards on readiness.total for the same reason.
+  const auditScored = !readiness.pending && readiness.total > 0;
+  const alertModifier = !auditScored ? ' is-pending' : warningCount ? ' has-warning' : '';
+  const alertHeadline = !auditScored
+    ? readiness.mismatched
+      ? `Not scored for ${summary.label}`
+      : 'Audit not evaluated yet'
+    : warningCount
+      ? `${warningCount} signal(s) still missing`
+      : 'Signals visible';
+  const alertDetail = auditScored
+    ? `${escapeHtml(summary.reference_format)} references, ${escapeHtml(sourceCte)} source flow`
+    : escapeHtml(readiness.detail);
   const transformCount = (events || []).filter((record) => record.event.cte_type === 'transformation').length;
   const cards = [
     ['Operation', operationTypeLabel(summary.operation_type)],
@@ -865,10 +900,10 @@ function renderScenarioWorkbench(status = state.status, events = state.events) {
         <p>${escapeHtml(summary.description)}</p>
         <p class="note">${escapeHtml(scenarioNarrative(summary))}</p>
       </div>
-      <div class="scenario-alert${warningCount ? ' has-warning' : ''}">
+      <div class="scenario-alert${alertModifier}">
         <span>Audit readiness</span>
-        <strong>${warningCount ? `${warningCount} signal(s) still missing` : 'Signals visible'}</strong>
-        <small>${escapeHtml(summary.reference_format)} references, ${escapeHtml(sourceCte)} source flow</small>
+        <strong>${escapeHtml(alertHeadline)}</strong>
+        <small>${alertDetail}</small>
       </div>
     </div>
     <div class="scenario-signal-grid">
@@ -1171,9 +1206,14 @@ function renderEvents(events) {
   ids.eventsBody.innerHTML = events
     .map((record) => {
       const event = record.event;
-      const warnings = recordWarnings(record, summary);
+      const audit = recordAudit(record, summary);
+      const rowClass = audit.messages.length
+        ? 'has-audit-warning'
+        : audit.evaluated
+          ? ''
+          : 'audit-not-evaluated';
       return `
-        <tr class="${warnings.length ? 'has-audit-warning' : ''}">
+        <tr class="${rowClass}">
           <td>${record.sequence_no}</td>
           <td><span class="pill">${escapeHtml(event.cte_type)}</span></td>
           <td><button class="link-button" data-lot="${escapeHtml(event.traceability_lot_code)}">${escapeHtml(event.traceability_lot_code)}</button></td>
@@ -1183,7 +1223,8 @@ function renderEvents(events) {
           <td>${escapeHtml(record.destination_mode)}</td>
           <td>
             ${escapeHtml(record.delivery_attempts || 0)}
-            ${warnings.length ? `<small class="status-warning">${escapeHtml(warnings[0])}</small>` : ''}
+            ${audit.messages.length ? `<small class="status-warning">${escapeHtml(audit.messages[0])}</small>` : ''}
+            ${audit.evaluated ? '' : '<small class="status-muted">Audit not evaluated</small>'}
           </td>
           <td>
             <span class="status-pill" data-tone="${deliveryTone(record.delivery_status)}">${escapeHtml(record.delivery_status)}</span>
@@ -1283,13 +1324,13 @@ function renderLineage(payload, traceabilityLotCode) {
   const timelineMarkup = records
     .map((record) => {
       const event = record.event;
-      const warnings = recordWarnings(record, scenarioSummary);
+      const audit = recordAudit(record, scenarioSummary);
       const kdes = Object.entries(event.kdes || {})
         .slice(0, 6)
         .map(([key, value]) => `<li><strong>${escapeHtml(key)}:</strong> ${escapeHtml(formatKdeValue(value))}</li>`)
         .join('');
       return `
-        <article class="lineage-card${warnings.length ? ' has-audit-warning' : ''}">
+        <article class="lineage-card${audit.messages.length ? ' has-audit-warning' : audit.evaluated ? '' : ' audit-not-evaluated'}">
           <header>
             <h3>${escapeHtml(cteLabel(event.cte_type))}</h3>
             <span>${formatDateTime(event.timestamp)}</span>
@@ -1297,7 +1338,8 @@ function renderLineage(payload, traceabilityLotCode) {
           <p><strong>Lot:</strong> ${escapeHtml(event.traceability_lot_code)}</p>
           <p><strong>Product:</strong> ${escapeHtml(event.product_description)}</p>
           <p><strong>Location:</strong> ${escapeHtml(event.location_name)}</p>
-          ${warnings.length ? `<p class="lineage-warning">${escapeHtml(warnings.join(' • '))}</p>` : ''}
+          ${audit.messages.length ? `<p class="lineage-warning">${escapeHtml(audit.messages.join(' • '))}</p>` : ''}
+          ${audit.evaluated ? '' : '<p class="status-muted">Audit not evaluated for this line profile.</p>'}
           <ul>${kdes}</ul>
         </article>
       `;

@@ -343,3 +343,165 @@ def test_the_real_server_422_renders_readably_in_the_console() -> None:
     assert "[object Object]" not in rendered
     assert "batch_size" in rendered
     assert "batch_size must be between 1 and 100" in rendered
+
+
+# ---------------------------------------------------------------------------
+# #193 -- the workbench must not assert a passing audit it never computed
+# ---------------------------------------------------------------------------
+
+_AUDIT_PRELUDE = """
+const SCENARIOS = [
+  {
+    id: 'leafy_greens_supplier',
+    label: 'Leafy greens supplier',
+    operation_type: 'supplier',
+    industry_type: 'produce',
+    reference_format: 'GS1',
+    requires_cooling: true,
+    description: 'Harvest through packout and shipment.',
+  },
+  {
+    id: 'fresh_cut_processor',
+    label: 'Fresh-cut processor',
+    operation_type: 'processor',
+    industry_type: 'produce',
+    reference_format: 'GS1',
+    requires_cooling: true,
+    description: 'Receiving through transformation and shipment.',
+  },
+];
+
+function statusFor(scenario, audit) {
+  return {
+    running: false,
+    config: { scenario, delivery: { mode: 'mock', mock_friction: [] } },
+    stats: { total_records: 1, unique_lots: 1, delivery: {}, engine: {}, audit },
+  };
+}
+
+function auditModel(overrides) {
+  return {
+    checks: [{ label: 'Cooling recorded', ok: false, detail: 'No cooling CTE seen yet.' }],
+    score: 60,
+    tone: 'watch',
+    label: 'Signals partly visible',
+    passed: 3,
+    total: 5,
+    missing: 2,
+    warnings_by_record: {},
+    ...overrides,
+  };
+}
+
+const RECORD = {
+  record_id: 'rec-1',
+  sequence_no: 1,
+  delivery_status: 'posted',
+  delivery_attempts: 1,
+  destination_mode: 'mock',
+  event: {
+    cte_type: 'harvesting',
+    traceability_lot_code: 'TLC-1',
+    product_description: 'Romaine Lettuce',
+    location_name: 'Valley Fresh Farms',
+    quantity: 10,
+    unit_of_measure: 'cases',
+    timestamp: '2026-02-10T08:00:00Z',
+    kdes: {},
+  },
+};
+
+const HEALTH = {
+  status: 'ok',
+  tenant: 'local-demo',
+  build: { version: '0.1.0', commit_sha_short: 'abc1234' },
+  auth: { enabled: false, uses_default_storage: true },
+};
+
+renderScenarioOptions(SCENARIOS, 'leafy_greens_supplier');
+"""
+
+
+def test_line_profile_mismatch_does_not_render_a_passing_audit_verdict() -> None:
+    """backendAudit() returns null whenever the Line-profile dropdown differs
+    from the scenario the backend ran, and the placeholder's `missing: 0` then
+    drove the reassuring branch: a green "Signals visible" verdict against
+    zero evaluated records."""
+    result = run_console(
+        _AUDIT_PRELUDE
+        + """
+        // A real snapshot lands with a real backend audit for leafy greens...
+        renderSnapshot(statusFor('leafy_greens_supplier', auditModel({})), [RECORD], HEALTH);
+        const beforeSwitch = ids.scenarioWorkbench.innerHTML;
+
+        // ...then the operator switches the Line profile to the processor,
+        // which is exactly what guide-rail step 1 invites. state.status still
+        // belongs to the previous run, so backendAudit() returns null.
+        ids.scenario.value = 'fresh_cut_processor';
+        renderReadinessBanner(activeScenarioSummary(), state.events, state.status);
+        renderScenarioWorkbench(state.status, state.events);
+        renderRecordSpotlight(state.events);
+        renderEvents(state.events);
+        return {
+          beforeSwitch,
+          workbench: ids.scenarioWorkbench.innerHTML,
+          banner: ids.readinessBanner.innerHTML,
+          rowClasses: ids.eventsBody.querySelectorAll('tr').map((row) => row.getAttribute('class') || ''),
+          rowText: ids.eventsBody.innerHTML,
+        };
+        """
+    )
+    # Before the switch the backend audit really did apply, so the row was
+    # rendered as evaluated -- this is the state the switch must not preserve.
+    assert "Not scored" not in result["beforeSwitch"]
+
+    workbench = result["workbench"]
+    assert "Signals visible" not in workbench
+    assert "has-warning" not in workbench
+    # It has to say which profile the backend actually scored.
+    assert "Fresh-cut processor" in workbench
+    assert "Leafy greens supplier" in result["banner"]
+
+    # Shift-log rows must not read as clean when nothing evaluated them.
+    assert any("audit-not-evaluated" in cls for cls in result["rowClasses"])
+    assert "not evaluated" in result["rowText"].lower()
+
+
+def test_backend_audit_gaps_still_render_as_warnings() -> None:
+    """The reassuring/warning branches must keep working when the audit is
+    real -- the fix must not mute genuine gaps."""
+    result = run_console(
+        _AUDIT_PRELUDE
+        + """
+        renderSnapshot(statusFor('leafy_greens_supplier', auditModel({ missing: 2 })), [RECORD], HEALTH);
+        const gaps = ids.scenarioWorkbench.innerHTML;
+        const gapRows = ids.eventsBody.innerHTML;
+
+        renderSnapshot(
+          statusFor('leafy_greens_supplier', auditModel({ missing: 0, passed: 5 })),
+          [RECORD],
+          HEALTH,
+        );
+        return { gaps, gapRows, clean: ids.scenarioWorkbench.innerHTML };
+        """
+    )
+    assert "2 signal(s) still missing" in result["gaps"]
+    assert "has-warning" in result["gaps"]
+    assert "Signals visible" not in result["gaps"]
+    # An evaluated row is not flagged "not evaluated".
+    assert "audit-not-evaluated" not in result["gapRows"]
+
+    assert "Signals visible" in result["clean"]
+    assert "has-warning" not in result["clean"]
+
+
+def test_workbench_before_the_first_snapshot_reports_pending_not_passing() -> None:
+    """The other reachable trigger: a workbench render with no status at all."""
+    result = run_console(
+        _AUDIT_PRELUDE
+        + """
+        renderScenarioWorkbench(null, []);
+        return ids.scenarioWorkbench.innerHTML;
+        """
+    )
+    assert "Signals visible" not in result
