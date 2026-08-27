@@ -5,12 +5,13 @@ import io
 import json
 import re
 from dataclasses import dataclass
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from typing import Any
 
 from pydantic import ValidationError
 
 from .cte_rules import validate_event_kdes
+from .mock_service import MAX_EVENT_AGE_DAYS
 from .schemas.domain import CSVImportType, CTEType, RegEngineEvent
 from .schemas.ingestion import CSVImportError, CSVImportWarning
 
@@ -125,6 +126,7 @@ def parse_csv_import(
         events.append(event)
         parent_lot_codes.append(parents)
         warnings.extend(row_warnings)
+        warnings.extend(_replay_window_warnings(event, row_number, now=default_timestamp))
 
     if total == 0 and not errors:
         errors.append(CSVImportError(row=0, field="csv_text", message="CSV contains no data rows"))
@@ -284,6 +286,50 @@ def _build_event(
         for warning in validate_event_kdes(event)
     ]
     return event, parent_lot_codes, [], warnings
+
+
+def _replay_window_warnings(
+    event: RegEngineEvent, row_number: int, *, now: datetime
+) -> list[CSVImportWarning]:
+    """Warn about rows live RegEngine will reject for being too old (#102).
+
+    RegEngine refuses any event older than WEBHOOK_MAX_EVENT_AGE_DAYS (90)
+    with "replay window exceeded". Historical backfill is a first-class use
+    of a food-traceability tool -- seeding last season's harvest and cooling
+    records is the natural thing to do -- so the import that fails this way
+    is the one a design partner is most likely to try.
+
+    The mock's own age check exists (mock_service.MAX_EVENT_AGE_DAYS) but
+    ships off by default, because switching it on would reject this repo's
+    own bundled demo fixtures; see MockRegEngineService.__init__ and issue
+    #199. That default is exactly why this warning matters: in mock mode
+    every stale row is accepted with a hash and a chain link, and without
+    this the simulator gives no hint that an age limit even exists until
+    the same batch is wholesale-rejected against live.
+
+    A warning rather than an error, deliberately: importing historical data
+    into the simulator is legitimate and useful, and refusing it here would
+    break a workflow live's limit does not actually forbid (mock delivery,
+    export rehearsal, lineage inspection). Required severity, because unlike
+    a missing recommended KDE this is a row live WILL reject.
+    """
+    timestamp = _ensure_timezone(event.timestamp)
+    cutoff = now - timedelta(days=MAX_EVENT_AGE_DAYS)
+    if timestamp >= cutoff:
+        return []
+    return [
+        CSVImportWarning(
+            row=row_number,
+            field="timestamp",
+            message=(
+                f"timestamp is {(now - timestamp).days} days old, past RegEngine's "
+                f"{MAX_EVENT_AGE_DAYS}-day replay window (WEBHOOK_MAX_EVENT_AGE_DAYS) — live "
+                "ingest rejects this row with 'replay window exceeded'. The built-in mock "
+                "accepts it, so this warning is the only signal you get before delivery."
+            ),
+            severity="required",
+        )
+    ]
 
 
 def _header_errors(fieldnames: list[str] | None) -> list[CSVImportError]:
