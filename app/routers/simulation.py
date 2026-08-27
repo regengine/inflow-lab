@@ -26,7 +26,7 @@ router = APIRouter(prefix="/api/simulate", tags=["Simulation"])
 async def simulate_status(
     active_controller: SimulationController = Depends(get_active_controller),
 ) -> StatusResponse:
-    status = active_controller.status()
+    status = await active_controller.status()
     return StatusResponse.model_validate(status)
 
 
@@ -38,7 +38,7 @@ async def simulate_stream(
     active_controller: SimulationController = Depends(get_active_controller),
 ) -> StreamingResponse:
     async def event_generator():
-        snapshot = active_controller.snapshot(event_limit=limit)
+        snapshot = await active_controller.snapshot(event_limit=limit)
         last_revision = snapshot["revision"]
         yield sse_message("snapshot", snapshot)
         if once:
@@ -53,7 +53,7 @@ async def simulate_stream(
                 yield ": keep-alive\n\n"
                 continue
 
-            snapshot = active_controller.snapshot(event_limit=limit)
+            snapshot = await active_controller.snapshot(event_limit=limit)
             last_revision = snapshot["revision"]
             yield sse_message("snapshot", snapshot)
 
@@ -77,7 +77,7 @@ async def simulate_start(
     # it), so an omitted credential here means "unchanged", not "clear it".
     config = config_with_stored_delivery_secrets(active_controller, start_request.config)
     await active_controller.start(tenancy.scope_config(context, config))
-    return StatusResponse.model_validate(active_controller.status())
+    return StatusResponse.model_validate(await active_controller.status())
 
 
 @router.post("/stop", response_model=StatusResponse)
@@ -85,7 +85,7 @@ async def simulate_stop(
     active_controller: SimulationController = Depends(get_active_controller),
 ) -> StatusResponse:
     await active_controller.stop()
-    return StatusResponse.model_validate(active_controller.status())
+    return StatusResponse.model_validate(await active_controller.status())
 
 
 @router.post("/reset", response_model=ResetResponse)

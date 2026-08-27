@@ -35,7 +35,8 @@ def test_controller_revision_notifies_after_step():
         waiter = asyncio.create_task(controller.wait_for_revision(starting_revision, timeout=1.0))
         await controller.step(batch_size=1)
         observed_revision = await waiter
-        return controller.snapshot(event_limit=5) | {"observed_revision": observed_revision}
+        snapshot = await controller.snapshot(event_limit=5)
+        return snapshot | {"observed_revision": observed_revision}
 
     snapshot = asyncio.run(wait_for_step_update())
 

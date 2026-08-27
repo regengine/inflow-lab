@@ -672,7 +672,18 @@ class SimulationController:
             config = request.config or self.config
             config = config.model_copy(update={"scenario": scenario_id}, deep=True)
             config = self._sanitize_saved_config(config)
-            records = self.store.all_between()
+            # Offloaded (#136's read half), and deliberately still INSIDE
+            # self._lock. all_between() re-reads the whole persisted log,
+            # and the snapshot written below has to be of the store as it
+            # was at one instant: hoisting the read out of the lock would
+            # let a reset()/load_scenario_save() land between the read and
+            # save_snapshot(), writing a "save" of history the operator had
+            # already cleared. Holding the data-plane lock across a local
+            # disk read on a worker thread is the same trade
+            # _commit_delivered_records already documents and is NOT what
+            # #208 forbids -- that is about the 30s network POSTs, which
+            # still happen with this lock released.
+            records = await self._store_all_between()
             snapshot = self.scenario_saves.save_snapshot(
                 scenario=scenario_id,
                 config=config,
@@ -757,7 +768,26 @@ class SimulationController:
             if request.record_ids is not None and len(request.record_ids) == 0:
                 candidates: list[StoredEventRecord] = []
             else:
-                candidates = self.store.failed_delivery_records(request.record_ids, limit=request.limit)
+                # Offloaded (#136's read half): failed_delivery_records()
+                # goes through _all_records(), i.e. a full re-read and
+                # re-parse of the persisted log, not a cache lookup.
+                #
+                # Deliberately still INSIDE self._lock, and this one is
+                # load-bearing rather than merely convenient: the candidate
+                # selection and the `store_epoch` snapshot below must come
+                # from one uninterrupted hold. If they did not, a reset()
+                # could land between them -- the candidates would name
+                # records that no longer exist while the epoch matched the
+                # cleared store, so _commit_retried_records would see no
+                # staleness and let update_many() rewrite the freshly
+                # emptied log from records it had just discarded. That is
+                # exactly the sharper stale case #208 calls out. Hoisting
+                # this read out of the lock to avoid an await under it
+                # would trade a bounded local-disk await for a correctness
+                # bug.
+                candidates = await self._store_failed_delivery_records(
+                    request.record_ids, request.limit
+                )
             # Truthiness (`if request.record_ids`) would misreport this the
             # same way: an explicitly empty list is falsy just like None, so
             # `requested` must key off "was the field provided at all" too.
@@ -995,11 +1025,18 @@ class SimulationController:
     #
     # EventStore guards its state with a threading.RLock (see the comment
     # on that lock in app/store.py) and does plain synchronous
-    # open()/write()/replace() calls. Called directly from one of the
-    # `async def` methods above, that I/O would run on the single event
-    # loop thread and block every other request in this process -- other
-    # tenants' SSE streams, health checks, unrelated API calls -- for as
-    # long as a big CSV import, delivery retry, or replay takes.
+    # open()/read()/write()/replace() calls. Called directly from one of
+    # the `async def` methods above, that I/O would run on the single
+    # event loop thread and block every other request in this process --
+    # other tenants' SSE streams, health checks, unrelated API calls --
+    # for as long as a big CSV import, delivery retry, replay, status
+    # poll or export takes.
+    #
+    # Reads count for this exactly as much as writes do, which is the
+    # half #136 originally missed: EventStore._all_records() re-reads and
+    # re-parses the whole persisted log, so all_between()/stats()/
+    # failed_delivery_records()/lineage() are full-file reads wearing an
+    # accessor's clothes, not cache lookups.
     #
     # The methods below are the only place offloading happens. Each one
     # runs exactly one EventStore call, start to finish, on a worker
@@ -1026,14 +1063,17 @@ class SimulationController:
     #     instead of the event loop's own thread;
     #   - the reentrant re-acquisitions inside the store (configure ->
     #     _load_from_disk -> read_persisted_records; update_many ->
+    #     _all_records -> read_persisted_records; and on the read side
+    #     all_between/stats/failed_delivery_records/lineage ->
     #     _all_records -> read_persisted_records) stay on that same single
     #     worker thread from start to finish, so RLock's "reentrant only
     #     for the thread that already holds it" guarantee is never asked
     #     to span two different threads, which is the one thing that would
     #     actually break it.
     # Do not turn EventStore's add_many/update_many/replace_all/configure/
-    # read_persisted_records into `async def` methods that hold its lock
-    # across an `await` -- that would let the event loop thread block
+    # read_persisted_records/all_between/stats/failed_delivery_records/
+    # lineage into `async def` methods that hold its lock across an
+    # `await` -- that would let the event loop thread block
     # waiting on a worker thread for the lock while that worker is itself
     # waiting on the event loop to resume it: a deadlock. Keep EventStore
     # synchronous and do the `asyncio.to_thread` here, at the call site.
@@ -1063,6 +1103,48 @@ class SimulationController:
         self, persist_path: str | None = None
     ) -> list[StoredEventRecord]:
         return await asyncio.to_thread(self.store.read_persisted_records, persist_path)
+
+    # -- The read half of the same offload (#136, finding from #210) -------
+    #
+    # #136 landed the write half and left these four on the event loop.
+    # They are not incidental accessors: every one of them goes through
+    # EventStore._all_records(), which calls read_persisted_records() and
+    # therefore re-reads and re-parses the ENTIRE persisted JSONL log on
+    # every call -- the same open()/read()/pydantic-validate work the
+    # replay path was already offloading. On a 5k-record store that is a
+    # quarter of a second of the loop thread, and status() (via
+    # /api/simulate/status and every /api/stream snapshot) is the most
+    # frequently called path in the app.
+    #
+    # `recent()` is deliberately NOT wrapped: it returns a slice of the
+    # in-memory deque and touches no file at all, so putting it on a
+    # worker thread would buy nothing and cost a thread hop on the
+    # hottest read in the app. Add a wrapper here only for a store method
+    # that actually reaches disk.
+    #
+    # These also close the second half of #210's finding. Before this,
+    # writes ran on worker threads while these reads ran on the loop
+    # thread, and both take EventStore's threading.RLock -- so the event
+    # loop thread could block in a *native, uninterruptible* lock acquire
+    # waiting for a worker thread to finish a large write. That stall
+    # cannot happen while everything runs on one thread, so the write-only
+    # offload is what introduced it; putting the reads on worker threads
+    # too is what removes it.
+    async def _store_all_between(
+        self, start_date: str | None = None, end_date: str | None = None
+    ) -> list[StoredEventRecord]:
+        return await asyncio.to_thread(self.store.all_between, start_date, end_date)
+
+    async def _store_failed_delivery_records(
+        self, record_ids: list[str] | None = None, limit: int = 50
+    ) -> list[StoredEventRecord]:
+        return await asyncio.to_thread(self.store.failed_delivery_records, record_ids, limit)
+
+    async def _store_stats(self) -> dict[str, Any]:
+        return await asyncio.to_thread(self.store.stats)
+
+    async def _store_lineage(self, traceability_lot_code: str) -> list[StoredEventRecord]:
+        return await asyncio.to_thread(self.store.lineage, traceability_lot_code)
 
     async def _store_configure(self, persist_path: str) -> None:
         # A configure() that lands on a *different* file replaces the whole
@@ -1340,21 +1422,50 @@ class SimulationController:
             )
             return self._revision
 
-    def snapshot(self, event_limit: int = 100) -> dict[str, Any]:
+    async def snapshot(self, event_limit: int = 100) -> dict[str, Any]:
+        """The /api/stream payload: revision + status + the recent events.
+
+        ``async def`` because ``status()`` is (see below). ``recent()``
+        stays a direct synchronous call on purpose: it is a slice of the
+        in-memory deque and reads no file, so it is not the stall #136 is
+        about and does not belong on a worker thread.
+        """
         return {
             "revision": self._revision,
-            "status": self.status(),
+            "status": await self.status(),
             "events": [record.model_dump(mode="json") for record in self.store.recent(limit=event_limit)],
         }
 
-    def status(self) -> dict[str, Any]:
-        records = self.store.all_between()
+    async def status(self) -> dict[str, Any]:
+        """The /api/simulate/status payload.
+
+        ``async def`` since #136's read half: both store calls below go
+        through ``EventStore._all_records()``, which re-reads and
+        re-parses the entire persisted JSONL log -- so this method used to
+        do two full-file reads on the event loop thread, on the most
+        frequently polled endpoint in the app (the console polls it, and
+        every /api/stream revision bump renders it through ``snapshot()``).
+
+        Takes no controller lock, so neither await here is under
+        ``self._lock``, and none of it can block a delivery. The two reads
+        still see the store at two separate instants, as the two separate
+        synchronous calls they replace already did -- a write landing
+        between them could make the audit summary and the record counts
+        disagree by a record. That window widens from "between two RLock
+        releases" to "across an await", which is acceptable precisely
+        because this is an unlocked read-only snapshot that never promised
+        a single consistent instant; the next poll corrects it. Anything
+        that needs the store at one instant takes ``self._lock`` and reads
+        inside it, the way ``save_scenario`` does.
+        """
+        records = await self._store_all_between()
+        stats = await self._store_stats()
         scenario = get_scenario(self.config.scenario)
         return {
             "running": self.running,
             "config": self._sanitize_public_config(self.config).model_dump(mode="json"),
             "stats": {
-                **self.store.stats(),
+                **stats,
                 "audit": summarize_scenario_audit(records, scenario),
                 "engine": self.engine.snapshot(),
             },

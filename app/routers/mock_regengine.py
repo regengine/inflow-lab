@@ -41,6 +41,12 @@ router = APIRouter(prefix="/api/mock/regengine", tags=["Mock RegEngine"])
 # unbounded by anything else in the system. A broad date range, or a lot
 # code with a wide trace graph, otherwise renders an arbitrarily large CSV
 # or JSON-LD document in one response.
+#
+# That same "reads the whole log from disk" property is why both endpoints
+# below take their records through the controller's ``_store_*`` helpers
+# rather than calling ``active_controller.store`` directly: it is real
+# blocking file I/O and belongs on a worker thread, not on the event loop
+# (#136's read half). See the offload block in app/controller.py.
 EXPORT_MAX_RECORDS = 5000
 
 
@@ -277,14 +283,14 @@ async def mock_fda_request_export(
         raise HTTPException(status_code=400, detail="traceability_lot_code is required for this export preset")
 
     if traceability_lot_code:
-        records = active_controller.store.lineage(traceability_lot_code)
+        records = await active_controller._store_lineage(traceability_lot_code)
         if not records:
             raise HTTPException(status_code=404, detail="No records found for that lot code")
         records = _filter_records_between(records, start_date=start_filter, end_date=end_filter)
     else:
-        records = active_controller.store.all_between(
-            start_date=start_filter.isoformat() if start_filter else None,
-            end_date=end_filter.isoformat() if end_filter else None,
+        records = await active_controller._store_all_between(
+            start_filter.isoformat() if start_filter else None,
+            end_filter.isoformat() if end_filter else None,
         )
     records = apply_fda_export_preset(records, preset)
     _enforce_export_record_cap(records, scoped_by_lot_code=bool(traceability_lot_code))
@@ -312,14 +318,14 @@ async def mock_epcis_export(
 ) -> JSONResponse:
     start_filter, end_filter = _parse_export_date_filters(start_date=start_date, end_date=end_date)
     if traceability_lot_code:
-        records = active_controller.store.lineage(traceability_lot_code)
+        records = await active_controller._store_lineage(traceability_lot_code)
         if not records:
             raise HTTPException(status_code=404, detail="No records found for that lot code")
         records = _filter_records_between(records, start_date=start_filter, end_date=end_filter)
     else:
-        records = active_controller.store.all_between(
-            start_date=start_filter.isoformat() if start_filter else None,
-            end_date=end_filter.isoformat() if end_filter else None,
+        records = await active_controller._store_all_between(
+            start_filter.isoformat() if start_filter else None,
+            end_filter.isoformat() if end_filter else None,
         )
 
     _enforce_export_record_cap(records, scoped_by_lot_code=bool(traceability_lot_code))
