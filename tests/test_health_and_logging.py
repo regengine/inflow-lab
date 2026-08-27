@@ -184,3 +184,57 @@ def test_store_write_failure_log_never_contains_a_configured_secret(monkeypatch,
     log_text = "\n".join(record.getMessage() for record in caplog.records)
     assert "super-secret-password" not in log_text
     assert _basic_auth_header("demo-user", "super-secret-password")["Authorization"] not in log_text
+
+
+# ---------------------------------------------------------------------------
+# #146 — the health endpoints must publish a concrete OpenAPI schema
+# ---------------------------------------------------------------------------
+
+
+def test_health_endpoints_publish_concrete_openapi_schemas():
+    """#146 asked for schemas that list concrete fields instead of
+    ``additionalProperties: true``. Adding the 503 branch moved it backwards
+    instead: the union return type forced ``response_model=None``, and the
+    published schema for both routes collapsed to ``{}`` -- strictly less than
+    the ``additionalProperties: true`` it replaced.
+    """
+    from fastapi.testclient import TestClient
+
+    from app.main import app as fastapi_app
+
+    with TestClient(fastapi_app) as client:
+        document = client.get("/openapi.json").json()
+
+    def resolve(ref: str) -> dict:
+        assert ref.startswith("#/components/schemas/"), ref
+        return document["components"]["schemas"][ref.rsplit("/", 1)[1]]
+
+    for path, expected_fields in (
+        ("/api/healthz", {"ok", "utc_time", "build", "contract_version"}),
+        ("/api/health", {"ok", "utc_time", "build", "contract_version", "tenant", "auth", "status"}),
+    ):
+        content = document["paths"][path]["get"]["responses"]["200"]["content"]["application/json"]
+        schema = content["schema"]
+        assert schema, f"{path} publishes an empty 200 schema"
+        resolved = resolve(schema["$ref"])
+        assert expected_fields <= set(resolved["properties"]), (
+            f"{path} 200 schema is missing fields: {expected_fields - set(resolved['properties'])}"
+        )
+        assert resolved.get("additionalProperties") is not True, (
+            f"{path} 200 schema is still an open dict"
+        )
+
+        # The 503 branch is documented too, and it is the one that carries
+        # `error` -- the healthy body has never included it.
+        unavailable = document["paths"][path]["get"]["responses"]["503"]["content"]["application/json"]
+        unavailable_schema = resolve(unavailable["schema"]["$ref"])
+        assert "error" in unavailable_schema["properties"], f"{path} 503 schema omits `error`"
+
+    # The build block is a named model, not a bare dict -- that was #146's
+    # actual complaint about the health payload.
+    build_ref = resolve(
+        document["paths"]["/api/healthz"]["get"]["responses"]["200"]["content"]["application/json"][
+            "schema"
+        ]["$ref"]
+    )["properties"]["build"]
+    assert "$ref" in build_ref or "allOf" in build_ref, "build is still an untyped object"

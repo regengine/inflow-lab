@@ -48,6 +48,17 @@ async def get_lineage(
 
     total_matched = len(records)
     truncated = total_matched > limit
+    # The GRAPH is always built from the complete matched set, never the
+    # truncated prefix. Building it from the prefix produced a structurally
+    # wrong answer rather than a smaller one: lineage_edges() filters on
+    # `source_lot_code not in related_lot_codes`, so an edge whose parent fell
+    # past the cut was dropped outright, not deferred -- and because the cut is
+    # a timestamp-ordered prefix, what it dropped was the NEWEST data, i.e. the
+    # forward trace of where the food went. That is the half a recall needs,
+    # which made the bounded response worse than the unbounded one it replaced.
+    # The queried lot itself could even be absent from its own lineage.
+    nodes = active_controller.store.lineage_nodes(records)
+    edges = active_controller.store.lineage_edges(records)
     if truncated:
         # Oldest-first, matching the order store.lineage() already sorts
         # in -- a plain prefix slice rather than a re-sort or a "most
@@ -68,6 +79,6 @@ async def get_lineage(
     return LineageResponse(
         traceability_lot_code=traceability_lot_code,
         records=records,
-        nodes=active_controller.store.lineage_nodes(records),
-        edges=active_controller.store.lineage_edges(records),
+        nodes=nodes,
+        edges=edges,
     )

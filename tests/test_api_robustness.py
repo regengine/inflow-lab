@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import json
+
 import asyncio
 from datetime import UTC, datetime, timedelta
 from typing import Any
@@ -307,6 +309,27 @@ def test_lineage_truncates_past_limit_and_signals_via_headers() -> None:
     assert response.headers["X-Lineage-Total-Matched"] == "5"
     assert response.headers["X-Lineage-Truncated"] == "true"
 
+    # The GRAPH must not be truncated with the records. Building nodes/edges
+    # from the prefix returned a structurally wrong answer rather than a
+    # smaller one -- lineage_edges() drops an edge whose parent is outside the
+    # set, so the newest half of the trace (where the food went, which is the
+    # half a recall needs) disappeared entirely. This test previously asserted
+    # nothing here, which is how that shipped.
+    node_lot_codes = {node["lot_code"] for node in body["nodes"]}
+    assert node_lot_codes == {f"TLC-CHAIN-{index}" for index in range(5)}
+
+    # Most pointedly: the lot that was actually queried must appear in its own
+    # lineage. With limit=2 it falls outside the record prefix entirely.
+    assert "TLC-CHAIN-4" in node_lot_codes
+
+    edge_pairs = {(edge["source_lot_code"], edge["target_lot_code"]) for edge in body["edges"]}
+    assert edge_pairs == {
+        ("TLC-CHAIN-0", "TLC-CHAIN-1"),
+        ("TLC-CHAIN-1", "TLC-CHAIN-2"),
+        ("TLC-CHAIN-2", "TLC-CHAIN-3"),
+        ("TLC-CHAIN-3", "TLC-CHAIN-4"),
+    }
+
 
 def test_lineage_under_limit_is_not_marked_truncated() -> None:
     records = [
@@ -361,3 +384,159 @@ def test_unknown_key_inside_inline_delivery_block_is_rejected() -> None:
         json={"delivery": {"mode": "mock", "endpiont": "https://example.test"}},
     )
     assert response.status_code == 422
+
+
+# ---------------------------------------------------------------------------
+# Scenario saves must be forward-compatible, and one bad file must not hide
+# every other save.
+# ---------------------------------------------------------------------------
+
+
+def test_scenario_save_with_unknown_config_keys_still_loads(tmp_path) -> None:
+    """`ScenarioSaveSnapshot` documents itself as deliberately permissive so a
+    save file from another schema version loads instead of hard-failing -- but
+    its nested `SimulationConfig`/`DeliveryConfig` set `extra="forbid"`, and
+    those are the version-carrying parts of the file.
+
+    So a save written by a version that added one config field did not
+    harmlessly ignore it; the whole file failed to load.
+    """
+    from app.scenario_saves import ScenarioSaveStore
+    from app.scenarios import ScenarioId
+
+    store = ScenarioSaveStore(save_dir=str(tmp_path))
+    payload = {
+        "scenario": ScenarioId.LEAFY_GREENS_SUPPLIER.value,
+        "config": {
+            "source": "codex-simulator",
+            "scenario": ScenarioId.LEAFY_GREENS_SUPPLIER.value,
+            "a_field_a_future_version_added": True,
+            "delivery": {"mode": "mock", "another_future_field": 7},
+        },
+        "records": [],
+        "saved_at": "2026-02-05T08:30:00Z",
+    }
+    (tmp_path / f"{ScenarioId.LEAFY_GREENS_SUPPLIER.value}.json").write_text(
+        json.dumps(payload), encoding="utf-8"
+    )
+
+    snapshot = store.get(ScenarioId.LEAFY_GREENS_SUPPLIER)
+    assert snapshot is not None, "a save carrying an unknown config key failed to load"
+    assert snapshot.config.source == "codex-simulator"
+    assert snapshot.config.delivery.mode.value == "mock"
+
+
+def test_one_unreadable_save_does_not_hide_the_others(tmp_path) -> None:
+    """`list()` calls `get()` for every scenario id, so a single unparseable
+    file used to turn the whole listing into a 400 -- the operator lost sight
+    of saves that were perfectly fine.
+    """
+    from app.scenario_saves import ScenarioSaveStore
+    from app.scenarios import ScenarioId
+
+    store = ScenarioSaveStore(save_dir=str(tmp_path))
+    ids = list(ScenarioId)
+    good, bad = ids[0], ids[1]
+
+    (tmp_path / f"{good.value}.json").write_text(
+        json.dumps(
+            {
+                "scenario": good.value,
+                "config": {"source": "codex-simulator", "scenario": good.value},
+                "records": [],
+                "saved_at": "2026-02-05T08:30:00Z",
+            }
+        ),
+        encoding="utf-8",
+    )
+    # Not merely an unknown key -- genuinely unparseable, so the pruning
+    # validator cannot rescue it and list() has to skip it.
+    (tmp_path / f"{bad.value}.json").write_text("{not json at all", encoding="utf-8")
+
+    saves = store.list()
+
+    assert [snapshot.scenario for snapshot in saves] == [good], (
+        "an unreadable save file hid the readable ones"
+    )
+
+
+# ---------------------------------------------------------------------------
+# Ingest strictness belongs on the events, not only the envelope
+# ---------------------------------------------------------------------------
+
+
+def _ingest_event_body(**overrides) -> dict:
+    event = {
+        "cte_type": "harvesting",
+        "traceability_lot_code": "TLC-INGEST-000001",
+        "product_description": "Romaine Lettuce",
+        "quantity": 100,
+        "unit_of_measure": "cases",
+        "location_name": "Valley Fresh Farms",
+        "timestamp": "2026-02-05T08:30:00Z",
+        "kdes": {},
+    }
+    event.update(overrides)
+    return event
+
+
+def test_ingest_rejects_a_misspelled_field_inside_an_event() -> None:
+    """The envelope's extra="forbid" caught a misspelled "events" key but did
+    nothing about a misspelled field INSIDE an event, because RegEngineEvent
+    is permissive -- so `product_desc` was silently dropped and the event was
+    ingested as though it were complete.
+
+    That is the far likelier integration typo, and surfacing exactly that is
+    what this simulator exists for.
+    """
+    response = client.post(
+        "/api/mock/regengine/ingest",
+        json={"source": "test", "events": [_ingest_event_body(product_desc="typo")]},
+    )
+
+    assert response.status_code == 422, (
+        "a misspelled per-event field was accepted; it would be silently dropped"
+    )
+    assert "product_desc" in response.text
+
+
+def test_ingest_accepts_the_body_level_tenant_id_the_contract_documents() -> None:
+    """The contract reference states RegEngine "resolves tenant from body,
+    then API-key lookup, then RBAC principal", so a body-level tenant id is
+    part of the shape real RegEngine accepts. Refusing it made the mock
+    stricter than the thing it simulates -- a parity break in the direction
+    that produces false confidence.
+    """
+    response = client.post(
+        "/api/mock/regengine/ingest",
+        json={"source": "test", "tenant_id": "acme-tenant", "events": [_ingest_event_body()]},
+    )
+
+    assert response.status_code == 200, response.text
+
+
+def test_ingest_still_rejects_a_misspelled_envelope_key() -> None:
+    """#143's original protection must survive: a caller who misspells
+    "events" gets a 422, not a silent 200 that ingested nothing."""
+    response = client.post(
+        "/api/mock/regengine/ingest",
+        json={"source": "test", "event": [_ingest_event_body()]},
+    )
+
+    assert response.status_code == 422
+
+
+def test_body_level_tenant_id_never_reaches_the_live_wire_payload() -> None:
+    """IngestPayload also builds the OUTBOUND payload in
+    LiveRegEngineClient.ingest, so a field that serialized would change the
+    bytes sent to real RegEngine -- and the bytes the HMAC is computed over.
+    Tenant goes to live RegEngine in the X-Tenant-ID header instead.
+    """
+    from app.schemas.ingestion import IngestPayload
+
+    payload = IngestPayload.model_validate(
+        {"source": "test", "tenant_id": "acme-tenant", "events": [_ingest_event_body()]}
+    )
+
+    assert payload.tenant_id == "acme-tenant", "the field must still be populated on input"
+    assert "tenant_id" not in payload.model_dump(mode="json")
