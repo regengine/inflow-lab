@@ -18,6 +18,19 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 20
 
+    # #126: this job used to run 3.11 only, while the image Railway deploys is
+    # `FROM python:3.12-slim`. Anything that breaks on 3.12 alone -- a
+    # dependency, a stdlib removal -- passed CI green and surfaced as a failed
+    # deploy. 3.11 stays because pyproject's `requires-python = ">=3.11"` still
+    # claims it, and ruff's target-version is py311; dropping it would trade
+    # one blind spot for another rather than close this one.
+    # tests/test_container_profile.py asserts this matrix still contains the
+    # Dockerfile's base-image version, so a base bump cannot silently outrun CI.
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ['3.11', '3.12']
+
     steps:
       - name: Check out repository
         uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
@@ -25,14 +38,17 @@ jobs:
       - name: Set up Python
         uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6.3.0
         with:
-          python-version: '3.11'
+          python-version: ${{ matrix.python-version }}
 
       - name: Cache uv
         uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
         with:
           path: ~/.cache/uv
-          key: uv-${{ runner.os }}-${{ hashFiles('uv.lock') }}
-          restore-keys: uv-${{ runner.os }}-
+          # The interpreter is part of the key: the two matrix legs resolve
+          # different wheels for the same uv.lock, so a shared key would let
+          # one leg restore the other's cache.
+          key: uv-${{ runner.os }}-py${{ matrix.python-version }}-${{ hashFiles('uv.lock') }}
+          restore-keys: uv-${{ runner.os }}-py${{ matrix.python-version }}-
 
       - name: Install uv
         run: python -m pip install --upgrade uv
@@ -85,3 +101,94 @@ jobs:
 
       - name: Run browser smoke
         run: uv run --frozen --no-dev --group browser python scripts/browser_smoke.py
+
+      # #133: scripts/browser_smoke.py already screenshots the failing page to
+      # output/playwright/, but the file died with the runner, so a red job
+      # left nothing to look at but an assertion message. `if: failure()` keeps
+      # this off passing runs entirely, and if-no-files-found: ignore makes it
+      # a clean no-op rather than a second error on the failures that happen
+      # before there is a page to screenshot -- a build-SHA mismatch, a server
+      # that never came up, playwright not installed.
+      - name: Upload browser smoke failure screenshots
+        if: failure()
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6.0.0
+        with:
+          name: browser-smoke-failure-${{ github.run_number }}
+          if-no-files-found: ignore
+          path: output/playwright/
+
+  # #126: no job built the image Railway actually deploys. `Dockerfile` is the
+  # deploy artifact (railway.json pins builder DOCKERFILE), so a broken COPY
+  # path, a base-image change, or a dependency that only fails under the
+  # image's Python passed this workflow green and surfaced as a failed deploy.
+  # This job builds that exact file and boots the result, so the failure lands
+  # on the pull request instead of on production.
+  docker-build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+
+      # Plain `docker build` on purpose: the point is to exercise the same
+      # single-stage Dockerfile Railway hands to its builder, with no registry
+      # push, no cache backend and no extra action in the trust surface.
+      - name: Build the deployed image
+        run: docker build --tag inflow-lab:ci .
+
+      # Building proves the Dockerfile parses and its layers succeed. It does
+      # not prove the result runs -- a bad CMD, a missing runtime dependency or
+      # an entrypoint that cannot drop privileges all build clean and then
+      # crash-loop on Railway. Hence the boot below.
+      - name: Start the built image
+        run: |
+          docker run --detach --name inflow-lab-ci --publish 8000:8000 \
+            --env REGENGINE_BASIC_AUTH_USERNAME=ci-docker-smoke \
+            --env REGENGINE_BASIC_AUTH_PASSWORD=ci-docker-smoke-password \
+            inflow-lab:ci
+
+      # /api/healthz is the container's own HEALTHCHECK target and
+      # railway.json's healthcheckPath, so this is the same signal the deploy
+      # gates on. Credentials are supplied above because the image sets
+      # REGENGINE_REQUIRE_AUTH=1 (#88) and app/main.py refuses to boot without
+      # them; the probe itself is unauthenticated by design.
+      - name: Probe /api/healthz
+        run: |
+          for _ in $(seq 1 60); do
+            if curl --fail --silent --show-error --output healthz.json \
+                http://127.0.0.1:8000/api/healthz; then
+              healthy=1
+              break
+            fi
+            sleep 2
+          done
+          if [ "${healthy:-0}" != "1" ]; then
+            echo "The built image never served /api/healthz"
+            exit 1
+          fi
+          cat healthz.json
+          test "$(jq -r '.ok' healthz.json)" = "true"
+
+      # The runtime half of the invariant tests/test_container_profile.py pins
+      # textually (#180): `exec uvicorn` is what makes uvicorn PID 1. Without
+      # it a shell sits at PID 1, never forwards SIGTERM, and every stop and
+      # redeploy skips the graceful shutdown -- which the Dockerfile text can
+      # promise but only a running container can demonstrate.
+      - name: Assert uvicorn is PID 1
+        run: |
+          cmdline=$(docker exec inflow-lab-ci cat /proc/1/cmdline | tr '\0' ' ')
+          echo "PID 1: ${cmdline}"
+          case "${cmdline}" in
+            *uvicorn*) ;;
+            *) echo "Expected uvicorn at PID 1 (#180), got: ${cmdline}"; exit 1 ;;
+          esac
+
+      # A crash-looping container is unreadable from the step that timed out.
+      - name: Container logs
+        if: always()
+        run: docker logs inflow-lab-ci || true
+
+      - name: Stop the container
+        if: always()
+        run: docker rm --force inflow-lab-ci || true

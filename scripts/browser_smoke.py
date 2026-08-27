@@ -166,7 +166,6 @@ def _run_dashboard_smoke(base_url: str, config: BrowserSmokeConfig) -> None:
 
     output_dir = Path("output/playwright")
     console_errors: list[str] = []
-    page = None
     failed = False
     try:
         with sync_playwright() as playwright:
@@ -180,102 +179,112 @@ def _run_dashboard_smoke(base_url: str, config: BrowserSmokeConfig) -> None:
             page.on("console", lambda message: console_errors.append(message.text) if message.type == "error" else None)
             page.on("pageerror", lambda error: console_errors.append(str(error)))
 
-            page.goto(base_url, wait_until="domcontentloaded")
-            expect(page.get_by_role("heading", name="Plant Operations Console", exact=True)).to_be_visible()
-            expect(page.locator("#guideRail")).to_contain_text("How to use this console")
-            expect(page.locator('#guideRail [data-guide-step="setup"]')).to_be_visible()
+            try:
+                page.goto(base_url, wait_until="domcontentloaded")
+                expect(page.get_by_role("heading", name="Plant Operations Console", exact=True)).to_be_visible()
+                expect(page.locator("#guideRail")).to_contain_text("How to use this console")
+                expect(page.locator('#guideRail [data-guide-step="setup"]')).to_be_visible()
 
-            # First visit shows the onboarding welcome; walk into the guided
-            # tour, navigate forward and back, then skip out of it.
-            expect(page.locator("#welcomeOverlay")).to_be_visible()
-            page.locator("#welcomeTourBtn").click()
-            expect(page.locator("#welcomeOverlay")).to_be_hidden()
-            expect(page.locator("#tourPopover")).to_be_visible()
-            expect(page.locator("#tourProgress")).to_have_text("Step 1 of 5")
-            page.locator("#tourNextBtn").click()
-            expect(page.locator("#tourProgress")).to_have_text("Step 2 of 5")
-            page.locator("#tourBackBtn").click()
-            expect(page.locator("#tourProgress")).to_have_text("Step 1 of 5")
-            page.locator("#tourSkipBtn").click()
-            expect(page.locator("#tourPopover")).to_be_hidden()
+                # First visit shows the onboarding welcome; walk into the guided
+                # tour, navigate forward and back, then skip out of it.
+                expect(page.locator("#welcomeOverlay")).to_be_visible()
+                page.locator("#welcomeTourBtn").click()
+                expect(page.locator("#welcomeOverlay")).to_be_hidden()
+                expect(page.locator("#tourPopover")).to_be_visible()
+                expect(page.locator("#tourProgress")).to_have_text("Step 1 of 5")
+                page.locator("#tourNextBtn").click()
+                expect(page.locator("#tourProgress")).to_have_text("Step 2 of 5")
+                page.locator("#tourBackBtn").click()
+                expect(page.locator("#tourProgress")).to_have_text("Step 1 of 5")
+                page.locator("#tourSkipBtn").click()
+                expect(page.locator("#tourPopover")).to_be_hidden()
 
-            # Onboarding is persisted, so a reload must not re-interrupt.
-            page.reload(wait_until="domcontentloaded")
-            expect(page.get_by_role("heading", name="Plant Operations Console", exact=True)).to_be_visible()
-            expect(page.locator("#welcomeOverlay")).to_be_hidden()
+                # Onboarding is persisted, so a reload must not re-interrupt.
+                page.reload(wait_until="domcontentloaded")
+                expect(page.get_by_role("heading", name="Plant Operations Console", exact=True)).to_be_visible()
+                expect(page.locator("#welcomeOverlay")).to_be_hidden()
 
-            page.locator("#advancedConfig").evaluate("element => { element.open = true; }")
-            page.locator("#batchSize").fill("1")
-            page.locator("#interval").fill("0.1")
-            page.locator("#deliveryMode").select_option("mock")
-            page.locator("#endpoint").fill("")
-            page.locator("#apiKey").fill("")
-            page.locator("#tenantId").fill("")
+                page.locator("#advancedConfig").evaluate("element => { element.open = true; }")
+                page.locator("#batchSize").fill("1")
+                page.locator("#interval").fill("0.1")
+                page.locator("#deliveryMode").select_option("mock")
+                page.locator("#endpoint").fill("")
+                page.locator("#apiKey").fill("")
+                page.locator("#tenantId").fill("")
 
-            # Pressing Enter inside the setup form must not trigger the
-            # implicit form submission (which used to reload the page).
-            page.evaluate("window.__smokeMarker = true")
-            page.locator("#source").press("Enter")
-            page.wait_for_timeout(300)
-            if page.evaluate("window.__smokeMarker") is not True:
-                raise RuntimeError("Enter inside the setup form reloaded the page")
+                # Pressing Enter inside the setup form must not trigger the
+                # implicit form submission (which used to reload the page).
+                page.evaluate("window.__smokeMarker = true")
+                page.locator("#source").press("Enter")
+                page.wait_for_timeout(300)
+                if page.evaluate("window.__smokeMarker") is not True:
+                    raise RuntimeError("Enter inside the setup form reloaded the page")
 
-            # Start/Pause mirror the loop state: pausing is only possible
-            # while running, starting only while idle.
-            expect(page.locator("#stopBtn")).to_be_disabled()
-            page.locator("#startBtn").click()
-            expect(page.locator("#statusMessage")).to_contain_text("Started production line")
-            expect(page.locator("#startBtn")).to_be_disabled()
-            page.locator("#stopBtn").click()
-            expect(page.locator("#statusMessage")).to_contain_text("Paused production line")
+                # Start/Pause mirror the loop state: pausing is only possible
+                # while running, starting only while idle.
+                expect(page.locator("#stopBtn")).to_be_disabled()
+                page.locator("#startBtn").click()
+                expect(page.locator("#statusMessage")).to_contain_text("Started production line")
+                expect(page.locator("#startBtn")).to_be_disabled()
+                page.locator("#stopBtn").click()
+                expect(page.locator("#statusMessage")).to_contain_text("Paused production line")
 
-            # Clear shift is two-step: first click arms, second click wipes.
-            page.locator("#resetBtn").click()
-            expect(page.locator("#resetBtn")).to_contain_text("Confirm clear shift")
-            page.locator("#resetBtn").click()
-            expect(page.locator("#statusMessage")).to_contain_text("Cleared line state")
+                # Clear shift is two-step: first click arms, second click wipes.
+                page.locator("#resetBtn").click()
+                expect(page.locator("#resetBtn")).to_contain_text("Confirm clear shift")
+                page.locator("#resetBtn").click()
+                expect(page.locator("#statusMessage")).to_contain_text("Cleared line state")
 
-            page.locator("#stepBtn").click()
-            expect(page.locator("#statusMessage")).to_contain_text("Recorded and posted")
-            expect(page.locator("#eventsBody tr")).to_have_count(1)
+                page.locator("#stepBtn").click()
+                expect(page.locator("#statusMessage")).to_contain_text("Recorded and posted")
+                expect(page.locator("#eventsBody tr")).to_have_count(1)
 
-            page.locator("#testConnectionBtn").click()
-            expect(page.locator("#connectionResult")).to_contain_text("mock")
+                page.locator("#testConnectionBtn").click()
+                expect(page.locator("#connectionResult")).to_contain_text("mock")
 
-            page.locator('#demoFixture option[value="fresh_cut_transformation"]').wait_for(state="attached")
-            page.locator("#demoFixture").select_option("fresh_cut_transformation")
-            page.locator("#loadFixtureBtn").click()
-            expect(page.locator("#statusMessage")).to_contain_text("Loaded line data and posted")
-            expect(page.locator("#eventsBody")).to_contain_text("TLC-DEMO-FC-OUT-001")
+                page.locator('#demoFixture option[value="fresh_cut_transformation"]').wait_for(state="attached")
+                page.locator("#demoFixture").select_option("fresh_cut_transformation")
+                page.locator("#loadFixtureBtn").click()
+                expect(page.locator("#statusMessage")).to_contain_text("Loaded line data and posted")
+                expect(page.locator("#eventsBody")).to_contain_text("TLC-DEMO-FC-OUT-001")
 
-            page.locator("#lotLookup").fill("TLC-DEMO-FC-OUT-001")
-            page.locator("#lineageBtn").click()
-            expect(page.locator("#statusMessage")).to_contain_text("Loaded lineage for TLC-DEMO-FC-OUT-001")
-            expect(page.locator("#lineageResults")).to_contain_text("TLC-DEMO-FC-OUT-001")
-            expect(page.locator("#lineageResults")).to_contain_text("Transformation")
+                page.locator("#lotLookup").fill("TLC-DEMO-FC-OUT-001")
+                page.locator("#lineageBtn").click()
+                expect(page.locator("#statusMessage")).to_contain_text("Loaded lineage for TLC-DEMO-FC-OUT-001")
+                expect(page.locator("#lineageResults")).to_contain_text("TLC-DEMO-FC-OUT-001")
+                expect(page.locator("#lineageResults")).to_contain_text("Transformation")
 
-            csv_path = output_dir / "browser_smoke_import.csv"
-            output_dir.mkdir(parents=True, exist_ok=True)
-            csv_path.write_text(CSV_WITH_KDE_WARNINGS, encoding="utf-8")
-            page.locator("#csvImportType").select_option("scheduled_events")
-            page.locator("#csvFile").set_input_files(str(csv_path))
-            page.locator("#importCsvBtn").click()
-            expect(page.locator("#statusMessage")).to_contain_text("warning")
-            expect(page.locator("#importResults")).to_contain_text("Missing expected harvesting KDE: reference_document")
+                csv_path = output_dir / "browser_smoke_import.csv"
+                output_dir.mkdir(parents=True, exist_ok=True)
+                csv_path.write_text(CSV_WITH_KDE_WARNINGS, encoding="utf-8")
+                page.locator("#csvImportType").select_option("scheduled_events")
+                page.locator("#csvFile").set_input_files(str(csv_path))
+                page.locator("#importCsvBtn").click()
+                expect(page.locator("#statusMessage")).to_contain_text("warning")
+                expect(page.locator("#importResults")).to_contain_text("Missing expected harvesting KDE: reference_document")
 
-            # Enter in the quick-trace box traces the lot without the button.
-            page.locator("#lotLookup").press("Enter")
-            expect(page.locator("#statusMessage")).to_contain_text("Loaded lineage for TLC-DEMO-FC-OUT-001")
+                # Enter in the quick-trace box traces the lot without the button.
+                page.locator("#lotLookup").press("Enter")
+                expect(page.locator("#statusMessage")).to_contain_text("Loaded lineage for TLC-DEMO-FC-OUT-001")
 
-            browser.close()
+                browser.close()
+            except Exception:
+                # The capture has to happen while the driver is still up (#133).
+                # It used to live in the outer handler below, which only runs
+                # after `with sync_playwright()` has already exited -- and that
+                # __exit__ stops the driver, so every screenshot() there raised
+                # "Event loop is closed! Is Playwright already stopped?", was
+                # swallowed by the except, and left the failure artifact empty.
+                try:
+                    output_dir.mkdir(parents=True, exist_ok=True)
+                    page.screenshot(
+                        path=str(output_dir / "browser_smoke_failure.png"), full_page=True
+                    )
+                except Exception:
+                    console_errors.append("Could not capture failure screenshot")
+                raise
     except Exception:
         failed = True
-        if page is not None:
-            try:
-                output_dir.mkdir(parents=True, exist_ok=True)
-                page.screenshot(path=str(output_dir / "browser_smoke_failure.png"), full_page=True)
-            except Exception:
-                console_errors.append("Could not capture failure screenshot")
         raise
     finally:
         if console_errors and not failed:
