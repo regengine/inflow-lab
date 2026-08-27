@@ -28,7 +28,18 @@ _BIZ_STEPS = {
 # owning_party/possessing_party, but this app has no ownership/possession
 # model distinct from location, so "location" is the one type it can back
 # with real data.
-_SDT_LOCATION = "urn:epcglobal:cbv:sdt:location"
+#
+# The BARE TOKEN, not the urn:epcglobal:cbv:sdt:location alias. GS1's own
+# epcis-context.jsonld declares sourceList/destinationList `type` as
+# "@type": "@vocab" over exactly three short names -- owning_party,
+# possessing_party, location -- so only the token expands to cbv:SDT-location.
+# The URN is a legitimate sameAs alias of that term, but it is not one of the
+# declared vocabulary entries, so it fails JSON-LD expansion; and the official
+# EPCIS 2.0 JSON Schema's source-dest-type carries a negative lookahead
+# ("^(?!(urn:epcglobal:cbv|https?://ns\.gs1\.org/cbv/))") that rejects this
+# exact prefix outright. Emitting the URN made both documents schema-invalid,
+# which is the opposite of what #187 asked for.
+_SDT_LOCATION = "location"
 
 _DISPOSITIONS = {
     CTEType.HARVESTING: "urn:epcglobal:cbv:disp:active",

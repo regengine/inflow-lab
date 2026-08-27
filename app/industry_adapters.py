@@ -110,6 +110,21 @@ class IndustryAdapter:
             "transformation_location": processor.name,
             "location_name": processor.name,
             "input_traceability_lot_codes": [lot.lot_code for lot in inputs],
+            # Per-input quantity/UoM (#159). The exporter reads this exact
+            # shape -- lot_code -> {"quantity", "unit_of_measure"} -- and until
+            # now nothing in app/ ever wrote it, so EPCIS inputQuantityList
+            # rendered every entry bare. The data was already here: `inputs` is
+            # a list of Lot, each carrying .quantity and .unit_of_measure, and
+            # the line above already derives lot codes from it. Keyed by lot
+            # code rather than positional because _input_lot_codes() merges
+            # codes from three sources that share no common order.
+            "input_lot_quantities": {
+                lot.lot_code: {
+                    "quantity": lot.quantity,
+                    "unit_of_measure": lot.unit_of_measure,
+                }
+                for lot in inputs
+            },
             "input_products": [lot.product_description for lot in inputs],
             "output_traceability_lot_codes": [lot.lot_code for lot in outputs],
             "reference_document": engine._reference_document(reference_type, reference_number),
