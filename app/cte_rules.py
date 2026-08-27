@@ -1,16 +1,28 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, Literal
 
 from .scenarios import ScenarioPreset
 from .schemas.domain import CTEType, RegEngineEvent, StoredEventRecord
+
+
+#: A warning is either a gap that would fail live RegEngine ingest ("required")
+#: or a nice-to-have the audit lens would like to see ("recommended"). Before
+#: this existed the distinction lived only inside the prose of `message`, so no
+#: surface could tell a blocker from a suggestion.
+WarningSeverity = Literal["required", "recommended"]
+
+#: Sort key: required warnings come first wherever a list is rendered, so the
+#: gaps that would fail live ingest are what an operator reads first.
+SEVERITY_ORDER: dict[str, int] = {"required": 0, "recommended": 1}
 
 
 @dataclass(frozen=True, slots=True)
 class CTEValidationWarning:
     field: str
     message: str
+    severity: WarningSeverity = "recommended"
 
 
 @dataclass(frozen=True, slots=True)
@@ -236,6 +248,7 @@ def validate_event_kdes(event: RegEngineEvent) -> list[CTEValidationWarning]:
                 CTEValidationWarning(
                     field=field,
                     message=f"Missing expected {event.cte_type.value} KDE: {field}",
+                    severity="required",
                 )
             )
 
@@ -245,6 +258,7 @@ def validate_event_kdes(event: RegEngineEvent) -> list[CTEValidationWarning]:
                 CTEValidationWarning(
                     field=field,
                     message=f"Missing recommended {event.cte_type.value} KDE: {field}",
+                    severity="recommended",
                 )
             )
 
@@ -258,7 +272,7 @@ def validate_event_kdes(event: RegEngineEvent) -> list[CTEValidationWarning]:
                 )
             )
 
-    return warnings
+    return sort_warnings(warnings)
 
 
 def audit_warnings_for_event(event: RegEngineEvent, scenario: ScenarioPreset) -> list[CTEValidationWarning]:
@@ -346,7 +360,12 @@ def dedupe_warnings(warnings: list[CTEValidationWarning]) -> list[CTEValidationW
             continue
         seen.add(key)
         deduped.append(warning)
-    return deduped
+    return sort_warnings(deduped)
+
+
+def sort_warnings(warnings: list[CTEValidationWarning]) -> list[CTEValidationWarning]:
+    """Required-severity warnings first, otherwise stable in discovery order."""
+    return sorted(warnings, key=lambda warning: SEVERITY_ORDER.get(warning.severity, 1))
 
 
 def _evaluate_check(records: list[StoredEventRecord], definition: AuditCheckDefinition) -> bool:

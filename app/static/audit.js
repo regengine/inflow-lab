@@ -70,6 +70,22 @@ export function renderReadinessBanner(summary, events, status = state.status) {
     return;
   }
   const readiness = backendAudit(status, summary) || pendingAuditModel(summary, status);
+  // Required gaps would fail live ingest; recommended ones would not, so they
+  // are counted separately and the banner never blends a blocker into a
+  // nice-to-have. A pending model scored nothing, so it may not claim zero.
+  const scored = !readiness.pending && Boolean(readiness.total);
+  const requiredWarnings = Number(readiness.required_warning_count) || 0;
+  const recommendedWarnings = Number(readiness.recommended_warning_count) || 0;
+  const severityClass = !scored
+    ? 'readiness-advisory'
+    : requiredWarnings
+      ? 'readiness-blocker'
+      : 'readiness-advisory';
+  const severityLabel = !scored
+    ? 'Required vs recommended pending'
+    : requiredWarnings
+      ? `${requiredWarnings} required KDE gap(s), ${recommendedWarnings} recommended`
+      : `0 required KDE gaps, ${recommendedWarnings} recommended`;
   ids.readinessBanner.innerHTML = `
     <div class="readiness-banner-shell" data-tone="${escapeHtml(readiness.tone)}">
       <div class="readiness-score">
@@ -85,29 +101,45 @@ export function renderReadinessBanner(summary, events, status = state.status) {
         <span>${escapeHtml(summary.reference_format)} references</span>
         <span>${escapeHtml(summary.requires_cooling ? 'Cooling required' : 'Continuous or direct flow')}</span>
         <span>${escapeHtml(readiness.total ? `${readiness.missing} gap(s) still visible` : 'Backend audit pending')}</span>
+        <span class="${escapeHtml(severityClass)}">${escapeHtml(severityLabel)}</span>
       </div>
     </div>
   `;
 }
 
-// Returns {evaluated, messages}. When the backend audit does not cover the
-// selected scenario nothing was evaluated, and a row must say so rather than
-// render as clean.
+// A warning whose severity the backend did not send is treated as advisory —
+// only an explicit "required" may be rendered as a live-ingest blocker.
+export function warningSeverity(warning) {
+  return warning?.severity === 'required' ? 'required' : 'recommended';
+}
+
+// Returns {evaluated, warnings, messages, requiredCount}. `warnings` carries
+// the severity for each entry, required-first; `messages` is the flat text
+// list. When the backend audit does not cover the selected scenario nothing
+// was evaluated, and a row must say so rather than render as clean.
 export function recordWarnings(record, summary, status = state.status) {
   const audit = backendAudit(status, summary);
   if (!audit) {
+    // Nothing was evaluated, so there is nothing to grade: callers read the
+    // optional `warnings`/`requiredCount` defensively for exactly this case.
     return { evaluated: false, messages: [] };
   }
   const warningPayload = audit.warnings_by_record?.[record.record_id];
   if (Array.isArray(warningPayload) && warningPayload.length) {
+    const warnings = warningPayload
+      .filter((warning) => typeof warning?.message === 'string' && warning.message)
+      .map((warning) => ({ message: warning.message, severity: warningSeverity(warning) }))
+      // The backend already orders required first; re-sorting here keeps that
+      // true even if a payload ever arrives in another order.
+      .sort((a, b) => (a.severity === b.severity ? 0 : a.severity === 'required' ? -1 : 1));
     return {
       evaluated: true,
-      messages: warningPayload
-        .map((warning) => warning.message)
-        .filter((message) => typeof message === 'string' && message),
+      warnings,
+      messages: warnings.map((warning) => warning.message),
+      requiredCount: warnings.filter((warning) => warning.severity === 'required').length,
     };
   }
-  return { evaluated: true, messages: [] };
+  return { evaluated: true, warnings: [], messages: [], requiredCount: 0 };
 }
 
 export function renderScenarioWorkbench(status = state.status, events = state.events) {

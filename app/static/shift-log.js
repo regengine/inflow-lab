@@ -7,6 +7,12 @@ import { escapeHtml } from './format.js';
 import { deliveryTone } from './labels.js';
 import { activeScenarioSummary, recordWarnings } from './audit.js';
 
+// The console must never make an operator read prose to learn whether a gap
+// would fail live ingest, so the severity is stamped on the front of the text.
+function severityPrefix(warning) {
+  return warning.severity === 'required' ? 'Required: ' : 'Recommended: ';
+}
+
 export function renderEvents(events) {
   const summary = activeScenarioSummary();
   const body = ids.eventsBody;
@@ -31,7 +37,12 @@ export function renderEvents(events) {
   events.forEach((record) => {
     const event = record.event;
     const audit = recordWarnings(record, summary);
-    const warnings = audit.messages;
+    const warnings = audit.warnings || [];
+    // Required-severity warnings are gaps that would fail live RegEngine
+    // ingest; recommended ones would not. `recordWarnings` orders required
+    // first, so the one warning a row has room for is the worst one.
+    const topWarning = warnings[0] || null;
+    const warningClass = topWarning?.severity === 'required' ? 'status-blocker' : 'status-warning';
     const cells = [
       escapeHtml(record.sequence_no),
       `<span class="pill">${escapeHtml(event.cte_type)}</span>`,
@@ -41,12 +52,15 @@ export function renderEvents(events) {
       escapeHtml(new Date(event.timestamp).toLocaleString()),
       escapeHtml(record.destination_mode),
       `${escapeHtml(record.delivery_attempts || 0)}
-        ${warnings.length ? `<small class="status-warning">${escapeHtml(warnings[0])}</small>` : ''}
+        ${topWarning ? `<small class="${escapeHtml(warningClass)}">${escapeHtml(severityPrefix(topWarning))}${escapeHtml(topWarning.message)}</small>` : ''}
         ${!audit.evaluated ? `<small class="status-unevaluated">Audit not evaluated</small>` : ''}`,
       `<span class="status-pill" data-tone="${escapeHtml(deliveryTone(record.delivery_status))}">${escapeHtml(record.delivery_status)}</span>
         ${record.error ? `<small class="status-error">${escapeHtml(record.error)}</small>` : ''}`,
     ];
-    const rowClass = [warnings.length ? 'has-audit-warning' : '', audit.evaluated ? '' : 'audit-not-evaluated']
+    const rowClass = [
+      warnings.length ? ((audit.requiredCount || 0) ? 'has-audit-blocker' : 'has-audit-warning') : '',
+      audit.evaluated ? '' : 'audit-not-evaluated',
+    ]
       .filter(Boolean)
       .join(' ');
     const key = record.record_id || `seq-${record.sequence_no}`;

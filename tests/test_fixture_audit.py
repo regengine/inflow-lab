@@ -15,7 +15,7 @@ import pytest
 from app.audit import summarize_scenario_audit
 from app.cte_rules import audit_warnings_for_event
 from app.demo_fixtures import DEMO_FIXTURES
-from app.engine import LegitFlowEngine
+from app.engine import LegitFlowEngine, gs1_check_digit
 from app.scenarios import SCENARIO_PRESETS, get_scenario
 from app.schemas.domain import StoredEventRecord
 
@@ -75,6 +75,45 @@ def test_demo_fixture_reference_documents_match_scenario_format(fixture_id) -> N
         reference_document = fixture_event.event.kdes.get("reference_document")
         assert reference_document, f"{fixture_id.value} event missing reference_document"
         assert reference_document.startswith("GS1"), reference_document
+
+
+SSCC_REFERENCE_PREFIX = "GS1-128 (00)"
+
+
+@pytest.mark.parametrize("fixture_id", sorted(DEMO_FIXTURES, key=lambda item: item.value))
+def test_fixture_sscc_references_are_real_ssccs(fixture_id) -> None:
+    """GS1 AI ``(00)`` promises 18 digits — not a human-readable BOL label.
+
+    Hand-written fixtures shipped ``GS1-128 (00)BOL-DEMO-LG-001``, which is
+    neither 18 characters nor numeric. A malformed identifier in the data a
+    design partner sees first is exactly the defect class this tool exists to
+    help people notice, so every ``(00)`` reference is checked for length,
+    digits, and a correct mod-10 check digit.
+    """
+    fixture = DEMO_FIXTURES[fixture_id]
+
+    for fixture_event in fixture.events:
+        reference = str(fixture_event.event.kdes.get("reference_document") or "")
+        if not reference.startswith(SSCC_REFERENCE_PREFIX):
+            continue
+        sscc = reference[len(SSCC_REFERENCE_PREFIX):]
+        assert len(sscc) == 18, f"{fixture_id.value}: {reference!r} is not 18 digits"
+        assert sscc.isdigit(), f"{fixture_id.value}: {reference!r} is not numeric"
+        assert int(sscc[-1]) == gs1_check_digit(sscc[:-1]), (
+            f"{fixture_id.value}: {reference!r} has a bad SSCC check digit"
+        )
+
+
+def test_fixtures_that_ship_an_sscc_keep_the_human_label_beside_it() -> None:
+    """The BOL label serves the demo narrative — it just cannot live in (00)."""
+    for fixture in DEMO_FIXTURES.values():
+        for fixture_event in fixture.events:
+            kdes = fixture_event.event.kdes
+            if not str(kdes.get("reference_document") or "").startswith(SSCC_REFERENCE_PREFIX):
+                continue
+            assert kdes.get("reference_document_number"), (
+                f"{fixture.id.value} ships an SSCC with no readable reference_document_number"
+            )
 
 
 @pytest.mark.parametrize("scenario_id", sorted(SCENARIO_PRESETS, key=lambda item: item.value))

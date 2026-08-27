@@ -811,8 +811,31 @@ th {
   color: var(--warning);
 }
 
+/* A required-KDE gap would be rejected by live RegEngine ingest, so it reads
+   as a blocker rather than sharing the advisory amber of a recommended one. */
+.status-blocker {
+  display: block;
+  margin-top: 6px;
+  font-weight: 600;
+  color: var(--danger);
+}
+
 tbody tr.has-audit-warning {
   background: rgba(255, 251, 235, 0.58);
+}
+
+tbody tr.has-audit-blocker {
+  background: var(--danger-soft);
+  box-shadow: inset 3px 0 0 var(--danger);
+}
+
+.readiness-meta span.readiness-blocker {
+  font-weight: 600;
+  color: var(--danger);
+}
+
+.readiness-meta span.readiness-advisory {
+  color: var(--muted);
 }
 
 .link-button {

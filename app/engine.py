@@ -32,6 +32,30 @@ DEFAULT_HISTORY_HOURS = 336  # 14 simulated days of runway
 # must still move: two CTEs for the same lot must never share an instant.
 MIN_TIME_ADVANCE = timedelta(microseconds=200)
 
+#: GS1 company prefix used for every synthetic SSCC this lab mints.
+SSCC_COMPANY_PREFIX = "8500000"
+
+
+def gs1_check_digit(digits: str) -> int:
+    """GS1 mod-10 check digit for a run of digits (SSCC, GTIN, GLN, ...)."""
+    total = 0
+    for index, digit in enumerate(reversed(digits), start=1):
+        total += int(digit) * (3 if index % 2 else 1)
+    return (10 - (total % 10)) % 10
+
+
+def sscc_from_base(base: str) -> str:
+    """Complete a 17-digit SSCC base into the full 18-digit SSCC.
+
+    GS1 Application Identifier ``(00)`` promises exactly 18 digits, so anything
+    that writes an ``(00)`` reference — the engine or a hand-written fixture —
+    must come through here rather than pasting a human-readable label after the
+    AI.
+    """
+    if len(base) != 17 or not base.isdigit():
+        raise ValueError(f"SSCC base must be 17 digits, got {base!r}")
+    return f"{base}{gs1_check_digit(base)}"
+
 
 @dataclass(slots=True)
 class Lot:
@@ -640,16 +664,13 @@ class LegitFlowEngine:
         # so the serial must be kept to six digits rather than truncated after
         # the fact — truncating a 7-digit serial collapsed every run of ten
         # consecutive references onto the same SSCC.
-        company_prefix = "8500000"
         serial = next(self._ref_counter) % 1_000_000
-        base = f"0{company_prefix}{self._time_cursor.strftime('%j')}{serial:06d}"
-        return f"{base}{self._gs1_check_digit(base)}"
+        return sscc_from_base(
+            f"0{SSCC_COMPANY_PREFIX}{self._time_cursor.strftime('%j')}{serial:06d}"
+        )
 
     def _gs1_check_digit(self, digits: str) -> int:
-        total = 0
-        for index, digit in enumerate(reversed(digits), start=1):
-            total += int(digit) * (3 if index % 2 else 1)
-        return (10 - (total % 10)) % 10
+        return gs1_check_digit(digits)
 
     def _gps_coordinate(self) -> str:
         lat = round(self.rng.uniform(32.0, 39.5), 4)
