@@ -307,7 +307,7 @@ Replay responses include `status`, `read`, `replayed`, `posted`, `failed`, `sour
 
 ## CSV import
 
-`POST /api/import/csv` accepts CSV text and imports either scheduled RegEngine-shaped events or seed lots. Valid rows are delivered through the selected delivery mode and persisted as `StoredEventRecord` JSONL entries. Invalid rows are skipped, with deterministic row-level errors in the response. Accepted rows are also checked against CTE-specific KDE expectations and can return warnings for missing lineage, document, location, or date context. The default dashboard/API delivery remains **`mock`** unless you explicitly submit a different `delivery` object.
+`POST /api/import/csv` accepts CSV text and imports either scheduled RegEngine-shaped events or seed lots. Valid rows are delivered through the selected delivery mode and persisted as `StoredEventRecord` JSONL entries. Invalid rows are skipped, with deterministic row-level errors in the response. Accepted rows are also checked against CTE-specific KDE expectations and can return warnings for missing lineage, document, location, or date context. Each warning carries a `severity` of `required` or `recommended`, so an FDA-mandatory KDE (for example a Transformation event's input-lot linkage) is distinguishable from an advisory one in the response and in the console, rather than only in the message text. The audit-readiness summary counts the two tiers separately (`required_warning_count` / `recommended_warning_count`). The default dashboard/API delivery remains **`mock`** unless you explicitly submit a different `delivery` object.
 
 Request body:
 

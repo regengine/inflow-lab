@@ -317,3 +317,105 @@ def test_transformation_required_kdes_still_matches_the_regengine_pin() -> None:
     """
     assert "input_traceability_lot_codes" not in REQUIRED_KDES[CTEType.TRANSFORMATION]
     assert "input_products" not in REQUIRED_KDES[CTEType.TRANSFORMATION]
+
+
+# ---------------------------------------------------------------------------
+# #189 -- severity is a real field, and consumers act on it.
+# ---------------------------------------------------------------------------
+
+
+def test_warning_severity_is_a_field_not_a_message_prefix() -> None:
+    """#189's promotion of input-lot linkage to required tier was, until
+    now, only a change to message text: CTEValidationWarning had no
+    severity field and no consumer in app/ told "Missing expected" from
+    "Missing recommended". Anything downstream that wanted to act on the
+    distinction had to string-match presentation copy. It is data now.
+    """
+    event = _transformation_event()  # no input linkage, no reference_document_type
+    by_field = {warning.field: warning for warning in validate_event_kdes(event)}
+
+    for field in ("input_traceability_lot_codes", "input_products"):
+        assert by_field[field].severity == "required", (
+            f"{field} is FDA-mandatory input linkage and must carry required severity"
+        )
+    # A genuinely advisory KDE on the same event must NOT be promoted along
+    # with them -- if everything is required, nothing is.
+    assert by_field["reference_document_type"].severity == "recommended"
+
+
+def test_a_malformed_input_lot_list_is_required_severity_too() -> None:
+    # Supplying the linkage in the wrong shape satisfies FDA's requirement
+    # no better than omitting it, so it cannot be the softer tier.
+    event = _transformation_event(input_traceability_lot_codes="TLC-IN-1", input_products=["Romaine"])
+    warnings = [w for w in validate_event_kdes(event) if w.field == "input_traceability_lot_codes"]
+
+    assert warnings, "a non-list input lot value should be flagged"
+    assert all(warning.severity == "required" for warning in warnings)
+
+
+def test_csv_import_warnings_carry_severity_to_the_caller() -> None:
+    """The CSV importer is one of the two consumers #189 names. Its
+    response used to hand back required-tier gaps and advisory nudges in
+    one undifferentiated list."""
+    from app.csv_importer import parse_csv_import
+    from app.schemas.domain import CSVImportType
+
+    csv_text = (
+        "cte_type,traceability_lot_code,product_description,quantity,unit_of_measure,"
+        "location_name,timestamp\n"
+        "transformation,TLC-SEV-000001,Chopped Romaine,50,cases,Fresh Cut Plant,"
+        "2026-03-01T08:00:00Z\n"
+    )
+    result = parse_csv_import(CSVImportType.SCHEDULED_EVENTS, csv_text)
+
+    severities = {warning.field: warning.severity for warning in result.warnings}
+    assert severities.get("input_traceability_lot_codes") == "required"
+    assert severities.get("reference_document_type") == "recommended"
+
+
+def test_audit_summary_counts_the_two_severities_separately() -> None:
+    """The other consumer: the console's audit-readiness summary. Every
+    warning counted the same, so a missing FDA-mandatory KDE scored
+    identically to a missing nicety."""
+    from app.audit import summarize_scenario_audit
+    from app.scenarios import SCENARIO_PRESETS, ScenarioId
+
+    scenario = SCENARIO_PRESETS[ScenarioId.FRESH_CUT_PROCESSOR]
+    record = StoredEventRecord(
+        sequence_no=1,
+        payload_source="test-conformance",
+        event=_transformation_event(),
+    )
+
+    summary = summarize_scenario_audit([record], scenario)
+
+    assert summary["required_warning_count"] > 0
+    assert summary["recommended_warning_count"] > 0
+    assert (
+        summary["required_warning_count"] + summary["recommended_warning_count"]
+        == summary["warning_count"]
+    )
+    payload = summary["warnings_by_record"][record.record_id]
+    assert {"required", "recommended"} >= {warning["severity"] for warning in payload}
+    assert any(warning["severity"] == "required" for warning in payload)
+
+
+def test_a_required_gap_is_never_shadowed_by_a_recommended_one_for_the_same_field() -> None:
+    """dedupe_warnings has to honour severity, not just uniqueness. The
+    shift log renders exactly one warning per row, so if an advisory entry
+    for a field could sort ahead of that field's required entry, the
+    operator would be shown the softer of the two."""
+    from app.cte_rules import CTEValidationWarning, dedupe_warnings
+
+    deduped = dedupe_warnings(
+        [
+            CTEValidationWarning(field="input_products", message="soft nudge", severity="recommended"),
+            CTEValidationWarning(field="input_products", message="hard gap", severity="required"),
+            CTEValidationWarning(field="carrier", message="soft nudge", severity="recommended"),
+        ]
+    )
+
+    assert [(w.field, w.severity) for w in deduped] == [
+        ("input_products", "required"),
+        ("carrier", "recommended"),
+    ]

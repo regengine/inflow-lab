@@ -729,15 +729,29 @@ function renderReadinessBanner(summary, events, status = state.status) {
   `;
 }
 
+// Returns {message, severity} rather than bare strings (#189). The backend
+// now marks each warning required or recommended instead of leaving the two
+// tiers distinguishable only by message prefix, and required ones sort
+// first -- which matters because the shift-log row shows exactly one
+// warning, so whichever lands at index 0 is the whole story an operator
+// sees for that event.
 function recordWarnings(record, summary, status = state.status) {
   const audit = backendAudit(status, summary);
   const warningPayload = audit?.warnings_by_record?.[record.record_id];
-  if (Array.isArray(warningPayload) && warningPayload.length) {
-    return warningPayload
-      .map((warning) => warning.message)
-      .filter((message) => typeof message === 'string' && message);
+  if (!Array.isArray(warningPayload) || !warningPayload.length) {
+    return [];
   }
-  return [];
+  return warningPayload
+    .filter((warning) => typeof warning?.message === 'string' && warning.message)
+    .map((warning) => ({
+      message: warning.message,
+      severity: warning.severity === 'required' ? 'required' : 'recommended',
+    }))
+    .sort((left, right) => (left.severity === right.severity ? 0 : left.severity === 'required' ? -1 : 1));
+}
+
+function warningSeverityTone(warnings) {
+  return warnings.some((warning) => warning.severity === 'required') ? 'required' : 'recommended';
 }
 
 function renderScenarioWorkbench(status = state.status, events = state.events) {
@@ -1078,7 +1092,7 @@ function renderEvents(events) {
       const event = record.event;
       const warnings = recordWarnings(record, summary);
       return `
-        <tr class="${warnings.length ? 'has-audit-warning' : ''}">
+        <tr class="${warnings.length ? 'has-audit-warning' : ''}" ${warnings.length ? `data-warning-severity="${warningSeverityTone(warnings)}"` : ''}>
           <td>${record.sequence_no}</td>
           <td><span class="pill">${escapeHtml(event.cte_type)}</span></td>
           <td><button class="link-button" data-lot="${escapeHtml(event.traceability_lot_code)}">${escapeHtml(event.traceability_lot_code)}</button></td>
@@ -1088,7 +1102,7 @@ function renderEvents(events) {
           <td>${escapeHtml(record.destination_mode)}</td>
           <td>
             ${escapeHtml(record.delivery_attempts || 0)}
-            ${warnings.length ? `<small class="status-warning">${escapeHtml(warnings[0])}</small>` : ''}
+            ${warnings.length ? `<small class="status-warning" data-severity="${warnings[0].severity}">${escapeHtml(warnings[0].severity === 'required' ? `Required: ${warnings[0].message}` : warnings[0].message)}</small>` : ''}
           </td>
           <td>
             <span class="status-pill" data-tone="${deliveryTone(record.delivery_status)}">${escapeHtml(record.delivery_status)}</span>
@@ -1194,7 +1208,7 @@ function renderLineage(payload, traceabilityLotCode) {
         .map(([key, value]) => `<li><strong>${escapeHtml(key)}:</strong> ${escapeHtml(formatKdeValue(value))}</li>`)
         .join('');
       return `
-        <article class="lineage-card${warnings.length ? ' has-audit-warning' : ''}">
+        <article class="lineage-card${warnings.length ? ' has-audit-warning' : ''}" ${warnings.length ? `data-warning-severity="${warningSeverityTone(warnings)}"` : ''}>
           <header>
             <h3>${escapeHtml(cteLabel(event.cte_type))}</h3>
             <span>${formatDateTime(event.timestamp)}</span>
@@ -1202,7 +1216,7 @@ function renderLineage(payload, traceabilityLotCode) {
           <p><strong>Lot:</strong> ${escapeHtml(event.traceability_lot_code)}</p>
           <p><strong>Product:</strong> ${escapeHtml(event.product_description)}</p>
           <p><strong>Location:</strong> ${escapeHtml(event.location_name)}</p>
-          ${warnings.length ? `<p class="lineage-warning">${escapeHtml(warnings.join(' • '))}</p>` : ''}
+          ${warnings.length ? `<p class="lineage-warning" data-severity="${warningSeverityTone(warnings)}">${escapeHtml(warnings.map((warning) => (warning.severity === 'required' ? `Required: ${warning.message}` : warning.message)).join(' • '))}</p>` : ''}
           <ul>${kdes}</ul>
         </article>
       `;
@@ -1247,7 +1261,11 @@ function renderImportResult(result) {
   const warningList = warnings
     .map((warning) => {
       const field = warning.field ? ` ${escapeHtml(warning.field)}:` : '';
-      return `<li>Row ${escapeHtml(warning.row)}${field} ${escapeHtml(warning.message)}</li>`;
+      // #189: an FDA-mandatory KDE and a nice-to-have used to read
+      // identically here. The backend distinguishes them now, so say which.
+      const severity = warning.severity === 'required' ? 'required' : 'recommended';
+      const prefix = severity === 'required' ? 'Required — ' : '';
+      return `<li data-severity="${severity}">Row ${escapeHtml(warning.row)}${field} ${escapeHtml(prefix)}${escapeHtml(warning.message)}</li>`;
     })
     .join('');
   ids.importResults.innerHTML = `
