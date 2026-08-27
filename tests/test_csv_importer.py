@@ -79,3 +79,23 @@ transformation,TLC-OUT,Fresh Cut Salad Mix,50,cases,ReadyFresh Processing Plant,
         ),
         ("reference_document", "Missing expected transformation KDE: reference_document"),
     }
+
+
+def test_parse_seed_lot_rejects_non_finite_quantity():
+    """#98: the seed-lots import path shares _parse_quantity, so a literal
+    ``inf`` token must be rejected there too -- it is > 0 and so passes the
+    positivity check on the merits, but has no RFC 8259 JSON encoding.
+    """
+    parsed = parse_csv_import(
+        CSVImportType.SEED_LOTS,
+        """traceability_lot_code,product_description,quantity,unit_of_measure,location_name
+TLC-SEED-NONFINITE,Romaine Hearts,inf,cases,Valley Fresh Farms
+""",
+        default_timestamp=datetime(2026, 2, 7, 11, 30, tzinfo=UTC),
+    )
+
+    assert parsed.total == 1
+    assert parsed.events == []
+    assert [(error.row, error.field, error.message) for error in parsed.errors] == [
+        (2, "quantity", "Quantity must be a finite number"),
+    ]

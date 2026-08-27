@@ -3,6 +3,7 @@ from __future__ import annotations
 import csv
 import io
 import json
+import math
 import re
 from dataclasses import dataclass
 from datetime import UTC, datetime
@@ -351,6 +352,19 @@ def _parse_quantity(value: str, row_number: int, errors: list[CSVImportError]) -
         quantity = float(value)
     except ValueError:
         errors.append(CSVImportError(row=row_number, field="quantity", message="Quantity must be numeric"))
+        return None
+
+    # float() happily accepts the literal tokens "nan", "inf", "-inf" and
+    # overflowing decimals like "1e400", and NaN compares False against every
+    # ordering operator -- so `nan <= 0` is False and the positivity check
+    # below waves it straight through (#98). Non-finite floats have no JSON
+    # representation: json.dumps would emit a bare NaN/Infinity token, which
+    # is not RFC 8259 and is rejected by strict parsers downstream. Reject
+    # here, before the value reaches the model, the store, or the wire.
+    if not math.isfinite(quantity):
+        errors.append(
+            CSVImportError(row=row_number, field="quantity", message="Quantity must be a finite number")
+        )
         return None
 
     if quantity <= 0:
