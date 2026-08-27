@@ -661,13 +661,13 @@ class SimulationController:
         request: DeliveryRetryRequest | None = None,
     ) -> DeliveryRetryResponse:
         request = request or DeliveryRetryRequest()
-        # --- Snapshot phase, under _retry_lock then self._lock --------------
         # _retry_lock is held for the whole call, delivery included: unlike
         # every other delivery path, this one selects the batch it posts from
         # shared mutable state (the store's failed records), so two
         # overlapping calls would otherwise both select and both post the
         # same records now that the POSTs happen with self._lock released
-        # (#208). It blocks nothing but another retry.
+        # (#208). It blocks nothing but another retry -- step, reset,
+        # configure_integration and the rest never take it.
         async with self._retry_lock:
             result = await self._retry_failed_delivery_locked(request)
         await self._publish_update()
@@ -676,6 +676,14 @@ class SimulationController:
     async def _retry_failed_delivery_locked(
         self, request: DeliveryRetryRequest
     ) -> DeliveryRetryResponse:
+        """The body of retry_failed_delivery; caller must hold ``_retry_lock``.
+
+        Split out purely so the lock is acquired once, in one place, around
+        all three of this path's phases -- snapshot under ``self._lock``,
+        POST per group with it released, commit back under it -- rather
+        than around a body with several early returns.
+        """
+        # --- Snapshot phase, under self._lock -------------------------------
         async with self._lock:
             base_config = self.config
             delivery = request.delivery or base_config.delivery
