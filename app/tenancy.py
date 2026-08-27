@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import logging
 import os
 import shutil
@@ -11,7 +12,7 @@ from typing import Any
 from fastapi import HTTPException
 
 from .auth import DEFAULT_TENANT_ID, TENANT_HEADER, TenantContext, normalize_tenant_id
-from .controller import SimulationController
+from .controller import DEFAULT_SHUTDOWN_TIMEOUT_SECONDS, SimulationController
 from .engine import LegitFlowEngine
 from .mock_service import MockRegEngineService
 from .regengine_client import LiveRegEngineClient
@@ -99,8 +100,37 @@ _tenant_lock = RLock()
 
 
 async def shutdown_tenant_controllers() -> None:
-    for tenant_controller in set(_tenant_controllers.values()):
-        await tenant_controller.shutdown()
+    """Stop every tenant's run loop, concurrently and under a bound.
+
+    This used to await each `shutdown()` in turn. A controller parked on a
+    delivery can take the full live-endpoint timeout to stop, so with N
+    tenants the serial version made container shutdown N x that timeout --
+    and on a 100-tenant process (the `DEFAULT_MAX_TENANTS` cap) that is long
+    enough for the orchestrator to SIGKILL instead, which is the one way a
+    store *can* be left torn (#208, criterion 5).
+
+    Both halves matter: the shutdowns overlap, so the wall clock is one
+    timeout rather than N, and each is bounded, so a single wedged tenant
+    cannot hold the process open on its own.
+    """
+    with _tenant_lock:
+        controllers = list({id(item): item for item in _tenant_controllers.values()}.values())
+
+    results = await asyncio.gather(
+        *(
+            tenant_controller.shutdown(timeout=DEFAULT_SHUTDOWN_TIMEOUT_SECONDS)
+            for tenant_controller in controllers
+        ),
+        return_exceptions=True,
+    )
+    for tenant_controller, result in zip(controllers, results):
+        if isinstance(result, BaseException):
+            logger.warning(
+                "Shutting down controller for %s failed: %s",
+                tenant_controller.store.persist_path,
+                result,
+                exc_info=result,
+            )
 
 
 def active_controller_for_context(context: TenantContext) -> SimulationController:
