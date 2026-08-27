@@ -20,7 +20,12 @@ from ..fda_export import (
     list_fda_export_preset_summaries,
     render_fda_request_csv,
 )
-from ..mock_service import MockRegEngineHTTPError, verify_webhook_signature
+from ..mock_service import (
+    MockRegEngineHTTPError,
+    parse_signature_digest,
+    verify_webhook_signature,
+    webhook_signing_secret,
+)
 from ..schemas.domain import FDAExportPreset
 from ..schemas.exports import FDAExportPresetListResponse, FDAExportPresetSummary
 from ..schemas.ingestion import IngestPayload, MockIngestResponse
@@ -124,14 +129,36 @@ async def mock_regengine_ingest(
     # enumerating the payload shape where they should only ever have seen a
     # flat 401.
     #
-    # Reading the bytes is unavoidable -- HMAC is computed over them -- but
-    # everything downstream of the bytes now happens only after the
-    # signature checks out. Verifying against the real wire bytes rather
-    # than a round-tripped re-serialization of a parsed model is itself the
-    # point of the check; see verify_webhook_signature's docstring (#113).
-    raw_body = await request.body()
-
+    # Holding the bytes is unavoidable for the COMPARISON -- the HMAC is
+    # computed over them -- but three of the four ways a signature is
+    # rejected never look at the body at all: no header, a scheme that is
+    # not sha256, and a digest that is not hex. Those are decided first, so
+    # a caller who never signed is turned away without the body ever being
+    # accumulated (#209). Only a request carrying a digest that could
+    # plausibly verify gets to spend the server's memory.
+    #
+    # Verifying against the real wire bytes rather than a round-tripped
+    # re-serialization of a parsed model is itself the point of the check;
+    # see verify_webhook_signature's docstring (#113).
     try:
+        if webhook_signing_secret():
+            try:
+                parse_signature_digest(x_webhook_signature)
+            except MockRegEngineHTTPError:
+                # Decided without the body -- but the client is midway
+                # through sending one, and answering while it is still
+                # writing makes the server close the connection under it:
+                # the caller sees a connection reset instead of the 401
+                # that names what was wrong with their header. So the body
+                # is drained and discarded rather than skipped. That keeps
+                # the diagnostic -- the whole point of this simulator is
+                # that an integrator can read why their request failed --
+                # at chunk-sized memory instead of the whole payload.
+                await _discard_body(request)
+                raise
+
+        raw_body = await request.body()
+
         verify_webhook_signature(raw_body, x_webhook_signature)
     except MockRegEngineHTTPError as exc:
         raise HTTPException(status_code=exc.status_code, detail=exc.detail) from exc
@@ -169,6 +196,19 @@ async def mock_regengine_ingest(
         )
     except MockRegEngineHTTPError as exc:
         raise HTTPException(status_code=exc.status_code, detail=exc.detail) from exc
+
+
+async def _discard_body(request: Request) -> None:
+    """Consume and throw away a request body already decided against.
+
+    Streams the chunks and keeps none of them, so an unauthenticated
+    caller's payload costs one chunk of memory rather than the whole body
+    (twice -- Starlette's own body() holds the chunk list and the joined
+    bytes at once). Draining rather than ignoring is what lets the client
+    finish its upload and actually read the 401.
+    """
+    async for _chunk in request.stream():
+        pass
 
 
 def _parse_ingest_payload(raw_body: bytes) -> IngestPayload:
