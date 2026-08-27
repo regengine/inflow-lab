@@ -3,14 +3,11 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import logging
-import os
 import uuid
 from datetime import UTC, datetime
-from typing import Any, Mapping
-from urllib.parse import urlparse
+from typing import Any
 
 from .audit import summarize_scenario_audit
-from .contract import INFLOW_CONTRACT_VERSION
 from .csv_importer import parse_csv_import
 from .delivery import (
     DeliveryOutcome,
@@ -21,6 +18,16 @@ from .delivery import (
     event_delivery_fields,
     pair_event_responses,
     rebuild_retried_records,
+    retry_idempotency_key,
+)
+from .integration_config import (
+    apply_integration_updates,
+    build_integration_status,
+    merge_delivery_credentials,
+    preserve_delivery_credentials,
+    sanitize_public_config,
+    sanitize_saved_config,
+    validate_live_delivery,
 )
 from .demo_fixtures import get_demo_fixture
 from .engine import LegitFlowEngine
@@ -45,16 +52,9 @@ from .schemas.scenarios import (
     ScenarioSaveSnapshot,
     ScenarioSaveSummary,
 )
-from .schemas.simulation import (
-    DeliveryConfig,
-    SimulationConfig,
-    StepResponse,
-)
-from .regengine_client import (
-    DEFAULT_LIVE_INGEST_ENDPOINT,
-    WEBHOOK_HMAC_SECRET_ENV,
-    LiveRegEngineClient,
-)
+from .schemas.simulation import SimulationConfig, StepResponse
+from .regengine_client import LiveRegEngineClient
+from .runtime_guard import MultiProcessRuntimeError, enforce_single_process_runtime
 from .schemas.integration import IntegrationConfigureRequest, IntegrationStatusResponse
 from .scenario_saves import ScenarioSaveStore
 from .scenarios import ScenarioId, get_scenario
@@ -64,60 +64,10 @@ from .store import EventStore
 logger = logging.getLogger(__name__)
 
 
-# Simulation run state -- `running`, `_task`, `_stop_event` -- and the tenant
-# controller registry in `tenancy.py` live in one process's memory. There is no
-# shared coordination point, so under two or more workers each request lands on
-# an arbitrary process: a Stop can return 200 while a *different* worker's run
-# loop keeps generating and delivering events, including live traffic.
-#
-# Single-process is therefore a hard requirement, not a coincidence of the
-# current Dockerfile CMD happening to omit `--workers`. Rather than leave it as
-# an accident that a later `WEB_CONCURRENCY=4` or a Railway replica bump would
-# silently break, the invariant is enforced here: a controller refuses to exist
-# in a process that was told to run alongside siblings. See
-# DEPLOYMENT_PROFILES.md ("Single-process requirement").
-#
-# Moving run/stop state to a shared coordination point (so Stop works from any
-# worker) is the larger fix and remains open; this makes the current limit
-# loud instead of silent.
-WORKER_COUNT_ENV_VARS = ("WEB_CONCURRENCY", "UVICORN_WORKERS", "GUNICORN_WORKERS")
-REPLICA_COUNT_ENV_VARS = ("RAILWAY_REPLICA_COUNT", "WEB_REPLICAS")
-
-
-class MultiProcessRuntimeError(RuntimeError):
-    """Raised when the process is configured to run alongside sibling workers."""
-
-
-def _configured_process_count(name: str, environ: Mapping[str, str]) -> int | None:
-    """Parse a worker/replica count env var, ignoring unset or malformed values."""
-    raw_value = (environ.get(name) or "").strip()
-    if not raw_value:
-        return None
-    try:
-        return int(raw_value)
-    except ValueError:
-        logger.warning("Ignoring malformed %s=%r when checking worker count", name, raw_value)
-        return None
-
-
-def enforce_single_process_runtime(environ: Mapping[str, str] | None = None) -> None:
-    """Refuse to run in a process configured for multi-worker/multi-replica.
-
-    Only an *explicit* count above 1 trips this: an unset or malformed value
-    is the single-process default and is allowed through, so the documented
-    local and Railway profiles keep working untouched.
-    """
-    environ = os.environ if environ is None else environ
-    for name in (*WORKER_COUNT_ENV_VARS, *REPLICA_COUNT_ENV_VARS):
-        count = _configured_process_count(name, environ)
-        if count is not None and count > 1:
-            raise MultiProcessRuntimeError(
-                f"{name}={count} would run the simulator in more than one process, but "
-                "simulation run/stop state is per-process: a Stop request could return "
-                "200 while another process keeps delivering events. Run a single worker "
-                "and a single replica (see DEPLOYMENT_PROFILES.md)."
-            )
-
+# The single-process guard and the delivery-config vocabulary now live in
+# ``app.runtime_guard`` and ``app.integration_config``. `MultiProcessRuntimeError`
+# and `enforce_single_process_runtime` stay importable from here because that is
+# where the controller enforces them and where tests reach for them.
 
 # Delivery mechanics now live in ``app.delivery``. These names stay importable
 # from ``app.controller`` because tests and older callers reach for them here.
@@ -266,8 +216,8 @@ class SimulationController:
         """
         async with self._lifecycle_lock:
             async with self._lock:
-                config = self._preserve_delivery_credentials(config)
-                _validate_live_delivery(config.delivery)
+                config = preserve_delivery_credentials(self.config.delivery, config)
+                validate_live_delivery(config.delivery)
                 previous_config = self.config
             engine_changed = (
                 config.seed != previous_config.seed
@@ -367,7 +317,7 @@ class SimulationController:
             await self._stop_run_loop()
             async with self._lock:
                 if config is not None:
-                    self.config = self._preserve_delivery_credentials(config)
+                    self.config = preserve_delivery_credentials(self.config.delivery, config)
                 await self._configure_store(self.config.persist_path)
                 self.engine.reset(self.config.seed, scenario=self.config.scenario, scale=self.config.scale)
                 self.store.reset()
@@ -381,7 +331,7 @@ class SimulationController:
 
     async def step(self, batch_size: int | None = None, config: SimulationConfig | None = None) -> StepResponse:
         async with self._lock:
-            _validate_live_delivery(self.config.delivery)
+            validate_live_delivery(self.config.delivery)
             step_config = self.config.model_copy(deep=True)
             epoch = self._store_epoch
             size = batch_size or step_config.batch_size
@@ -440,7 +390,7 @@ class SimulationController:
             persist_path = request.persist_path or self.config.persist_path
             source = request.source or self.config.source
             delivery = request.delivery or self.config.delivery
-            _validate_live_delivery(delivery)
+            validate_live_delivery(delivery)
             replay_config = self.config.model_copy(
                 update={
                     "source": source,
@@ -521,7 +471,7 @@ class SimulationController:
         async with self._lock:
             source = request.source or self.config.source
             delivery = request.delivery or self.config.delivery
-            _validate_live_delivery(delivery)
+            validate_live_delivery(delivery)
             import_config = self.config.model_copy(
                 update={
                     "source": source,
@@ -632,8 +582,8 @@ class SimulationController:
             await self._stop_run_loop()
             async with self._lock:
                 source = request.source or self.config.source
-                delivery = self._merge_delivery_credentials(request.delivery)
-                _validate_live_delivery(delivery)
+                delivery = merge_delivery_credentials(self.config.delivery, request.delivery)
+                validate_live_delivery(delivery)
                 self.config = self.config.model_copy(
                     update={
                         "source": source,
@@ -717,7 +667,7 @@ class SimulationController:
         async with self._lock:
             config = request.config or self.config
             config = config.model_copy(update={"scenario": scenario_id}, deep=True)
-            config = self._sanitize_saved_config(config)
+            config = sanitize_saved_config(config)
             records = self.store.all_between()
             snapshot = self.scenario_saves.save_snapshot(
                 scenario=scenario_id,
@@ -765,7 +715,7 @@ class SimulationController:
     ) -> DeliveryRetryResponse:
         request = request or DeliveryRetryRequest()
         async with self._lock:
-            delivery = self._merge_delivery_credentials(request.delivery)
+            delivery = merge_delivery_credentials(self.config.delivery, request.delivery)
             base_config = self.config.model_copy(deep=True)
             candidates = self.store.failed_delivery_records(request.record_ids, limit=request.limit)
             requested = len(request.record_ids) if request.record_ids else len(candidates)
@@ -798,7 +748,7 @@ class SimulationController:
                 error="Retry requires mock or live delivery mode.",
             )
         else:
-            _validate_live_delivery(delivery)
+            validate_live_delivery(delivery)
             posted = 0
             failed = 0
             attempted = 0
@@ -808,7 +758,7 @@ class SimulationController:
             for record in candidates:
                 source = request.source or record.payload_source
                 idempotency_key = (
-                    _retry_idempotency_key(record)
+                    retry_idempotency_key(record)
                     if delivery.mode != DestinationMode.NONE
                     else None
                 )
@@ -896,46 +846,6 @@ class SimulationController:
             )
         await self._publish_update()
         return result
-
-    def _preserve_delivery_credentials(self, config: SimulationConfig) -> SimulationConfig:
-        """Fill in credentials the caller did not send from the stored config.
-
-        `status()` scrubs `api_key` (and, in live mode, `tenant_id`) before
-        it leaves the process, so a console tab that loaded after the
-        credentials were configured has never seen them and cannot echo them
-        back. Treating their absence as "clear them" meant Start, Reset and
-        Retry silently downgraded a live integration (#148). An omitted or
-        null credential therefore keeps the stored one, exactly as
-        `/api/integration/configure` already behaves; clearing one is done
-        there, explicitly.
-        """
-        delivery = self._merge_delivery_credentials(config.delivery)
-        if delivery is config.delivery:
-            return config
-        return config.model_copy(update={"delivery": delivery}, deep=True)
-
-    def _merge_delivery_credentials(self, delivery: DeliveryConfig | None) -> DeliveryConfig:
-        """One delivery config with the caller's fields over the stored secrets.
-
-        Scoped to live delivery, which is the only mode that uses
-        credentials. Pointing the simulator back at the sandbox is also how
-        an operator stops using a live tenant, so a mock/off config is taken
-        at face value and drops the stored secret rather than keeping a live
-        credential alive in a config that no longer sends to it.
-        """
-        stored = self.config.delivery
-        if delivery is None:
-            return stored
-        if delivery.mode != DestinationMode.LIVE:
-            return delivery
-        updates: dict[str, Any] = {}
-        if delivery.api_key is None and stored.api_key:
-            updates["api_key"] = stored.api_key
-        if delivery.tenant_id is None and stored.tenant_id:
-            updates["tenant_id"] = stored.tenant_id
-        if not updates:
-            return delivery
-        return delivery.model_copy(update=updates, deep=True)
 
     async def _configure_store(self, persist_path: str) -> None:
         """Point the store at `persist_path` without blocking the event loop.
@@ -1055,7 +965,7 @@ class SimulationController:
         scenario = get_scenario(self.config.scenario)
         return {
             "running": self.running,
-            "config": self._sanitize_public_config(self.config).model_dump(mode="json"),
+            "config": sanitize_public_config(self.config).model_dump(mode="json"),
             "stats": {
                 # `StatusResponse.stats` is a free-form dict, which is why the
                 # run error rides here rather than as a sibling of `running`:
@@ -1070,59 +980,17 @@ class SimulationController:
         }
 
     def integration_status(self) -> IntegrationStatusResponse:
-        delivery = self.config.delivery
-        endpoint = str(delivery.endpoint) if delivery.endpoint else DEFAULT_LIVE_INGEST_ENDPOINT
-        return IntegrationStatusResponse(
-            mode=delivery.mode,
-            endpoint=endpoint,
-            endpoint_host=urlparse(endpoint).netloc,
-            api_key_configured=bool(delivery.api_key),
-            tenant_configured=bool(delivery.tenant_id),
-            hmac_configured=bool(os.getenv(WEBHOOK_HMAC_SECRET_ENV, "").strip()),
-            contract_version=INFLOW_CONTRACT_VERSION,
-            mock_friction=list(delivery.mock_friction),
-        )
+        return build_integration_status(self.config.delivery)
 
     async def configure_integration(
         self, request: IntegrationConfigureRequest
     ) -> IntegrationStatusResponse:
         async with self._lock:
-            updates: dict[str, Any] = {}
-            if request.mode is not None:
-                updates["mode"] = request.mode
-            if request.endpoint is not None:
-                updates["endpoint"] = request.endpoint
-            if request.api_key is not None:
-                updates["api_key"] = request.api_key or None
-            if request.tenant_id is not None:
-                updates["tenant_id"] = request.tenant_id or None
-            if request.mock_friction is not None:
-                updates["mock_friction"] = list(request.mock_friction)
-            delivery = self.config.delivery.model_copy(update=updates, deep=True)
-            _validate_live_delivery(delivery)
+            delivery = apply_integration_updates(self.config.delivery, request)
+            validate_live_delivery(delivery)
             self.config = self.config.model_copy(update={"delivery": delivery}, deep=True)
         await self._publish_update()
         return self.integration_status()
-
-    def _sanitize_public_config(self, config: SimulationConfig) -> SimulationConfig:
-        delivery = config.delivery.model_copy(update={"api_key": None}, deep=True)
-        if delivery.mode == DestinationMode.LIVE:
-            delivery = delivery.model_copy(update={"tenant_id": None}, deep=True)
-        return config.model_copy(update={"delivery": delivery}, deep=True)
-
-    def _sanitize_saved_config(self, config: SimulationConfig) -> SimulationConfig:
-        delivery = config.delivery.model_copy(update={"api_key": None}, deep=True)
-        if delivery.mode == DestinationMode.LIVE:
-            delivery = delivery.model_copy(
-                update={
-                    "mode": DestinationMode.MOCK,
-                    "endpoint": None,
-                    "tenant_id": None,
-                    "api_key": None,
-                },
-                deep=True,
-            )
-        return config.model_copy(update={"delivery": delivery}, deep=True)
 
     def _scenario_save_summary(self, snapshot: ScenarioSaveSnapshot) -> ScenarioSaveSummary:
         lot_codes = []
@@ -1141,37 +1009,3 @@ class SimulationController:
             persist_path=snapshot.config.persist_path,
             delivery_mode=snapshot.config.delivery.mode,
         )
-
-
-def _validate_live_delivery(delivery: DeliveryConfig) -> None:
-    if delivery.mode == DestinationMode.LIVE and (not delivery.api_key or not delivery.tenant_id):
-        raise ValueError("Live delivery requires both api_key and tenant_id")
-
-
-def _retry_idempotency_key(record: StoredEventRecord) -> str | None:
-    """The key a retry of `record` should carry, or None to mint a fresh one.
-
-    A reused `Idempotency-Key` is answered from RegEngine's 24h cache
-    without revalidation, so replaying the original key can never redeliver
-    an event the server rejected per-event on a 2xx response -- the record
-    stays `failed` however many times an operator clicks retry, and the
-    cached batch's `accepted` count is folded into the retry's total (#95).
-
-    The key is therefore reused only for the case it exists to protect: an
-    attempt that produced no per-event verdict at all (a transport failure,
-    where the original request may or may not have reached the server, and
-    replay-safety is what stops a double ingest). A record carrying a
-    verdict was answered, so its retry is a genuinely new request and gets
-    a new key.
-    """
-    if record.delivery_response is not None:
-        return None
-    return _stored_idempotency_key(record)
-
-
-def _stored_idempotency_key(record: StoredEventRecord) -> str | None:
-    metadata = record.delivery_metadata or {}
-    value = metadata.get("idempotency_key")
-    if isinstance(value, str) and value:
-        return value
-    return None

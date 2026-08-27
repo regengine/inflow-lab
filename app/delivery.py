@@ -273,6 +273,36 @@ def aggregate_outcomes(outcomes: Sequence[DeliveryOutcome]) -> DeliveryOutcome:
     )
 
 
+def stored_idempotency_key(record: StoredEventRecord) -> str | None:
+    """The `Idempotency-Key` a stored record was delivered under, if any."""
+    metadata = record.delivery_metadata or {}
+    value = metadata.get("idempotency_key")
+    if isinstance(value, str) and value:
+        return value
+    return None
+
+
+def retry_idempotency_key(record: StoredEventRecord) -> str | None:
+    """The key a retry of `record` should carry, or None to mint a fresh one.
+
+    A reused `Idempotency-Key` is answered from RegEngine's 24h cache
+    without revalidation, so replaying the original key can never redeliver
+    an event the server rejected per-event on a 2xx response -- the record
+    stays `failed` however many times an operator clicks retry, and the
+    cached batch's `accepted` count is folded into the retry's total (#95).
+
+    The key is therefore reused only for the case it exists to protect: an
+    attempt that produced no per-event verdict at all (a transport failure,
+    where the original request may or may not have reached the server, and
+    replay-safety is what stops a double ingest). A record carrying a
+    verdict was answered, so its retry is a genuinely new request and gets
+    a new key.
+    """
+    if record.delivery_response is not None:
+        return None
+    return stored_idempotency_key(record)
+
+
 IDEMPOTENCY_REPLAY_ERROR = (
     "RegEngine answered this request from its idempotency cache: the response "
     "describes the original batch, so nothing was re-validated or re-ingested."

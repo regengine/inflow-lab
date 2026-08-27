@@ -18,7 +18,7 @@ from datetime import UTC, datetime
 import pytest
 from fastapi.testclient import TestClient
 
-from app.controller import _retry_idempotency_key
+from app.delivery import retry_idempotency_key
 from app.csv_importer import parse_csv_import
 from app.delivery import chunk_events, deliver_payload
 from app.fda_export import FDA_EXPORT_COLUMNS, render_fda_request_csv
@@ -211,9 +211,9 @@ def test_retry_key_is_reused_only_when_the_attempt_produced_no_verdict():
 
     # No response at all: the original request may have landed, so replaying
     # the key is what stops a double ingest.
-    assert _retry_idempotency_key(transport_failure) == "original-key"
+    assert retry_idempotency_key(transport_failure) == "original-key"
     # A verdict came back, so the retry is a new request and needs a new key.
-    assert _retry_idempotency_key(per_event_rejection) is None
+    assert retry_idempotency_key(per_event_rejection) is None
 
 
 def test_an_idempotency_replay_is_reported_instead_of_counted_as_posted():
