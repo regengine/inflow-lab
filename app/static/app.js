@@ -766,16 +766,16 @@ function updateExportLink() {
     : `${presetDescription} EPCIS uses the same lot and date filters.`;
 }
 
+// aria-disabled rather than a class: an <a> has no :disabled state, and the
+// anchor must stay focusable so activating it can explain *why* it is off.
 function setExportLinkEnabled(link, enabled) {
   if (!link) {
     return;
   }
   if (enabled) {
     link.removeAttribute('aria-disabled');
-    link.classList.remove('is-disabled');
   } else {
     link.setAttribute('aria-disabled', 'true');
-    link.classList.add('is-disabled');
   }
 }
 
