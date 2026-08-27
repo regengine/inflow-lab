@@ -3,6 +3,7 @@ from __future__ import annotations
 import os
 import sys
 from dataclasses import dataclass, field
+from functools import partial
 from pathlib import Path
 from typing import Any
 from urllib.parse import urlparse
@@ -14,6 +15,8 @@ if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
 from app.build_info import APP_VERSION
+from scripts import _smoke_common
+from scripts._smoke_common import origin_from_url, secret_values
 
 
 DEFAULT_TENANT = "remote-smoke"
@@ -270,17 +273,9 @@ def request_json(
         json=json,
         params=params,
     )
-    assert_status(config, response, 200, path)
-    try:
-        payload = response.json()
-    except ValueError as exc:
-        raise RemoteSmokeFailure(
-            f"{path}: expected JSON response, got "
-            f"{config.redact(response.text[:300])!r}"
-        ) from exc
-    if not isinstance(payload, dict):
-        raise RemoteSmokeFailure(f"{path}: expected JSON object response")
-    return payload
+    return _smoke_common.response_json(
+        RemoteSmokeFailure, response, path, redact=config.redact
+    )
 
 
 def request(
@@ -321,18 +316,23 @@ def health_response_header(
     )
 
 
+# The shared harness in _smoke_common takes the failure type as its first
+# argument so every script can keep its own exception class. These bind
+# this script's class once instead of at each of the call sites below.
+assert_equal = partial(_smoke_common.assert_equal, RemoteSmokeFailure)
+assert_in = partial(_smoke_common.assert_in, RemoteSmokeFailure)
+assert_build_sha = partial(_smoke_common.assert_build_sha, RemoteSmokeFailure)
+
+
 def assert_status(
     config: RemoteSmokeConfig,
     response: httpx.Response,
     expected_status: int,
     label: str,
 ) -> None:
-    if response.status_code != expected_status:
-        body = config.redact(response.text[:500])
-        raise RemoteSmokeFailure(
-            f"{label}: expected HTTP {expected_status}, got "
-            f"{response.status_code}: {body}"
-        )
+    _smoke_common.assert_status(
+        RemoteSmokeFailure, response, expected_status, label, redact=config.redact
+    )
 
 
 def assert_header(
@@ -342,59 +342,29 @@ def assert_header(
     expected_value: str,
     label: str,
 ) -> None:
-    actual = response.headers.get(header_name)
-    if actual != expected_value:
-        raise RemoteSmokeFailure(
-            f"{label}: expected {header_name}={expected_value!r}, got "
-            f"{config.redact(str(actual))!r}"
-        )
-
-
-def assert_equal(actual: Any, expected: Any, label: str) -> None:
-    if actual != expected:
-        raise RemoteSmokeFailure(f"{label}: expected {expected!r}, got {actual!r}")
-
-
-def assert_in(member: Any, container: Any, label: str) -> None:
-    if member not in container:
-        raise RemoteSmokeFailure(f"{label}: expected {member!r} to be present")
+    _smoke_common.assert_header(
+        RemoteSmokeFailure,
+        response,
+        header_name,
+        expected_value,
+        label,
+        redact=config.redact,
+    )
 
 
 def assert_build_info(config: RemoteSmokeConfig, build: Any) -> dict[str, Any]:
-    if not isinstance(build, dict):
-        raise RemoteSmokeFailure("healthz build: expected build metadata object")
-    assert_equal(build.get("version"), APP_VERSION, "healthz build version")
-    for field in ("commit_sha", "commit_sha_short", "branch", "deployment_id"):
-        value = build.get(field)
-        if value is not None and not isinstance(value, str):
-            raise RemoteSmokeFailure(f"healthz build {field}: expected string or null")
-    return build
-
-
-def assert_build_sha(actual: Any, expected: str, label: str) -> None:
-    if not isinstance(actual, str) or not actual:
-        raise RemoteSmokeFailure(f"{label}: expected deployed commit {expected[:12]}, got none")
-    if not _sha_prefix_match(actual, expected):
-        raise RemoteSmokeFailure(
-            f"{label}: expected deployed commit {expected[:12]}, got {actual[:12]}"
-        )
-
-
-def _sha_prefix_match(actual: str, expected: str) -> bool:
-    actual = actual.strip().lower()
-    expected = expected.strip().lower()
-    return actual.startswith(expected) or expected.startswith(actual)
+    return _smoke_common.assert_build_info(RemoteSmokeFailure, build, APP_VERSION)
 
 
 def normalize_base_url(value: str) -> str:
-    base_url = value.strip().rstrip("/")
-    parsed = urlparse(base_url)
-    if parsed.scheme not in {"http", "https"} or not parsed.netloc:
-        raise RemoteSmokeFailure(
+    return _smoke_common.normalize_base_url(
+        RemoteSmokeFailure,
+        value,
+        message=(
             "REGENGINE_REMOTE_BASE_URL must be an HTTP(S) URL such as "
             "https://demo.example.com"
-        )
-    return base_url
+        ),
+    )
 
 
 def normalize_optional_origin(value: str | None) -> str | None:
@@ -402,27 +372,12 @@ def normalize_optional_origin(value: str | None) -> str | None:
         return None
     origin = value.strip().rstrip("/")
     parsed = urlparse(origin)
-    if parsed.scheme not in {"http", "https"} or not parsed.netloc:
+    if parsed.scheme not in _smoke_common.HTTP_SCHEMES or not parsed.netloc:
         raise RemoteSmokeFailure(
             "Remote smoke CORS origins must be HTTP(S) origins such as "
             "https://demo.example.com"
         )
     return f"{parsed.scheme}://{parsed.netloc}"
-
-
-def origin_from_url(value: str) -> str:
-    parsed = urlparse(value)
-    port = f":{parsed.port}" if parsed.port else ""
-    return f"{parsed.scheme}://{parsed.hostname}{port}"
-
-
-def secret_values(*extra_values: str | None) -> set[str]:
-    values = {value for value in extra_values if value}
-    for key, value in os.environ.items():
-        key_lower = key.lower()
-        if value and any(token in key_lower for token in ("password", "api_key", "apikey", "secret", "token")):
-            values.add(value)
-    return {value for value in values if len(value) >= 4}
 
 
 if __name__ == "__main__":

@@ -18,6 +18,7 @@ if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
 from app.build_info import APP_VERSION
+from scripts._smoke_common import sha_prefix_match
 
 
 CSV_WITH_KDE_WARNINGS = """cte_type,traceability_lot_code,product_description,quantity,unit_of_measure,location_name,timestamp,kdes
@@ -293,16 +294,10 @@ def _check_healthz_build(base_url: str, expected_build_sha: str | None) -> None:
             raise RuntimeError(
                 f"/api/healthz build commit mismatch: expected {expected_build_sha[:12]}, got none"
             )
-        if not _sha_prefix_match(actual, expected_build_sha):
+        if not sha_prefix_match(actual, expected_build_sha):
             raise RuntimeError(
                 f"/api/healthz build commit mismatch: expected {expected_build_sha[:12]}, got {actual[:12]}"
             )
-
-
-def _sha_prefix_match(actual: str, expected: str) -> bool:
-    actual = actual.strip().lower()
-    expected = expected.strip().lower()
-    return actual.startswith(expected) or expected.startswith(actual)
 
 
 def _wait_for_healthz(base_url: str, process: subprocess.Popen[str]) -> None:

@@ -87,6 +87,7 @@ app/
   workflows/codex-autopilot.yml
   workflows/remote-smoke.yml
 scripts/
+  _smoke_common.py       # Shared assertion/redaction harness for the smoke scripts
   smoke_regression.py    # End-to-end API smoke for demo-ready release checks
   browser_smoke.py       # Headless Playwright dashboard smoke
   remote_smoke.py        # HTTP smoke harness for deployed shared-demo instances

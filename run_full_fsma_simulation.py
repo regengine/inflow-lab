@@ -4,6 +4,7 @@ import base64
 import shutil
 import sys
 from collections import Counter
+from functools import partial
 from typing import Any
 
 from fastapi.testclient import TestClient
@@ -17,6 +18,7 @@ from app.schemas.domain import RegEngineEvent
 # the real golden-path-demo directory behind in the configured store
 # (#108).
 from app.tenancy import tenant_dir
+from scripts import _smoke_common
 
 
 TENANT_ID = "golden-path-demo"
@@ -209,26 +211,19 @@ def cleanup_demo_tenant() -> None:
     shutil.rmtree(tenant_dir(TENANT_ID), ignore_errors=True)
 
 
+# _smoke_common holds the one implementation of this harness, shared with
+# the other smoke scripts (#139). It takes the failure type first so each
+# script keeps its own exception class; bind it once rather than at every
+# call site.
+assert_status = partial(_smoke_common.assert_status, SimulationFailure)
+assert_equal = partial(_smoke_common.assert_equal, SimulationFailure)
+assert_in = partial(_smoke_common.assert_in, SimulationFailure)
+
+
 def assert_json(response, expected_status: int) -> dict[str, Any]:
-    assert_status(response, expected_status)
-    return response.json()
-
-
-def assert_status(response, expected_status: int) -> None:
-    if response.status_code != expected_status:
-        raise SimulationFailure(
-            f"Expected status {expected_status}, got {response.status_code}: {response.text}"
-        )
-
-
-def assert_equal(actual: Any, expected: Any, label: str) -> None:
-    if actual != expected:
-        raise SimulationFailure(f"{label}: expected {expected!r}, got {actual!r}")
-
-
-def assert_in(member: Any, container: Any, label: str) -> None:
-    if member not in container:
-        raise SimulationFailure(f"{label}: expected {member!r} to be present")
+    return _smoke_common.response_json(
+        SimulationFailure, response, "response", expected_status=expected_status
+    )
 
 
 def _env(name: str) -> str:

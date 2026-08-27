@@ -4,10 +4,18 @@ import argparse
 import os
 import sys
 from dataclasses import dataclass, field
+from functools import partial
+from pathlib import Path
 from typing import Any
-from urllib.parse import urlparse
 
 import httpx
+
+REPO_ROOT = Path(__file__).resolve().parents[1]
+if str(REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPO_ROOT))
+
+from scripts import _smoke_common  # noqa: E402
+from scripts._smoke_common import secret_values  # noqa: E402
 
 
 DEFAULT_TIMEOUT_SECONDS = 30.0
@@ -331,16 +339,7 @@ def request_json(
     params: dict[str, str] | None = None,
 ) -> dict[str, Any]:
     response = request(client, config, method, path, json=json, params=params)
-    assert_status(config, response, 200, path)
-    try:
-        payload = response.json()
-    except ValueError as exc:
-        raise LiveTrialFailure(
-            f"{path}: expected JSON response, got {config.redact(response.text[:300])!r}"
-        ) from exc
-    if not isinstance(payload, dict):
-        raise LiveTrialFailure(f"{path}: expected JSON object response")
-    return payload
+    return _smoke_common.response_json(LiveTrialFailure, response, path, redact=config.redact)
 
 
 def request(
@@ -362,43 +361,21 @@ def request(
     )
 
 
+# _smoke_common's helpers take the failure type first so each script keeps
+# its own exception class; bind it once here rather than at every call site.
+assert_equal = partial(_smoke_common.assert_equal, LiveTrialFailure)
+normalize_base_url = partial(_smoke_common.normalize_base_url, LiveTrialFailure)
+
+
 def assert_status(
     config: LiveTrialConfig,
     response: httpx.Response,
     expected_status: int,
     label: str,
 ) -> None:
-    if response.status_code != expected_status:
-        raise LiveTrialFailure(
-            f"{label}: expected HTTP {expected_status}, got "
-            f"{response.status_code}: {config.redact(response.text[:500])}"
-        )
-
-
-def assert_equal(actual: Any, expected: Any, label: str) -> None:
-    if actual != expected:
-        raise LiveTrialFailure(f"{label}: expected {expected!r}, got {actual!r}")
-
-
-def normalize_base_url(value: str) -> str:
-    base_url = value.strip().rstrip("/")
-    parsed = urlparse(base_url)
-    if parsed.scheme not in {"http", "https"} or not parsed.netloc:
-        raise LiveTrialFailure(f"Expected an HTTP(S) URL, got {value!r}")
-    return base_url
-
-
-def secret_values(*extra_values: str | None) -> set[str]:
-    values = {value for value in extra_values if value}
-    for key, value in os.environ.items():
-        key_lower = key.lower()
-        credential_name = any(
-            token in key_lower
-            for token in ("password", "api_key", "apikey", "secret", "token")
-        )
-        if value and credential_name:
-            values.add(value)
-    return {value for value in values if len(value) >= 4}
+    _smoke_common.assert_status(
+        LiveTrialFailure, response, expected_status, label, redact=config.redact
+    )
 
 
 if __name__ == "__main__":

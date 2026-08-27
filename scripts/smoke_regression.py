@@ -4,6 +4,7 @@ import base64
 import os
 import shutil
 import sys
+from functools import partial
 from pathlib import Path
 from typing import Any
 
@@ -21,6 +22,7 @@ from app.main import app
 # the cleanup rmtree miss -- leaving release-smoke tenants behind in
 # whatever store the operator's shell actually pointed at (#108).
 from app.tenancy import tenant_dir, tenant_events_path
+from scripts import _smoke_common
 
 
 TENANTS = ["release-smoke-main", "release-smoke-other"]
@@ -181,26 +183,19 @@ def cleanup_smoke_tenants() -> None:
         shutil.rmtree(tenant_dir(tenant_id), ignore_errors=True)
 
 
+# _smoke_common holds the one implementation of this harness, shared with
+# the other smoke scripts (#139). It takes the failure type first so each
+# script keeps its own exception class; bind it once rather than at every
+# call site.
+assert_status = partial(_smoke_common.assert_status, SmokeFailure)
+assert_equal = partial(_smoke_common.assert_equal, SmokeFailure)
+assert_in = partial(_smoke_common.assert_in, SmokeFailure)
+
+
 def assert_json(response, expected_status: int) -> dict[str, Any]:
-    assert_status(response, expected_status)
-    return response.json()
-
-
-def assert_status(response, expected_status: int) -> None:
-    if response.status_code != expected_status:
-        raise SmokeFailure(
-            f"Expected status {expected_status}, got {response.status_code}: {response.text}"
-        )
-
-
-def assert_equal(actual: Any, expected: Any, label: str) -> None:
-    if actual != expected:
-        raise SmokeFailure(f"{label}: expected {expected!r}, got {actual!r}")
-
-
-def assert_in(member: Any, container: Any, label: str) -> None:
-    if member not in container:
-        raise SmokeFailure(f"{label}: expected {member!r} to be present")
+    return _smoke_common.response_json(
+        SmokeFailure, response, "response", expected_status=expected_status
+    )
 
 
 if __name__ == "__main__":
