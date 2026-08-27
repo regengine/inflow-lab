@@ -13,9 +13,6 @@ tests/support/api_client.py.
 
 from tests.support.api_client import client, reset_app_state
 
-SECRET = "regengine-live-secret"
-PUBLIC_ENDPOINT = "https://www.regengine.co/api/v1/webhooks/ingest"
-
 
 def setup_function() -> None:
     # reset shared app state between tests
