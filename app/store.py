@@ -229,7 +229,24 @@ class EventStore:
 
         with self._lock:
             if path.exists():
-                with path.open("r", encoding="utf-8") as handle:
+                # Opened in BINARY mode, deliberately (#93). A text-mode
+                # handle decodes as it iterates, so a run of invalid UTF-8
+                # bytes anywhere in the file raises UnicodeDecodeError out
+                # of the `for` statement itself -- outside the try below,
+                # and therefore past every skip-and-log guard here. That is
+                # the same whole-read abort this method exists to prevent,
+                # just triggered by byte corruption instead of a syntax
+                # error: torn writes, a truncated volume restore, or a file
+                # written by something that was not this app.
+                #
+                # Reading bytes and letting model_validate_json do the
+                # decoding moves that failure inside the try, where it
+                # arrives as a pydantic ValidationError (a ValueError) and
+                # is skipped and logged exactly like any other unparseable
+                # line. Iterating a binary handle still splits on b"\n",
+                # which is precisely what _serialize_record writes, so
+                # line numbering is unchanged.
+                with path.open("rb") as handle:
                     for line_number, line in enumerate(handle, start=1):
                         if not line.strip():
                             continue
@@ -467,7 +484,41 @@ class EventStore:
                     self._counter = next_sequence_no
                     self._records.appendleft(record)
                     stored.append(record)
+                if stored:
+                    self._fsync_appended(handle)
         return stored
+
+    def _fsync_appended(self, handle: Any) -> None:
+        """Force this batch's appended bytes to stable storage (#93).
+
+        ``flush()`` in the loop above only pushes the bytes out of Python's
+        buffer into the OS page cache. That is enough to make a write error
+        surface synchronously and enough to survive the process dying, but
+        not enough to survive the machine losing power -- so an
+        acknowledged append could still be missing after a hard restart.
+        ``update_many``/``replace_all`` get their durability from the tmp +
+        ``os.replace`` swap in ``_write_records``; the append path had no
+        equivalent, which is the durability half of #93.
+
+        A tmp + rename would give the same guarantee here only by
+        rewriting the entire log on every append -- turning an O(1) append
+        into O(total records), on the hot path every step() takes. #93
+        names ``fsync`` as the alternative for exactly this reason.
+
+        One fsync per *batch*, not per record: the per-record ``flush()``
+        already supplies the error detection and the write-then-commit
+        ordering the loop depends on, and an fsync per record would make a
+        multi-thousand-row CSV import pay a disk round-trip per row.
+
+        Skipped for anything that is not a regular file: the persist path
+        can legitimately point at a character device (the durability tests
+        use /dev/full to force ENOSPC), which has no durable state to
+        flush. Same constraint ``_truncate_torn_tail`` and
+        ``_resync_counter_from_disk`` already carry, for the same reason.
+        """
+        if not self.persist_path.is_file():
+            return
+        os.fsync(handle.fileno())
 
     def update_many(self, records: Iterable[StoredEventRecord]) -> list[StoredEventRecord]:
         self._refuse_if_retired()
