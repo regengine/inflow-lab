@@ -25,15 +25,26 @@ made to match what those already-correct modules expect, not the reverse.
 from __future__ import annotations
 
 from collections import defaultdict
+from datetime import UTC, datetime, timedelta
 
 import pytest
 
 from app.audit import summarize_scenario_audit
-from app.demo_fixtures import DEMO_FIXTURES, DemoFixture
+from app.demo_fixtures import (
+    DEMO_FIXTURES,
+    FIXTURE_RECENCY_DAYS,
+    DemoFixture,
+    get_demo_fixture,
+)
 from app.engine import LegitFlowEngine
-from app.mock_service import validate_event_like_regengine
+from app.mock_service import (
+    MAX_EVENT_AGE_DAYS,
+    MockRegEngineService,
+    validate_event_like_regengine,
+)
 from app.scenarios import SCENARIO_PRESETS, ScenarioId, ScenarioPreset, _gln, get_scenario
 from app.schemas.domain import StoredEventRecord
+from app.schemas.ingestion import IngestPayload
 
 # A live run needs enough events to exercise harvest, cooling, packing,
 # shipping, receiving, and transformation at least once each -- 120 matches
@@ -251,3 +262,155 @@ def test_copacker_nut_butter_no_longer_collides_with_dairy_or_seafood() -> None:
     assert not _non_farm_glns(copacker) & _non_farm_glns(seafood), (
         "copacker cooler/packer/processor/dc/retailer GLNs still collide with seafood's"
     )
+
+
+# ---------------------------------------------------------------------------
+# #199 -- shipped fixtures must stay inside RegEngine's 90-day replay window.
+#
+# The fixture literals in app/demo_fixtures.py are fixed dates (2026-02-05
+# and friends), which the golden export tests depend on. What must not be
+# fixed is how old they are when *loaded*: live ingest rejects anything older
+# than MAX_EVENT_AGE_DAYS, so a literal date silently rots by one day every
+# day until the Load Demo Fixture walkthrough fails wholesale against a real
+# RegEngine -- while the mock keeps accepting it. get_demo_fixture() rebases
+# onto the current date, so these assert the property at load time and at an
+# arbitrary future run date.
+# ---------------------------------------------------------------------------
+
+_FIXTURE_IDS = tuple(DEMO_FIXTURES)
+
+
+@pytest.mark.parametrize("fixture_id", _FIXTURE_IDS, ids=lambda f: f.value)
+def test_loaded_fixture_events_are_inside_the_replay_window(fixture_id) -> None:
+    now = datetime.now(UTC)
+    fixture = get_demo_fixture(fixture_id)
+
+    for fixture_event in fixture.events:
+        age = now - fixture_event.event.timestamp
+        assert age < timedelta(days=MAX_EVENT_AGE_DAYS), (
+            f"{fixture_id.value} / {fixture_event.event.traceability_lot_code} is "
+            f"{age.days} days old; live ingest rejects past {MAX_EVENT_AGE_DAYS}"
+        )
+        # Not in the future either: both the mock and live reject events past
+        # a small future ceiling, so rebasing must not overshoot.
+        assert fixture_event.event.timestamp <= now
+
+
+@pytest.mark.parametrize("years_from_now", [1, 5, 50], ids=["1y", "5y", "50y"])
+@pytest.mark.parametrize("fixture_id", _FIXTURE_IDS, ids=lambda f: f.value)
+def test_fixtures_cannot_silently_rot_at_a_future_run_date(fixture_id, years_from_now) -> None:
+    """The anti-rot guarantee: the window property holds whenever the repo is
+    run, not just on the day the fixtures were written.
+    """
+    future_now = datetime.now(UTC) + timedelta(days=365 * years_from_now)
+    fixture = get_demo_fixture(fixture_id, now=future_now)
+
+    for fixture_event in fixture.events:
+        age = future_now - fixture_event.event.timestamp
+        assert timedelta(0) <= age < timedelta(days=MAX_EVENT_AGE_DAYS)
+
+
+@pytest.mark.parametrize("fixture_id", _FIXTURE_IDS, ids=lambda f: f.value)
+def test_rebasing_preserves_relative_spacing_and_kde_dates(fixture_id) -> None:
+    """The lineage narrative is carried by the *gaps* between events, so the
+    rebased copy has to be a rigid translation of the original -- and any
+    bare-date KDE has to move with the timestamp it describes, or a record
+    starts contradicting itself (a harvest_date of 2026-02-05 on an event
+    stamped last Tuesday).
+    """
+    original = DEMO_FIXTURES[fixture_id]
+    rebased = get_demo_fixture(fixture_id)
+
+    assert len(rebased.events) == len(original.events)
+
+    shifts = {
+        rebased_event.event.timestamp - original_event.event.timestamp
+        for original_event, rebased_event in zip(original.events, rebased.events, strict=True)
+    }
+    # Exactly one offset across every event == spacing and ordering preserved.
+    assert len(shifts) == 1
+    (shift,) = shifts
+    assert shift.seconds == 0, "whole days only, so each event keeps its time of day"
+
+    for original_event, rebased_event in zip(original.events, rebased.events, strict=True):
+        assert rebased_event.parent_lot_codes == original_event.parent_lot_codes
+        assert (
+            rebased_event.event.traceability_lot_code
+            == original_event.event.traceability_lot_code
+        )
+        for key, original_value in original_event.event.kdes.items():
+            rebased_value = rebased_event.event.kdes[key]
+            if key.endswith("_date"):
+                assert (
+                    datetime.fromisoformat(rebased_value).date()
+                    == datetime.fromisoformat(original_value).date() + shift
+                ), key
+            else:
+                assert rebased_value == original_value, key
+
+
+@pytest.mark.parametrize("fixture_id", _FIXTURE_IDS, ids=lambda f: f.value)
+def test_loaded_fixtures_pass_ingest_with_the_age_window_enforced(fixture_id) -> None:
+    """Acceptance criterion: ``enforce_event_age_window=True`` can be turned on
+    without rejecting fixture events. That flag has to stay off by default for
+    now only because dozens of *other* tests still use the fixed 2026-02-05
+    timestamp as their canonical valid event (#102's remaining half) -- the
+    fixtures themselves no longer stand in the way.
+    """
+    now = datetime.now(UTC)
+    fixture = get_demo_fixture(fixture_id, now=now)
+
+    for fixture_event in fixture.events:
+        assert validate_event_like_regengine(fixture_event.event, now=now) == [], (
+            f"{fixture_id.value} / {fixture_event.event.traceability_lot_code}"
+        )
+
+    service = MockRegEngineService(enforce_event_age_window=True)
+    response = service.ingest(
+        IngestPayload(
+            source="fixture-window-check",
+            events=[fixture_event.event for fixture_event in fixture.events],
+        )
+    )
+    assert [event.status for event in response.events] == ["accepted"] * len(fixture.events)
+
+
+def test_engine_generated_events_also_pass_with_the_age_window_enforced() -> None:
+    """The other half of the same acceptance criterion. The engine anchors its
+    clock to ``now - 12h``, so this should already hold -- pinned so a future
+    change to the engine's time cursor cannot quietly break the flag.
+    """
+    now = datetime.now(UTC)
+    engine = LegitFlowEngine(seed=_LIVE_SEED, scenario=ScenarioId.LEAFY_GREENS_SUPPLIER)
+    events = [engine.next_event()[0] for _ in range(_LIVE_EVENT_COUNT)]
+
+    for event in events:
+        assert validate_event_like_regengine(event, now=now) == [], event.traceability_lot_code
+
+
+@pytest.mark.parametrize("fixture_id", _FIXTURE_IDS, ids=lambda f: f.value)
+def test_rebasing_does_not_regress_the_audit_score(fixture_id) -> None:
+    """#172's fix made all three fixtures score 100%. Rebasing must not undo
+    that -- the audit reads KDEs, and the KDE dates move during a rebase.
+    """
+    fixture = get_demo_fixture(fixture_id)
+    summary = summarize_scenario_audit(_fixture_records(fixture), get_scenario(fixture.scenario))
+
+    assert summary["tone"] == "ready"
+    assert summary["score"] == 100
+    assert summary["warning_count"] == 0
+
+
+def test_the_newest_fixture_event_lands_where_the_rebase_intends() -> None:
+    """Pins FIXTURE_RECENCY_DAYS' contract: the set is anchored by its newest
+    event across all three fixtures, so their order relative to each other is
+    preserved too.
+    """
+    now = datetime.now(UTC)
+    newest = max(
+        fixture_event.event.timestamp
+        for fixture_id in _FIXTURE_IDS
+        for fixture_event in get_demo_fixture(fixture_id, now=now).events
+    )
+
+    assert newest.date() == (now - timedelta(days=FIXTURE_RECENCY_DAYS)).date()
