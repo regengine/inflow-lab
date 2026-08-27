@@ -114,6 +114,53 @@ def _resume_chain_hash(store: EventStore) -> str:
     return ""
 
 
+def webhook_signing_secret() -> str:
+    """The configured shared secret, or "" when signing is not enforced.
+
+    Read through a function rather than captured at import time because the
+    env var is monkeypatched per-test and, in a real deployment, is what
+    distinguishes the pre-signing migration ramp from an enforcing one.
+    """
+    return os.getenv(WEBHOOK_HMAC_SECRET_ENV, "").strip()
+
+
+def parse_signature_digest(signature_header: str | None) -> str:
+    """Check everything about X-Webhook-Signature that does not need the body.
+
+    Split out of verify_webhook_signature so the HTTP route can run these
+    checks BEFORE it reads the request body (#209). A missing header, a
+    scheme that is not sha256, and a digest that is not hexadecimal are all
+    rejections no body can rescue: the bytes are never consulted, so
+    reading them first only lets an unauthenticated caller spend the
+    server's memory on a request that was already decided. The route
+    therefore calls this first and reads the body only once a digest exists
+    that could plausibly verify.
+
+    The 401 details are unchanged from when these three checks lived inline,
+    so what a caller sees is exactly what it was.
+    """
+    if not signature_header:
+        raise MockRegEngineHTTPError(401, "Missing X-Webhook-Signature header")
+
+    scheme, _, provided_digest = signature_header.partition("=")
+    if scheme != "sha256" or not provided_digest:
+        raise MockRegEngineHTTPError(
+            401, "Unsupported X-Webhook-Signature scheme (expected 'sha256=<hex>')"
+        )
+
+    # A digest that is not pure hex cannot be a valid signature, so it fails
+    # the same way a wrong one does -- deliberately the SAME 401 detail, so
+    # the rejection reason is not itself an oracle for how the header was
+    # malformed. The check has to happen before compare_digest rather than
+    # after: compare_digest raises TypeError on a str argument containing a
+    # non-ASCII character, which escaped this module as an unhandled 500
+    # with a traceback, unauthenticated (#209).
+    if not _HEX_DIGEST_PATTERN.fullmatch(provided_digest):
+        raise MockRegEngineHTTPError(401, "Invalid X-Webhook-Signature")
+
+    return provided_digest
+
+
 def verify_webhook_signature(body: bytes | None, signature_header: str | None) -> None:
     """Reject a missing/incorrect X-Webhook-Signature the way live RegEngine does (#113).
 
@@ -149,28 +196,11 @@ def verify_webhook_signature(body: bytes | None, signature_header: str | None) -
       payload and never serializes or signs anything, so there is nothing
       to verify on that path.
     """
-    secret = os.getenv(WEBHOOK_HMAC_SECRET_ENV, "").strip()
+    secret = webhook_signing_secret()
     if not secret or body is None:
         return
 
-    if not signature_header:
-        raise MockRegEngineHTTPError(401, "Missing X-Webhook-Signature header")
-
-    scheme, _, provided_digest = signature_header.partition("=")
-    if scheme != "sha256" or not provided_digest:
-        raise MockRegEngineHTTPError(
-            401, "Unsupported X-Webhook-Signature scheme (expected 'sha256=<hex>')"
-        )
-
-    # A digest that is not pure hex cannot be a valid signature, so it fails
-    # the same way a wrong one does -- deliberately the SAME 401 detail, so
-    # the rejection reason is not itself an oracle for how the header was
-    # malformed. The check has to happen before compare_digest rather than
-    # after: compare_digest raises TypeError on a str argument containing a
-    # non-ASCII character, which escaped this module as an unhandled 500
-    # with a traceback, unauthenticated (#209).
-    if not _HEX_DIGEST_PATTERN.fullmatch(provided_digest):
-        raise MockRegEngineHTTPError(401, "Invalid X-Webhook-Signature")
+    provided_digest = parse_signature_digest(signature_header)
 
     expected_digest = hmac.new(secret.encode("utf-8"), body, hashlib.sha256).hexdigest()
     # hmac.compare_digest, never == -- a time-variable comparison leaks how
