@@ -85,9 +85,12 @@ app/
   codex/prompts/autobuild.md
   workflows/ci.yml
   workflows/codex-autopilot.yml
+  workflows/contract-pin-drift.yml
   workflows/remote-smoke.yml
 scripts/
   _smoke_common.py       # Shared assertion/redaction harness for the smoke scripts
+  regengine_kde_contract.py  # Reads RegEngine's required-KDE table out of its source
+  contract_pin_drift.py  # Fails when either repo's pin to the other goes stale
   smoke_regression.py    # End-to-end API smoke for demo-ready release checks
   browser_smoke.py       # Headless Playwright dashboard smoke
   remote_smoke.py        # HTTP smoke harness for deployed shared-demo instances
@@ -632,7 +635,7 @@ The live delivery client targets the current RegEngine webhook shape:
 }
 ```
 
-Required KDEs per CTE are mirrored in `app/cte_rules.py` and pinned to RegEngine's `REQUIRED_KDES_BY_CTE` by `tests/test_regengine_contract_pin.py`; the detailed contract reference lives in `.agents/skills/regengine-api-contract/references/contract.md`.
+Required KDEs per CTE are mirrored in `app/cte_rules.py` and pinned to RegEngine's `REQUIRED_KDES_BY_CTE` by `tests/test_regengine_contract_pin.py`. That test compares against `tests/data/regengine_required_kdes.json`, which `scripts/regengine_kde_contract.py` generates by parsing the table out of RegEngine's `services/ingestion/app/webhook_models.py` — it records the repository, path, symbol and commit it came from plus a sha256 over the table, so the copy cannot be hand-edited into agreement, and the cross-repo CI job re-extracts it from a real RegEngine checkout. The detailed contract reference lives in `.agents/skills/regengine-api-contract/references/contract.md`.
 
 **Contract version handshake.** Both sides advertise an ingest contract version (`app/contract.py` here, `webhook_models.INFLOW_CONTRACT_VERSION` in RegEngine) — inflow-lab via `/api/healthz`, `/api/health`, and `/api/integration/status`; RegEngine via `/health`. The test-connection probe compares them and reports a `contract_mismatch` verdict when deployed instances have skewed (one side running an older deploy), so version drift is a visible, named state instead of a silent live-post failure. Bump the version in both repos together whenever the wire contract changes. The mock FDA export was RegEngine's documented 11-column request export shape; it now carries two additional columns (Ship-To / Previous Source Location Description, TLC Source Reference) that FSMA 204 requires for Shipping and Receiving but that shape omitted. **RegEngine's mirrored export needs the same two columns before the shapes match again.** The EPCIS 2.0 export is a separate derived JSON-LD scaffold and does not change this webhook contract.
 
@@ -641,7 +644,16 @@ Required KDEs per CTE are mirrored in `app/cte_rules.py` and pinned to RegEngine
 - `assert_contract_pin_is_fresh()` fails an ordinary pytest test once `CONTRACT_LAST_CONFIRMED` is older than 90 days, so a pin nobody has re-checked becomes a build failure rather than a silent assumption. Override the window with `REGENGINE_CONTRACT_STALENESS_WINDOW_DAYS`. This is a deliberate time bomb: it will eventually fail with nothing actually wrong, because "nobody has verified this lately" is the condition it reports. Re-confirm the pin against RegEngine and move the date — do not delete the check.
 - `check_remote_kde_contract()` diffs `REQUIRED_KDES` against a machine-readable upstream artifact, loaded from `REGENGINE_CONTRACT_ARTIFACT_PATH` (local file) or `REGENGINE_CONTRACT_ARTIFACT_URL`. With neither set it raises rather than reporting a match, so an unverifiable check can never read as a passing one.
 
-Run both from the CLI with `uv run python -m app.contract` — exit `0` clean, `1` stale pin, `2` real mismatch, `3` unverifiable. Wiring it into CI is deliberately **not** done yet: it needs RegEngine to publish `REQUIRED_KDES_BY_CTE` as a fetchable JSON artifact first, and until that exists a CI step would just pin the build permanently red on exit `3`. Once published, the natural home is the existing weekly `schedule` trigger in `.github/workflows/ci.yml` rather than every PR, since it depends on an external resource.
+Run both from the CLI with `uv run python -m app.contract` — exit `0` clean, `1` stale pin, `2` real mismatch, `3` unverifiable. RegEngine still publishes no fetchable artifact, so the artifact is produced from source instead: `uv run python scripts/regengine_kde_contract.py extract --regengine-root <regengine checkout> --output kdes.json`, then run `python -m app.contract` with `REGENGINE_CONTRACT_ARTIFACT_PATH=kdes.json`. That is exactly what the cross-repo CI job below does.
+
+**Cross-repo ingest contract CI.** `.github/workflows/ci.yml` has a `regengine-contract` job that checks RegEngine out beside this repository, stands up Postgres, Redis, migrations and the ingestion service, and runs `scripts/live_trial.py --confirm-live` to post one signed batch into it — the only place `app/regengine_client.py` and `app/controller.py` (notably `_pair_event_responses`, written for RegEngine's rejected-first response ordering that `app/mock_service.py` cannot reproduce) meet a real RegEngine response. It runs on changes to the ingest contract surface and needs cross-repo read access:
+
+- `secrets.REGENGINE_CONTRACT_TOKEN` — a token with `contents: read` on `regengine/regengine`. The default `GITHUB_TOKEN` is scoped to this repository and cannot check another private repository out. Required unless that repository is public.
+- `vars.REGENGINE_CONTRACT_PUBLIC` — set to `true` if `regengine/regengine` is public, to use the default `GITHUB_TOKEN` instead.
+- `vars.REGENGINE_CONTRACT_REPOSITORY` — optional, defaults to `regengine/regengine`.
+- `vars.REGENGINE_CONTRACT_REF` — optional, defaults to `main`; this side tracks RegEngine rather than pinning it. Set a SHA only to ride out an upstream breakage.
+
+Without that access — including every pull request from a fork, which GitHub never gives secrets to — the job skips and the `contract-status-gate` job says so as a warning and in the job summary rather than failing the contributor. `.github/workflows/contract-pin-drift.yml` separately watches how far each repository's pin to the other has fallen behind, failing beyond 10 commits or on any commit touching the contract surface.
 
 ## Deployment
 
