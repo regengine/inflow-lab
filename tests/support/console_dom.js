@@ -81,6 +81,9 @@ class ClassList {
 }
 
 let nodeSeq = 0;
+// Every programmatic .click(), so a test can see that a blob download was
+// actually triggered rather than only that no error was raised.
+const clickLog = [];
 
 class El {
   constructor(tagName = 'div', attributes = {}) {
@@ -236,7 +239,23 @@ class El {
     }
   }
   scrollIntoView() {}
+  appendChild(child) {
+    child.parentNode = this;
+    this.childNodes.push(child);
+    return child;
+  }
+  removeChild(child) {
+    this.childNodes = this.childNodes.filter((node) => node !== child);
+    child.parentNode = null;
+    return child;
+  }
+  remove() {
+    if (this.parentNode) {
+      this.parentNode.removeChild(this);
+    }
+  }
   click() {
+    clickLog.push({ tagName: this.tagName, href: this.href, download: this.download || '' });
     return this.dispatchEvent('click');
   }
 
@@ -471,6 +490,7 @@ function makeResponse({ status = 200, body = null, contentType = 'application/js
       throw new SyntaxError('Unexpected token in JSON');
     },
     text: async () => payload,
+    blob: async () => ({ __blob: true, type: contentType, size: payload.length, text: async () => payload }),
   };
 }
 
@@ -494,8 +514,27 @@ for (const [key, value] of Object.entries(sandbox)) {
   // accessors on globalThis, so assign through defineProperty.
   Object.defineProperty(globalThis, key, { value, writable: true, configurable: true });
 }
+// node has URL.createObjectURL, but nothing to observe with it; record the
+// object URLs app.js mints so a download is assertable.
+const objectUrls = [];
+const realCreateObjectURL = URL.createObjectURL;
+URL.createObjectURL = (blob) => {
+  const handle = `blob:console-dom/${objectUrls.length}`;
+  objectUrls.push({ handle, blob, revoked: false });
+  return handle;
+};
+URL.revokeObjectURL = (handle) => {
+  const entry = objectUrls.find((item) => item.handle === handle);
+  if (entry) {
+    entry.revoked = true;
+  }
+};
+void realCreateObjectURL;
+
 globalThis.__dom = {
   El,
+  clickLog,
+  objectUrls,
   documentStub,
   makeResponse,
   descendants,

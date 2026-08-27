@@ -384,7 +384,9 @@ input::placeholder {
   border-color: var(--border-strong);
 }
 
-.button:disabled {
+.button:disabled,
+/* #194: an <a> cannot be :disabled, and the export controls are anchors. */
+.button[aria-disabled='true'] {
   cursor: not-allowed;
   filter: grayscale(0.4);
   opacity: 0.55;

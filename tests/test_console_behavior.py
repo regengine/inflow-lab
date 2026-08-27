@@ -505,3 +505,146 @@ def test_workbench_before_the_first_snapshot_reports_pending_not_passing() -> No
         """
     )
     assert "Signals visible" not in result
+
+
+# ---------------------------------------------------------------------------
+# #194 -- an export preset that needs a lot code must not be offered without one
+# ---------------------------------------------------------------------------
+
+_EXPORT_PRELUDE = """
+const PRESETS = [
+  { id: 'all_records', label: 'All records', description: 'Full FDA-request export.', requires_lot_code: false },
+  { id: 'lot_trace', label: 'Lot trace', description: 'Lineage for one lot.', requires_lot_code: true },
+];
+const RECORD = {
+  record_id: 'rec-1',
+  sequence_no: 1,
+  delivery_status: 'posted',
+  delivery_attempts: 1,
+  destination_mode: 'mock',
+  event: {
+    cte_type: 'harvesting',
+    traceability_lot_code: 'TLC-1',
+    product_description: 'Romaine Lettuce',
+    location_name: 'Valley Fresh Farms',
+    quantity: 10,
+    unit_of_measure: 'cases',
+    timestamp: '2026-02-10T08:00:00Z',
+    kdes: {},
+  },
+};
+state.events = [RECORD];
+renderExportPresetOptions(PRESETS);
+"""
+
+
+def test_lot_trace_preset_without_a_lot_code_is_refused_in_console() -> None:
+    """Selecting "Lot trace" with an empty lot field used to open a raw JSON
+    400 in a new tab, show nothing in the console, and still mark the guided
+    flow's "Export evidence" step done."""
+    result = run_console(
+        _EXPORT_PRELUDE
+        + """
+        __dom.setFetch(() => {
+          throw new Error('the export must not be requested at all');
+        });
+        ids.exportPreset.value = 'lot_trace';
+        ids.exportLot.value = '';
+        updateExportLink();
+        const guarded = {
+          ariaDisabled: ids.exportDownloadLink.getAttribute('aria-disabled'),
+          hint: ids.exportPresetDescription.textContent,
+        };
+        await ids.exportDownloadLink.dispatchEvent('click');
+        return {
+          guarded,
+          exported: journey.exported,
+          status: ids.statusMessage.textContent,
+          tone: ids.statusMessage.dataset.tone,
+          downloads: __dom.clickLog.length,
+        };
+        """
+    )
+    assert result["guarded"]["ariaDisabled"] == "true"
+    assert "Traceability Lot Code" in result["guarded"]["hint"]
+    assert result["exported"] is False
+    assert result["tone"] == "error"
+    assert "lot code" in result["status"].lower()
+    assert result["downloads"] == 0
+
+
+def test_failed_export_does_not_mark_the_guided_flow_complete() -> None:
+    """A 404 for a typo'd lot code must reach #statusMessage with the backend's
+    own detail, and must not advance the guide rail."""
+    result = run_console(
+        _EXPORT_PRELUDE
+        + """
+        __dom.setFetch(() => __dom.makeResponse({
+          status: 404,
+          body: { detail: 'No records found for that lot code' },
+        }));
+        ids.exportPreset.value = 'all_records';
+        ids.exportLot.value = 'TLC-TYPO';
+        updateExportLink();
+        await ids.exportDownloadLink.dispatchEvent('click');
+        return {
+          exported: journey.exported,
+          status: ids.statusMessage.textContent,
+          tone: ids.statusMessage.dataset.tone,
+          downloads: __dom.clickLog.length,
+        };
+        """
+    )
+    assert result["exported"] is False
+    assert result["status"] == "No records found for that lot code"
+    assert result["tone"] == "error"
+    assert result["downloads"] == 0
+
+
+def test_successful_export_downloads_a_file_and_marks_the_step_done() -> None:
+    """The working path has to keep working: a real file reaches the operator
+    and the guide rail advances."""
+    result = run_console(
+        _EXPORT_PRELUDE
+        + """
+        __dom.setFetch(() => __dom.makeResponse({
+          status: 200,
+          contentType: 'text/csv',
+          text: 'Traceability Lot Code\\nTLC-1\\n',
+        }));
+        ids.exportPreset.value = 'lot_trace';
+        ids.exportLot.value = 'TLC-1';
+        updateExportLink();
+        const ariaDisabled = ids.exportDownloadLink.getAttribute('aria-disabled');
+        await ids.exportDownloadLink.dispatchEvent('click');
+        await ids.epcisDownloadLink.dispatchEvent('click');
+        return {
+          ariaDisabled,
+          exported: journey.exported,
+          tone: ids.statusMessage.dataset.tone,
+          clicks: __dom.clickLog,
+          objectUrls: __dom.objectUrls.map((entry) => entry.revoked),
+        };
+        """
+    )
+    assert result["ariaDisabled"] in (None, "false")
+    assert result["exported"] is True
+    assert result["tone"] != "error"
+    downloads = [click for click in result["clicks"] if click["tagName"] == "A" and click["download"]]
+    assert len(downloads) == 2, result["clicks"]
+    # Object URLs are released rather than leaked for the tab's lifetime.
+    assert all(result["objectUrls"])
+
+
+def test_export_preset_list_still_advertises_the_lot_code_requirement() -> None:
+    """The client fix depends on a wire field it previously ignored entirely."""
+    from fastapi.testclient import TestClient
+
+    from app.main import app
+
+    with TestClient(app) as client:
+        presets = client.get("/api/mock/regengine/export/presets").json()["presets"]
+
+    by_id = {preset["id"]: preset for preset in presets}
+    assert by_id["lot_trace"]["requires_lot_code"] is True
+    assert by_id["all_records"]["requires_lot_code"] is False

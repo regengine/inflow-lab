@@ -34,6 +34,7 @@ const state = {
   exportPresetDescriptions: {
     all_records: 'Full FDA-request export for the selected date range.',
   },
+  exportPresetRequiresLot: {},
 };
 
 const DEFAULT_LIVE_INGEST_ENDPOINT = 'https://www.regengine.co/api/v1/webhooks/ingest';
@@ -667,6 +668,12 @@ function renderExportPresetOptions(presets) {
   state.exportPresetDescriptions = Object.fromEntries(
     presets.map((preset) => [preset.id, preset.description]),
   );
+  // The backend has always shipped requires_lot_code on this payload; the
+  // console just never read it, so "Lot trace" was offered with an empty lot
+  // field and failed with a raw JSON 400 in a new tab (#194).
+  state.exportPresetRequiresLot = Object.fromEntries(
+    presets.map((preset) => [preset.id, Boolean(preset.requires_lot_code)]),
+  );
   ids.exportPreset.innerHTML = presets
     .map(
       (preset) => `
@@ -707,7 +714,76 @@ function updateExportLink() {
   ids.exportDownloadLink.href = `/api/mock/regengine/export/fda-request?${csvParams.toString()}`;
   ids.epcisDownloadLink.href = `/api/mock/regengine/export/epcis${epcisQuery ? `?${epcisQuery}` : ''}`;
   const presetDescription = state.exportPresetDescriptions[preset] || 'FDA-request CSV export.';
-  ids.exportPresetDescription.textContent = `${presetDescription} EPCIS uses the same lot and date filters.`;
+  // Only the CSV export takes a preset; EPCIS filters by lot/date alone.
+  const lotRequired = Boolean(state.exportPresetRequiresLot[preset]) && !lotCode;
+  setExportLinkEnabled(ids.exportDownloadLink, !lotRequired);
+  ids.exportPresetDescription.textContent = lotRequired
+    ? `${presetDescription} Enter a Traceability Lot Code to enable this export. EPCIS uses the same lot and date filters.`
+    : `${presetDescription} EPCIS uses the same lot and date filters.`;
+}
+
+function setExportLinkEnabled(link, enabled) {
+  if (!link) {
+    return;
+  }
+  if (enabled) {
+    link.removeAttribute('aria-disabled');
+    link.classList.remove('is-disabled');
+  } else {
+    link.setAttribute('aria-disabled', 'true');
+    link.classList.add('is-disabled');
+  }
+}
+
+function exportFilename(disposition, fallback) {
+  const match = /filename\*?=(?:UTF-8'')?"?([^";]+)"?/i.exec(String(disposition || ''));
+  return match ? decodeURIComponent(match[1].trim()) : fallback;
+}
+
+// Fetch the export instead of letting the anchor navigate. A plain anchor
+// bypasses api()/setStatus() entirely, so a 400 (preset needs a lot code) or
+// 404 (typo'd lot) rendered as raw JSON in a new tab while the console
+// itself reported nothing -- and the guide rail marked "Export evidence"
+// done regardless of the outcome (#194).
+async function downloadExport(link, fallbackFilename) {
+  if (link.getAttribute('aria-disabled') === 'true') {
+    setStatus(
+      'This export preset needs a Traceability Lot Code. Enter one in the export filters, then try again.',
+      'error',
+      6000,
+    );
+    ids.exportLot.focus();
+    return;
+  }
+  try {
+    const response = await fetch(link.href, { headers: { Accept: '*/*' } });
+    if (!response.ok) {
+      const rawBody = await response.text().catch(() => '');
+      let payload = {};
+      try {
+        payload = rawBody ? JSON.parse(rawBody) : {};
+      } catch (error) {
+        payload = {};
+      }
+      throw new Error(describeApiError(payload, response, rawBody));
+    }
+    const blob = await response.blob();
+    const filename = exportFilename(response.headers.get('content-disposition'), fallbackFilename);
+    const objectUrl = URL.createObjectURL(blob);
+    const anchor = document.createElement('a');
+    anchor.href = objectUrl;
+    anchor.download = filename;
+    document.body.appendChild(anchor);
+    anchor.click();
+    anchor.remove();
+    URL.revokeObjectURL(objectUrl);
+    // Only a confirmed 2xx counts as evidence produced.
+    journey.exported = true;
+    renderGuide();
+    setStatus(`Downloaded ${filename}.`, 'success', 3500);
+  } catch (error) {
+    setStatus(error.message, 'error', 6000);
+  }
 }
 
 function preferredTraceLot(lotCodes = []) {
@@ -1914,13 +1990,13 @@ ids.lotLookup.addEventListener('keydown', (event) => {
 });
 
 document.getElementById('nextActionGo')?.addEventListener('click', goToNextAction);
-for (const link of [ids.exportDownloadLink, ids.epcisDownloadLink]) {
-  link?.addEventListener('click', () => {
-    if (!state.events.length) {
-      return;
-    }
-    journey.exported = true;
-    renderGuide();
+for (const [link, fallbackFilename] of [
+  [ids.exportDownloadLink, 'fda-request-export.csv'],
+  [ids.epcisDownloadLink, 'epcis-events.json'],
+]) {
+  link?.addEventListener('click', (event) => {
+    event.preventDefault();
+    runWithBusy(link, () => downloadExport(link, fallbackFilename));
   });
 }
 document.querySelectorAll('#guideRail [data-guide-target]').forEach((step) => {
