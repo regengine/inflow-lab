@@ -3,7 +3,10 @@
 tests/test_api.py for #132).
 """
 
+from datetime import timedelta
+
 from tests.support.api_client import client, reset_app_state
+from tests.support.timestamps import CANONICAL_EVENT_DATE, canonical_event_timestamp
 
 
 def setup_function() -> None:
@@ -21,10 +24,18 @@ def test_csv_import_scheduled_events_stores_valid_rows_and_reports_errors(tmp_pa
             "persist_path": str(custom_path),
         },
     )
-    csv_text = """cte_type,traceability_lot_code,product_description,quantity,unit_of_measure,location_name,timestamp,source_traceability_lot_code,kdes
-harvesting,TLC-CSV-HARVEST,Romaine Lettuce,120,cases,Valley Fresh Farms,2026-02-05T08:00:00Z,,"{""harvest_date"":""2026-02-05""}"
-initial_packing,TLC-CSV-PACKED,Romaine Lettuce,112,cases,Coastal Packhouse,2026-02-05T10:00:00Z,TLC-CSV-HARVEST,"{""pack_date"":""2026-02-05""}"
-receiving,TLC-CSV-BAD,Romaine Lettuce,,cases,Distribution Center #4,2026-02-05T12:00:00Z,,
+    # Relative timestamps, not literals: the mock enforces RegEngine's
+    # 90-day replay window, and a fixed date here would eventually add a
+    # second, unrelated rejection reason on top of the missing-KDE one
+    # this test is actually about (#209).
+    harvest_at = canonical_event_timestamp()
+    pack_at = canonical_event_timestamp(timedelta(hours=2))
+    receive_at = canonical_event_timestamp(timedelta(hours=4))
+    day = CANONICAL_EVENT_DATE
+    csv_text = f"""cte_type,traceability_lot_code,product_description,quantity,unit_of_measure,location_name,timestamp,source_traceability_lot_code,kdes
+harvesting,TLC-CSV-HARVEST,Romaine Lettuce,120,cases,Valley Fresh Farms,{harvest_at},,"{{""harvest_date"":""{day}""}}"
+initial_packing,TLC-CSV-PACKED,Romaine Lettuce,112,cases,Coastal Packhouse,{pack_at},TLC-CSV-HARVEST,"{{""pack_date"":""{day}""}}"
+receiving,TLC-CSV-BAD,Romaine Lettuce,,cases,Distribution Center #4,{receive_at},,
 """
 
     response = client.post(

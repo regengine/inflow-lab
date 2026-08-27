@@ -4,6 +4,7 @@ tests/test_api.py for #132).
 """
 
 from tests.support.api_client import client, reset_app_state
+from tests.support.timestamps import CANONICAL_EVENT_DATE, CANONICAL_EVENT_TIMESTAMP
 
 
 def setup_function() -> None:
@@ -22,9 +23,9 @@ def test_mock_ingest_endpoint_returns_hashes():
                 "quantity": 500,
                 "unit_of_measure": "cases",
                 "location_name": "Distribution Center #4",
-                "timestamp": "2026-02-05T08:30:00Z",
+                "timestamp": CANONICAL_EVENT_TIMESTAMP,
                 "kdes": {
-                    "receive_date": "2026-02-05",
+                    "receive_date": CANONICAL_EVENT_DATE,
                     "receiving_location": "Distribution Center #4",
                     "ship_from_location": "Valley Fresh Farms",
                     "immediate_previous_source": "Valley Fresh Farms",
@@ -54,12 +55,12 @@ def test_mock_ingest_rejects_events_missing_required_kdes_like_regengine():
                 "quantity": 500,
                 "unit_of_measure": "cases",
                 "location_name": "Distribution Center #4",
-                "timestamp": "2026-02-05T08:30:00Z",
+                "timestamp": CANONICAL_EVENT_TIMESTAMP,
                 # reference_document_type/number deliberately do NOT satisfy
                 # the combined reference_document key: the live validator uses
                 # strict string lookup, and the mock must match it.
                 "kdes": {
-                    "receive_date": "2026-02-05",
+                    "receive_date": CANONICAL_EVENT_DATE,
                     "receiving_location": "Distribution Center #4",
                     "reference_document_type": "Bill of Lading",
                     "reference_document_number": "BOL-TEST-0002",

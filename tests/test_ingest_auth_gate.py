@@ -38,7 +38,6 @@ import asyncio
 import hashlib
 import hmac as hmac_lib
 import json
-from datetime import UTC, datetime
 from typing import Any
 
 import pytest
@@ -50,6 +49,7 @@ from app.mock_service import MockRegEngineHTTPError, parse_signature_digest
 from app.schemas.domain import CTEType, RegEngineEvent
 from app.schemas.ingestion import IngestPayload
 from app.schemas.simulation import SimulationConfig
+from tests.support.timestamps import CANONICAL_EVENT_DATE, CANONICAL_EVENT_TIME
 
 HMAC_ENV_VAR = "REGENGINE_WEBHOOK_HMAC_SECRET"
 INGEST_URL = "/api/mock/regengine/ingest"
@@ -74,9 +74,9 @@ def _valid_event(lot: str = "TLC-GATE-000001") -> RegEngineEvent:
         quantity=100,
         unit_of_measure="cases",
         location_name="Valley Fresh Farms",
-        timestamp=datetime(2026, 2, 5, 8, 0, tzinfo=UTC),
+        timestamp=CANONICAL_EVENT_TIME,
         kdes={
-            "harvest_date": "2026-02-05",
+            "harvest_date": CANONICAL_EVENT_DATE,
             "reference_document": "Harvest Log HAR-0001",
         },
     )

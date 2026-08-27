@@ -351,11 +351,16 @@ def test_rebasing_preserves_relative_spacing_and_kde_dates(fixture_id) -> None:
 
 @pytest.mark.parametrize("fixture_id", _FIXTURE_IDS, ids=lambda f: f.value)
 def test_loaded_fixtures_pass_ingest_with_the_age_window_enforced(fixture_id) -> None:
-    """Acceptance criterion: ``enforce_event_age_window=True`` can be turned on
-    without rejecting fixture events. That flag has to stay off by default for
-    now only because dozens of *other* tests still use the fixed 2026-02-05
-    timestamp as their canonical valid event (#102's remaining half) -- the
-    fixtures themselves no longer stand in the way.
+    """Acceptance criterion: ``enforce_event_age_window=True`` does not reject
+    fixture events. This was the precondition for the flip, and #209 has since
+    taken it -- the flag now defaults to True, and the other blocker named here
+    (dozens of tests on a fixed 2026-02-05 timestamp, #102's remaining half) is
+    gone too, replaced by tests/support/timestamps.py.
+
+    The explicit ``enforce_event_age_window=True`` below is kept rather than
+    left to the default: this test's subject IS the age window, so it should
+    say so at the construction site and keep testing the same thing if the
+    default ever moves again.
     """
     now = datetime.now(UTC)
     fixture = get_demo_fixture(fixture_id, now=now)
