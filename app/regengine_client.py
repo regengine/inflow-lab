@@ -251,6 +251,8 @@ class LiveRegEngineClient:
             response.status_code,
             ("error", f"Unexpected HTTP {response.status_code} from RegEngine."),
         )
+        if verdict == "connected":
+            detail = f"{detail} {_local_signing_posture()}"
         if verdict == "connected" and remote_contract is not None and remote_contract != INFLOW_CONTRACT_VERSION:
             verdict = "contract_mismatch"
             detail = (
@@ -265,6 +267,37 @@ class LiveRegEngineClient:
             status_code=response.status_code,
             endpoint_host=host,
         )
+
+
+def _local_signing_posture() -> str:
+    """State THIS side's HMAC posture as fact, in the connected detail (#100).
+
+    Of the three ingest-only gates a read probe cannot see, one half is not
+    a mystery at all: whether this simulator will sign its requests is
+    decided entirely by REGENGINE_WEBHOOK_HMAC_SECRET, right here. Saying
+    "unsigned, and if RegEngine requires signatures they will 401" is
+    strictly more actionable than listing the signature as a generic
+    unknown alongside two genuine ones.
+
+    It is deliberately NOT the verdict-level fix #100 asks for. That needs
+    RegEngine's OWN posture -- an HMAC-configured flag on its /health, or a
+    preflight endpoint carrying /ingest's gates -- and neither exists in
+    the contract surface this repo has evidence for. Guessing a field name
+    RegEngine has not agreed to publish would be inventing the very
+    assurance #100 is about; the seam for wiring it up when it does exist
+    is _fetch_remote_contract_version's handshake plus this function.
+    """
+    if os.getenv(WEBHOOK_HMAC_SECRET_ENV, "").strip():
+        return (
+            f"On the signature specifically, this side is known: {WEBHOOK_HMAC_SECRET_ENV} is "
+            "set here, so ingests will be signed -- they will still 401 if RegEngine's "
+            "WEBHOOK_HMAC_SECRET differs from this one."
+        )
+    return (
+        f"On the signature specifically, this side is known: {WEBHOOK_HMAC_SECRET_ENV} is NOT "
+        "set here, so every ingest from this simulator will be UNSIGNED. If RegEngine has "
+        "WEBHOOK_HMAC_SECRET set, all of them will 401 no matter how green this probe is."
+    )
 
 
 async def _fetch_remote_contract_version(client: httpx.AsyncClient, parsed) -> str | None:
