@@ -3,7 +3,7 @@ from __future__ import annotations
 from datetime import UTC, datetime
 from typing import Any, Literal
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 from ..scenarios import ScenarioId
 from .domain import DemoFixtureId, DestinationMode, StoredEventRecord
@@ -36,6 +36,41 @@ class ScenarioSaveSnapshot(BaseModel):
     config: SimulationConfig
     records: list[StoredEventRecord] = Field(default_factory=list)
     saved_at: datetime = Field(default_factory=lambda: datetime.now(UTC))
+
+    @model_validator(mode="before")
+    @classmethod
+    def _drop_unknown_config_keys(cls, data: Any) -> Any:
+        """Extend this model's forward-compatibility to its nested config.
+
+        Being permissive at the snapshot level alone was not enough, and the
+        gap contradicted the comment above. `SimulationConfig` and
+        `DeliveryConfig` set extra="forbid" -- correctly, for the request
+        boundary (#143) -- but they are also the version-carrying parts of a
+        save file. So a save written by a version that added one config field
+        did not "harmlessly ignore" it: the whole file failed to load, and
+        because ScenarioSaveStore.list() calls get() for every id, one such
+        file hid every other save behind a 400.
+
+        Unknown keys are pruned here, on the way in from disk only. Request
+        bodies are validated through SimulationConfig directly and never reach
+        this validator, so a misspelled field in a request is still the 422
+        that #143 made it.
+        """
+        if not isinstance(data, dict):
+            return data
+        config = data.get("config")
+        if not isinstance(config, dict):
+            return data
+
+        pruned = {key: value for key, value in config.items() if key in SimulationConfig.model_fields}
+        delivery = pruned.get("delivery")
+        if isinstance(delivery, dict):
+            pruned["delivery"] = {
+                key: value for key, value in delivery.items() if key in DeliveryConfig.model_fields
+            }
+        if pruned != config:
+            data = {**data, "config": pruned}
+        return data
 
 
 class ScenarioSaveSummary(BaseModel):

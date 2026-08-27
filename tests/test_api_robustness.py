@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import json
+
 import asyncio
 from datetime import UTC, datetime, timedelta
 from typing import Any
@@ -307,6 +309,27 @@ def test_lineage_truncates_past_limit_and_signals_via_headers() -> None:
     assert response.headers["X-Lineage-Total-Matched"] == "5"
     assert response.headers["X-Lineage-Truncated"] == "true"
 
+    # The GRAPH must not be truncated with the records. Building nodes/edges
+    # from the prefix returned a structurally wrong answer rather than a
+    # smaller one -- lineage_edges() drops an edge whose parent is outside the
+    # set, so the newest half of the trace (where the food went, which is the
+    # half a recall needs) disappeared entirely. This test previously asserted
+    # nothing here, which is how that shipped.
+    node_lot_codes = {node["lot_code"] for node in body["nodes"]}
+    assert node_lot_codes == {f"TLC-CHAIN-{index}" for index in range(5)}
+
+    # Most pointedly: the lot that was actually queried must appear in its own
+    # lineage. With limit=2 it falls outside the record prefix entirely.
+    assert "TLC-CHAIN-4" in node_lot_codes
+
+    edge_pairs = {(edge["source_lot_code"], edge["target_lot_code"]) for edge in body["edges"]}
+    assert edge_pairs == {
+        ("TLC-CHAIN-0", "TLC-CHAIN-1"),
+        ("TLC-CHAIN-1", "TLC-CHAIN-2"),
+        ("TLC-CHAIN-2", "TLC-CHAIN-3"),
+        ("TLC-CHAIN-3", "TLC-CHAIN-4"),
+    }
+
 
 def test_lineage_under_limit_is_not_marked_truncated() -> None:
     records = [
@@ -361,3 +384,77 @@ def test_unknown_key_inside_inline_delivery_block_is_rejected() -> None:
         json={"delivery": {"mode": "mock", "endpiont": "https://example.test"}},
     )
     assert response.status_code == 422
+
+
+# ---------------------------------------------------------------------------
+# Scenario saves must be forward-compatible, and one bad file must not hide
+# every other save.
+# ---------------------------------------------------------------------------
+
+
+def test_scenario_save_with_unknown_config_keys_still_loads(tmp_path) -> None:
+    """`ScenarioSaveSnapshot` documents itself as deliberately permissive so a
+    save file from another schema version loads instead of hard-failing -- but
+    its nested `SimulationConfig`/`DeliveryConfig` set `extra="forbid"`, and
+    those are the version-carrying parts of the file.
+
+    So a save written by a version that added one config field did not
+    harmlessly ignore it; the whole file failed to load.
+    """
+    from app.scenario_saves import ScenarioSaveStore
+    from app.scenarios import ScenarioId
+
+    store = ScenarioSaveStore(save_dir=str(tmp_path))
+    payload = {
+        "scenario": ScenarioId.LEAFY_GREENS_SUPPLIER.value,
+        "config": {
+            "source": "codex-simulator",
+            "scenario": ScenarioId.LEAFY_GREENS_SUPPLIER.value,
+            "a_field_a_future_version_added": True,
+            "delivery": {"mode": "mock", "another_future_field": 7},
+        },
+        "records": [],
+        "saved_at": "2026-02-05T08:30:00Z",
+    }
+    (tmp_path / f"{ScenarioId.LEAFY_GREENS_SUPPLIER.value}.json").write_text(
+        json.dumps(payload), encoding="utf-8"
+    )
+
+    snapshot = store.get(ScenarioId.LEAFY_GREENS_SUPPLIER)
+    assert snapshot is not None, "a save carrying an unknown config key failed to load"
+    assert snapshot.config.source == "codex-simulator"
+    assert snapshot.config.delivery.mode.value == "mock"
+
+
+def test_one_unreadable_save_does_not_hide_the_others(tmp_path) -> None:
+    """`list()` calls `get()` for every scenario id, so a single unparseable
+    file used to turn the whole listing into a 400 -- the operator lost sight
+    of saves that were perfectly fine.
+    """
+    from app.scenario_saves import ScenarioSaveStore
+    from app.scenarios import ScenarioId
+
+    store = ScenarioSaveStore(save_dir=str(tmp_path))
+    ids = list(ScenarioId)
+    good, bad = ids[0], ids[1]
+
+    (tmp_path / f"{good.value}.json").write_text(
+        json.dumps(
+            {
+                "scenario": good.value,
+                "config": {"source": "codex-simulator", "scenario": good.value},
+                "records": [],
+                "saved_at": "2026-02-05T08:30:00Z",
+            }
+        ),
+        encoding="utf-8",
+    )
+    # Not merely an unknown key -- genuinely unparseable, so the pruning
+    # validator cannot rescue it and list() has to skip it.
+    (tmp_path / f"{bad.value}.json").write_text("{not json at all", encoding="utf-8")
+
+    saves = store.list()
+
+    assert [snapshot.scenario for snapshot in saves] == [good], (
+        "an unreadable save file hid the readable ones"
+    )
