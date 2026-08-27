@@ -426,3 +426,58 @@ def test_imported_location_gln_reaches_both_exports():
     csv_text = render_fda_request_csv([record], location_gln=lambda _name: known_gln)
     rows = list(csv.DictReader(io.StringIO(csv_text)))
     assert rows[0]["Location Identifier (GLN)"] == known_gln
+
+
+# ---------------------------------------------------------------------------
+# The stack must not contradict its own contract.md
+# ---------------------------------------------------------------------------
+
+
+def test_top_level_input_lot_codes_satisfy_validation_and_reach_epcis():
+    """`contract.md` declares the TOP-LEVEL `input_traceability_lot_codes`
+    authoritative and says the simulator now emits it there. Only the engine
+    path does -- demo fixtures and CSV imports leave it `None`.
+
+    An integrator following the contract, sending the field exactly where the
+    contract says to send it and nowhere else, was flagged at required
+    severity (promoted by #189 in this same stack) for a KDE they had in fact
+    supplied, and their EPCIS `inputQuantityList` came out empty -- silently
+    losing the input-to-output lineage link that is the whole point of a
+    transformation CTE.
+    """
+    from app.cte_rules import validate_event_kdes
+
+    record = _transformation_record(None)
+    # Exactly what a contract-following integrator sends: top-level only.
+    record.event.kdes.pop("input_traceability_lot_codes", None)
+    record.event.input_traceability_lot_codes = ["TLC-INPUT-000001", "TLC-INPUT-000002"]
+
+    warnings = validate_event_kdes(record.event)
+    missing = [w for w in warnings if w.field == "input_traceability_lot_codes"]
+    assert not missing, (
+        "a contract-compliant top-level value was still reported missing: "
+        f"{[w.message for w in missing]}"
+    )
+
+    document = render_epcis_document(
+        [record],
+        source="test",
+        location_gln=lambda _name: "",
+        creation_date=datetime(2026, 2, 5, tzinfo=UTC),
+    )
+    rendered = json.dumps(document)
+    for lot_code in record.event.input_traceability_lot_codes:
+        assert lot_code in rendered, f"{lot_code} never reached the EPCIS document"
+
+
+def test_kdes_copy_still_wins_when_both_are_present():
+    """Additive, not a replacement -- matching how the top-level field was
+    introduced. The local validator, audit checks and exports all read the
+    kdes copy, so it must keep taking precedence when both carry a value."""
+    from app.cte_rules import merged_event_values
+
+    record = _transformation_record(None)
+    record.event.kdes["input_traceability_lot_codes"] = ["TLC-FROM-KDES"]
+    record.event.input_traceability_lot_codes = ["TLC-FROM-TOP-LEVEL"]
+
+    assert merged_event_values(record.event)["input_traceability_lot_codes"] == ["TLC-FROM-KDES"]
