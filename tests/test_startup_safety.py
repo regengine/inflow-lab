@@ -23,7 +23,14 @@ import logging
 import pytest
 from fastapi.testclient import TestClient
 
-from app.cors import DEFAULT_CORS_ORIGINS, cors_origins_from_env, resolve_cors_origins
+import base64
+
+from app.cors import (
+    DEFAULT_CORS_ORIGINS,
+    cors_origins_from_env,
+    resolve_cors_origins,
+    resolve_cors_origins_cached,
+)
 from app.main import _shared_deployment_requires_auth, create_app
 
 
@@ -149,3 +156,80 @@ def test_cors_origins_from_env_still_raises_for_direct_callers(monkeypatch):
 
     with pytest.raises(ValueError, match="HTTP\\(S\\) origins"):
         cors_origins_from_env()
+
+
+# ---------------------------------------------------------------------------
+# #200 - the same malformed variable on the REQUEST path
+# ---------------------------------------------------------------------------
+
+
+def _basic_auth_header(username: str, password: str) -> str:
+    token = base64.b64encode(f"{username}:{password}".encode()).decode()
+    return f"Basic {token}"
+
+
+def test_malformed_cors_origin_does_not_500_state_changing_requests(monkeypatch):
+    """#200: #178 fixed create_app(); this pins the request path.
+
+    ``_reject_untrusted_unsafe_origin`` consults the trusted-origin list on
+    every authenticated state-changing request. While it called the strict
+    ``cors_origins_from_env()``, one malformed entry raised there, and
+    ``auth_and_tenant_middleware``'s handler logs and re-raises -- so the app
+    booted cleanly on a warning and then 500'd every mutating browser
+    request. That is strictly worse than the pre-#178 hard crash, because it
+    is silent at boot.
+
+    This test would have caught it: the pre-fix code returns 500 for both
+    origins below.
+    """
+    _clear_cors_env(monkeypatch)
+    monkeypatch.setenv("REGENGINE_CORS_ORIGINS", "https://good.example.com, bad-domain-no-scheme")
+    # Auth on is what makes this branch reachable at all -- and the Dockerfile
+    # now forces it on for every container deployment.
+    monkeypatch.setenv("REGENGINE_BASIC_AUTH_USERNAME", "demo-user")
+    monkeypatch.setenv("REGENGINE_BASIC_AUTH_PASSWORD", "demo-password")
+    monkeypatch.delenv("REGENGINE_REQUIRE_AUTH", raising=False)
+
+    auth = _basic_auth_header("demo-user", "demo-password")
+
+    with TestClient(create_app()) as client:
+        trusted = client.post(
+            "/api/simulate/reset",
+            json={},
+            headers={"Authorization": auth, "Origin": "https://good.example.com"},
+        )
+        # The surviving good entry is honored, so the origin gate passes and
+        # the request reaches the route. Any non-500 status proves the guard
+        # itself did not blow up; it must specifically not be 403 either,
+        # since this origin *was* configured.
+        assert trusted.status_code != 500
+        assert trusted.status_code != 403
+
+        untrusted = client.post(
+            "/api/simulate/reset",
+            json={},
+            headers={"Authorization": auth, "Origin": "https://untrusted.example"},
+        )
+        # Skipping the malformed entry must not fall open: an origin that was
+        # never configured is still refused, and refused deliberately (403),
+        # not by crashing (500).
+        assert untrusted.status_code == 403
+
+
+def test_resolve_cors_origins_cached_reparses_when_the_environment_changes(monkeypatch):
+    """The request-path cache is keyed on the variables it derives from.
+
+    A cache that ignored the environment would be a correctness bug, not just
+    a stale read: an operator fixing a typo and restarting nothing would keep
+    the old answer for the life of the process.
+    """
+    _clear_cors_env(monkeypatch)
+    monkeypatch.setenv("REGENGINE_CORS_ORIGINS", "https://first.example.com")
+    assert resolve_cors_origins_cached() == ["https://first.example.com"]
+
+    monkeypatch.setenv("REGENGINE_CORS_ORIGINS", "https://second.example.com")
+    assert resolve_cors_origins_cached() == ["https://second.example.com"]
+
+    # And a repeat call at the same environment is still correct (the cache
+    # hit path, which is the one that actually runs per request).
+    assert resolve_cors_origins_cached() == ["https://second.example.com"]
