@@ -82,6 +82,13 @@ def _live_config(**overrides) -> SimulationConfig:
     )
 
 
+# The genuine LiveRegEngineClient the shared controller is built with.
+# Captured once, at import, before any test has had a chance to swap in a
+# stub -- so teardown can prove a test put the real one back rather than
+# merely assuming it.
+_REAL_LIVE_CLIENT = controller.live_client
+
+
 def _rebind_controller_locks() -> None:
     """Hand the shared controller a fresh set of unbound asyncio locks.
 
@@ -115,8 +122,38 @@ def setup_function() -> None:
 
 
 def teardown_function() -> None:
+    """Restore the shared singleton, then prove the test had already done so.
+
+    Every test here swaps something onto the module-level controller (a
+    stub ``live_client``, and in one case a probe wrapped around
+    ``_lock``) and restores it in a ``finally``. Teardown restoring them
+    again would silently paper over a test that forgot -- and
+    ``_rebind_controller_locks`` in particular would replace a leaked probe
+    with a fresh Lock, hiding the leak completely while the *next* test ran
+    against contaminated instrumentation.
+
+    So: capture what the test actually left behind, put the singleton back
+    to pristine unconditionally, and only then assert the captured state
+    was already clean. The next test starts clean either way, and a leak is
+    attributed to the test that caused it instead of surfacing as a
+    mysterious failure somewhere downstream.
+    """
+    leaked_lock = controller._lock
+    leaked_client = controller.live_client
+
+    controller.live_client = _REAL_LIVE_CLIENT
     asyncio.run(controller.reset(SimulationConfig()))
     _rebind_controller_locks()
+
+    assert isinstance(leaked_lock, asyncio.Lock), (
+        f"test left {type(leaked_lock).__name__} wrapped around controller._lock "
+        "instead of restoring the real asyncio.Lock"
+    )
+    assert leaked_client is _REAL_LIVE_CLIENT, (
+        f"test left {type(leaked_client).__name__} installed as "
+        "controller.live_client instead of restoring the real one"
+    )
+    assert not controller.running, "test left a live run loop on the shared controller"
 
 
 async def _idle_run_loop(stop_event: asyncio.Event) -> None:
@@ -171,6 +208,10 @@ class ProbingLiveClient:
         self.gate = gate
         self.locked_during_post: list[bool] = []
         self.payload_sizes: list[int] = []
+        # (start, end) monotonic bounds of each POST -- see
+        # test_the_longest_lock_hold_never_overlaps_a_post for why the
+        # interval, rather than a duration, is what gets asserted on.
+        self.post_intervals: list[tuple[float, float]] = []
         self.started = asyncio.Event()
         self._gate_consumed = False
 
@@ -181,12 +222,14 @@ class ProbingLiveClient:
         if gated:
             self._gate_consumed = True
         self.started.set()
+        started_at = time.monotonic()
         if gated:
             await self.gate.wait()
         elif self.delay:
             await asyncio.sleep(self.delay)
         else:
             await asyncio.sleep(0)
+        self.post_intervals.append((started_at, time.monotonic()))
         return _accepted_response(payload, idempotency_key)
 
 
@@ -332,10 +375,15 @@ class LockHoldProbe:
 
     def __init__(self, lock: asyncio.Lock) -> None:
         self._lock = lock
-        self.hold_durations: list[float] = []
+        # (start, end) monotonic bounds of each hold of self._lock.
+        self.hold_intervals: list[tuple[float, float]] = []
         self.posts_under_current_hold = 0
         self.max_posts_under_one_hold = 0
         self._started_at: float | None = None
+
+    @property
+    def hold_durations(self) -> list[float]:
+        return [end - start for start, end in self.hold_intervals]
 
     def locked(self) -> bool:
         return self._lock.locked()
@@ -355,7 +403,7 @@ class LockHoldProbe:
 
     def release(self) -> None:
         if self._started_at is not None:
-            self.hold_durations.append(time.monotonic() - self._started_at)
+            self.hold_intervals.append((self._started_at, time.monotonic()))
             self._started_at = None
         self._lock.release()
 
@@ -367,16 +415,45 @@ class LockHoldProbe:
         self.release()
 
 
-def test_the_longest_lock_hold_is_shorter_than_a_single_post():
+def test_the_longest_lock_hold_never_overlaps_a_post():
     """#208 criterion 4: assert the hold, not just the end state.
 
     Three chunks x a 60ms POST. Before the fix the whole replay ran under
-    one hold, so ``max(hold_durations)`` was >= 3 x POST_DELAY and
+    one hold, so that hold's interval contained all three POSTs and
     ``max_posts_under_one_hold`` was 3 -- the issue's own "4 POSTs under one
-    hold" measurement, at chunk-count 3. After the fix no POST happens
-    under any hold at all, and the longest hold is the snapshot phase,
-    which does no network I/O and so cannot reach even one POST_DELAY.
+    hold" measurement, at chunk-count 3. After the fix no lock hold and no
+    POST overlap at all.
+
+    What is asserted, and why it is an interval overlap rather than a
+    duration
+    ---------------------------------------------------------------------
+    The first version of this test asserted ``max(hold_durations) <
+    post_delay`` -- an absolute wall-clock threshold. That was wrong, and
+    deterministically so: it passed alone (~14ms) and failed whenever its
+    siblings ran first (~64ms), with the store state provably identical
+    both ways (1001 records seeded, three chunks of 500/500/1, 1001 lines
+    on disk, and the same count of live StoredEventRecord objects). The
+    difference was a gen-2 GC pause landing inside the measured window --
+    the snapshot phase reads and validates 1001 pydantic models, which
+    allocates heavily, so whether a collection falls inside the hold
+    depends on how much allocation happened earlier in the process. A
+    threshold over real work is contaminated by allocation history,
+    machine speed and heap size, none of which this test is about.
+
+    The property #208 actually needs is causal, not statistical: a lock
+    hold must never be in progress while a POST is in progress. Recording
+    both as (start, end) intervals and asserting no pair overlaps says
+    exactly that, at any speed, with no constant to tune -- and it is
+    strictly STRONGER than the threshold it replaces. It catches a hold
+    spanning even a microsecond-long POST, which no duration bound can,
+    and it catches a hold that merely *begins* mid-POST, which
+    ``max_posts_under_one_hold`` alone would miss because that counter only
+    sees POSTs that start while a hold is already open.
     """
+
+    def _overlap(first: tuple[float, float], second: tuple[float, float]) -> float:
+        return min(first[1], second[1]) - max(first[0], second[0])
+
     post_delay = 0.06
     client = ProbingLiveClient(delay=post_delay)
     probe = LockHoldProbe(controller._lock)
@@ -412,18 +489,31 @@ def test_the_longest_lock_hold_is_shorter_than_a_single_post():
         controller.live_client = original_client
 
     assert len(client_note_post) == 3, client_note_post
-    # The work really did take three sequential POSTs -- otherwise the
-    # hold assertion below would pass trivially.
+    # The work really did take three sequential POSTs, each of real
+    # duration -- otherwise there would be no window for a hold to overlap
+    # and the assertions below would pass trivially. A lower bound on
+    # elapsed time, so a GC pause can only ever help it hold.
     assert elapsed >= post_delay * 3
+    assert len(client.post_intervals) == 3
+    assert all(end - start >= post_delay for start, end in client.post_intervals)
 
     assert probe.max_posts_under_one_hold == 0, (
         "a POST was awaited while self._lock was held "
         f"({probe.max_posts_under_one_hold} under one hold)"
     )
-    assert probe.hold_durations, "self._lock was never taken at all"
-    assert max(probe.hold_durations) < post_delay, (
-        f"longest self._lock hold {max(probe.hold_durations):.3f}s spans a "
-        f"{post_delay:.3f}s POST"
+    assert probe.hold_intervals, "self._lock was never taken at all"
+
+    overlaps = [
+        (hold, post, _overlap(hold, post))
+        for hold in probe.hold_intervals
+        for post in client.post_intervals
+        if _overlap(hold, post) > 0
+    ]
+    assert not overlaps, (
+        "self._lock was held while a POST was in flight; longest overlap "
+        f"{max(overlap for _, _, overlap in overlaps):.3f}s across "
+        f"{len(overlaps)} hold/POST pair(s). Holds: "
+        f"{[f'{d:.3f}s' for d in probe.hold_durations]}"
     )
 
 
