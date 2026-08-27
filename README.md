@@ -244,7 +244,7 @@ export REGENGINE_REDIS_URL=redis://localhost:6379/0
 uv run python scripts/customer_journey.py --local
 ```
 
-Steps: health probe → tenant + API key provisioning through `/v1/admin` → billing activation (seeds `billing:tenant:{id}` in Redis so the subscription gate passes) → connection test → several canonical CTE batches ingested with the same engine and live client the console uses → friction demos (a KDE-rejected event and an idempotency replay) → verification that RegEngine now holds the evidence (`/api/v1/webhooks/recent`, `/api/v1/webhooks/chain/verify`, `/api/v1/fda/export/all`).
+Steps: health probe → tenant + API key provisioning through `/v1/admin` → billing activation (seeds `billing:tenant:{id}` in Redis so the subscription gate passes) → connection test → several canonical CTE batches ingested with the same engine and live client the console uses → friction demos (a KDE-rejected event and an idempotency replay) → verification that RegEngine now holds the evidence (`/api/v1/webhooks/recent`, `/api/v1/webhooks/chain/verify`, `/api/v1/fda/export/all`) → teardown of the tenant and key it provisioned. The teardown runs from a `finally` block, so a run that fails partway still removes what it created; if the admin API refuses the delete, the journey reports that as a failed step naming the tenant id to remove by hand.
 
 For a deployed RegEngine, the harness follows `scripts/live_trial.py`'s gating: it refuses to run without `--confirm-live`, requires pre-provisioned `REGENGINE_LIVE_ENDPOINT` / `REGENGINE_LIVE_API_KEY` / `REGENGINE_LIVE_TENANT_ID`, never provisions or touches Redis, sends one small batch, and skips the deliberate-failure demos.
 
