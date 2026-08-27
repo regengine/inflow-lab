@@ -149,6 +149,25 @@ uv run python scripts/live_trial.py --confirm-live
 
 The script refuses to run without either `--dry-run-only` or `--confirm-live`. It never prints the Basic Auth password, live API key, or live tenant id. Stop after the first live result and review the posted/failed status before any further volume.
 
+**The trial disarms itself, and you should confirm that it did.** `--confirm-live` arms `REGENGINE_REMOTE_TENANT` for live delivery by posting a `delivery.mode: live` reset, and the tenant controller keeps that config — endpoint, API key and tenant id — cached for the lifetime of the server process. Left armed, the next Start or Step from the dashboard posts simulated CTEs into the live endpoint with nobody re-entering a credential. So the script reverts that tenant to `delivery.mode: mock` with an empty endpoint, API key and tenant id from a `finally` block, which also runs when the batch or a later assertion fails. Two outcomes to read for:
+
+- `delivery reverted to mock for tenant <id>` — the revert returned 200. The tenant is disarmed.
+- `CRITICAL: failed to revert ... may still be armed for live delivery` (exit code 1) — treat the tenant as armed and clear it by hand before anyone else uses the demo.
+
+Verify either way before walking away:
+
+```bash
+curl -sS -u "$REGENGINE_REMOTE_USERNAME:$REGENGINE_REMOTE_PASSWORD" \
+  -H "X-RegEngine-Tenant: $REGENGINE_REMOTE_TENANT" \
+  "$REGENGINE_REMOTE_BASE_URL/api/simulate/status"     # config.delivery.mode must be "mock"
+
+curl -sS -u "$REGENGINE_REMOTE_USERNAME:$REGENGINE_REMOTE_PASSWORD" \
+  -H "X-RegEngine-Tenant: $REGENGINE_REMOTE_TENANT" \
+  "$REGENGINE_REMOTE_BASE_URL/api/integration/status"  # api_key_configured must be false
+```
+
+`/api/simulate/status` redacts the stored API key from its response, so it cannot tell you whether one is still held — read `api_key_configured` from `/api/integration/status` for that.
+
 Dry-run the exact scenario without live traffic:
 
 ```bash
@@ -226,9 +245,9 @@ REGENGINE_BASIC_AUTH_PASSWORD=<strong generated password>
 REGENGINE_DEFAULT_TENANT=demo-default
 REGENGINE_CORS_ORIGINS=https://<railway-domain>
 REGENGINE_DATA_DIR=/data
-REGENGINE_BUILD_SHA=<deployed git sha>
-REGENGINE_BUILD_BRANCH=main
 ```
+
+Do not set `REGENGINE_BUILD_SHA` or `REGENGINE_BUILD_BRANCH` here. The shared demo is GitHub-connected, so Railway injects `RAILWAY_GIT_COMMIT_SHA`; those two variables outrank it (`app/build_info.py`) and would make `/api/healthz` report a hand-typed commit instead of the deployed one. They belong only to "Manual CLI deploy (fallback)" below.
 
 Attach a Railway volume at `/data` before using the service for partner demos. After a Railway domain is generated, update `REGENGINE_CORS_ORIGINS` to that exact HTTPS origin.
 
@@ -282,7 +301,7 @@ next one starts.
    Verify: `https://<dashboard-host>/api/inflow-lab/api/healthz` reports the
    new commit with `commit_source: RAILWAY_GIT_COMMIT_SHA`.
 4. **Carry the persistent volume across before sending traffic.** The demo
-   writes its event history to `REGENGINE_DATA_DIR` (`app/tenancy.py:22`,
+   writes its event history to `REGENGINE_DATA_DIR` (`DATA_ROOT` in `app/tenancy.py`,
    `/data/tenants/{tenant_id}/events.jsonl` in production), and on Railway that
    path only survives a redeploy if a volume is mounted there. A service
    created fresh has none, and nothing about the running service says so: it
@@ -312,17 +331,41 @@ GitHub-injected build identity rather than a stale `REGENGINE_BUILD_SHA`, and
 the new service trusting its own origin. It is read-only — the demo is shared,
 and the POST routes the dashboard proxies mutate its state.
 
-It deliberately cannot check steps 2 or 4, and says so on success rather than
-implying a clean bill of health. Both are invisible from outside: a service
-with the wrong credentials and a service with the right ones both answer 401,
-and a service with no volume is indistinguishable from one with a volume until
-the next redeploy discards the data. The Basic-auth credentials live as secrets on
-two different platforms, so from outside a service with the *wrong* credentials
-is indistinguishable from one with the right ones — both answer 401 to an
-unauthenticated probe. Vercel's `INFLOW_LAB_BASIC_AUTH_USERNAME` / `_PASSWORD`
-must equal the new service's `REGENGINE_BASIC_AUTH_USERNAME` / `_PASSWORD`, as
-concrete values. If they differ, every proxied call answers 401 the moment
-`INFLOW_LAB_SERVICE_URL` is flipped.
+**Export `REGENGINE_REMOTE_USERNAME` and `REGENGINE_REMOTE_PASSWORD` before you
+run it** — the same pair `remote_smoke.py` and `live_trial.py` use. Basic Auth
+is the shared demo's configuration, so every path in the contract loop answers
+`401 application/json` to an unauthenticated probe on *both* services, and a
+401-vs-401 match is not evidence of an identical contract (#106). The script
+refuses to call that green:
+
+- With no credentials the contract section prints `UNVERIFIABLE` and counts as
+  a failure, so `PRE-FLIGHT PASSED` is unreachable rather than misleading.
+- A path is only usable as a baseline if the OLD service — the known-good one —
+  answers 2xx with the credentials supplied. Anything else (401 wrong or stale
+  credentials, 404 not a mounted route, 000 unreachable) is reported `FAIL`,
+  even when NEW answers identically.
+- The probed paths are only routes `app/main.py` actually mounts. Two earlier
+  entries, `/api/regengine/export/fda-request` and `/api/regengine/export/epcis`,
+  were never mounted here — only `/api/mock/regengine/...` is — and have been
+  removed. RegEngine's `frontend/src/app/api/inflow-lab/[...path]/route.ts` still
+  allows them, so the two repos remain to be reconciled.
+
+A green contract section therefore also proves that the credential pair you
+supplied authenticates against both services, which covers the demo half of
+step 2.
+
+What it still cannot check, and says so on success rather than implying a clean
+bill of health:
+
+- **Step 4, the volume.** A service with no volume is indistinguishable from one
+  with a volume until the next redeploy discards the data. Check the Railway
+  config, not this script.
+- **The Vercel half of step 2.** Vercel keeps its own copy of the credentials as
+  secrets on a different platform. The pre-flight can prove the demo accepts the
+  pair *you* typed; it cannot see what Vercel holds. `INFLOW_LAB_BASIC_AUTH_USERNAME`
+  / `_PASSWORD` must equal the new service's `REGENGINE_BASIC_AUTH_USERNAME` /
+  `_PASSWORD`, as concrete values. If they differ, every proxied call answers 401
+  the moment `INFLOW_LAB_SERVICE_URL` is flipped.
 
 Verify the flip on `/api/simulate/status`, not `/api/healthz`: the proxy
 answers HTTP 200 with `{"offline":true}` when the backend is unreachable

@@ -87,6 +87,7 @@ app/
   workflows/codex-autopilot.yml
   workflows/remote-smoke.yml
 scripts/
+  _smoke_common.py       # Shared assertion/redaction harness for the smoke scripts
   smoke_regression.py    # End-to-end API smoke for demo-ready release checks
   browser_smoke.py       # Headless Playwright dashboard smoke
   remote_smoke.py        # HTTP smoke harness for deployed shared-demo instances
@@ -244,7 +245,7 @@ export REGENGINE_REDIS_URL=redis://localhost:6379/0
 uv run python scripts/customer_journey.py --local
 ```
 
-Steps: health probe → tenant + API key provisioning through `/v1/admin` → billing activation (seeds `billing:tenant:{id}` in Redis so the subscription gate passes) → connection test → several canonical CTE batches ingested with the same engine and live client the console uses → friction demos (a KDE-rejected event and an idempotency replay) → verification that RegEngine now holds the evidence (`/api/v1/webhooks/recent`, `/api/v1/webhooks/chain/verify`, `/api/v1/fda/export/all`).
+Steps: health probe → tenant + API key provisioning through `/v1/admin` → billing activation (seeds `billing:tenant:{id}` in Redis so the subscription gate passes) → connection test → several canonical CTE batches ingested with the same engine and live client the console uses → friction demos (a KDE-rejected event and an idempotency replay) → verification that RegEngine now holds the evidence (`/api/v1/webhooks/recent`, `/api/v1/webhooks/chain/verify`, `/api/v1/fda/export/all`) → teardown of the tenant and key it provisioned. The teardown runs from a `finally` block, so a run that fails partway still removes what it created; if the admin API refuses the delete, the journey reports that as a failed step naming the tenant id to remove by hand.
 
 For a deployed RegEngine, the harness follows `scripts/live_trial.py`'s gating: it refuses to run without `--confirm-live`, requires pre-provisioned `REGENGINE_LIVE_ENDPOINT` / `REGENGINE_LIVE_API_KEY` / `REGENGINE_LIVE_TENANT_ID`, never provisions or touches Redis, sends one small batch, and skips the deliberate-failure demos.
 
@@ -740,13 +741,19 @@ docker run --rm \
 
 `railway.json` uses the same Dockerfile and healthcheck for Railway deployments. Mount persistent storage at `/data` and keep `REGENGINE_DATA_DIR=/data`.
 
-Expose non-secret build metadata so stale shared-demo deployments are obvious from `/api/healthz` and remote smoke failures:
+The shared demo deploys from Railway's GitHub connection, which injects `RAILWAY_GIT_COMMIT_SHA`, so its build identity needs no manual variable. Leave `REGENGINE_BUILD_SHA` and `REGENGINE_BUILD_BRANCH` **unset** there: they take precedence over the injected metadata (`app/build_info.py`), so setting them makes `/api/healthz` report a hand-typed commit rather than what is running, which is exactly the stale-demo blindness the nightly smoke exists to catch. Confirm with `build.commit_source: RAILWAY_GIT_COMMIT_SHA`.
+
+#### Manual CLI deploy (fallback)
+
+Only for a service deployed by hand with `railway up`. There is no GitHub connection injecting metadata, and `.dockerignore` excludes `.git`, so these variables are the container's only source of build identity:
 
 ```bash
 railway variable set --skip-deploys REGENGINE_BUILD_SHA="$(git rev-parse HEAD)" \
   REGENGINE_BUILD_BRANCH="$(git branch --show-current)"
 railway up --ci -m "Deploy $(git rev-parse --short HEAD)"
 ```
+
+A stale value makes `/api/healthz` report a commit that is not deployed. If the service is later switched to Railway's GitHub integration, delete both variables again. `DEPLOYMENT_PROFILES.md` -> "Manual CLI deploy (fallback)" carries the same instruction, and `scripts/cutover_preflight.sh` fails a service whose `commit_source` is anything but `RAILWAY_GIT_COMMIT_SHA`.
 
 The health responses always include `build.version`; `build.commit_sha`, `build.commit_sha_short`, `build.branch`, and `build.deployment_id` are populated from whitelisted environment variables when available, or from local `.git` metadata during local development.
 
@@ -792,7 +799,7 @@ Common failure patterns:
 - Auth failures: request logs show `status=401` on `/api/...`; confirm `REGENGINE_BASIC_AUTH_USERNAME` and `REGENGINE_BASIC_AUTH_PASSWORD` are set as intended.
 - CORS failures: Railway HTTP logs may show successful `OPTIONS` but the browser blocks a follow-up request; confirm `REGENGINE_CORS_ORIGINS` is the exact HTTPS dashboard origin.
 - Volume/storage failures: `/api/health` should report tenant-scoped paths under `REGENGINE_DATA_DIR`; confirm Railway has a volume mounted at `/data` and `REGENGINE_DATA_DIR=/data`.
-- Stale deployment failures: `/api/healthz` should report the expected `build.commit_sha_short`; if it does not, redeploy current `main` and update `REGENGINE_BUILD_SHA`.
+- Stale deployment failures: `/api/healthz` should report the expected `build.commit_sha_short` **and** `build.commit_source: RAILWAY_GIT_COMMIT_SHA`. If `commit_source` is `REGENGINE_BUILD_SHA`, that variable is masking the real commit on the GitHub-connected service — delete it (and `REGENGINE_BUILD_BRANCH`) rather than refreshing it. If the source is already `RAILWAY_GIT_COMMIT_SHA` and the SHA is still behind `main`, the deploy itself did not land: redeploy current `main`.
 - Live delivery failures: request logs identify the route and tenant while dashboard delivery stats show the sanitized delivery error; confirm endpoint, API key, and tenant id before retrying.
 - Local dependency conflicts: remove `.venv`, run `uv sync --group dev`, and retry before diagnosing app failures; global Python packages such as OpenTelemetry or Semgrep can drift independently of this repo.
 - Railway startup log noise: Uvicorn startup messages may appear with `level=error` in Railway logs. Treat them as noise unless there is a traceback, failed deployment, or HTTP 5xx.

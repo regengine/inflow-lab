@@ -15,6 +15,10 @@ software up to RegEngine, against a real RegEngine stack:
     idempotency replay, exactly as a live integrator hits them.
 7.  Verify the evidence on the RegEngine side: recent events, hash-chain
     verification, and an FDA export.
+8.  Tear down: delete the tenant and API key step 2 provisioned, so a
+    stack used for repeated runs does not accumulate one of each per run
+    (local mode only, and from a finally block so it also runs when an
+    earlier step fails).
 
 Local mode (default):
 
@@ -38,8 +42,10 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import contextlib
 import os
 import socket
+import ssl
 import sys
 import uuid
 from dataclasses import dataclass, field
@@ -103,37 +109,155 @@ def resp_command(*parts: str) -> bytes:
     return b"".join(encoded)
 
 
+# Human names for the RESP type bytes this client understands, used only to
+# make a wrong-type failure legible in the journey report.
+_RESP_TYPE_NAMES = {b"+": "simple string", b":": "integer", b"$": "bulk string"}
+
+
+def _read_reply(conn_file: Any, label: str) -> tuple[bytes, bytes | None]:
+    """Read one RESP reply, or raise explaining why there wasn't one.
+
+    The old version of this checked only for a leading b"-" and called
+    everything else success (#109). Two things that are not error replies
+    reached that check and passed it: an empty read, which is what a peer
+    that closed the connection returns, and arbitrary bytes such as a TLS
+    alert from a server expecting a handshake. Both made the journey print
+    PASS for the billing seed and then fail every subsequent ingest at the
+    subscription gate -- the operator staring at a green line for the step
+    that actually broke.
+    """
+    line = conn_file.readline()
+    if not line:
+        raise RuntimeError(
+            f"Redis closed the connection without replying to {label}. "
+            "An empty read is not a success: check the server is reachable, "
+            "and that a TLS endpoint is addressed as rediss:// rather than redis://."
+        )
+    kind, body = line[:1], line[1:].rstrip(b"\r\n")
+    if kind == b"-":
+        raise RuntimeError(f"Redis rejected {label}: {body.decode('utf-8', 'replace')}")
+    if kind == b"$":
+        try:
+            length = int(body)
+        except ValueError as exc:
+            raise RuntimeError(
+                f"Redis sent a malformed bulk-string header for {label}: {line[:64]!r}"
+            ) from exc
+        if length < 0:
+            return kind, None
+        chunk = conn_file.read(length + 2)
+        if len(chunk) < length:
+            raise RuntimeError(f"Redis sent a truncated reply to {label}.")
+        return kind, chunk[:length]
+    if kind in (b"+", b":"):
+        return kind, body
+    raise RuntimeError(
+        f"Redis replied to {label} with an unrecognized RESP type {kind!r}: {line[:64]!r}. "
+        "Bytes like these are what a TLS handshake alert, or a non-Redis service "
+        "on this port, looks like from here."
+    )
+
+
+def _expect_reply(
+    conn_file: Any,
+    label: str,
+    kind: bytes,
+    value: bytes | None = None,
+) -> bytes | None:
+    actual_kind, actual_value = _read_reply(conn_file, label)
+    if actual_kind != kind:
+        raise RuntimeError(
+            f"{label}: expected a RESP {_RESP_TYPE_NAMES[kind]} reply, got "
+            f"{_RESP_TYPE_NAMES.get(actual_kind, repr(actual_kind))} {actual_value!r}."
+        )
+    if value is not None and actual_value != value:
+        raise RuntimeError(
+            f"{label}: expected {value!r}, got {actual_value!r}."
+        )
+    return actual_value
+
+
 def seed_billing_status(redis_url: str, tenant_id: str, status: str = "trialing") -> None:
     """HSET billing:tenant:{tenant_id} status <status> via a raw socket.
 
     Uses a minimal RESP client so the journey script needs no Redis
-    dependency. Raises on any non-success reply.
+    dependency. Every reply is checked for its expected RESP type, and the
+    value is read back with HGET before this returns -- so the PASS line the
+    caller prints means the key is actually set, not merely that no error
+    reply arrived.
+
+    rediss:// URLs negotiate TLS before anything is written. parse_redis_url
+    has always accepted that scheme, but the socket was never wrapped, so
+    the AUTH password went out in plaintext and the handshake then failed
+    (#109).
     """
+    scheme = (urlparse(redis_url).scheme or "").lower()
     host, port, db, password = parse_redis_url(redis_url)
-    with socket.create_connection((host, port), timeout=5) as conn:
+    conn: Any = socket.create_connection((host, port), timeout=5)
+    try:
+        if scheme == "rediss":
+            # Before any sendall below, so a failed handshake cannot leak the
+            # credential the next line would have written.
+            conn = ssl.create_default_context().wrap_socket(conn, server_hostname=host)
         conn_file = conn.makefile("rb")
 
-        def send(*parts: str) -> bytes:
+        def send(*parts: str) -> None:
             conn.sendall(resp_command(*parts))
-            reply = conn_file.readline()
-            if reply.startswith(b"-"):
-                raise RuntimeError(f"Redis error: {reply.decode().strip()}")
-            if reply.startswith(b"$"):
-                length = int(reply[1:].strip())
-                if length >= 0:
-                    conn_file.read(length + 2)
-            return reply
 
         if password:
             send("AUTH", password)
+            _expect_reply(conn_file, "AUTH", b"+", b"OK")
         if db:
             send("SELECT", str(db))
-        send("HSET", f"billing:tenant:{tenant_id}", "status", status)
+            _expect_reply(conn_file, f"SELECT {db}", b"+", b"OK")
+
+        key = f"billing:tenant:{tenant_id}"
+        send("HSET", key, "status", status)
+        # HSET answers 1 for a new field and 0 for an overwritten one; both
+        # are successful writes, so only the integer type is asserted here.
+        _expect_reply(conn_file, "HSET", b":")
+
+        send("HGET", key, "status")
+        stored = _expect_reply(conn_file, "HGET", b"$")
+        if stored != status.encode("utf-8"):
+            raise RuntimeError(
+                f"Redis stored {stored!r} for {key} status, expected {status!r}."
+            )
+    finally:
+        conn.close()
+
+
+def record_billing_seed(report: JourneyReport, redis_url: str, tenant_id: str) -> None:
+    """Seed the subscription gate's billing status and report the outcome.
+
+    Split out of run_journey so the failure paths seed_billing_status now
+    raises on (#109) can be exercised end-to-end: what matters is not only
+    that it raises, but that the journey records FAIL rather than PASS.
+    """
+    try:
+        seed_billing_status(redis_url, tenant_id, "trialing")
+    except Exception as exc:  # noqa: BLE001 - the gate will 402/503 without it
+        report.record(
+            "Activate billing (Redis seed)",
+            False,
+            f"{exc} — without it the subscription gate returns 402/503. "
+            "Seed manually: redis-cli HSET billing:tenant:<id> status trialing, "
+            "or set SUBSCRIPTION_GATE_FAIL_OPEN=true on the stack.",
+        )
+        return
+    report.record("Activate billing (Redis seed)", True, "status=trialing")
 
 
 async def provision_tenant_and_key(
     client: httpx.AsyncClient, base_url: str, admin_key: str
-) -> tuple[str, str]:
+) -> tuple[str, str, str | None]:
+    """Create a journey tenant and a key scoped to it.
+
+    Returns (tenant_id, api_key, key_id). The key id is what
+    deprovision_tenant_and_key needs to delete the key on its own; it is
+    optional because deleting the tenant is expected to take its keys with
+    it, and not every admin API returns an id for a freshly minted key.
+    """
     headers = {"X-Admin-Key": admin_key}
     tenant_response = await client.post(
         f"{base_url}/v1/admin/tenants",
@@ -157,7 +281,64 @@ async def provision_tenant_and_key(
     api_key = key_payload.get("api_key") or key_payload.get("key")
     if not api_key:
         raise RuntimeError("Admin key creation response did not include the raw API key")
-    return tenant_id, api_key
+    key_id = key_payload.get("key_id") or key_payload.get("id")
+    return tenant_id, api_key, str(key_id) if key_id else None
+
+
+async def deprovision_tenant_and_key(
+    client: httpx.AsyncClient,
+    base_url: str,
+    admin_key: str,
+    tenant_id: str,
+    key_id: str | None,
+    report: JourneyReport,
+) -> None:
+    """Delete what provision_tenant_and_key created, and say whether it worked.
+
+    Every --local run minted a fresh "Meridian Fresh Foods (journey ...)"
+    tenant and an API key and left both behind (#190), so a stack used for
+    iterating on the onboarding flow accumulated one of each per run --
+    surfacing later only as a cluttered tenant picker or a mysteriously
+    large local database. The two sibling release scripts both remove the
+    tenant footprint they create from a finally block; this is the same
+    contract for the one thing this script provisions.
+
+    The outcome is recorded as a journey step rather than logged and
+    swallowed. If the admin API has no delete route, that is a real leftover
+    tenant and the operator needs to see it, with the id needed to remove it
+    by hand.
+    """
+    headers = {"X-Admin-Key": admin_key}
+    # 204/200/202 are all "done"; 404 means it is already gone, which is the
+    # state we wanted either way.
+    gone = {200, 202, 204, 404}
+    problems: list[str] = []
+
+    if key_id:
+        try:
+            response = await client.delete(f"{base_url}/v1/admin/keys/{key_id}", headers=headers)
+            if response.status_code not in gone:
+                problems.append(f"key {key_id}: HTTP {response.status_code}")
+        except httpx.HTTPError as exc:
+            problems.append(f"key {key_id}: {exc.__class__.__name__}: {exc}")
+
+    try:
+        response = await client.delete(f"{base_url}/v1/admin/tenants/{tenant_id}", headers=headers)
+        if response.status_code not in gone:
+            problems.append(f"tenant {tenant_id}: HTTP {response.status_code}")
+    except httpx.HTTPError as exc:
+        problems.append(f"tenant {tenant_id}: {exc.__class__.__name__}: {exc}")
+
+    if problems:
+        report.record(
+            "Teardown: journey tenant + key removed",
+            False,
+            "; ".join(problems)
+            + f" — remove tenant {tenant_id} by hand, or the stack keeps one "
+            "journey tenant per run.",
+        )
+        return
+    report.record("Teardown: journey tenant + key removed", True, f"tenant {tenant_id}")
 
 
 def build_config(endpoint: str, api_key: str, tenant_id: str) -> SimulationConfig:
@@ -288,8 +469,17 @@ async def verify_evidence(
         )
 
 
-async def run_journey(args: argparse.Namespace) -> int:
+async def run_journey(
+    args: argparse.Namespace,
+    *,
+    client: httpx.AsyncClient | None = None,
+) -> int:
     report = JourneyReport()
+    # Set the moment provisioning succeeds, so the teardown below knows a
+    # tenant exists even if the very next step raises. Stays None for
+    # --confirm-live, which provisions nothing.
+    provisioned: tuple[str, str | None] | None = None
+    admin_key = ""
 
     if args.confirm_live:
         endpoint = os.environ.get("REGENGINE_LIVE_ENDPOINT", "").strip()
@@ -321,7 +511,14 @@ async def run_journey(args: argparse.Namespace) -> int:
             return 2
         batches, batch_size = args.batches, args.batch_size
 
-    async with httpx.AsyncClient(timeout=30.0) as client:
+    # A caller-supplied client belongs to the caller, so it is wrapped in
+    # nullcontext instead of being closed on the way out of this block.
+    client_context = (
+        contextlib.nullcontext(client)
+        if client is not None
+        else httpx.AsyncClient(timeout=30.0)
+    )
+    async with client_context as client:
         # 1. Reach RegEngine.
         try:
             health = await client.get(f"{base_url}/health")
@@ -333,69 +530,77 @@ async def run_journey(args: argparse.Namespace) -> int:
         # 2-3. Onboarding (local only).
         if not args.confirm_live:
             try:
-                tenant_id, api_key = await provision_tenant_and_key(client, base_url, admin_key)
+                tenant_id, api_key, key_id = await provision_tenant_and_key(
+                    client, base_url, admin_key
+                )
+                provisioned = (tenant_id, key_id)
                 report.record("Onboard: tenant + API key provisioned", True, f"tenant {tenant_id}")
             except Exception as exc:  # noqa: BLE001 - report and stop
                 report.record("Onboard: tenant + API key provisioned", False, str(exc))
                 return 1
 
-            redis_url = os.environ.get("REGENGINE_REDIS_URL", DEFAULT_REDIS_URL)
-            try:
-                seed_billing_status(redis_url, tenant_id, "trialing")
-                report.record("Activate billing (Redis seed)", True, "status=trialing")
-            except Exception as exc:  # noqa: BLE001 - the gate will 402/503 without it
-                report.record(
-                    "Activate billing (Redis seed)",
-                    False,
-                    f"{exc} — without it the subscription gate returns 402/503. "
-                    "Seed manually: redis-cli HSET billing:tenant:<id> status trialing, "
-                    "or set SUBSCRIPTION_GATE_FAIL_OPEN=true on the stack.",
+            record_billing_seed(
+                report,
+                os.environ.get("REGENGINE_REDIS_URL", DEFAULT_REDIS_URL),
+                tenant_id,
+            )
+
+        try:
+            # 4. Test the connection like the console does.
+            live_client = LiveRegEngineClient()
+            config = build_config(endpoint, api_key, tenant_id)
+            check = await live_client.check_connection(config)
+            report.record(
+                "Test connection",
+                check.verdict == "connected",
+                f"{check.verdict}: {check.detail}",
+            )
+
+            # 5. Run the factory. Clamp the engine's demo clock to "now": the
+            # webhook validator allows +24h, but RegEngine's canonical storage
+            # layer only tolerates small clock skew — future-dated events pass
+            # validation and then fail persistence with a per-event storage
+            # error, which is not the journey we want to demonstrate.
+            os.environ.setdefault("REGENGINE_SIM_MAX_FUTURE_HOURS", "0")
+            engine = LegitFlowEngine()
+            engine.reset(args.seed, scenario=ScenarioId.FRESH_CUT_PROCESSOR, scale=args.scale)
+            ingested = 0
+            for index in range(batches):
+                payload = generate_batch(engine, batch_size)
+                try:
+                    result = await live_client.ingest(payload, config, idempotency_key=uuid.uuid4().hex)
+                    accepted = result.response.get("accepted", 0)
+                    rejected = result.response.get("rejected", 0)
+                    ingested += accepted
+                    report.record(
+                        f"Ingest batch {index + 1}/{batches}",
+                        rejected == 0 and accepted == len(payload.events),
+                        f"accepted={accepted} rejected={rejected}",
+                    )
+                    if rejected:
+                        for item in result.response.get("events", []):
+                            if item.get("status") == "rejected":
+                                print(f"       rejected {item.get('traceability_lot_code')}: {item.get('errors')}")
+                except LiveRegEngineDeliveryError as exc:
+                    report.record(f"Ingest batch {index + 1}/{batches}", False, str(exc))
+
+            # 6. Friction demos.
+            if args.friction:
+                await run_friction_demos(live_client, config, engine, report)
+
+            # 7. Verify the evidence RegEngine now holds.
+            await verify_evidence(client, base_url, api_key, tenant_id, report, expected_min_events=ingested)
+        finally:
+            # Runs on the success path, on any exception mid-journey, and
+            # on a KeyboardInterrupt. The tenant exists from the moment
+            # provisioning returned, so removing it cannot be conditional
+            # on the rest of the journey working (#190). --confirm-live
+            # provisions nothing, so provisioned stays None and this is a
+            # no-op there.
+            if provisioned is not None:
+                await deprovision_tenant_and_key(
+                    client, base_url, admin_key, provisioned[0], provisioned[1], report
                 )
-
-        # 4. Test the connection like the console does.
-        live_client = LiveRegEngineClient()
-        config = build_config(endpoint, api_key, tenant_id)
-        check = await live_client.check_connection(config)
-        report.record(
-            "Test connection",
-            check.verdict == "connected",
-            f"{check.verdict}: {check.detail}",
-        )
-
-        # 5. Run the factory. Clamp the engine's demo clock to "now": the
-        # webhook validator allows +24h, but RegEngine's canonical storage
-        # layer only tolerates small clock skew — future-dated events pass
-        # validation and then fail persistence with a per-event storage
-        # error, which is not the journey we want to demonstrate.
-        os.environ.setdefault("REGENGINE_SIM_MAX_FUTURE_HOURS", "0")
-        engine = LegitFlowEngine()
-        engine.reset(args.seed, scenario=ScenarioId.FRESH_CUT_PROCESSOR, scale=args.scale)
-        ingested = 0
-        for index in range(batches):
-            payload = generate_batch(engine, batch_size)
-            try:
-                result = await live_client.ingest(payload, config, idempotency_key=uuid.uuid4().hex)
-                accepted = result.response.get("accepted", 0)
-                rejected = result.response.get("rejected", 0)
-                ingested += accepted
-                report.record(
-                    f"Ingest batch {index + 1}/{batches}",
-                    rejected == 0 and accepted == len(payload.events),
-                    f"accepted={accepted} rejected={rejected}",
-                )
-                if rejected:
-                    for item in result.response.get("events", []):
-                        if item.get("status") == "rejected":
-                            print(f"       rejected {item.get('traceability_lot_code')}: {item.get('errors')}")
-            except LiveRegEngineDeliveryError as exc:
-                report.record(f"Ingest batch {index + 1}/{batches}", False, str(exc))
-
-        # 6. Friction demos.
-        if args.friction:
-            await run_friction_demos(live_client, config, engine, report)
-
-        # 7. Verify the evidence RegEngine now holds.
-        await verify_evidence(client, base_url, api_key, tenant_id, report, expected_min_events=ingested)
 
     print()
     passed = sum(1 for _, ok, _ in report.steps if ok)
