@@ -105,7 +105,7 @@ def validate_egress_endpoint(url: HttpUrl | None) -> None:
     controls a DNS zone. Closing that needs the validated address pinned at
     connect time -- resolving once, dialing the IP directly, and carrying the
     original hostname through as the Host header and TLS SNI so certificate
-    verification still applies. Tracked separately; see the rebinding test in
+    verification still applies. Tracked as issue #207; see the rebinding test in
     tests/test_egress_guard.py, which documents the gap rather than asserting
     it is closed.
 
