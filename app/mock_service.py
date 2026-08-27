@@ -4,6 +4,7 @@ import hashlib
 import hmac
 import json
 import os
+import re
 from collections import OrderedDict
 from datetime import UTC, datetime, timedelta
 from typing import Any, Callable, NamedTuple
@@ -46,6 +47,12 @@ LOCATION_KDE_FIELDS = (
     "ship_to_gln",
 )
 _IDEMPOTENCY_CACHE_LIMIT = 1024
+# An HMAC-SHA256 hex digest and nothing else. Enforced BEFORE
+# hmac.compare_digest, which raises TypeError -- not False -- when either
+# argument is a str carrying a non-ASCII character. An unauthenticated
+# caller sending `X-Webhook-Signature: sha256=caf\u00e9...` therefore used to
+# get an unhandled 500 with a traceback instead of a 401 (#209).
+_HEX_DIGEST_PATTERN = re.compile(r"[0-9a-fA-F]+")
 
 # Friction injection codes -> the HTTP failure a real customer hits. Keyed by
 # the DeliveryConfig.mock_friction values so operators can rehearse each
@@ -107,8 +114,15 @@ def _resume_chain_hash(store: EventStore) -> str:
     return ""
 
 
-def _verify_webhook_signature(body: bytes | None, signature_header: str | None) -> None:
+def verify_webhook_signature(body: bytes | None, signature_header: str | None) -> None:
     """Reject a missing/incorrect X-Webhook-Signature the way live RegEngine does (#113).
+
+    Public because the HTTP route calls it directly, on the raw wire bytes,
+    BEFORE those bytes are JSON-decoded or validated into an IngestPayload
+    (#209). ingest() still calls it too -- that is not redundant belt-and-
+    braces, it is what keeps the guarantee for every non-HTTP caller; the
+    second call re-HMACs bytes already in memory and costs nothing next to
+    the parse it now precedes.
 
     Gated by REGENGINE_WEBHOOK_HMAC_SECRET -- the same env var
     LiveRegEngineClient reads (see regengine_client.py's
@@ -147,6 +161,16 @@ def _verify_webhook_signature(body: bytes | None, signature_header: str | None) 
         raise MockRegEngineHTTPError(
             401, "Unsupported X-Webhook-Signature scheme (expected 'sha256=<hex>')"
         )
+
+    # A digest that is not pure hex cannot be a valid signature, so it fails
+    # the same way a wrong one does -- deliberately the SAME 401 detail, so
+    # the rejection reason is not itself an oracle for how the header was
+    # malformed. The check has to happen before compare_digest rather than
+    # after: compare_digest raises TypeError on a str argument containing a
+    # non-ASCII character, which escaped this module as an unhandled 500
+    # with a traceback, unauthenticated (#209).
+    if not _HEX_DIGEST_PATTERN.fullmatch(provided_digest):
+        raise MockRegEngineHTTPError(401, "Invalid X-Webhook-Signature")
 
     expected_digest = hmac.new(secret.encode("utf-8"), body, hashlib.sha256).hexdigest()
     # hmac.compare_digest, never == -- a time-variable comparison leaks how
@@ -232,12 +256,34 @@ class MockRegEngineService:
         # API key or an inactive subscription, which is a different
         # concern from "is this request from the holder of the shared
         # secret at all") (#113).
-        _verify_webhook_signature(raw_body, signature_header)
+        #
+        # "Outermost" here means outermost *within this method*, which was
+        # not far enough out: the HTTP route declared `payload:
+        # IngestPayload`, so FastAPI read, JSON-decoded and model-validated
+        # the entire batch before this method was ever entered (#209). The
+        # route now verifies the raw bytes itself, ahead of parsing; this
+        # call remains the gate for callers that reach ingest() directly.
+        verify_webhook_signature(raw_body, signature_header)
 
-        for code in friction:
-            failure = FRICTION_RESPONSES.get(code)
-            if failure is not None:
-                raise MockRegEngineHTTPError(*failure)
+        # An unrecognized friction code is rejected, never skipped (#210).
+        # Silently ignoring it produced the exact failure this simulator
+        # exists to surface: an operator rehearsing a failure mode types
+        # "rate-limit" or "subscription-inactive", the request returns a
+        # clean 200, and they conclude they have exercised a path they have
+        # not. The whole header is refused rather than just the bad code,
+        # so a typo alongside a valid code cannot be masked by the valid
+        # one raising first.
+        unknown = [code for code in friction if code not in FRICTION_RESPONSES]
+        if unknown:
+            raise MockRegEngineHTTPError(
+                400,
+                f"Unknown mock friction code(s): {', '.join(sorted(unknown))}. "
+                f"Supported codes: {', '.join(sorted(FRICTION_RESPONSES))}.",
+            )
+        if friction:
+            # First listed code wins, as before -- every code is known to
+            # map to a response by the time we get here.
+            raise MockRegEngineHTTPError(*FRICTION_RESPONSES[friction[0]])
 
         if len(payload.events) < MIN_BATCH_EVENTS:
             raise MockRegEngineHTTPError(

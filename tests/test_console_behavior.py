@@ -508,6 +508,82 @@ def test_workbench_before_the_first_snapshot_reports_pending_not_passing() -> No
 
 
 # ---------------------------------------------------------------------------
+# #189 -- warning severity has to survive the keyed row diffing #195 introduced
+# ---------------------------------------------------------------------------
+
+_SEVERITY_PRELUDE = _AUDIT_PRELUDE + """
+function warnedStatus(warnings) {
+  return statusFor('leafy_greens_supplier', auditModel({ warnings_by_record: { 'rec-1': warnings } }));
+}
+function row() {
+  return ids.eventsBody.querySelectorAll('tr')[0];
+}
+const SOFT = { field: 'reference_document_type', message: 'soft nudge', severity: 'recommended' };
+const HARD = { field: 'input_products', message: 'hard gap', severity: 'required' };
+"""
+
+
+def test_shift_log_row_shows_the_required_warning_not_the_advisory_one() -> None:
+    """A row has space for exactly one warning, so the required tier has to
+    sort to index 0 -- an advisory entry arriving first would otherwise be the
+    whole story the operator gets for that event."""
+    result = run_console(
+        _SEVERITY_PRELUDE
+        + """
+        // The advisory entry is listed first, so only sorting saves this.
+        renderSnapshot(warnedStatus([SOFT, HARD]), [RECORD], HEALTH);
+        return {
+          markup: row().innerHTML,
+          tone: row().getAttribute('data-warning-severity'),
+          rowClass: row().getAttribute('class') || '',
+        };
+        """
+    )
+    assert "Required: hard gap" in result["markup"]
+    assert "soft nudge" not in result["markup"]
+    # The tone the stylesheet keys off, on the row itself.
+    assert result["tone"] == "required"
+    assert "has-audit-warning" in result["rowClass"]
+
+
+def test_a_reused_row_never_keeps_a_severity_tone_it_no_longer_earns() -> None:
+    """#195 keeps row nodes alive across snapshots, so the severity attribute
+    #189 adds has to be re-applied and cleared on the surviving node -- the old
+    innerHTML rebuild got that for free."""
+    result = run_console(
+        _SEVERITY_PRELUDE
+        + """
+        renderSnapshot(warnedStatus([SOFT, HARD]), [RECORD], HEALTH);
+        const first = row();
+
+        // The required gap closes; the advisory nudge remains.
+        renderSnapshot(warnedStatus([SOFT]), [RECORD], HEALTH);
+        const softened = { tone: row().getAttribute('data-warning-severity'), markup: row().innerHTML };
+
+        // Every warning clears.
+        renderSnapshot(warnedStatus([]), [RECORD], HEALTH);
+        const cleared = {
+          tone: row().getAttribute('data-warning-severity'),
+          rowClass: row().getAttribute('class') || '',
+        };
+
+        return { softened, cleared, sameNodeThroughout: row() === first };
+        """
+    )
+    # The node really was reused -- otherwise this proves nothing about #195.
+    assert result["sameNodeThroughout"] is True
+
+    assert result["softened"]["tone"] == "recommended"
+    assert "soft nudge" in result["softened"]["markup"]
+    assert "Required:" not in result["softened"]["markup"]
+
+    assert result["cleared"]["tone"] is None
+    assert "has-audit-warning" not in result["cleared"]["rowClass"]
+    # An evaluated-and-clean row is still not a row nothing audited (#193).
+    assert "audit-not-evaluated" not in result["cleared"]["rowClass"]
+
+
+# ---------------------------------------------------------------------------
 # #194 -- an export preset that needs a lot code must not be offered without one
 # ---------------------------------------------------------------------------
 

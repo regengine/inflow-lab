@@ -5,6 +5,7 @@ from typing import Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
+from ..cte_rules import WarningSeverity
 from .domain import CSVImportType, CTEType, DestinationMode, RegEngineEvent
 from .simulation import DeliveryConfig
 
@@ -182,6 +183,13 @@ class CSVImportWarning(BaseModel):
     row: int
     field: str | None = None
     message: str
+    # Carried through from CTEValidationWarning (#189). Without it the
+    # import panel could only tell a required-tier gap from an advisory one
+    # by string-matching the message, which no consumer did -- so an FDA-
+    # mandatory KDE and a nice-to-have read identically in the response and
+    # in the console. Defaulted so a warning raised by the importer itself,
+    # about the file rather than the event's KDEs, needs no new argument.
+    severity: WarningSeverity = "recommended"
 
 
 class CSVImportResponse(BaseModel):

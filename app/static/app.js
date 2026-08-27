@@ -955,24 +955,41 @@ function renderReadinessBanner(summary, events, status = state.status) {
   `;
 }
 
-// Returns both the warnings AND whether an audit ran at all. The two used to
+// Returns both the warnings AND whether an audit ran at all (#193), with every
+// warning carrying its severity and the required ones sorted first (#189).
+//
+// #193: "nothing audited this row" and "the audit cleared this row" used to
 // collapse into one empty array, so a row nothing had evaluated rendered
-// exactly like a row the backend had cleared (#193).
+// exactly like a row the backend had cleared. `evaluated` keeps them apart.
+//
+// #189: a warning is {message, severity} rather than a bare string, because the
+// backend marks each one required or recommended instead of leaving the tiers
+// distinguishable only by a message prefix. Required sorts first -- a shift-log
+// row shows exactly one warning, so whichever lands at index 0 is the whole
+// story an operator gets for that event.
 function recordAudit(record, summary, status = state.status) {
   const audit = backendAudit(status, summary);
   if (!audit) {
-    return { evaluated: false, messages: [] };
+    return { evaluated: false, warnings: [] };
   }
   const warningPayload = audit.warnings_by_record?.[record.record_id];
-  if (Array.isArray(warningPayload) && warningPayload.length) {
-    return {
-      evaluated: true,
-      messages: warningPayload
-        .map((warning) => warning.message)
-        .filter((message) => typeof message === 'string' && message),
-    };
+  if (!Array.isArray(warningPayload) || !warningPayload.length) {
+    return { evaluated: true, warnings: [] };
   }
-  return { evaluated: true, messages: [] };
+  return {
+    evaluated: true,
+    warnings: warningPayload
+      .filter((warning) => typeof warning?.message === 'string' && warning.message)
+      .map((warning) => ({
+        message: warning.message,
+        severity: warning.severity === 'required' ? 'required' : 'recommended',
+      }))
+      .sort((left, right) => (left.severity === right.severity ? 0 : left.severity === 'required' ? -1 : 1)),
+  };
+}
+
+function warningSeverityTone(warnings) {
+  return warnings.some((warning) => warning.severity === 'required') ? 'required' : 'recommended';
 }
 
 function renderScenarioWorkbench(status = state.status, events = state.events) {
@@ -1314,14 +1331,31 @@ function formatKdeValue(value) {
 }
 
 function eventRowClass(audit) {
-  if (audit.messages.length) {
+  if (audit.warnings.length) {
     return 'has-audit-warning';
   }
   return audit.evaluated ? '' : 'audit-not-evaluated';
 }
 
+// #189 puts the row's severity tone in an attribute rather than the class list,
+// so the keyed-diff path (#195) has to set it on the node the way it sets the
+// class -- and clear it when a row stops warning. Rows now outlive a snapshot,
+// so a stale tone would otherwise cling to a reused node after its warning went
+// away, which the old innerHTML rebuild got for free.
+function applyEventRowAttributes(node, audit) {
+  node.setAttribute('class', eventRowClass(audit));
+  if (audit.warnings.length) {
+    node.setAttribute('data-warning-severity', warningSeverityTone(audit.warnings));
+  } else {
+    node.removeAttribute('data-warning-severity');
+  }
+}
+
 function eventRowCells(record, audit) {
   const event = record.event;
+  // Required sorts first in recordAudit, so index 0 is the strongest warning --
+  // the only one this row has room to show (#189).
+  const topWarning = audit.warnings[0];
   return `
     <td>${record.sequence_no}</td>
     <td><span class="pill">${escapeHtml(event.cte_type)}</span></td>
@@ -1332,7 +1366,7 @@ function eventRowCells(record, audit) {
     <td>${escapeHtml(record.destination_mode)}</td>
     <td>
       ${escapeHtml(record.delivery_attempts || 0)}
-      ${audit.messages.length ? `<small class="status-warning">${escapeHtml(audit.messages[0])}</small>` : ''}
+      ${topWarning ? `<small class="status-warning" data-severity="${topWarning.severity}">${escapeHtml(topWarning.severity === 'required' ? `Required: ${topWarning.message}` : topWarning.message)}</small>` : ''}
       ${audit.evaluated ? '' : '<small class="status-muted">Audit not evaluated</small>'}
     </td>
     <td>
@@ -1353,7 +1387,12 @@ function eventRowSignature(record, audit) {
     record.destination_mode,
     record.error || '',
     audit.evaluated,
-    audit.messages[0] || '',
+    // Both the one warning the row shows and the row-level tone -- #189 derives
+    // the tone from every warning, not just the first, so a required entry
+    // arriving behind the displayed one still has to repaint the row.
+    audit.warnings[0]?.message || '',
+    audit.warnings[0]?.severity || '',
+    audit.warnings.length ? warningSeverityTone(audit.warnings) : '',
     record.event.cte_type,
     record.event.traceability_lot_code,
     record.event.product_description,
@@ -1406,7 +1445,7 @@ function renderEvents(events) {
       rows.set(record.record_id, entry);
     }
     if (entry.signature !== signature) {
-      entry.node.setAttribute('class', eventRowClass(audit));
+      applyEventRowAttributes(entry.node, audit);
       entry.node.innerHTML = eventRowCells(record, audit);
       entry.signature = signature;
     }
@@ -1511,7 +1550,7 @@ function renderLineage(payload, traceabilityLotCode) {
         .map(([key, value]) => `<li><strong>${escapeHtml(key)}:</strong> ${escapeHtml(formatKdeValue(value))}</li>`)
         .join('');
       return `
-        <article class="lineage-card${audit.messages.length ? ' has-audit-warning' : audit.evaluated ? '' : ' audit-not-evaluated'}">
+        <article class="lineage-card${audit.warnings.length ? ' has-audit-warning' : audit.evaluated ? '' : ' audit-not-evaluated'}"${audit.warnings.length ? ` data-warning-severity="${warningSeverityTone(audit.warnings)}"` : ''}>
           <header>
             <h3>${escapeHtml(cteLabel(event.cte_type))}</h3>
             <span>${formatDateTime(event.timestamp)}</span>
@@ -1519,7 +1558,7 @@ function renderLineage(payload, traceabilityLotCode) {
           <p><strong>Lot:</strong> ${escapeHtml(event.traceability_lot_code)}</p>
           <p><strong>Product:</strong> ${escapeHtml(event.product_description)}</p>
           <p><strong>Location:</strong> ${escapeHtml(event.location_name)}</p>
-          ${audit.messages.length ? `<p class="lineage-warning">${escapeHtml(audit.messages.join(' • '))}</p>` : ''}
+          ${audit.warnings.length ? `<p class="lineage-warning" data-severity="${warningSeverityTone(audit.warnings)}">${escapeHtml(audit.warnings.map((warning) => (warning.severity === 'required' ? `Required: ${warning.message}` : warning.message)).join(' • '))}</p>` : ''}
           ${audit.evaluated ? '' : '<p class="status-muted">Audit not evaluated for this line profile.</p>'}
           <ul>${kdes}</ul>
         </article>
@@ -1565,7 +1604,11 @@ function renderImportResult(result) {
   const warningList = warnings
     .map((warning) => {
       const field = warning.field ? ` ${escapeHtml(warning.field)}:` : '';
-      return `<li>Row ${escapeHtml(warning.row)}${field} ${escapeHtml(warning.message)}</li>`;
+      // #189: an FDA-mandatory KDE and a nice-to-have used to read
+      // identically here. The backend distinguishes them now, so say which.
+      const severity = warning.severity === 'required' ? 'required' : 'recommended';
+      const prefix = severity === 'required' ? 'Required — ' : '';
+      return `<li data-severity="${severity}">Row ${escapeHtml(warning.row)}${field} ${escapeHtml(prefix)}${escapeHtml(warning.message)}</li>`;
     })
     .join('');
   ids.importResults.innerHTML = `

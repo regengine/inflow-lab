@@ -207,7 +207,9 @@ simulate -> ingest -> validate -> trace -> export
 The simulator supports three delivery modes, configured via the `delivery.mode` field:
 
 ### `mock` (default)
-No credentials required. Events go to the built-in RegEngine stand-in, which **mirrors the live webhook's validation** rather than accepting everything: strict per-CTE KDE checks (exact key lookup, no aliasing), the location-identifier requirement, a 500-event batch cap, an empty-batch rejection, in-batch duplicate rejection, future-timestamp rejection, and 24-hour idempotency replays. When `REGENGINE_WEBHOOK_HMAC_SECRET` is set, the stand-in also **verifies** `X-Webhook-Signature` over the raw request bytes and 401s a missing, malformed or mismatched signature — so a signing bug fails here rather than only against production. Verification applies to the HTTP route; the in-process delivery path has no wire bytes to check and skips it. The route additionally accepts a mock-only `X-Mock-Friction` header (comma-separated `invalid_key`, `subscription_inactive`, `rate_limit`) so an external caller can rehearse the same failure modes the console's toggles inject. Accepted events return a synthetic `event_id`, `sha256_hash`, and `chain_hash`; rejected events return the same per-event `errors` shape live RegEngine produces. Safe for demos and design-partner testing.
+No credentials required. Events go to the built-in RegEngine stand-in, which **mirrors the live webhook's validation** rather than accepting everything: strict per-CTE KDE checks (exact key lookup, no aliasing), the location-identifier requirement, a 500-event batch cap, an empty-batch rejection, in-batch duplicate rejection, future-timestamp rejection, and 24-hour idempotency replays. When `REGENGINE_WEBHOOK_HMAC_SECRET` is set, the stand-in also **verifies** `X-Webhook-Signature` over the raw request bytes and 401s a missing, malformed or mismatched signature — so a signing bug fails here rather than only against production. Verification runs *before* the body is decoded or validated, so an unsigned caller gets a flat 401 rather than a field-level 422 enumerating the schema, and an unsigned oversized body is never parsed. Verification applies to the HTTP route; the in-process delivery path has no wire bytes to check and skips it. The route additionally accepts a mock-only `X-Mock-Friction` header (comma-separated `invalid_key`, `subscription_inactive`, `rate_limit`) so an external caller can rehearse the same failure modes the console's toggles inject; an unrecognized code is a 400, never a silent 200 that injects nothing. Accepted events return a synthetic `event_id`, `sha256_hash`, and `chain_hash`; rejected events return the same per-event `errors` shape live RegEngine produces. Safe for demos and design-partner testing.
+
+**One live check the stand-in deliberately does not apply by default: the 90-day event-age replay window.** Live RegEngine rejects any event older than `WEBHOOK_MAX_EVENT_AGE_DAYS` (90) with "replay window exceeded". The stand-in implements the same floor (`MAX_EVENT_AGE_DAYS` in `app/mock_service.py`, pinned by `tests/test_mock_validation_parity.py`) but constructs with `enforce_event_age_window=False`, because the bundled demo fixtures carry hardcoded dates that are already outside the window — switching it on would make Load Demo Fixture fail on this repository's own data. Re-timing those fixtures is tracked as issue #199; until then this is the one documented place where the mock accepts what live would reject. So that the divergence is never silent, **CSV import warns on every row outside the window before any delivery is attempted**, at `required` severity, naming the limit and live's exact rejection wording. Historical backfill still imports and still delivers in mock mode — the warning is the signal, not a refusal.
 
 Mock delivery also supports **failure-mode rehearsal** via `delivery.mock_friction` (or the "Rehearse failure modes" toggles in the console): `invalid_key` (401), `subscription_inactive` (402), and `rate_limit` (429) inject the exact failures a live integration hits, so operators can practice diagnosing and retrying — retries reuse the stored idempotency key, so nothing double-ingests.
 
@@ -308,7 +310,7 @@ Replay responses include `status`, `read`, `replayed`, `posted`, `failed`, `sour
 
 ## CSV import
 
-`POST /api/import/csv` accepts CSV text and imports either scheduled RegEngine-shaped events or seed lots. Valid rows are delivered through the selected delivery mode and persisted as `StoredEventRecord` JSONL entries. Invalid rows are skipped, with deterministic row-level errors in the response. Accepted rows are also checked against CTE-specific KDE expectations and can return warnings for missing lineage, document, location, or date context. The default dashboard/API delivery remains **`mock`** unless you explicitly submit a different `delivery` object.
+`POST /api/import/csv` accepts CSV text and imports either scheduled RegEngine-shaped events or seed lots. Valid rows are delivered through the selected delivery mode and persisted as `StoredEventRecord` JSONL entries. Invalid rows are skipped, with deterministic row-level errors in the response. Accepted rows are also checked against CTE-specific KDE expectations and can return warnings for missing lineage, document, location, or date context. Each warning carries a `severity` of `required` or `recommended`, so an FDA-mandatory KDE (for example a Transformation event's input-lot linkage) is distinguishable from an advisory one in the response and in the console, rather than only in the message text. The audit-readiness summary counts the two tiers separately (`required_warning_count` / `recommended_warning_count`). The default dashboard/API delivery remains **`mock`** unless you explicitly submit a different `delivery` object.
 
 Request body:
 
@@ -386,6 +388,8 @@ The dashboard fixture loader resets the current event log before loading the sel
 
 If a lot code is supplied, the export is scoped to that lot's transitive lineage before applying the preset filter. `GET /api/mock/regengine/export/presets` returns the preset catalog used by the dashboard. The dashboard export panel builds CSV and EPCIS download links from the same lot and date filters.
 
+**Export size limit.** Both export endpoints (`export/fda-request` and `export/epcis`) refuse a request matching more than **5,000 records** with HTTP 413, naming the matched count and how to narrow the request. They read the full persisted JSONL history, so a broad date range or a wide lineage graph is otherwise unbounded. The response is refused rather than truncated on purpose: these are `Content-Disposition: attachment` downloads, so a shortened file is indistinguishable from a complete one once it is saved — and it is evidence handed to a regulator. A successful export carries `X-Export-Record-Count`, so a count under the limit is proof nothing was left out. (`/api/lineage`, which is read in the browser rather than downloaded, caps and reports truncation in `X-Lineage-Truncated` instead.)
+
 ## EPCIS 2.0 export scaffolding
 
 `GET /api/mock/regengine/export/epcis` derives a scaffolded EPCIS 2.0 JSON-LD document from stored simulator records. This is intentionally additive: it does not change live RegEngine ingest payloads, the mock ingest route, or the FDA CSV export shape.
@@ -438,12 +442,14 @@ The service wrapper examples below can be used with any profile; keep the profil
 | `POST` | `/api/simulate/stop` | Stop the loop |
 | `POST` | `/api/simulate/step` | Emit one batch synchronously |
 | `POST` | `/api/simulate/replay` | Replay persisted JSONL events through the configured delivery mode |
-| `POST` | `/api/simulate/reset` | Clear state and persisted events |
+| `POST` | `/api/simulate/reset` | Clear state and persisted events (accepts the config fields **unwrapped**) |
 | `GET` | `/api/simulate/stream` | Server-Sent Events snapshots for live dashboard updates |
 | `POST` | `/api/import/csv` | Bulk import scheduled events or seed lots from CSV text |
 | `POST` | `/api/delivery/retry` | Retry failed stored deliveries with the current or supplied delivery config |
 
 All routes accept optional `X-RegEngine-Tenant` for tenant-scoped storage. If Basic Auth is enabled, include standard HTTP Basic credentials.
+
+**`/start` and `/reset` take a config override in different shapes, on purpose.** `/start` requires one, so it is wrapped: `{"config": {...}}`. `/reset` treats one as optional — an empty body clears state without reconfiguring — so it takes the same fields unwrapped at the top level. Sending either shape to the other endpoint is a 422 whose message names both shapes; neither is ever silently dropped. See the two examples below.
 
 ### Inspection
 

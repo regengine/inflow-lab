@@ -1,11 +1,12 @@
 from __future__ import annotations
 
+import asyncio
 import ipaddress
 import os
 import socket
 from typing import Any, Literal
 
-from pydantic import BaseModel, ConfigDict, Field, HttpUrl, field_validator
+from pydantic import BaseModel, ConfigDict, Field, HttpUrl, field_validator, model_validator
 
 from ..scenarios import ScenarioId
 from .domain import DestinationMode, OperationScale
@@ -144,6 +145,26 @@ def validate_egress_endpoint(url: HttpUrl | None) -> None:
         )
 
 
+async def validate_egress_endpoint_async(url: HttpUrl | None) -> None:
+    """``validate_egress_endpoint`` for callers running on the event loop.
+
+    The guard's one expensive step is ``socket.getaddrinfo``, which is
+    blocking C code: called straight from ``async def ingest`` /
+    ``check_connection`` it pinned the whole event loop for the duration of
+    a DNS lookup, so one slow or timing-out resolver stalled every other
+    request in the process -- including the SSE stream the console renders
+    from (#209). Offloaded to a worker thread the same way #136 moved store
+    I/O off the loop (``asyncio.to_thread`` throughout app/controller.py).
+
+    The synchronous function stays the single implementation and remains
+    the entry point for synchronous callers and tests; this only changes
+    which thread it runs on. Module-level lookups inside it (notably
+    ``_resolved_addresses``) still resolve through this module's globals on
+    the worker thread, so monkeypatching them in a test works unchanged.
+    """
+    await asyncio.to_thread(validate_egress_endpoint, url)
+
+
 class DeliveryConfig(BaseModel):
     # extra="forbid" (#143): this arrives inline in request bodies (the
     # integration routes, and the `delivery` block on CSV-import, replay and
@@ -161,6 +182,17 @@ class DeliveryConfig(BaseModel):
     mock_friction: list[MockFrictionCode] = Field(default_factory=list)
 
 
+# What /start and /reset each want their config sent as. Kept as one string
+# so both misnesting errors below describe the pair the same way and cannot
+# drift from each other (#143).
+_CONFIG_SHAPE_GUIDANCE = (
+    'POST /api/simulate/start takes its config wrapped -- {"config": {...}} -- because a '
+    "config is required to start. POST /api/simulate/reset takes the same fields unwrapped "
+    "at the top level, because its config is optional: an empty body resets without "
+    "reconfiguring."
+)
+
+
 class SimulationConfig(BaseModel):
     # extra="forbid" (#143): POST /api/simulate/reset validates the raw body
     # directly as this model, so a caller who wrapped it as {"config": {...}}
@@ -168,6 +200,34 @@ class SimulationConfig(BaseModel):
     # scenario. There is no field named "config" here, so forbidding extras
     # turns that mistake into the 422 it always should have been.
     model_config = ConfigDict(extra="forbid")
+
+    @model_validator(mode="before")
+    @classmethod
+    def _explain_a_wrapped_config(cls, data: Any) -> Any:
+        """Answer the specific mistake, not just refuse it (#143).
+
+        extra="forbid" already stops `{"config": {...}}` reaching /reset,
+        but it stops it with pydantic's generic "Extra inputs are not
+        permitted" -- which tells a caller their body is wrong and nothing
+        about what right looks like. Since "config" can never be a legal key
+        on this model, seeing one is unambiguous evidence of exactly which
+        mistake was made, and the error can say so.
+
+        This is the deliberate alternative to unifying the two endpoints'
+        body shapes: the mistake becomes impossible to make silently AND
+        self-correcting, without a breaking change to a documented endpoint
+        that the console, three operator scripts and the test suite all
+        call. See the API reference in README.md.
+
+        Save files never reach this: ScenarioSaveSnapshot prunes unknown
+        config keys before validating (app/schemas/scenarios.py).
+        """
+        if isinstance(data, dict) and "config" in data:
+            raise ValueError(
+                "'config' is not a field of SimulationConfig -- the config fields belong "
+                f"at this level, not nested under a 'config' key. {_CONFIG_SHAPE_GUIDANCE}"
+            )
+        return data
 
     source: str = "codex-simulator"
     scenario: ScenarioId = ScenarioId.LEAFY_GREENS_SUPPLIER
@@ -195,6 +255,26 @@ class SimulationConfig(BaseModel):
 
 class StartRequest(BaseModel):
     config: SimulationConfig
+
+    @model_validator(mode="before")
+    @classmethod
+    def _explain_an_unwrapped_config(cls, data: Any) -> Any:
+        """The mirror image of SimulationConfig's check above (#143).
+
+        A caller who sends /reset's unwrapped body to /start got "Field
+        required" against `config` -- accurate, and useless if you do not
+        already know the wrapper exists, since the fields you sent are
+        simply not mentioned. Recognising that the body IS a config, just
+        at the wrong depth, lets the error say what to do with it.
+        """
+        if isinstance(data, dict) and "config" not in data:
+            misplaced = sorted(set(data) & set(SimulationConfig.model_fields))
+            if misplaced:
+                raise ValueError(
+                    f"config field(s) {misplaced} were sent at the top level. "
+                    f"{_CONFIG_SHAPE_GUIDANCE}"
+                )
+        return data
 
 
 class StepRequest(BaseModel):

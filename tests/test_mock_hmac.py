@@ -428,3 +428,191 @@ def test_route_friction_header_agrees_with_direct_service_friction() -> None:
 
     assert response.status_code == exc_info.value.status_code == 401
     assert response.json()["detail"] == exc_info.value.detail
+
+
+# ---------------------------------------------------------------------------
+# #209: HMAC verification must be the OUTERMOST gate on the HTTP route
+# ---------------------------------------------------------------------------
+
+
+def test_route_401s_an_unsigned_body_without_ever_validating_its_schema(
+    monkeypatch: Any,
+) -> None:
+    """An unsigned caller must get a flat 401, never a field-level 422.
+
+    The route used to declare `payload: IngestPayload`, so FastAPI parsed
+    and model-validated the entire batch before the handler -- and thus
+    before the signature check -- ever ran. That handed an unauthenticated
+    caller a schema oracle: send a deliberately malformed body and read the
+    422 back to enumerate field names, types and constraints. It also meant
+    an unsigned 50 MB body was fully decoded before being thrown away.
+
+    The body below is malformed three ways at once (unknown envelope key,
+    unknown per-event field, wrong type on quantity). Each of those is a
+    422 that this suite pins elsewhere; with a secret configured and no
+    signature, the caller must learn none of it.
+    """
+    monkeypatch.setenv(HMAC_ENV_VAR, "route-shared-secret")
+
+    response = client.post(
+        INGEST_URL,
+        json={
+            "sorce": "typo",
+            "events": [{"cte_type": "harvesting", "product_desc": "x", "quantity": "not-a-number"}],
+        },
+    )
+
+    assert response.status_code == 401, response.text
+    body = response.text
+    for leaked in ("sorce", "product_desc", "quantity", "extra_forbidden"):
+        assert leaked not in body, f"unsigned caller was told about {leaked!r}"
+
+
+def test_route_401s_an_unsigned_body_that_is_not_even_json(monkeypatch: Any) -> None:
+    """The same ordering, one step earlier: bytes that cannot be decoded at
+    all must still cost an unsigned caller a 401 rather than a JSON-decode
+    422. Nothing may be parsed before the signature is checked."""
+    monkeypatch.setenv(HMAC_ENV_VAR, "route-shared-secret")
+
+    response = client.post(
+        INGEST_URL,
+        content=b"{not json at all",
+        headers={"Content-Type": "application/json"},
+    )
+
+    assert response.status_code == 401, response.text
+
+
+def test_route_still_422s_a_malformed_body_once_the_signature_is_valid(
+    monkeypatch: Any,
+) -> None:
+    """The flip side: moving the parse behind the signature check must not
+    lose the parse. A correctly signed but malformed body still gets the
+    same field-level 422 (#143's extra_forbidden shape included) it always
+    did -- the detail is withheld from strangers, not from everyone."""
+    secret = "route-shared-secret"
+    monkeypatch.setenv(HMAC_ENV_VAR, secret)
+    raw_body = json.dumps(
+        {"source": "hmac-test", "sorce": "typo", "events": [_valid_event().model_dump(mode="json")]},
+        separators=(",", ":"),
+        sort_keys=True,
+    ).encode("utf-8")
+
+    response = client.post(
+        INGEST_URL,
+        content=raw_body,
+        headers={"Content-Type": "application/json", "X-Webhook-Signature": _sign(secret, raw_body)},
+    )
+
+    assert response.status_code == 422, response.text
+    assert any(error["type"] == "extra_forbidden" for error in response.json()["detail"])
+
+
+def test_route_401s_a_non_ascii_signature_header_instead_of_500(monkeypatch: Any) -> None:
+    """hmac.compare_digest raises TypeError -- not False -- when a str
+    argument carries a non-ASCII character, so a header like
+    `sha256=café...` escaped as an unhandled 500 with a traceback, from an
+    unauthenticated caller. It fails closed, so this is availability and
+    information disclosure rather than a bypass, but a 500 is never the
+    right answer to a bad signature (#209)."""
+    secret = "route-shared-secret"
+    monkeypatch.setenv(HMAC_ENV_VAR, secret)
+    raw_body = _canonical_body()
+    # Sent as raw bytes, because that is how the byte reaches a real server:
+    # HTTP header octets are decoded latin-1 by the ASGI layer, so 0xE9
+    # arrives at the route as "é" in a str. httpx refuses to ASCII-encode a
+    # str header value, which is exactly why passing bytes here is not a
+    # contrivance -- it is the only way to reproduce the real request.
+    non_ascii_digest = ("caf\u00e9" + "0" * 60).encode("latin-1")
+
+    response = client.post(
+        INGEST_URL,
+        content=raw_body,
+        headers={
+            "Content-Type": "application/json",
+            "X-Webhook-Signature": b"sha256=" + non_ascii_digest,
+        },
+    )
+
+    assert response.status_code == 401, response.text
+    assert response.status_code != 500
+    assert "signature" in response.json()["detail"].lower()
+
+
+def test_service_rejects_a_non_ascii_signature_without_raising_type_error(
+    monkeypatch: Any,
+) -> None:
+    """Same defect at the service level, where the TypeError originates."""
+    monkeypatch.setenv(HMAC_ENV_VAR, "unit-test-shared-secret")
+    raw_body = _canonical_body()
+    payload = IngestPayload.model_validate_json(raw_body)
+    service = MockRegEngineService()
+
+    with pytest.raises(MockRegEngineHTTPError) as exc_info:
+        service.ingest(payload, raw_body=raw_body, signature_header="sha256=café")
+
+    assert exc_info.value.status_code == 401
+
+
+# ---------------------------------------------------------------------------
+# #210: an unknown X-Mock-Friction code must be rejected, not ignored
+# ---------------------------------------------------------------------------
+
+
+def test_route_rejects_an_unknown_mock_friction_code() -> None:
+    """A misspelled friction code returned 200 and injected nothing.
+
+    That is the exact silent no-op this simulator exists to surface, in the
+    feature whose entire purpose is rehearsing failure: the operator types
+    "rate-limit" instead of "rate_limit", sees a clean 200, and concludes
+    they have exercised a rate-limit path they never touched (#210).
+    """
+    response = client.post(
+        INGEST_URL, json=_payload_dict(lot="TLC-FRICTION-TYPO"), headers={"X-Mock-Friction": "rate-limit"}
+    )
+
+    assert response.status_code == 400, response.text
+    detail = response.json()["detail"]
+    assert "rate-limit" in detail
+    assert "rate_limit" in detail, "the rejection should name the codes that do work"
+
+
+def test_route_rejects_an_unknown_code_even_alongside_a_valid_one() -> None:
+    """The whole header is refused rather than just the bad code. A valid
+    code raising first would mask the typo behind a plausible-looking 401,
+    which is the same silent no-op one layer down."""
+    response = client.post(
+        INGEST_URL,
+        json=_payload_dict(lot="TLC-FRICTION-MIXED"),
+        headers={"X-Mock-Friction": "invalid_key, subscription-inactive"},
+    )
+
+    assert response.status_code == 400, response.text
+    assert "subscription-inactive" in response.json()["detail"]
+
+
+def test_every_documented_friction_code_is_still_accepted() -> None:
+    # The rejection must be scoped to genuinely unknown codes: every code
+    # DeliveryConfig.mock_friction accepts still injects its failure.
+    for code, expected_status in (
+        ("invalid_key", 401),
+        ("subscription_inactive", 402),
+        ("rate_limit", 429),
+    ):
+        response = client.post(
+            INGEST_URL, json=_payload_dict(lot=f"TLC-FRICTION-{code}"), headers={"X-Mock-Friction": code}
+        )
+        assert response.status_code == expected_status, (code, response.text)
+
+
+def test_service_rejects_an_unknown_friction_code() -> None:
+    """Same guarantee at the service level, so every caller of ingest()
+    gets it -- not only the HTTP route."""
+    service = MockRegEngineService()
+    payload = IngestPayload(source="unit-test", events=[_valid_event()])
+
+    with pytest.raises(MockRegEngineHTTPError) as exc_info:
+        service.ingest(payload, friction=("not_a_real_code",))
+
+    assert exc_info.value.status_code == 400
+    assert "not_a_real_code" in exc_info.value.detail
