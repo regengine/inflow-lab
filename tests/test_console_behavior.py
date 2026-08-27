@@ -217,3 +217,129 @@ def test_welcome_dialog_traps_keyboard_focus() -> None:
     assert result["afterDismiss"]["focus"] == "startBtn"
     assert result["afterDismiss"]["prevented"] is False
     assert result["afterDismiss"]["backgroundInert"] is False
+
+
+# ---------------------------------------------------------------------------
+# #196 -- a 422 must reach the operator as text, not "[object Object]"
+# ---------------------------------------------------------------------------
+
+_API_ERROR_SNIPPET = """
+const seen = {};
+
+async function capture(name, response) {
+  __dom.setFetch(() => response);
+  try {
+    await api('/api/simulate/start', { method: 'POST', body: '{}' });
+    seen[name] = null;
+  } catch (error) {
+    seen[name] = error.message;
+  }
+}
+
+// FastAPI's own 422 shape: detail is an ARRAY of error objects.
+await capture('fastapiArray', __dom.makeResponse({
+  status: 422,
+  body: {
+    detail: [{
+      type: 'value_error',
+      loc: ['body', 'config', 'batch_size'],
+      msg: 'Value error, batch_size must be between 1 and 100',
+      input: 500,
+    }],
+  },
+}));
+
+// Two failures at once must both survive.
+await capture('twoErrors', __dom.makeResponse({
+  status: 422,
+  body: {
+    detail: [
+      { loc: ['body', 'config', 'interval_seconds'], msg: 'interval_seconds must be >= 0' },
+      { loc: ['body', 'config', 'batch_size'], msg: 'batch_size must be between 1 and 100' },
+    ],
+  },
+}));
+
+// The plain-string detail every other endpoint returns is untouched.
+await capture('stringDetail', __dom.makeResponse({
+  status: 400,
+  body: { detail: 'Live delivery requires both api_key and tenant_id' },
+}));
+
+// A proxy's HTML 502 has no JSON at all.
+await capture('htmlBody', __dom.makeResponse({
+  status: 502,
+  contentType: 'text/html',
+  text: '<html><head><title>502</title></head><body><h1>Bad Gateway</h1></body></html>',
+}));
+
+// And a body that is empty entirely.
+await capture('emptyBody', __dom.makeResponse({ status: 503, contentType: 'text/plain', text: '' }));
+
+// The operator sees error.message verbatim through setStatus().
+setStatus(seen.fastapiArray, 'error', 5000);
+seen.statusLine = ids.statusMessage.textContent;
+return seen;
+"""
+
+
+def test_api_error_messages_are_readable_for_every_error_body_shape() -> None:
+    """`new Error(payload.detail)` stringifies FastAPI's list-shaped 422 detail
+    to "[object Object]", discarding the only actionable half of the response."""
+    result = run_console(_API_ERROR_SNIPPET)
+
+    assert "[object Object]" not in json.dumps(result)
+    assert "config.batch_size" in result["fastapiArray"]
+    assert "batch_size must be between 1 and 100" in result["fastapiArray"]
+    assert result["statusLine"] == result["fastapiArray"]
+
+    assert "interval_seconds must be >= 0" in result["twoErrors"]
+    assert "batch_size must be between 1 and 100" in result["twoErrors"]
+
+    assert result["stringDetail"] == "Live delivery requires both api_key and tenant_id"
+
+    assert "502" in result["htmlBody"]
+    assert "Bad Gateway" in result["htmlBody"]
+    assert "<" not in result["htmlBody"]
+
+    assert "503" in result["emptyBody"]
+
+
+def test_the_real_server_422_renders_readably_in_the_console() -> None:
+    """End-to-end for #196: take the exact 422 body FastAPI produces for an
+    out-of-range Batch size and prove the console turns it into something the
+    operator can act on. Pins the wire shape and the rendering together, so a
+    change to either side has to keep the operator's status line readable."""
+    from fastapi.testclient import TestClient
+
+    from app.main import app
+
+    with TestClient(app) as client:
+        response = client.post("/api/simulate/start", json={"config": {"batch_size": 500}})
+
+    assert response.status_code == 422
+    detail = response.json()["detail"]
+    # FastAPI's documented HTTPValidationError shape: a list of error objects.
+    # That is exactly what `new Error(payload.detail)` used to flatten to
+    # "[object Object]".
+    assert isinstance(detail, list) and detail, detail
+
+    rendered = run_console(
+        f"""
+        __dom.setFetch(() => __dom.makeResponse({{
+          status: {response.status_code},
+          body: {json.dumps(response.json())},
+        }}));
+        try {{
+          await api('/api/simulate/start', {{ method: 'POST', body: '{{}}' }});
+          return null;
+        }} catch (error) {{
+          setStatus(error.message, 'error', 5000);
+          return ids.statusMessage.textContent;
+        }}
+        """
+    )
+    assert rendered is not None
+    assert "[object Object]" not in rendered
+    assert "batch_size" in rendered
+    assert "batch_size must be between 1 and 100" in rendered

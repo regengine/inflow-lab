@@ -433,14 +433,63 @@ function buildConfig() {
   };
 }
 
+// #196: `detail` is not always a string. FastAPI answers a body/query
+// validation failure with an ARRAY of error objects, and passing that to
+// new Error() stringifies it to "[object Object]" -- setStatus() then shows
+// the operator that literal text instead of which field is wrong and why.
+// A non-JSON error body (an HTML 5xx from a proxy in front of the app) lost
+// everything the same way. This turns both into something actionable.
+function describeApiError(payload, response, rawBody = '') {
+  const detail = payload?.detail;
+  if (typeof detail === 'string' && detail.trim()) {
+    return detail.trim();
+  }
+  if (Array.isArray(detail) && detail.length) {
+    const lines = detail
+      .map((item) => {
+        // loc is ["body", "config", "batch_size"] -- the leading request
+        // part is noise; the rest names a field the operator can find.
+        const location = Array.isArray(item?.loc)
+          ? item.loc
+              .filter((part, index) => !(index === 0 && ['body', 'query', 'path', 'header', 'cookie'].includes(part)))
+              .join('.')
+          : '';
+        const message = typeof item?.msg === 'string' && item.msg ? item.msg : JSON.stringify(item);
+        return location ? `${location}: ${message}` : message;
+      })
+      .filter(Boolean);
+    if (lines.length) {
+      return lines.join('; ');
+    }
+  }
+  if (detail && typeof detail === 'object') {
+    return JSON.stringify(detail);
+  }
+  const statusLine = `Request failed: ${response.status}${response.statusText ? ` ${response.statusText}` : ''}`;
+  const snippet = String(rawBody || '')
+    .replace(/<[^>]*>/g, ' ')
+    .replace(/\s+/g, ' ')
+    .trim()
+    .slice(0, 120);
+  return snippet ? `${statusLine} — ${snippet}` : statusLine;
+}
+
 async function api(path, options = {}) {
   const response = await fetch(path, {
     headers: { 'Content-Type': 'application/json' },
     ...options,
   });
   if (!response.ok) {
-    const payload = await response.json().catch(() => ({}));
-    throw new Error(payload.detail || `Request failed: ${response.status}`);
+    // Read as text first: the body can only be consumed once, and a
+    // non-JSON error body still has to reach describeApiError().
+    const rawBody = await response.text().catch(() => '');
+    let payload = {};
+    try {
+      payload = rawBody ? JSON.parse(rawBody) : {};
+    } catch (error) {
+      payload = {};
+    }
+    throw new Error(describeApiError(payload, response, rawBody));
   }
   const contentType = response.headers.get('content-type') || '';
   if (contentType.includes('application/json')) {
