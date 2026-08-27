@@ -134,6 +134,111 @@ def test_add_many_leaves_no_phantom_when_a_later_write_in_the_same_batch_fails(t
 
 
 # ---------------------------------------------------------------------------
+# #185 (second half) — a torn append must not destroy the NEXT good record.
+# ---------------------------------------------------------------------------
+
+
+def test_a_torn_trailing_fragment_does_not_swallow_the_next_record(tmp_path):
+    """The failure the two tests above do not reach.
+
+    ``add_many`` writes ``json + "\n"`` as one call, so a write that fails
+    partway can leave JSON on disk with **no terminating newline**. The next
+    append opens the file in ``"a"`` and writes straight onto that same
+    physical line, fusing the fragment and the new record into one unparseable
+    line -- so a record that was fully written, flushed, and acknowledged to
+    the API caller becomes unreadable.
+
+    Simulated directly by writing a fragment, because the point is what the
+    *next* append does with it, not how it got there.
+    """
+    persist_path = tmp_path / "events.jsonl"
+    store = EventStore(persist_path=str(persist_path))
+    store.add_many([make_record("TLC-BEFORE-000001")])
+
+    # A half-written record: valid JSON prefix, no trailing newline.
+    with persist_path.open("a", encoding="utf-8") as handle:
+        handle.write('{"record_id": "torn", "event": {"traceability_lot_code": "TLC-TO')
+
+    # This record is fully written and acknowledged to the caller.
+    stored = store.add_many([make_record("TLC-AFTER-000002")])
+    assert stored[0].event.traceability_lot_code == "TLC-AFTER-000002"
+
+    # It must still be readable. Before the fix the fragment and this record
+    # shared one line, so the whole line failed to parse and the acknowledged
+    # record was lost.
+    reloaded = store.read_persisted_records()
+    lot_codes = [record.event.traceability_lot_code for record in reloaded]
+    assert "TLC-AFTER-000002" in lot_codes, "the acknowledged record was destroyed by the torn fragment"
+    assert lot_codes == ["TLC-BEFORE-000001", "TLC-AFTER-000002"]
+
+    # And every line on disk is independently parseable.
+    for line in persist_path.read_text(encoding="utf-8").splitlines():
+        if line.strip():
+            json.loads(line)
+
+
+def test_sequence_numbers_do_not_repeat_when_a_flush_fails_after_bytes_land(tmp_path, monkeypatch):
+    """``_counter`` advances only after ``flush()`` returns.
+
+    That is right when nothing reached disk, and wrong when the bytes landed
+    and the flush still raised: the record sits on disk holding sequence N
+    while ``_counter`` still reads N-1, so the next append issues N again and
+    the log carries a duplicate ``sequence_no``. Here the buffered bytes reach
+    disk when the handle closes during unwinding, which is exactly that case.
+    """
+    persist_path = tmp_path / "events.jsonl"
+    store = EventStore(persist_path=str(persist_path))
+
+    real_open = Path.open
+    flushes = {"count": 0}
+
+    def flaky_open(self, *args, **kwargs):
+        handle = real_open(self, *args, **kwargs)
+        if self != store.persist_path or "a" not in str(args[0] if args else kwargs.get("mode", "")):
+            return handle
+
+        real_flush = handle.flush
+
+        def flaky_flush():
+            flushes["count"] += 1
+            # Flush for real FIRST -- the whole point of this case is that the
+            # bytes reach disk and the flush still reports failure. Raising
+            # without flushing would instead lose the buffer at close(), which
+            # is the already-covered "nothing landed" case.
+            result = real_flush()
+            if flushes["count"] == 2:
+                raise OSError("simulated flush failure after the write landed")
+            return result
+
+        handle.flush = flaky_flush
+        return handle
+
+    monkeypatch.setattr(Path, "open", flaky_open)
+
+    with pytest.raises(OSError):
+        store.add_many([make_record("TLC-OK-000001"), make_record("TLC-LANDED-000002")])
+
+    monkeypatch.undo()
+
+    on_disk = [
+        json.loads(line)
+        for line in persist_path.read_text(encoding="utf-8").splitlines()
+        if line.strip()
+    ]
+    sequence_numbers = [entry["sequence_no"] for entry in on_disk]
+    assert len(sequence_numbers) == len(set(sequence_numbers)), (
+        f"duplicate sequence_no on disk: {sequence_numbers}"
+    )
+
+    # The next append must continue past whatever actually reached disk.
+    resumed = store.add_many([make_record("TLC-RESUMED-000003")])
+    all_sequences = sequence_numbers + [resumed[0].sequence_no]
+    assert len(all_sequences) == len(set(all_sequences)), (
+        f"the resumed record reused a sequence_no already on disk: {all_sequences}"
+    )
+
+
+# ---------------------------------------------------------------------------
 # #90 — every persisted-record write path must apply the secret scrub.
 # ---------------------------------------------------------------------------
 
