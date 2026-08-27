@@ -1,0 +1,84 @@
+{
+  "provenance": {
+    "source_repository": "regengine/regengine",
+    "source_path": "services/ingestion/app/webhook_models.py",
+    "source_symbol": "REQUIRED_KDES_BY_CTE",
+    "source_enum": "WebhookCTEType",
+    "source_commit": "fa614d4d9d90261116cc17636bf98173c7d057c4",
+    "extracted_by": "scripts/regengine_kde_contract.py",
+    "extracted_at": "2026-08-27",
+    "table_sha256": "01952b0674c1be77a8de300d8b830122215720cba2cbb83b0ecd73fd3661529c",
+    "regenerate": "python scripts/regengine_kde_contract.py snapshot --regengine-root <regengine checkout> --source-commit <sha>",
+    "enforced_by": "tests/test_contract_provenance.py (checksum + shape, offline) and the regengine-contract job in .github/workflows/ci.yml, which re-extracts this table from a real RegEngine checkout and fails on any difference."
+  },
+  "required_kdes_by_cte": {
+    "cooling": [
+      "traceability_lot_code",
+      "product_description",
+      "quantity",
+      "unit_of_measure",
+      "cooling_date",
+      "location_name",
+      "reference_document"
+    ],
+    "first_land_based_receiving": [
+      "traceability_lot_code",
+      "product_description",
+      "quantity",
+      "unit_of_measure",
+      "landing_date",
+      "receiving_location",
+      "reference_document"
+    ],
+    "harvesting": [
+      "traceability_lot_code",
+      "product_description",
+      "quantity",
+      "unit_of_measure",
+      "harvest_date",
+      "location_name",
+      "reference_document"
+    ],
+    "initial_packing": [
+      "traceability_lot_code",
+      "product_description",
+      "quantity",
+      "unit_of_measure",
+      "packing_date",
+      "location_name",
+      "reference_document",
+      "harvester_business_name"
+    ],
+    "receiving": [
+      "traceability_lot_code",
+      "product_description",
+      "quantity",
+      "unit_of_measure",
+      "receive_date",
+      "receiving_location",
+      "immediate_previous_source",
+      "reference_document",
+      "tlc_source_reference"
+    ],
+    "shipping": [
+      "traceability_lot_code",
+      "product_description",
+      "quantity",
+      "unit_of_measure",
+      "ship_date",
+      "ship_from_location",
+      "ship_to_location",
+      "reference_document",
+      "tlc_source_reference"
+    ],
+    "transformation": [
+      "traceability_lot_code",
+      "product_description",
+      "quantity",
+      "unit_of_measure",
+      "transformation_date",
+      "location_name",
+      "reference_document"
+    ]
+  }
+}
