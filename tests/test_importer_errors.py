@@ -131,7 +131,7 @@ def test_duplicate_normalized_header_is_rejected() -> None:
 
 
 # ---------------------------------------------------------------------------
-# _parse_quantity's two branches
+# _parse_quantity's branches
 # ---------------------------------------------------------------------------
 
 
@@ -162,3 +162,35 @@ def test_non_positive_quantity_is_rejected(quantity: str) -> None:
     assert error.row == 2
     assert error.field == "quantity"
     assert error.message == "Quantity must be greater than 0"
+
+
+# ---------------------------------------------------------------------------
+# #98 — a non-finite quantity must be rejected at import, not persisted.
+#
+# float() accepts the literal tokens "nan"/"inf"/"-inf" and overflowing
+# decimals like "1e400". NaN compares False against every ordering operator,
+# so `nan <= 0` is False and the positivity branch above waves it through;
+# infinities are genuinely > 0 and pass on the merits. Both then reach
+# json.dumps, which emits a bare NaN/Infinity token -- not RFC 8259 -- into
+# the tenant's durable JSONL and onto the signed wire.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "quantity",
+    ["nan", "NaN", "-nan", "inf", "Infinity", "-inf", "1e400"],
+    ids=["nan", "nan_capitalized", "negative_nan", "inf", "infinity_word", "negative_inf", "overflow_literal"],
+)
+def test_non_finite_quantity_is_rejected(quantity: str) -> None:
+    csv_text = SCHEDULED_HEADER + "\n" + _scheduled_row(lot="TLC-QTY-NONFINITE", quantity=quantity) + "\n"
+
+    parsed = parse_csv_import(CSVImportType.SCHEDULED_EVENTS, csv_text)
+
+    assert parsed.total == 1
+    # No record is produced, so nothing can be delivered or persisted.
+    assert parsed.events == []
+    assert len(parsed.errors) == 1
+    error = parsed.errors[0]
+    assert error.row == 2
+    assert error.field == "quantity"
+    assert error.message == "Quantity must be a finite number"

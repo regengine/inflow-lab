@@ -192,17 +192,31 @@ def run_live_trial(
         # other exception (e.g. a dropped connection mid-batch), or a
         # KeyboardInterrupt -- because they live in this `finally`, not
         # after a `return` on the happy path (#105).
-        stop_simulation(client, config)
-        if confirm_live:
-            # Only --confirm-live can arm live delivery, so only that path
-            # needs to disarm it again. A dry run never leaves delivery on
-            # anything but mock, and run_mock_dry_run's own reset already
-            # proves that. Guarded on the flag rather than on whether this
-            # run actually reached run_one_live_batch: the tenant may
-            # already have been armed by an earlier run (that is the exact
-            # failure mode #105 reports), so --confirm-live always tries to
-            # disarm it, even if this run's own mock dry-run failed first.
-            revert_delivery_to_mock(client, config)
+        try:
+            stop_simulation(client, config)
+            if confirm_live:
+                # Only --confirm-live can arm live delivery, so only that
+                # path needs to disarm it again. A dry run never leaves
+                # delivery on anything but mock, and run_mock_dry_run's own
+                # reset already proves that. Guarded on the flag rather than
+                # on whether this run actually reached run_one_live_batch:
+                # the tenant may already have been armed by an earlier run
+                # (that is the exact failure mode #105 reports), so
+                # --confirm-live always tries to disarm it, even if this
+                # run's own mock dry-run failed first.
+                revert_delivery_to_mock(client, config)
+        finally:
+            # #137: `owns_client` was computed and then never read, so a
+            # client this function created itself was never closed. Closing
+            # it here matches the owns_client/close pair in
+            # scripts/remote_smoke.py. Nested in its own `finally` so the
+            # close still happens if either cleanup call above raises --
+            # an aborted run is exactly when a leaked connection is likeliest
+            # and least welcome. Ordered after them because both still need
+            # the connection open. A caller-supplied client is left alone;
+            # closing someone else's client is theirs to do.
+            if owns_client:
+                client.close()
 
 
 def run_mock_dry_run(client: httpx.Client, config: LiveTrialConfig) -> dict[str, Any]:

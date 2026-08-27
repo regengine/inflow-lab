@@ -13,7 +13,10 @@ from fastapi.testclient import TestClient
 REPO_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(REPO_ROOT))
 
-from app.main import app
+# Must follow the sys.path insert above: this script is run directly
+# (`python scripts/smoke_regression.py`), so the repo root is not on sys.path
+# until that line puts it there. Deliberate, not an ordering slip (#137).
+from app.main import app  # noqa: E402
 
 # The app resolves its data root from REGENGINE_DATA_DIR at import time
 # (app.tenancy.DATA_ROOT), so this script must ask tenancy where a tenant
@@ -21,8 +24,9 @@ from app.main import app
 # persist_path assertion below fail on a literal string mismatch, and made
 # the cleanup rmtree miss -- leaving release-smoke tenants behind in
 # whatever store the operator's shell actually pointed at (#108).
-from app.tenancy import tenant_dir, tenant_events_path
-from scripts import _smoke_common
+# Same reason as the import above (#137).
+from app.tenancy import tenant_dir, tenant_events_path  # noqa: E402
+from scripts import _smoke_common  # noqa: E402
 
 
 TENANTS = ["release-smoke-main", "release-smoke-other"]

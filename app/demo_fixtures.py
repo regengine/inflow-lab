@@ -1,7 +1,9 @@
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
+from typing import Any
 
 from .schemas.domain import CTEType, DemoFixtureId, RegEngineEvent
 from .scenarios import ScenarioId
@@ -690,8 +692,113 @@ DEMO_FIXTURES: dict[DemoFixtureId, DemoFixture] = {
 }
 
 
-def get_demo_fixture(fixture_id: DemoFixtureId | str) -> DemoFixture:
-    return DEMO_FIXTURES[DemoFixtureId(fixture_id)]
+# ---------------------------------------------------------------------------
+# Load-time rebasing (#199)
+#
+# The literals above are the fixtures' canonical *shape*: which events happen,
+# in what order, and how far apart. They are deliberately fixed dates, because
+# the export conformance tests render golden FDA/EPCIS output straight from
+# DEMO_FIXTURES and need it byte-reproducible.
+#
+# What must not be fixed is how old those events are when they are *loaded*.
+# RegEngine enforces a 90-day event-age replay window on ingest, so a literal
+# 2026-02-05 harvest was 202 days old by the time #199 was filed and live
+# ingest would have rejected the entire Load Demo Fixture flow -- the one
+# workflow the fixtures exist to make reliable. The mock accepted them
+# happily, which is exactly the mock-versus-live drift this repository exists
+# to catch, and the gap widened by one day every day.
+#
+# So get_demo_fixture() returns a copy shifted onto today. The shift is a
+# whole number of days, computed once across *all* fixtures from a single
+# anchor, which is what preserves the lineage narrative: every event keeps its
+# time of day, its spacing from its neighbours, and its ordering relative to
+# events in the other fixtures.
+# ---------------------------------------------------------------------------
+
+# How far before "now" the newest fixture event should land. Non-zero so no
+# fixture event is ever in the future (the mock and live both reject events
+# beyond a small future ceiling), and small enough that the whole ~4-day span
+# sits far inside the 90-day window.
+FIXTURE_RECENCY_DAYS = 2
+
+# Matches a bare calendar date and nothing else. Fixture KDEs carry dates as
+# exact "YYYY-MM-DD" strings (harvest_date, cooling_date, pack_date,
+# ship_date, receive_date, transformation_date, landing_date ...) which have
+# to move with the event timestamp they describe, or the record starts
+# contradicting itself. Anchored on both ends so a reference number or lot
+# code that merely contains digits is never touched.
+_BARE_DATE = re.compile(r"\d{4}-\d{2}-\d{2}\Z")
+
+
+def _latest_fixture_timestamp() -> datetime:
+    return max(
+        fixture_event.event.timestamp
+        for fixture in DEMO_FIXTURES.values()
+        for fixture_event in fixture.events
+    )
+
+
+def demo_fixture_shift(now: datetime | None = None) -> timedelta:
+    """Whole-day offset that moves the fixture set onto the current date.
+
+    Derived from the newest event across every fixture, not per fixture, so
+    the three fixtures keep their positions relative to each other as well as
+    internally. Whole days only: that preserves each event's time of day and
+    lets the bare-date KDEs shift by simple date arithmetic.
+    """
+    now = now or datetime.now(UTC)
+    target = now.date() - timedelta(days=FIXTURE_RECENCY_DAYS)
+    return timedelta(days=(target - _latest_fixture_timestamp().date()).days)
+
+
+def _shift_kde_value(value: Any, shift: timedelta) -> Any:
+    if isinstance(value, str) and _BARE_DATE.fullmatch(value):
+        return (datetime.fromisoformat(value).date() + shift).isoformat()
+    if isinstance(value, dict):
+        return {key: _shift_kde_value(item, shift) for key, item in value.items()}
+    if isinstance(value, list):
+        return [_shift_kde_value(item, shift) for item in value]
+    return value
+
+
+def rebase_demo_fixture(fixture: DemoFixture, shift: timedelta) -> DemoFixture:
+    """Return ``fixture`` with every timestamp and bare-date KDE moved by ``shift``."""
+    if not shift:
+        return fixture
+    return DemoFixture(
+        id=fixture.id,
+        label=fixture.label,
+        description=fixture.description,
+        scenario=fixture.scenario,
+        events=tuple(
+            DemoFixtureEvent(
+                fixture_event.event.model_copy(
+                    update={
+                        "timestamp": fixture_event.event.timestamp + shift,
+                        "kdes": _shift_kde_value(fixture_event.event.kdes, shift),
+                    }
+                ),
+                fixture_event.parent_lot_codes,
+            )
+            for fixture_event in fixture.events
+        ),
+    )
+
+
+def get_demo_fixture(
+    fixture_id: DemoFixtureId | str,
+    now: datetime | None = None,
+) -> DemoFixture:
+    """The fixture as it should be *loaded*: rebased onto the current date.
+
+    Every caller that delivers or persists fixture events goes through here
+    (``SimulationController.load_demo_fixture``), so the events that reach
+    live ingest are always inside the replay window no matter when the repo
+    is run. ``DEMO_FIXTURES`` still holds the fixed-date originals for the
+    golden export tests.
+    """
+    fixture = DEMO_FIXTURES[DemoFixtureId(fixture_id)]
+    return rebase_demo_fixture(fixture, demo_fixture_shift(now))
 
 
 def list_demo_fixture_summaries() -> list[dict[str, object]]:

@@ -5,7 +5,7 @@ from enum import Enum
 from itertools import count
 from typing import Mapping
 
-from .schemas.domain import CTEType, OperationScale
+from .schemas.domain import OperationScale
 
 
 class ScenarioId(str, Enum):
@@ -54,7 +54,15 @@ class ScenarioPreset:
     industry_type: str
     operation_type: str
     reference_format: str
-    source_cte_type: CTEType = CTEType.HARVESTING
+    # source_cte_type deliberately absent (#164): an operation's source CTE
+    # type is a property of its *industry*, not of an individual scenario, and
+    # it lives on IndustryAdapter -- alongside source_reference_type, which the
+    # engine already reads from there. It used to be duplicated here as well,
+    # with engine.py reading this copy and nothing at all reading the adapter's,
+    # so the two had to be hand-synced across unrelated files and a new
+    # industry/scenario pairing that updated only one would have diverged
+    # silently. The engine now reads the adapter, which it derives from
+    # industry_type, so the pairing cannot be inconsistent.
     requires_cooling: bool = True
     harvest_target: int = 3
     packed_to_processor_probability: float = 0.45
@@ -292,7 +300,6 @@ SCENARIO_PRESETS: dict[ScenarioId, ScenarioPreset] = {
         industry_type="seafood",
         operation_type="first_receiver",
         reference_format="GS1",
-        source_cte_type=CTEType.FIRST_LAND_BASED_RECEIVING,
         requires_cooling=False,
         harvest_target=4,
         packed_to_processor_probability=0.65,

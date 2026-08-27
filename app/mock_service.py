@@ -220,20 +220,30 @@ class MockRegEngineService:
         self._clock = clock
         # Off by default -- deliberately, not an oversight (#102). Turning
         # this on unconditionally against the *default* wall-clock `clock`
-        # would reject every one of this repo's own fixed-date fixtures the
-        # instant real time drifts past them by more than
-        # MAX_EVENT_AGE_DAYS: app/demo_fixtures.py's three shipped
-        # DemoFixture entries, and the "2026-02-05"-style timestamp dozens
-        # of existing tests across the suite use as their canonical valid
-        # event, are already >90 days stale as of this writing. That is
-        # exactly the "green demo, failing live post" failure this
+        # would reject any of this repo's own fixed-date events the instant
+        # real time drifts past them by more than MAX_EVENT_AGE_DAYS. That
+        # is exactly the "green demo, failing live post" failure this
         # simulator exists to avoid -- just inverted (a demo that now fails
         # on its own bundled data instead of passing data live would
-        # reject). The check itself is fully implemented and correct (see
-        # validate_event_like_regengine's `now` parameter); a caller that
-        # wants it live -- this test suite, or a future caller with a
-        # source of non-stale demo data -- opts in explicitly here and
-        # supplies `clock=` to control what "now" means for it.
+        # reject).
+        #
+        # #199 removed half the obstacle: app/demo_fixtures.py's three
+        # shipped DemoFixture entries used to be the headline blocker, and
+        # get_demo_fixture() now rebases them onto the current date at load
+        # time, so they stay inside the window however long after they were
+        # written the repo is run. tests/test_fixture_quality.py pins that,
+        # and pins that enforce_event_age_window=True accepts both the
+        # rebased fixtures and engine-generated events.
+        #
+        # What still keeps the default off is the *other* population named
+        # in #102: the "2026-02-05"-style timestamp that dozens of existing
+        # tests across the suite use as their canonical valid event. Those
+        # need the same treatment before this can flip. The check itself is
+        # fully implemented and correct (see validate_event_like_regengine's
+        # `now` parameter); a caller that wants it live -- this test suite,
+        # or a future caller with a source of non-stale demo data -- opts in
+        # explicitly here and supplies `clock=` to control what "now" means
+        # for it.
         self._enforce_event_age_window = enforce_event_age_window
 
     def reset(self) -> None:

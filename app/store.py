@@ -51,8 +51,26 @@ def _serialize_record(record: StoredEventRecord) -> str:
     ``replace_all``). Routing them all through the same function is what
     keeps the ``_scrub_secrets`` pass from drifting out of sync between an
     append and a rewrite of the same record.
+
+    ``allow_nan=False`` (#98) is the last line of defence for the file
+    format. Python's default ``allow_nan=True`` emits bare ``NaN`` /
+    ``Infinity`` tokens, which are *not* RFC 8259: a strict reader
+    (browser ``JSON.parse``, Go ``encoding/json``, Rust serde) rejects the
+    whole line and ``jq`` quietly coerces the value to ``null``. The
+    ``quantity`` field is now guarded at the model (``allow_inf_nan=False``),
+    so a validated record cannot reach here carrying NaN; this keeps the
+    guarantee at the file boundary itself, where it belongs, for any producer
+    that bypasses model validation. It matters specifically for *typed*
+    ``float`` fields: ``model_dump(mode="json")`` passes a non-finite typed
+    float through unchanged, while a non-finite value under an ``Any``-typed
+    field such as ``kdes`` is already coerced to ``None`` by pydantic. Both
+    write paths are safe against the resulting ``ValueError``:
+    ``_write_records`` builds a ``.tmp`` and only ``replace``s it on success,
+    and ``_append_locked`` flushes and commits one record at a time, so a
+    mid-batch failure behaves exactly like the mid-batch ``OSError`` those
+    paths already document.
     """
-    return json.dumps(_scrub_secrets(record.model_dump(mode="json")))
+    return json.dumps(_scrub_secrets(record.model_dump(mode="json")), allow_nan=False)
 
 
 def mask_secret_in_string(message: str | None, secret: str | None) -> str | None:

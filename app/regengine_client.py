@@ -142,10 +142,15 @@ class LiveRegEngineClient:
         # to httpx, it would re-serialize and any whitespace/key-order drift
         # between our HMAC input and the wire body would cause RegEngine's
         # signature check to 401 on every request.
+        # allow_nan=False (#98): bare NaN/Infinity tokens are not RFC 8259,
+        # and this body is both HMAC-signed and PUT on the live wire. Fail
+        # here rather than sign and ship something RegEngine's own strict
+        # JSON parser will reject (or worse, silently coerce).
         body_bytes = json.dumps(
             payload.model_dump(mode="json"),
             separators=(",", ":"),
             sort_keys=True,
+            allow_nan=False,
         ).encode("utf-8")
 
         signature_header = _build_signature_header(body_bytes)
