@@ -20,7 +20,7 @@ from datetime import UTC, datetime, timedelta, timezone
 
 from app.demo_fixtures import DEMO_FIXTURES
 from app.epcis_export import render_epcis_document
-from app.fda_export import render_fda_request_csv
+from app.fda_export import normalize_to_utc, render_fda_request_csv
 from app.schemas.domain import CTEType, DemoFixtureId, RegEngineEvent, StoredEventRecord
 
 
@@ -282,3 +282,98 @@ def test_output_quantity_list_is_unaffected_by_the_input_quantity_change() -> No
             "regengine:productDescription": "Fresh Cut Salad Mix",
         }
     ]
+
+
+# ---------------------------------------------------------------------------
+# #159 — the engine-generated path must actually populate input_lot_quantities
+# ---------------------------------------------------------------------------
+
+
+def test_engine_generated_transformation_carries_per_input_quantities():
+    """The gap #159 was actually about.
+
+    The exporter has always read ``kdes["input_lot_quantities"]``, but nothing
+    in ``app/`` ever wrote it -- a repo-wide search found the key only in
+    ``epcis_export.py`` and its own tests -- so every engine-generated and
+    demo-fixture transformation rendered ``inputQuantityList`` entries bare.
+    The tests around it built their records by hand and so could not see that.
+
+    The data was never missing: ``industry_adapters.transformation_kdes``
+    receives ``inputs: list[Lot]``, each carrying ``.quantity`` and
+    ``.unit_of_measure``, and already derived ``input_traceability_lot_codes``
+    from that same list.
+
+    This drives the real engine, so it fails if the adapter stops populating
+    the key regardless of what the hand-built fixtures assert.
+    """
+    from app.engine import LegitFlowEngine
+
+    engine = LegitFlowEngine(seed=204)
+    for _ in range(180):
+        event, _ = engine.next_event()
+        if event.cte_type != CTEType.TRANSFORMATION:
+            continue
+
+        per_lot = event.kdes.get("input_lot_quantities")
+        assert isinstance(per_lot, dict) and per_lot, (
+            "engine-generated transformation carries no input_lot_quantities; "
+            "EPCIS inputQuantityList would render every entry bare"
+        )
+
+        # Every declared input lot must have a usable quantity, and the keys
+        # must line up with the lot codes the same adapter emits -- a mapping
+        # keyed on something else would silently miss on export.
+        for lot_code in event.kdes["input_traceability_lot_codes"]:
+            entry = per_lot.get(lot_code)
+            assert isinstance(entry, dict), f"no quantity entry for input lot {lot_code}"
+            assert isinstance(entry["quantity"], (int, float))
+            assert not isinstance(entry["quantity"], bool)
+            assert entry["quantity"] > 0
+            assert isinstance(entry["unit_of_measure"], str)
+            assert entry["unit_of_measure"]
+        return
+
+    raise AssertionError("Expected a transformation event within 180 events")
+
+
+# ---------------------------------------------------------------------------
+# #157 — the day filter and the exported Date column must agree
+# ---------------------------------------------------------------------------
+
+
+def test_fda_day_filter_agrees_with_the_exported_date_column(tmp_path):
+    """#157 normalized the exported Date/Time columns to UTC but left the
+    day filter keyed on the raw local date, desyncing the two.
+
+    ``event.timestamp`` keeps whatever offset the source carried -- a CSV
+    row's explicit ``+05:00`` survives import untouched -- so an event at
+    ``2026-02-05T02:00:00+05:00`` exports a Date column of ``2026-02-04``
+    while ``all_between`` filed it under ``2026-02-05``. A day-scoped FDA
+    request could then omit exactly the rows printing that day, and return
+    rows printing a different one. Before #157 both sides read the raw local
+    date and agreed; normalizing only the column is what split them.
+    """
+    from app.store import EventStore
+
+    offset_timestamp = datetime(2026, 2, 5, 2, 0, tzinfo=timezone(timedelta(hours=5)))
+    record = _transformation_record(None)
+    record.event.timestamp = offset_timestamp
+
+    store = EventStore(persist_path=str(tmp_path / "events.jsonl"))
+    store.add_many([record])
+
+    exported_day = normalize_to_utc(offset_timestamp).date().isoformat()
+    assert exported_day == "2026-02-04", "fixture no longer exercises an offset that shifts the day"
+
+    # The day the export prints must be the day the filter returns it for.
+    same_day = store.all_between(start_date=exported_day, end_date=exported_day)
+    assert len(same_day) == 1, (
+        f"a row whose exported Date column reads {exported_day} was not returned "
+        f"by a request scoped to {exported_day}"
+    )
+
+    # And it must not also answer to the raw local date, which is the
+    # symptom of the two sides keying on different things.
+    local_day = offset_timestamp.date().isoformat()
+    assert local_day == "2026-02-05"
+    assert store.all_between(start_date=local_day, end_date=local_day) == []

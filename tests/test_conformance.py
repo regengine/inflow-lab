@@ -122,7 +122,7 @@ def test_shipping_event_carries_destination_list_for_ship_to_location() -> None:
 
     assert shipping_event["destinationList"] == [
         {
-            "type": "urn:epcglobal:cbv:sdt:location",
+            "type": "location",
             "destination": "urn:regengine:location:Distribution%20Center%20%234",
         }
     ]
@@ -137,12 +137,40 @@ def test_receiving_event_carries_source_list_for_previous_source() -> None:
 
     assert receiving_event["sourceList"] == [
         {
-            "type": "urn:epcglobal:cbv:sdt:location",
+            "type": "location",
             "source": "urn:regengine:location:FreshPack%20Central",
         }
     ]
     assert "destinationList" not in receiving_event
     assert receiving_event["regengine:kdes"]["immediate_previous_source"] == "FreshPack Central"
+
+
+def test_source_and_destination_types_use_gs1s_declared_vocabulary_tokens() -> None:
+    """The `type` member must be a bare CBV vocabulary token, never a URN.
+
+    GS1's own epcis-context.jsonld declares sourceList/destinationList `type`
+    as ``"@type": "@vocab"`` over exactly three short names, so only those
+    expand to the intended cbv:SDT-* term. The official EPCIS 2.0 JSON Schema
+    additionally rejects the ``urn:epcglobal:cbv`` prefix here outright, via a
+    negative lookahead on source-dest-type -- emitting the (otherwise
+    legitimate) ``urn:epcglobal:cbv:sdt:location`` alias made every shipping
+    and receiving document schema-invalid.
+
+    Pinned as a set membership rather than a literal so this keeps failing for
+    any URN, not just the one that was there.
+    """
+    declared_tokens = {"owning_party", "possessing_party", "location"}
+
+    events = _epcis_events(DemoFixtureId.LEAFY_GREENS_TRACE)
+    seen = 0
+    for event in events:
+        for entry in event.get("sourceList", []) + event.get("destinationList", []):
+            seen += 1
+            assert entry["type"] in declared_tokens, (
+                f"{entry['type']!r} is not one of GS1's declared sourceDestinationType "
+                "tokens; a URN here fails both JSON-LD expansion and the EPCIS 2.0 schema"
+            )
+    assert seen, "fixture produced no source/destination entries to check"
 
 
 def test_non_handoff_events_carry_neither_source_nor_destination_list() -> None:

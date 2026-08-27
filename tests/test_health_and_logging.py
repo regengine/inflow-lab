@@ -43,17 +43,35 @@ def _basic_auth_header(username: str, password: str) -> dict[str, str]:
 
 
 def test_store_write_error_probe_never_produces_a_phantom_record(tmp_path):
-    """The probe must actually be able to write (happy path), and it must
-    never show up as a record on reload -- it's a liveness probe, not data.
+    """The probe must be able to write (happy path), must never show up as a
+    record, and must never touch the tenant's event log at all.
+
+    This previously asserted ``persist_path.read_text() == "\n\n"`` -- it
+    documented the probe appending a blank line to the real event file on
+    every poll, rather than bounding it. That is an unauthenticated, unbounded
+    append to tenant data: the Docker ``HEALTHCHECK --interval=30s`` alone
+    grows the persistent volume forever, and an unauthenticated caller can
+    drive it far faster. The probe now writes a truncating sentinel beside the
+    log instead, so the assertions below are the stronger property: the event
+    log is left byte-for-byte untouched, and the sentinel cannot grow no
+    matter how many times it is polled.
     """
     persist_path = tmp_path / "events.jsonl"
     store = EventStore(persist_path=str(persist_path))
+    persist_path.write_text("", encoding="utf-8")
+    before = persist_path.read_bytes()
 
-    assert _store_write_error(store) is None
-    assert _store_write_error(store) is None
+    for _ in range(25):
+        assert _store_write_error(store) is None
 
-    assert persist_path.read_text(encoding="utf-8") == "\n\n"
+    assert persist_path.read_bytes() == before, "the health probe wrote into the event log"
     assert store.read_persisted_records() == []
+
+    probe_path = persist_path.parent / ".healthz-write-probe"
+    assert probe_path.is_file(), "the probe must actually have written something"
+    assert probe_path.stat().st_size <= len("ok\n"), (
+        f"probe file grew across polls: {probe_path.stat().st_size} bytes"
+    )
 
 
 def test_store_write_error_detects_a_write_that_cannot_land_on_disk(tmp_path):

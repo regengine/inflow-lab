@@ -112,8 +112,8 @@ def render_fda_request_csv(
     writer.writeheader()
     for record in records:
         event = record.event
-        # Normalize before splitting -- see _normalize_to_utc below (issue #157).
-        normalized_timestamp = _normalize_to_utc(event.timestamp)
+        # Normalize before splitting -- see normalize_to_utc below (issue #157).
+        normalized_timestamp = normalize_to_utc(event.timestamp)
         writer.writerow(
             {
                 "Traceability Lot Code": event.traceability_lot_code,
@@ -134,7 +134,7 @@ def render_fda_request_csv(
     return output.getvalue()
 
 
-def _normalize_to_utc(value: datetime) -> datetime:
+def normalize_to_utc(value: datetime) -> datetime:
     """Normalize to UTC before Date/Time are ever split off of a timestamp.
 
     Two events at genuinely different absolute instants must not collapse
