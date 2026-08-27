@@ -82,8 +82,26 @@ RegEngine's `WebhookCTEType` (services/ingestion/app/webhook_models.py line 41):
   RegEngine's `require_location` validator looks for location-bearing KDEs
   (`ship_from_location`, `ship_to_location`, `receiving_location`, etc.).
   The simulator currently emits `location_name` only.
-- `timestamp` — ISO 8601 string. Must not be more than 24h in the future.
-  Older than 90 days accepted but flagged with `_historical_warning`.
+- `timestamp` — ISO 8601 string. Checked twice: a Pydantic field validator
+  rejects anything more than `WEBHOOK_MAX_EVENT_FUTURE_HOURS` (24) in the
+  future, and `_validate_event_timestamp_window`
+  (`services/ingestion/app/webhook_router_v2/security.py`) **rejects**
+  anything older than `WEBHOOK_MAX_EVENT_AGE_DAYS` (90) with "replay window
+  exceeded". The floor is applied per event inside the route handler, so a
+  stale timestamp rejects that one event and the rest of the batch still
+  succeeds. Exactly 90 days old is inside the window — the comparison is
+  `dt < now - timedelta(days=age_cap_days)`.
+
+  This entry previously read "Older than 90 days accepted but flagged with
+  `_historical_warning`". That was wrong in both halves: stale events are
+  rejected, not accepted, and no `_historical_warning` symbol exists
+  anywhere in RegEngine. It was hand-written in #43 and never re-checked —
+  the same unfalsifiable-by-construction problem #104 built the generated
+  KDE pin to solve. Corrected under #209 by reading
+  `webhook_router_v2/security.py` and `routes.py` at the commit
+  `tests/data/regengine_required_kdes.json` already pins, where
+  RegEngine's own `test_replay_window_rejects_stale_event` asserts the
+  rejection.
 - `input_traceability_lot_codes` — Optional first-class field on RegEngine's
   `IngestEvent` for transformation CTEs. **RegEngine reads it from the
   top-level field, not from `kdes`.** This document previously claimed the

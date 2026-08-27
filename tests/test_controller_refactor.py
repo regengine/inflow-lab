@@ -32,7 +32,6 @@ must not be edited.
 from __future__ import annotations
 
 import asyncio
-from datetime import UTC, datetime
 
 from app.controller import DeliveryOutcome, _build_stored_records
 from app.demo_fixtures import get_demo_fixture
@@ -48,9 +47,13 @@ from app.schemas.domain import (
 from app.schemas.ingestion import CSVImportRequest, DeliveryRetryRequest
 from app.schemas.scenarios import DemoFixtureLoadRequest
 from app.schemas.simulation import DeliveryConfig, SimulationConfig
+from tests.support.timestamps import CANONICAL_EVENT_DATE, CANONICAL_EVENT_TIME
 
 
-_BASE_TIME = datetime(2026, 3, 1, 8, 0, tzinfo=UTC)
+# The suite's canonical valid-event time, relative to now rather than a
+# fixed literal: the mock enforces RegEngine's 90-day replay window, so a
+# hardcoded date here would silently age these records out of it (#209).
+_BASE_TIME = CANONICAL_EVENT_TIME
 
 
 def _response(lot_code: str, cte_type: str, status: str, **extra) -> dict:
@@ -298,7 +301,7 @@ def _make_failed_record(lot: str, *, attempts: int = 1) -> StoredEventRecord:
             unit_of_measure="cases",
             location_name="Valley Fresh Farms",
             timestamp=_BASE_TIME,
-            kdes={"harvest_date": "2026-03-01", "reference_document": "Harvest Log HL-REFACTOR-001"},
+            kdes={"harvest_date": CANONICAL_EVENT_DATE, "reference_document": "Harvest Log HL-REFACTOR-001"},
         ),
         destination_mode=DestinationMode.NONE,
         delivery_status="failed",

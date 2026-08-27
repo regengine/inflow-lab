@@ -10,6 +10,7 @@ import pytest
 
 from app.schemas.domain import CTEType, DemoFixtureId
 from tests.support.api_client import client, reset_app_state
+from tests.support.timestamps import CANONICAL_EVENT_DATE, CANONICAL_EVENT_TIMESTAMP
 
 
 def setup_function() -> None:
@@ -178,9 +179,9 @@ def test_epcis_export_scaffold_maps_lineage_to_jsonld_without_changing_ingest_co
                     "quantity": 12,
                     "unit_of_measure": "cases",
                     "location_name": "Distribution Center #4",
-                    "timestamp": "2026-02-05T08:30:00Z",
+                    "timestamp": CANONICAL_EVENT_TIMESTAMP,
                     "kdes": {
-                        "receive_date": "2026-02-05",
+                        "receive_date": CANONICAL_EVENT_DATE,
                         "receiving_location": "Distribution Center #4",
                         "immediate_previous_source": "Coastal Packhouse",
                         "reference_document": "Bill of Lading BOL-EP-CHECK",

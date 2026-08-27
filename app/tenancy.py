@@ -49,7 +49,14 @@ store = EventStore(persist_path=str(DATA_ROOT / "events.jsonl"))
 scenario_saves = ScenarioSaveStore(save_dir=str(DATA_ROOT / "scenario_saves"))
 # Seed the mock's hash chain from what is already persisted, so a restart
 # continues the chain instead of forking a second one from an empty hash.
-mock_service = MockRegEngineService(store=store)
+#
+# enforce_event_age_window is spelled out rather than inherited (#209): it
+# is MockRegEngineService's default, but this is the deployed stand-in real
+# customers post at, and "does the thing we ship enforce live's 90-day
+# replay window?" should be answerable from this line without chasing a
+# default. See app/mock_service.py's __init__ for why the default moved --
+# and for why the floor bounds replay rather than closing it.
+mock_service = MockRegEngineService(store=store, enforce_event_age_window=True)
 controller = SimulationController(
     engine=engine,
     store=store,
@@ -348,6 +355,10 @@ def _create_tenant_controller(tenant_id: str) -> SimulationController:
         engine=tenant_engine,
         store=tenant_store,
         scenario_saves=tenant_saves,
-        mock_service=MockRegEngineService(store=tenant_store),
+        # Explicit for the same reason as the default tenant's service
+        # above: a per-tenant stand-in that quietly accepted what live
+        # rejects would put every tenant demo back on the wrong side of
+        # the parity gap (#209).
+        mock_service=MockRegEngineService(store=tenant_store, enforce_event_age_window=True),
         live_client=LiveRegEngineClient(),
     )
