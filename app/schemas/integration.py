@@ -49,6 +49,14 @@ class ConnectionTestRequest(BaseModel):
     tenant_id: str | None = None
 
 
+# Verdict for a test whose endpoint is not the configured one, where the
+# stored credentials were therefore deliberately not sent. Distinct from
+# `not_configured`, which means no credentials exist to send at all: the two
+# call for opposite operator actions (supply this endpoint's own credentials
+# vs. configure any credentials), so they must not share a verdict.
+CREDENTIALS_WITHHELD_VERDICT = "credentials_withheld"
+
+
 class ConnectionTestResponse(BaseModel):
     verdict: str
     detail: str

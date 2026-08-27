@@ -28,6 +28,7 @@ from app.regengine_client import (
     assert_delivery_endpoint_allowed,
 )
 from app.schemas.domain import CTEType, RegEngineEvent
+from app.schemas.integration import CREDENTIALS_WITHHELD_VERDICT
 from app.schemas.ingestion import IngestPayload
 from app.schemas.simulation import SimulationConfig
 from scripts.remote_smoke import (
@@ -173,8 +174,11 @@ def test_integration_test_never_sends_stored_credentials_to_another_host(
         )
         assert response.status_code == 200
         body = response.json()
-        # No credentials were inherited, so the probe stops before any request.
-        assert body["verdict"] == "not_configured"
+        # No credentials were inherited, so the probe stops before any request
+        # (ExplodingAsyncClient would raise if one were attempted). The verdict
+        # names the real reason: credentials exist, they were withheld.
+        assert body["verdict"] == CREDENTIALS_WITHHELD_VERDICT
+        assert "never sent anywhere else" in body["detail"]
         assert "rge_live_stored_secret" not in response.text
 
         blocked = client.post(
