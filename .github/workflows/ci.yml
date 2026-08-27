@@ -102,6 +102,21 @@ jobs:
       - name: Run browser smoke
         run: uv run --frozen --no-dev --group browser python scripts/browser_smoke.py
 
+      # #133: scripts/browser_smoke.py already screenshots the failing page to
+      # output/playwright/, but the file died with the runner, so a red job
+      # left nothing to look at but an assertion message. `if: failure()` keeps
+      # this off passing runs entirely, and if-no-files-found: ignore makes it
+      # a clean no-op rather than a second error on the failures that happen
+      # before there is a page to screenshot -- a build-SHA mismatch, a server
+      # that never came up, playwright not installed.
+      - name: Upload browser smoke failure screenshots
+        if: failure()
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6.0.0
+        with:
+          name: browser-smoke-failure-${{ github.run_number }}
+          if-no-files-found: ignore
+          path: output/playwright/
+
   # #126: no job built the image Railway actually deploys. `Dockerfile` is the
   # deploy artifact (railway.json pins builder DOCKERFILE), so a broken COPY
   # path, a base-image change, or a dependency that only fails under the
