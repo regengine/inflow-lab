@@ -231,7 +231,7 @@ Every stored record tracks `delivery_status`, `destination_mode`, `delivery_atte
 
 The console treats RegEngine like any third-party integration a customer configures, backed by three endpoints:
 
-- `GET /api/integration/status` — sanitized connection state: mode, endpoint host, whether an API key / tenant are configured, whether HMAC signing is enabled, and active `mock_friction` codes. Secrets are never returned.
+- `GET /api/integration/status` — sanitized connection state: mode, endpoint host, `default_endpoint` (the live ingest URL applied when none is configured — the console reads its endpoint-field placeholder from this rather than hardcoding the URL, so `DEFAULT_LIVE_INGEST_ENDPOINT` in `app/regengine_client.py` stays the single source of truth), whether an API key / tenant are configured, whether HMAC signing is enabled, and active `mock_friction` codes. Secrets are never returned.
 - `POST /api/integration/configure` — partial update of `mode`, `endpoint`, `api_key`, `tenant_id`, and `mock_friction`; omitted fields keep their stored values so the settings page can switch modes without re-entering credentials.
 - `POST /api/integration/test` — probes RegEngine with the configured (or request-supplied) credentials using the cheapest authenticated read (`GET /api/v1/webhooks/recent?limit=1`) and maps the response to an actionable verdict: `connected`, `contract_mismatch` (authenticated read succeeded but the two deploys advertise different ingest contract versions), `unauthorized` (401), `subscription_inactive` (402), `forbidden` (403), `tenant_mismatch` (404), `rate_limited` (429), `service_unavailable` (503), `unreachable`, or `not_configured`. In mock mode with no credentials it reports `mock` without touching the network.
 
@@ -462,7 +462,7 @@ All routes accept optional `X-RegEngine-Tenant` for tenant-scoped storage. If Ba
 
 | Method | Path | Purpose |
 |---|---|---|
-| `GET` | `/api/integration/status` | Sanitized connection state (mode, endpoint host, key/tenant configured, HMAC, friction) |
+| `GET` | `/api/integration/status` | Sanitized connection state (mode, endpoint host, default endpoint, key/tenant configured, HMAC, friction) |
 | `POST` | `/api/integration/configure` | Partial update of mode/endpoint/api_key/tenant_id/mock_friction |
 | `POST` | `/api/integration/test` | Probe RegEngine with configured or supplied credentials; returns an actionable verdict |
 

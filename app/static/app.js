@@ -39,8 +39,6 @@ const state = {
   streamRevision: null,
 };
 
-const DEFAULT_LIVE_INGEST_ENDPOINT = 'https://www.regengine.co/api/v1/webhooks/ingest';
-
 const ids = {
   source: document.getElementById('source'),
   operationType: document.getElementById('operationType'),
@@ -456,7 +454,7 @@ function hydrateDeliveryForm(status = state.status) {
 }
 
 function buildConfig() {
-  const endpoint = ids.endpoint.value.trim() || DEFAULT_LIVE_INGEST_ENDPOINT;
+  const endpoint = ids.endpoint.value.trim();
   const apiKey = ids.apiKey.value.trim();
   const tenantId = ids.tenantId.value.trim();
   const seedValue = ids.seed.value.trim();
@@ -1795,8 +1793,24 @@ function renderConnectionStatus(integration) {
   }
 }
 
+// #155: the live ingest default is single-sourced from
+// DEFAULT_LIVE_INGEST_ENDPOINT in app/regengine_client.py and published as
+// `default_endpoint` here. The console used to keep its own copy of that
+// literal and substitute it into every buildConfig(), so the server's
+// default was unreachable from the UI and changing the Python constant
+// alone would have left live traffic going to the stale URL. Now the hint
+// comes from the server and buildConfig() sends null for a blank field, so
+// the server applies the same default it just reported.
+function applyDefaultEndpointPlaceholder(integration) {
+  const fallback = integration?.default_endpoint;
+  if (ids.endpoint && fallback) {
+    ids.endpoint.setAttribute('placeholder', fallback);
+  }
+}
+
 async function loadIntegrationStatus() {
   const integration = await api('/api/integration/status');
+  applyDefaultEndpointPlaceholder(integration);
   renderConnectionStatus(integration);
 }
 

@@ -1272,6 +1272,7 @@ class SimulationController:
             mode=delivery.mode,
             endpoint=endpoint,
             endpoint_host=urlparse(endpoint).netloc,
+            default_endpoint=DEFAULT_LIVE_INGEST_ENDPOINT,
             api_key_configured=bool(delivery.api_key),
             tenant_configured=bool(delivery.tenant_id),
             hmac_configured=bool(os.getenv(WEBHOOK_HMAC_SECRET_ENV, "").strip()),

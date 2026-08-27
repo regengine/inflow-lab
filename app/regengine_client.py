@@ -19,6 +19,14 @@ from .schemas.simulation import SimulationConfig, validate_egress_endpoint_async
 from .store import mask_secret_in_payload, mask_secret_in_string
 
 
+# THE single source of truth for the live RegEngine ingest URL (#155).
+# The literal belongs here and nowhere else: the console used to keep its
+# own copy in app/static/app.js and substitute it into every config it
+# submitted, so this constant was unreachable from the UI and changing it
+# alone would have left the operator console posting live traffic at the
+# stale URL. The console now reads the value off
+# /api/integration/status.default_endpoint and sends a null endpoint when
+# its field is blank, which is what makes every fallback below apply.
 DEFAULT_LIVE_INGEST_ENDPOINT = "https://www.regengine.co/api/v1/webhooks/ingest"
 DEFAULT_LIVE_TIMEOUT_SECONDS = 30.0
 
