@@ -743,13 +743,17 @@ class SimulationController:
             delivery = request.delivery or base_config.delivery
             # record_ids distinguishes "omitted" (None -- no filter, retry
             # every failed record up to limit) from "present but empty"
-            # ([] -- retry nothing). EventStore.failed_delivery_records()
-            # cannot make that distinction itself: it builds its filter as
-            # set(record_ids or []), which treats [] exactly like None and
-            # so retries everything for an explicitly empty list (#144).
-            # Short-circuiting the empty-list case here, before the store
-            # is ever consulted, fixes the caller-visible behavior without
-            # touching that store method's filtering logic.
+            # ([] -- retry nothing) (#144). Short-circuited here, before
+            # the store is ever consulted, so the empty case answers
+            # without a read at all.
+            #
+            # EventStore.failed_delivery_records() makes the same
+            # distinction as of #211 -- it used to build its filter as
+            # set(record_ids or []), which treated [] exactly like None,
+            # so this short-circuit was the only thing standing between an
+            # explicitly empty list and "retry everything". Both layers
+            # now agree; this one stays because it is the caller-visible
+            # contract #144's tests pin, and because it saves the read.
             if request.record_ids is not None and len(request.record_ids) == 0:
                 candidates: list[StoredEventRecord] = []
             else:

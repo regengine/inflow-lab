@@ -566,13 +566,28 @@ class EventStore:
         record_ids: list[str] | None = None,
         limit: int = 50,
     ) -> list[StoredEventRecord]:
-        record_id_filter = set(record_ids or [])
+        """Failed records, optionally narrowed to *record_ids*.
+
+        ``record_ids=None`` means "no filter -- every failed record".
+        ``record_ids=[]`` means "this explicitly empty set" and therefore
+        matches nothing. That distinction is #144's, and until #211 it
+        lived only in SimulationController.retry_failed_delivery, which
+        short-circuits the empty list before ever calling this method:
+        this method itself built its filter as ``set(record_ids or [])``
+        and then treated an empty filter as "match everything", so a
+        direct caller passing ``[]`` got every failed record retried --
+        exactly the behaviour #144 is about, one layer down. The
+        controller keeps its short-circuit (it is pinned by tests, and it
+        answers without touching the store at all); this makes the store
+        agree rather than depending on being called from there.
+        """
+        record_id_filter = None if record_ids is None else set(record_ids)
         records = self._all_records()
         failed_records = [
             record
             for record in records
             if record.delivery_status == "failed"
-            and (not record_id_filter or record.record_id in record_id_filter)
+            and (record_id_filter is None or record.record_id in record_id_filter)
         ]
         return failed_records[:limit]
 
