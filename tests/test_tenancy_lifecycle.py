@@ -272,3 +272,81 @@ def test_delete_endpoint_race_returns_sane_error_not_500(monkeypatch):
         assert after.status_code == 200
     finally:
         _cleanup_tenant_dir(tenant_id)
+
+
+def test_an_already_resolved_controller_cannot_resurrect_a_deleted_tenant():
+    """The other half of #175's window, which the test above does not reach.
+
+    ``_tenants_being_deleted`` only blocks *creating* a controller. A request
+    that resolved its controller BEFORE the delete started still holds that
+    object, and every ``EventStore`` write path calls
+    ``mkdir(parents=True, exist_ok=True)`` on its own -- so a write through the
+    popped controller recreated the tenant directory after the rmtree, and
+    ``known_tenant_ids()`` reported the tenant as present again. The popped
+    controller was a genuine zombie: the next request for that tenant minted a
+    second ``EventStore`` over the same file with an independent ``_counter``.
+
+    Retiring the store on pop makes that write fail loudly instead.
+    """
+    from app.store import RetiredStoreError
+
+    tenant_id = "zombie-tenant-alpha"
+
+    try:
+        # A request resolves its controller and holds on to it -- this is the
+        # in-flight request the delete is about to race.
+        in_flight = tenancy.get_tenant_controller_for_id(tenant_id)
+        assert tenancy.tenant_dir(tenant_id).exists()
+
+        # The operator delete runs to completion while that request is still
+        # holding `in_flight`.
+        tenancy.pop_tenant_controller(tenant_id)
+        shutil.rmtree(tenancy.tenant_dir(tenant_id), ignore_errors=True)
+        tenancy.finish_tenant_delete(tenant_id)
+        assert not tenancy.tenant_dir(tenant_id).exists()
+
+        # The in-flight request now writes through the controller it still
+        # holds. Before the fix this silently recreated the directory.
+        with pytest.raises(RetiredStoreError):
+            in_flight.store.add_many([_stored_record("TLC-ZOMBIE-000001")])
+
+        assert not tenancy.tenant_dir(tenant_id).exists(), (
+            "a write through the popped controller recreated the deleted tenant's directory"
+        )
+        assert tenant_id not in tenancy.known_tenant_ids(), (
+            "the deleted tenant reappeared in the operator listing"
+        )
+
+        # The other two write paths are guarded the same way -- a retry path
+        # or a scenario load must not resurrect it either.
+        with pytest.raises(RetiredStoreError):
+            in_flight.store.update_many([_stored_record("TLC-ZOMBIE-000002")])
+        with pytest.raises(RetiredStoreError):
+            in_flight.store.replace_all([_stored_record("TLC-ZOMBIE-000003")])
+        assert not tenancy.tenant_dir(tenant_id).exists()
+    finally:
+        tenancy.finish_tenant_delete(tenant_id)
+        tenancy._tenant_controllers.pop(tenant_id, None)
+        shutil.rmtree(tenancy.tenant_dir(tenant_id), ignore_errors=True)
+
+
+def _stored_record(lot_code: str):
+    from datetime import UTC, datetime
+
+    from app.schemas.domain import CTEType, DestinationMode, RegEngineEvent, StoredEventRecord
+
+    return StoredEventRecord(
+        payload_source="test-suite",
+        event=RegEngineEvent(
+            cte_type=CTEType.HARVESTING,
+            traceability_lot_code=lot_code,
+            product_description="Romaine Lettuce",
+            quantity=100,
+            unit_of_measure="cases",
+            location_name="Valley Fresh Farms",
+            timestamp=datetime(2026, 2, 5, 8, 30, tzinfo=UTC),
+            kdes={},
+        ),
+        destination_mode=DestinationMode.NONE,
+        delivery_status="generated",
+    )
