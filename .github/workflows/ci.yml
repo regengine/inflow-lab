@@ -59,6 +59,32 @@ jobs:
       - name: Run tests
         run: uv run --frozen --group dev pytest
 
+      # #211 moved the contract pin's wall-clock verdict out of pytest, because
+      # asserting it there scheduled the whole suite to fail on a fixed calendar
+      # date (2026-10-28) with nothing wrong and nothing to fix but the date. The
+      # suite now drives the guard through an injected clock and warns on a real
+      # staleness; `python -m app.contract` is what still exits 1 on it. Without
+      # this step that exit code runs nowhere, so defusing the time bomb would
+      # have left the pin with no hard enforcement at all.
+      #
+      # Exit codes (see app/contract.py::_main): 0 clean, 1 dated pin stale,
+      # 2 mismatch against the upstream artifact, 3 the remote half could not
+      # run. 3 is the NORMAL result here -- this job has no RegEngine checkout,
+      # so no artifact is configured, and #140 is precisely that reporting
+      # "still matches" against nothing is worse than not checking. The
+      # regengine-contract job below is where the remote half actually runs.
+      # So: fail on 1 and 2, accept 0 and 3.
+      - name: Check the RegEngine contract pin is fresh
+        run: |
+          set +e
+          uv run --frozen --group dev python -m app.contract
+          status=$?
+          set -e
+          case "$status" in
+            0|3) exit 0 ;;
+            *)   exit "$status" ;;
+          esac
+
       - name: Check dependency health
         run: |
           uv pip check
