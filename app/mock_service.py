@@ -5,11 +5,14 @@ import hmac
 import json
 import logging
 import os
+import re
 from collections import OrderedDict
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from typing import Any, Callable, Iterable, Protocol
 from uuid import uuid4
+
+from pydantic import ValidationError
 
 from .cte_rules import REQUIRED_KDES
 from .regengine_client import WEBHOOK_HMAC_SECRET_ENV
@@ -22,6 +25,21 @@ logger = logging.getLogger(__name__)
 # Mirrors RegEngine's WebhookPayload constraint: events accepts 1-500 items.
 MIN_BATCH_EVENTS = 1
 MAX_BATCH_EVENTS = 500
+# Hard ceiling on a single ingest request body, in bytes.
+#
+# The batch cap above can only be enforced after the body has been parsed into
+# events, and parsing is the expensive part. Signature verification now runs
+# before parsing (see the mock router), so an unsigned caller buys nothing but
+# an HMAC over the raw bytes — but a *well-formed* unsigned batch would still
+# have its bytes read into memory first. This bounds that: 500 events at ~8 KiB
+# each is ~4 MiB, so the ceiling only bites on a body no legitimate batch can
+# reach, and it is checked against Content-Length before the body is read.
+MAX_INGEST_BODY_BYTES = 4 * 1024 * 1024
+# A sha256 hex digest and nothing else. `hmac.compare_digest` raises TypeError
+# on str operands carrying any character outside ASCII, and Starlette decodes
+# headers as latin-1, so a signature header with any byte >= 0x80 used to reach
+# compare_digest and escape as an unauthenticated 500 (with a traceback).
+_HEX_DIGEST_RE = re.compile(r"[0-9a-f]+", re.IGNORECASE)
 # Mirrors RegEngine's Pydantic timestamp validator: >24h in the future is rejected.
 MAX_FUTURE_HOURS = 24
 # Mirrors RegEngine's handler-level replay guard
@@ -218,6 +236,14 @@ class MockRegEngineService:
         configured, a missing or non-matching ``X-Webhook-Signature`` raises a
         401 exactly as the live webhook does, so body-bytes drift in the
         client's signer is caught locally instead of in production.
+
+        A header that is not a sha256 hex digest of the expected length is
+        rejected as an ordinary 401 *before* the comparison. That pre-check is
+        not a timing side channel worth worrying about — it leaks only the
+        digest algorithm and length, which the contract publishes — and it is
+        what keeps a non-ASCII header value out of ``hmac.compare_digest``,
+        whose ``TypeError`` otherwise escapes as an unauthenticated 500. The
+        comparison that actually matters stays constant-time.
         """
         expected = expected_signature(body_bytes)
         if expected is None:
@@ -227,7 +253,12 @@ class MockRegEngineService:
         candidate = signature.strip()
         if candidate.startswith("sha256="):
             candidate = candidate[len("sha256=") :]
-        if not hmac.compare_digest(candidate, expected.removeprefix("sha256=")):
+        digest = expected.removeprefix("sha256=")
+        # Same 401 wording as a digest mismatch: a malformed header must not be
+        # distinguishable from a wrong one.
+        if len(candidate) != len(digest) or not _HEX_DIGEST_RE.fullmatch(candidate):
+            raise MockRegEngineHTTPError(401, "Invalid webhook signature")
+        if not hmac.compare_digest(candidate, digest):
             raise MockRegEngineHTTPError(401, "Invalid webhook signature")
 
     def ingest(
@@ -389,6 +420,64 @@ def _batch_fatal_detail(failures: list[str], total_events: int) -> str:
         f"{total_events} event(s) was rejected and nothing was stored. "
         + "; ".join(failures)
     )
+
+
+def parse_ingest_payload(raw_body: bytes) -> IngestPayload:
+    """Parse a raw ingest body, 422ing in the mock's own voice on failure.
+
+    This exists so the HTTP route can verify the HMAC signature *before* the
+    body is parsed. Live RegEngine verifies the signature ahead of body
+    validation, so an unsigned or badly-signed caller there sees a 401 and
+    nothing else; leaving the parse to FastAPI's request-body binding made the
+    mock answer such a caller with a field-by-field 422 that enumerated the
+    accepted CTE vocabulary — a schema oracle live never opens.
+
+    The 422 detail is a plain string, matching :func:`_batch_fatal_detail`
+    rather than FastAPI's list of error dicts: the mock already reports
+    RegEngine's request-fatal field constraints that way (see #101), and one
+    shape for "the whole batch died before ingest" is what a client can code
+    against.
+    """
+    try:
+        return IngestPayload.model_validate_json(raw_body)
+    except ValidationError as exc:
+        raise MockRegEngineHTTPError(422, _request_body_detail(exc)) from exc
+
+
+def _request_body_detail(exc: ValidationError) -> str:
+    failures = [
+        f"{'.'.join(str(part) for part in error['loc'])}: {error['msg']}"
+        for error in exc.errors()
+    ]
+    return (
+        "Request body failed validation before ingest: "
+        f"{len(failures)} field constraint violation(s). The entire batch was "
+        "rejected and nothing was stored. " + "; ".join(failures)
+    )
+
+
+def validate_friction_codes(codes: Iterable[str]) -> tuple[str, ...]:
+    """Reject friction codes this mock does not implement.
+
+    :meth:`MockRegEngineService.ingest` only acts on codes present in
+    ``FRICTION_RESPONSES``, so an unrecognised code used to sail through as a
+    clean 200. The in-process path never hit that — ``DeliveryConfig``'s
+    ``mock_friction`` is a typed ``Literal`` and pydantic rejects a typo — but
+    the ``X-Mock-Friction`` header path is exactly the one a customer testing
+    their own client uses, and an operator rehearsing a 402 against a
+    misspelled code would read the green 200 as "that failure mode is
+    handled". Surfacing silent no-ops is the entire point of this simulator,
+    so an unknown code is a 400 that names it.
+    """
+    requested = tuple(codes)
+    unknown = [code for code in requested if code not in FRICTION_RESPONSES]
+    if unknown:
+        raise MockRegEngineHTTPError(
+            400,
+            f"Unknown X-Mock-Friction code(s): {', '.join(unknown)}. "
+            f"Accepted codes: {', '.join(sorted(FRICTION_RESPONSES))}.",
+        )
+    return requested
 
 
 def chain_hash_from_records(records: Iterable[StoredEventRecord]) -> str:

@@ -6,15 +6,20 @@ from typing import Any, Callable
 
 from fastapi import APIRouter, Depends, Header, HTTPException, Query, Request, Response
 from fastapi.responses import JSONResponse, PlainTextResponse
+from pydantic import BaseModel
 
 from ..controller import SimulationController
 from ..dependencies import get_active_controller
 from ..epcis_export import epcis_filename, render_epcis_document
 from ..mock_service import (
     EVENT_AGE_MODE_WARN,
+    MAX_BATCH_EVENTS,
+    MAX_INGEST_BODY_BYTES,
     MockRegEngineHTTPError,
     event_age_mode,
     max_event_age_days,
+    parse_ingest_payload,
+    validate_friction_codes,
 )
 from ..fda_export import (
     FDA_EXPORT_PRESETS,
@@ -47,11 +52,50 @@ EXPORT_MAX_LIMIT = 100_000
 TRUNCATION_BANNER_PREFIX = "# PARTIAL EXPORT - NOT A COMPLETE RECORD SET"
 
 
-@router.post("/ingest", response_model=MockIngestResponse)
+def _inlined_schema(model: type[BaseModel]) -> dict[str, Any]:
+    """``model``'s JSON schema with every ``$defs`` reference expanded in place.
+
+    ``openapi_extra`` schemas are spliced into the document verbatim, and a
+    ``$ref`` inside one resolves against the OPENAPI DOCUMENT root, not against
+    the embedded schema — so a `#/$defs/RegEngineEvent` produced by
+    ``model_json_schema()`` would dangle, and `#/components/schemas/...` would
+    dangle too now that no route registers `IngestPayload` as a component.
+    Inlining sidesteps both. The models here are shallow and non-recursive.
+    """
+    schema = model.model_json_schema()
+    defs: dict[str, Any] = schema.pop("$defs", {})
+
+    def expand(node: Any) -> Any:
+        if isinstance(node, dict):
+            ref = node.get("$ref")
+            if isinstance(ref, str) and ref.startswith("#/$defs/"):
+                resolved = dict(defs[ref.removeprefix("#/$defs/")])
+                resolved.update({k: v for k, v in node.items() if k != "$ref"})
+                return expand(resolved)
+            return {key: expand(value) for key, value in node.items()}
+        if isinstance(node, list):
+            return [expand(item) for item in node]
+        return node
+
+    return expand(schema)
+
+
+#: Declared by hand because the handler no longer takes a parsed body
+#: parameter — see the docstring below. Without this the route would publish no
+#: request body at all and the generated client and docs would lose the payload
+#: shape entirely.
+_INGEST_REQUEST_BODY = {
+    "requestBody": {
+        "required": True,
+        "content": {"application/json": {"schema": _inlined_schema(IngestPayload)}},
+    }
+}
+
+
+@router.post("/ingest", response_model=MockIngestResponse, openapi_extra=_INGEST_REQUEST_BODY)
 async def mock_regengine_ingest(
     request: Request,
     response: Response,
-    payload: IngestPayload,
     active_controller: SimulationController = Depends(get_active_controller),
     idempotency_key: str | None = Header(default=None, alias="Idempotency-Key"),
     webhook_signature: str | None = Header(default=None, alias="X-Webhook-Signature"),
@@ -67,22 +111,62 @@ async def mock_regengine_ingest(
     testing their own client against this route sees the same deduping and the
     same failure modes as the in-process simulator path. Signature
     verification is a no-op unless REGENGINE_WEBHOOK_HMAC_SECRET is set.
+
+    The body is read and parsed by hand rather than declared as a handler
+    parameter, because a declared parameter is bound by FastAPI *before* the
+    handler runs — which put the whole batch through pydantic before the
+    signature was ever checked. Live RegEngine verifies the signature first, so
+    an unsigned caller there gets a 401 and learns nothing else; here it bought
+    a full parse of an arbitrarily large batch and, on a malformed one, a 422
+    enumerating every accepted CTE type. Signature verification is the
+    outermost gate now: size ceiling, then HMAC, then everything else.
     """
     service = active_controller.mock_service
     try:
-        # Starlette caches the body FastAPI already read, so this is the exact
-        # byte sequence the client signed — the point of verifying at all.
-        service.verify_signature(await request.body(), webhook_signature)
+        raw_body = await _read_bounded_body(request)
+        service.verify_signature(raw_body, webhook_signature)
+        # Past this point the caller is authenticated (or no secret is set, in
+        # which case there is nothing to authenticate against), so a detailed
+        # 400/422 tells them nothing they were not entitled to know.
+        friction = validate_friction_codes(_parse_mock_friction(mock_friction))
+        payload = parse_ingest_payload(raw_body)
         body = service.ingest(
             payload,
             idempotency_key=idempotency_key,
-            friction=_parse_mock_friction(mock_friction),
+            friction=friction,
         )
         _apply_event_age_headers(response, getattr(service, "last_age_window_warnings", ()))
         return body
     except MockRegEngineHTTPError as exc:
-        # Without this the mock's own 401/402/422/429 escape as an unhandled 500.
+        # Without this the mock's own 400/401/402/413/422/429 escape as an
+        # unhandled 500.
         raise HTTPException(status_code=exc.status_code, detail=exc.detail) from exc
+
+
+async def _read_bounded_body(request: Request) -> bytes:
+    """The raw request body, refused above ``MAX_INGEST_BODY_BYTES``.
+
+    Checked against ``Content-Length`` first so an oversized body is refused
+    without being read at all. The post-read check covers callers that send no
+    length (chunked transfer encoding), where the bytes have to arrive before
+    they can be counted.
+    """
+    declared = request.headers.get("content-length")
+    if declared is not None and declared.isdigit() and int(declared) > MAX_INGEST_BODY_BYTES:
+        raise _body_too_large(int(declared))
+    raw_body = await request.body()
+    if len(raw_body) > MAX_INGEST_BODY_BYTES:
+        raise _body_too_large(len(raw_body))
+    return raw_body
+
+
+def _body_too_large(size: int) -> MockRegEngineHTTPError:
+    return MockRegEngineHTTPError(
+        413,
+        f"Request body is {size} bytes, above the {MAX_INGEST_BODY_BYTES} byte "
+        f"ingest ceiling. Batches are capped at {MAX_BATCH_EVENTS} events; "
+        "split the batch and retry.",
+    )
 
 
 def _apply_event_age_headers(response: Response, warnings: tuple[str, ...]) -> None:
@@ -121,6 +205,7 @@ def _header_safe(value: str) -> str:
 
 
 def _parse_mock_friction(raw: str | None) -> tuple[str, ...]:
+    """Split the header. Validation of the codes is `validate_friction_codes`."""
     if not raw:
         return ()
     return tuple(code.strip() for code in raw.split(",") if code.strip())

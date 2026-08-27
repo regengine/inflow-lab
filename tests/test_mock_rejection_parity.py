@@ -168,7 +168,29 @@ def test_http_ingest_returns_422_rather_than_a_partial_success_body() -> None:
     body = response.json()
     # The reassuring "1 accepted, 1 rejected" shape must not appear at all.
     assert "accepted" not in body
+    # A plain-string detail, not FastAPI's list of error dicts. Since the mock
+    # route parses the body itself (so the HMAC gate can run first -- see
+    # tests/test_mock_gate.py), a body that fails pydantic outright returns
+    # this same shape, so BOTH request-fatal paths look identical to a client.
+    assert isinstance(body["detail"], str)
     assert "events.1.traceability_lot_code" in body["detail"]
+
+
+def test_a_body_pydantic_cannot_parse_uses_the_same_422_shape() -> None:
+    """The other request-fatal path, since the route now parses by hand.
+
+    A field constraint (above) and an unparseable body are both "the whole
+    batch died before ingest", and a client should not need two error readers.
+    """
+    response = client.post(INGEST_URL, content=b'{"events":[{"cte_type":"bogus"}]}',
+                           headers={"Content-Type": "application/json"})
+
+    assert response.status_code == 422
+    body = response.json()
+    assert "accepted" not in body
+    assert isinstance(body["detail"], str)
+    assert "nothing was stored" in body["detail"]
+    assert "events.0.cte_type" in body["detail"]
 
 
 def test_field_constraint_422_precedes_idempotency_bookkeeping() -> None:

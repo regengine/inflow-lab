@@ -4,6 +4,10 @@ These cover the branches that only exist so the mock behaves like the live
 webhook: the 1-500 batch bounds, in-batch duplicate rejection, HMAC signature
 verification, the 24h idempotency replay window (and its capacity bound), and
 chain-hash continuity across a process restart.
+
+What runs *before* any of that -- the body-size ceiling, HMAC as the outermost
+gate, signature-header format, and unknown ``X-Mock-Friction`` codes -- lives in
+tests/test_mock_gate.py.
 """
 
 from __future__ import annotations
@@ -291,6 +295,26 @@ def test_verify_signature_accepts_a_bare_hex_digest(monkeypatch):
     body = b'{"events":[]}'
     bare = signature_for(body).removeprefix("sha256=")
     service.verify_signature(body, bare)  # must not raise
+
+
+def test_a_bad_signature_is_answered_before_the_body_is_looked_at(monkeypatch):
+    """HMAC is the outermost gate, so the 401 does not depend on a valid body.
+
+    A signature failure used to be reported only after FastAPI had parsed and
+    validated the whole batch, so a badly-signed caller sending nonsense got a
+    field-by-field 422 instead. See tests/test_mock_gate.py.
+    """
+    monkeypatch.setenv(WEBHOOK_HMAC_SECRET_ENV, HMAC_SECRET)
+    response = client.post(
+        "/api/mock/regengine/ingest",
+        content=b'{"events":[{"cte_type":"bogus"}]}',
+        headers={
+            "Content-Type": "application/json",
+            "X-Webhook-Signature": "sha256=" + "0" * 64,
+        },
+    )
+    assert response.status_code == 401
+    assert response.json()["detail"] == "Invalid webhook signature"
 
 
 # --- #120: 24h idempotency window ---------------------------------------------
