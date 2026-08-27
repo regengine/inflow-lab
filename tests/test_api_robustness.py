@@ -661,3 +661,81 @@ def test_export_record_cap_is_the_documented_value() -> None:
     # Pins the constant itself, so the number in the README and the number
     # the routes enforce cannot drift apart unnoticed.
     assert mock_regengine_router.EXPORT_MAX_RECORDS == 5000
+
+
+# ---------------------------------------------------------------------------
+# #143 AC2 -- /start and /reset keep DIFFERENT body shapes on purpose, so
+# each one's rejection has to teach the other's shape.
+# ---------------------------------------------------------------------------
+
+
+def test_reset_rejection_names_the_shape_reset_actually_wants() -> None:
+    """The exact body #143 was filed over.
+
+    Sending /start's wrapper to /reset used to return 200 while silently
+    discarding the override and falling back to hard-coded defaults; it is
+    a 422 now. But "Extra inputs are not permitted" tells a caller their
+    body is wrong and nothing about what right looks like, and the two
+    endpoints genuinely do take different shapes. So the refusal names
+    both.
+    """
+    response = client.post(
+        "/api/simulate/reset", json={"config": {"scenario": "dairy_continuous_flow"}}
+    )
+
+    assert response.status_code == 422
+    message = response.json()["detail"][0]["msg"]
+    assert "/api/simulate/reset takes the same fields unwrapped" in message
+    assert "/api/simulate/start takes its config wrapped" in message
+
+    # And the override really was refused rather than half-applied.
+    status = client.get("/api/simulate/status").json()
+    assert status["config"]["scenario"] == "leafy_greens_supplier"
+
+
+def test_start_rejection_names_the_wrapper_start_actually_wants() -> None:
+    """The mirror mistake. Bare "Field required" against `config` never
+    mentions the fields the caller did send, so it reads as "you sent
+    nothing" rather than "you sent it one level too high"."""
+    response = client.post("/api/simulate/start", json={"scenario": "dairy_continuous_flow"})
+
+    assert response.status_code == 422
+    message = response.json()["detail"][0]["msg"]
+    assert "'scenario'" in message, "the error should name the field that was misplaced"
+    assert "/api/simulate/start takes its config wrapped" in message
+
+
+def test_both_endpoints_still_accept_the_shape_they_document() -> None:
+    # The guidance would be worthless if either shape had stopped working.
+    reset = client.post("/api/simulate/reset", json={"scenario": "dairy_continuous_flow"})
+    assert reset.status_code == 200, reset.text
+    assert client.get("/api/simulate/status").json()["config"]["scenario"] == "dairy_continuous_flow"
+
+    start = client.post(
+        "/api/simulate/start",
+        json={"config": {"scenario": "leafy_greens_supplier", "interval_seconds": 0}},
+    )
+    assert start.status_code == 200, start.text
+    assert start.json()["config"]["scenario"] == "leafy_greens_supplier"
+    client.post("/api/simulate/stop")
+
+
+def test_a_saved_scenario_file_with_an_unknown_config_key_still_loads() -> None:
+    """SimulationConfig's new before-validator must not reach save files.
+
+    ScenarioSaveSnapshot prunes unknown config keys on the way in from disk
+    precisely so an older/newer save stays loadable; if the validator fired
+    there it would turn forward-compatible pruning back into a hard
+    failure.
+    """
+    from app.schemas.scenarios import ScenarioSaveSnapshot
+
+    snapshot = ScenarioSaveSnapshot.model_validate(
+        {
+            "scenario": "leafy_greens_supplier",
+            "config": {"scenario": "leafy_greens_supplier", "a_field_from_the_future": 1},
+            "records": [],
+        }
+    )
+
+    assert snapshot.config.scenario.value == "leafy_greens_supplier"

@@ -439,12 +439,14 @@ The service wrapper examples below can be used with any profile; keep the profil
 | `POST` | `/api/simulate/stop` | Stop the loop |
 | `POST` | `/api/simulate/step` | Emit one batch synchronously |
 | `POST` | `/api/simulate/replay` | Replay persisted JSONL events through the configured delivery mode |
-| `POST` | `/api/simulate/reset` | Clear state and persisted events |
+| `POST` | `/api/simulate/reset` | Clear state and persisted events (accepts the config fields **unwrapped**) |
 | `GET` | `/api/simulate/stream` | Server-Sent Events snapshots for live dashboard updates |
 | `POST` | `/api/import/csv` | Bulk import scheduled events or seed lots from CSV text |
 | `POST` | `/api/delivery/retry` | Retry failed stored deliveries with the current or supplied delivery config |
 
 All routes accept optional `X-RegEngine-Tenant` for tenant-scoped storage. If Basic Auth is enabled, include standard HTTP Basic credentials.
+
+**`/start` and `/reset` take a config override in different shapes, on purpose.** `/start` requires one, so it is wrapped: `{"config": {...}}`. `/reset` treats one as optional — an empty body clears state without reconfiguring — so it takes the same fields unwrapped at the top level. Sending either shape to the other endpoint is a 422 whose message names both shapes; neither is ever silently dropped. See the two examples below.
 
 ### Inspection
 
