@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import hmac
 import ipaddress
@@ -39,6 +40,14 @@ WEBHOOK_HMAC_SECRET_ENV = "REGENGINE_WEBHOOK_HMAC_SECRET"  # nosec B105
 # credential-exfiltration channel. Both outbound paths -- ingest() and
 # check_connection() -- validate the endpoint before sending anything.
 #
+# Validation alone is not enough, because validating a *name* and then handing
+# that same name to httpx means the name is resolved twice, independently. A
+# hostile zone with a short TTL answers public for the guard's lookup and
+# loopback for httpx's, and the credentials follow the second answer (#207).
+# So the guard resolves once and returns the address it approved, and the
+# client dials *that address* -- see PinnedEndpoint and _PinnedAddressTransport
+# below. There is no second resolution to poison.
+#
 # Optional strict allowlist: comma-separated hosts. A leading dot matches
 # subdomains (".regengine.co" allows "www.regengine.co"). When unset, any
 # public host is allowed but private/loopback/link-local destinations are not.
@@ -66,6 +75,19 @@ BLOCKED_ENDPOINT_VERDICT = "blocked_endpoint"
 
 class BlockedDeliveryEndpointError(ValueError):
     """Raised when a delivery endpoint is not an allowed egress destination."""
+
+
+@dataclass(frozen=True, slots=True)
+class PinnedEndpoint:
+    """The one address the guard approved, plus the name it approved it for.
+
+    `hostname` is the endpoint's original hostname and stays authoritative for
+    everything name-shaped: the `Host` header, TLS SNI and therefore
+    certificate verification. `address` is the literal the socket is opened to.
+    """
+
+    hostname: str
+    address: str
 
 
 def _env_flag(name: str) -> bool:
@@ -98,7 +120,7 @@ def _is_blocked_address(address: str) -> bool:
 
 
 def _resolved_addresses(host: str) -> list[str]:
-    """Best-effort DNS resolution.
+    """Best-effort blocking DNS resolution, for synchronous callers.
 
     A host that does not resolve cannot be reached, so an unresolvable name is
     not a bypass -- it is left to fail as an ordinary connection error rather
@@ -111,11 +133,29 @@ def _resolved_addresses(host: str) -> list[str]:
     return [info[4][0] for info in infos]
 
 
-def assert_delivery_endpoint_allowed(endpoint: str) -> None:
-    """Reject endpoints that are not permitted egress destinations.
+async def _aresolved_addresses(host: str) -> list[str]:
+    """`_resolved_addresses` without blocking the event loop.
 
-    Raises BlockedDeliveryEndpointError (a ValueError) before any request is
-    built, so no credential header is ever constructed for a blocked host.
+    `socket.getaddrinfo` blocks for the full resolver timeout, and the guard
+    runs on every live delivery and every connection test, so doing it inline
+    in an `async def` stalls every other request in the process behind a slow
+    or unresponsive resolver. The loop's own `getaddrinfo` runs the same call
+    in its executor and yields meanwhile; failures degrade exactly as above.
+    """
+    loop = asyncio.get_running_loop()
+    try:
+        infos = await loop.getaddrinfo(host, None, type=socket.SOCK_STREAM)
+    except (OSError, UnicodeError):
+        return []
+    return [str(info[4][0]) for info in infos]
+
+
+def _static_endpoint_checks(endpoint: str) -> str | None:
+    """Every check that needs no resolver, cheapest first.
+
+    Returns the hostname still awaiting DNS validation, or None when the
+    endpoint is already fully checked (IP literal, opt-out in force, DNS guard
+    disabled). Raises BlockedDeliveryEndpointError for a refused endpoint.
     """
     parsed = urlparse(endpoint)
     if parsed.scheme not in {"http", "https"}:
@@ -133,7 +173,12 @@ def assert_delivery_endpoint_allowed(endpoint: str) -> None:
         )
 
     if _env_flag(ALLOW_PRIVATE_DELIVERY_ENV):
-        return
+        # Local-development opt-out: the operator has deliberately pointed the
+        # simulator at a private stack (localhost, the built-in mock, a LAN
+        # host). Nothing is resolved and nothing is pinned -- there is no
+        # address the guard would refuse, so pinning would only make this path
+        # behave differently from a plain httpx call.
+        return None
 
     if host in _BLOCKED_HOSTNAMES or host.endswith(_BLOCKED_HOST_SUFFIXES):
         raise BlockedDeliveryEndpointError(
@@ -154,16 +199,181 @@ def assert_delivery_endpoint_allowed(endpoint: str) -> None:
     except ValueError:
         pass
     else:
-        return  # Literal address already checked; nothing to resolve.
+        # Literal address already checked, and the URL already carries it:
+        # there is no name for a resolver to answer differently later.
+        return None
 
     if os.getenv(DELIVERY_DNS_GUARD_ENV, "1").strip().lower() not in _TRUTHY:
-        return
-    for address in _resolved_addresses(host):
+        return None
+    return host
+
+
+def _pin_from_addresses(host: str, addresses: list[str]) -> PinnedEndpoint | None:
+    """Check every answer for `host` and return the one address to dial."""
+    for address in addresses:
         if _is_blocked_address(address):
             raise BlockedDeliveryEndpointError(
                 f"Delivery endpoint host {host!r} resolves to {address}, which is "
                 "loopback/private/link-local and is not an allowed destination."
             )
+    if not addresses:
+        # Nothing resolved here, so there is nothing to pin and the dial falls
+        # back to httpx's own lookup. Stating the residual case plainly rather
+        # than implying it is closed: a zone that fails this lookup and answers
+        # loopback for httpx's would still slip past. Refusing instead would
+        # turn every transient resolver failure into a "blocked endpoint"
+        # verdict for an endpoint that is not blocked, and would refuse names
+        # this process cannot resolve but the runtime can (split-horizon DNS, a
+        # container resolver). Operators who need that case closed set
+        # REGENGINE_ALLOWED_DELIVERY_HOSTS, which gates on the name and never
+        # depends on a resolver answering.
+        return None
+    # Every answer was checked; dial the first one. That is the address an
+    # unpinned connect would have tried first anyway -- getaddrinfo returns
+    # them in the platform's RFC 6724 preference order. The trade-off is that a
+    # pinned dial does not fall through to the remaining answers if the first
+    # is unreachable; a delivery endpoint whose primary address is down now
+    # surfaces as a connection error instead of silently failing over.
+    return PinnedEndpoint(hostname=host, address=addresses[0])
+
+
+def assert_delivery_endpoint_allowed(endpoint: str) -> PinnedEndpoint | None:
+    """Reject endpoints that are not permitted egress destinations.
+
+    Raises BlockedDeliveryEndpointError (a ValueError) before any request is
+    built, so no credential header is ever constructed for a blocked host.
+
+    Synchronous entry point, for callers that are not already on an event loop.
+    Coroutines must use `resolve_delivery_endpoint` instead: this one resolves
+    with a blocking `socket.getaddrinfo`.
+
+    Returns the single address this call resolved and approved, so the caller
+    can dial that address instead of re-resolving the name (#207). Returns None
+    when there is nothing to pin -- the host is already an IP literal, DNS
+    checking is switched off, the private-host opt-out is in force, or the name
+    did not resolve here. A None return is never a verdict of "unsafe": the
+    endpoint has passed every check that applies to it.
+    """
+    host = _static_endpoint_checks(endpoint)
+    if host is None:
+        return None
+    return _pin_from_addresses(host, _resolved_addresses(host))
+
+
+async def resolve_delivery_endpoint(endpoint: str) -> PinnedEndpoint | None:
+    """`assert_delivery_endpoint_allowed` for coroutines.
+
+    Identical checks and identical verdicts; the resolver call is awaited
+    instead of blocking the event loop.
+    """
+    host = _static_endpoint_checks(endpoint)
+    if host is None:
+        return None
+    return _pin_from_addresses(host, await _aresolved_addresses(host))
+
+
+# The genuine httpx client class, captured before any test double can replace
+# the module attribute. A pinned dial is expressed through an httpx transport,
+# so it can only be attached to a real httpx client; substituted clients (the
+# in-memory doubles this repo's tests install over `httpx.AsyncClient`) never
+# open a socket, so there is nothing for a pin to protect there.
+_HTTPX_ASYNC_CLIENT = httpx.AsyncClient
+
+
+class _PinnedAddressTransport(httpx.AsyncHTTPTransport):
+    """Dial the address the guard approved, under the original hostname.
+
+    Rewriting the URL host to the literal is what stops httpx from resolving
+    the name a second time. Everything name-shaped is preserved:
+
+    * the `Host` header was already set from the original URL when the request
+      was built (`httpx.Request._prepare`), so the server still sees the name;
+    * `sni_hostname` carries the name into the TLS handshake, and httpx's
+      default SSL context has `check_hostname=True`, so the certificate is
+      verified against the hostname -- never against the pinned literal.
+
+    Only the pinned host is rewritten. A redirect or health probe aimed at any
+    other host goes out untouched.
+    """
+
+    def __init__(self, pin: PinnedEndpoint, **transport_kwargs: Any) -> None:
+        # No transport_kwargs in production: the defaults are exactly what
+        # `httpx.AsyncClient()` would have built, so pinning changes where the
+        # socket goes and nothing about how the connection is made. The
+        # parameter exists so a test can point verification at its own CA.
+        super().__init__(**transport_kwargs)
+        self._pin = pin
+
+    async def handle_async_request(self, request: httpx.Request) -> httpx.Response:
+        host = (request.url.host or "").strip().lower().rstrip(".")
+        if host == self._pin.hostname:
+            request.url = request.url.copy_with(host=self._pin.address)
+            request.extensions = {
+                **request.extensions,
+                "sni_hostname": self._pin.hostname,
+            }
+        return await super().handle_async_request(request)
+
+
+def _environment_proxy_applies(endpoint: str) -> bool:
+    """True when httpx would send this URL through an environment proxy.
+
+    Mirrors httpx's own mount matching rather than guessing, because being
+    wrong either way is costly: a proxied request that we pin would break (see
+    _dial_pin), and an unproxied request that we decline to pin would leave the
+    rebinding gap open.
+    """
+    try:
+        from httpx._utils import URLPattern, get_environment_proxies
+    except ImportError:  # pragma: no cover - httpx internals moved
+        return any(
+            os.getenv(name, "").strip()
+            for name in ("HTTPS_PROXY", "https_proxy", "ALL_PROXY", "all_proxy")
+        )
+    url = httpx.URL(endpoint)
+    mounts = sorted(
+        ((URLPattern(pattern), proxy) for pattern, proxy in get_environment_proxies().items()),
+        key=lambda item: item[0],
+    )
+    for pattern, proxy in mounts:
+        if pattern.matches(url):
+            return proxy is not None
+    return False
+
+
+async def _dial_pin(endpoint: str) -> PinnedEndpoint | None:
+    """Validate `endpoint` and return the address to dial, if any.
+
+    Pinning is suppressed when an environment proxy handles the request. That
+    is not a loophole: with a proxy in play the client never resolves the name
+    at all -- it sends `CONNECT <name>:<port>` and the proxy resolves -- so
+    there is no second local lookup to poison, and the guard's own resolution
+    does not describe the connection either way. Pinning anyway would be
+    actively harmful: httpcore's tunnel connection ignores the `sni_hostname`
+    extension and takes the TLS `server_hostname` from the request origin, so a
+    pinned URL would verify the certificate against the IP and fail, and
+    passing an explicit transport to httpx would disable the proxy mounts
+    (`allow_env_proxies = trust_env and transport is None`) and silently route
+    around the operator's proxy. The residual risk -- a rebinding zone answering
+    the *proxy* -- belongs to the proxy, not to this process.
+    """
+    pin = await resolve_delivery_endpoint(endpoint)
+    if pin is None or _environment_proxy_applies(endpoint):
+        return None
+    return pin
+
+
+def _open_live_client(pin: PinnedEndpoint | None) -> Any:
+    """An httpx client for one live exchange, dialing the pinned address."""
+    timeout = _live_timeout_seconds()
+    client_cls = httpx.AsyncClient
+    if (
+        pin is not None
+        and isinstance(client_cls, type)
+        and issubclass(client_cls, _HTTPX_ASYNC_CLIENT)
+    ):
+        return client_cls(timeout=timeout, transport=_PinnedAddressTransport(pin))
+    return client_cls(timeout=timeout)
 
 
 # RegEngine's IngestEvent declares `input_traceability_lot_codes` as a
@@ -325,8 +535,9 @@ class LiveRegEngineClient:
         tenant_id = config.delivery.tenant_id
         if not api_key or not tenant_id:
             raise ValueError("Live delivery requires both api_key and tenant_id")
-        # Validate before any credential header is built.
-        assert_delivery_endpoint_allowed(endpoint)
+        # Validate before any credential header is built, and keep the address
+        # that validation approved so the dial cannot land anywhere else.
+        pin = await _dial_pin(endpoint)
 
         idempotency_key = idempotency_key or uuid.uuid4().hex
         # Serialize the body exactly once so the bytes we sign are the same
@@ -364,7 +575,7 @@ class LiveRegEngineClient:
         if signature_header is not None:
             headers["X-Webhook-Signature"] = signature_header
         try:
-            async with httpx.AsyncClient(timeout=_live_timeout_seconds()) as client:
+            async with _open_live_client(pin) as client:
                 response = await client.post(endpoint, headers=headers, content=body_bytes)
         except httpx.HTTPError as exc:
             raise LiveRegEngineDeliveryError(str(exc), metadata) from exc
@@ -396,7 +607,7 @@ class LiveRegEngineClient:
         parsed = urlparse(endpoint)
         host = parsed.netloc
         try:
-            assert_delivery_endpoint_allowed(endpoint)
+            pin = await _dial_pin(endpoint)
         except BlockedDeliveryEndpointError as exc:
             # Refuse before credentials are placed in any header.
             return ConnectionCheckResult(
@@ -417,7 +628,7 @@ class LiveRegEngineClient:
             "X-Tenant-ID": tenant_id,
         }
         try:
-            async with httpx.AsyncClient(timeout=_live_timeout_seconds()) as client:
+            async with _open_live_client(pin) as client:
                 response = await client.get(
                     probe_url,
                     headers=headers,
