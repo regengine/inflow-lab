@@ -159,6 +159,68 @@ def test_advancing_time_never_exceeds_the_live_window_ceiling_by_more_than_a_tic
         assert engine._time_cursor <= ceiling + timedelta(microseconds=1)
 
 
+def _freeze_engine_clock(monkeypatch, instant: datetime) -> None:
+    """Pin ``datetime.now()`` inside app.engine to a fixed instant.
+
+    This is what makes the capped regime actually discriminating. The three
+    tests above let real wall-clock time advance between calls, so
+    ``live_window_ceiling`` -- recomputed from ``datetime.now(UTC)`` on every
+    call -- creeps forward on its own. Under that condition even the original
+    bare `candidate = live_window_ceiling` clamp produces strictly increasing
+    timestamps, because the thing it clamps *to* keeps moving. Freezing the
+    clock removes that accidental source of monotonicity and leaves only the
+    behavior under test.
+
+    Subclassing ``datetime`` rather than replacing it wholesale keeps every
+    other use in the module (arithmetic, comparison, ``strftime``) intact --
+    app/engine.py calls ``.now()`` in exactly two places, the cursor's initial
+    value and the ceiling.
+    """
+
+    class _FrozenDatetime(datetime):
+        @classmethod
+        def now(cls, tz=None):  # noqa: ARG003 - signature must match datetime.now
+            return instant
+
+    monkeypatch.setattr(engine_module, "datetime", _FrozenDatetime)
+
+
+def test_capped_timestamps_stay_unique_when_the_wall_clock_does_not_move(monkeypatch):
+    """#119's actual regression test.
+
+    With the clock frozen, the live-window ceiling is a constant. The original
+    bug -- clamping straight to that constant -- therefore returns the *same*
+    instant for every call once the cursor reaches it. Restoring the pre-fix
+    line makes this test fail with hundreds of duplicates; the three
+    wall-clock-based tests above stay green against that same revert, which is
+    why this one exists.
+    """
+    instant = datetime(2026, 8, 27, 12, 0, 0, tzinfo=UTC)
+    _freeze_engine_clock(monkeypatch, instant)
+
+    engine = LegitFlowEngine(seed=204)
+    ceiling = instant + timedelta(hours=engine_module._max_future_hours())
+
+    timestamps = [engine._advance_time(30, 180) for _ in range(400)]
+
+    # The cursor starts 12h behind the frozen instant and the ceiling sits
+    # 20h ahead of it, so a 30-180 minute step crosses that ~32h of headroom
+    # well inside 400 calls. Assert we genuinely got into the capped regime,
+    # so the uniqueness check below is not trivially true of the free-running
+    # phase.
+    capped = [ts for ts in timestamps if ts >= ceiling]
+    assert len(capped) > 300, f"expected to spend most of the run capped, got {len(capped)}"
+
+    assert len(timestamps) == len(set(timestamps)), "capped timestamps collapsed onto one instant"
+    for earlier, later in zip(timestamps, timestamps[1:]):
+        assert later > earlier
+
+    # The fix rides a frozen ceiling by exactly one microsecond per call, so
+    # the run may pass the ceiling -- but only by the number of capped steps
+    # taken, never by the minutes-wide jumps of the uncapped phase.
+    assert max(timestamps) <= ceiling + timedelta(microseconds=len(timestamps))
+
+
 # ---------------------------------------------------------------------------
 # Determinism: neither fix may reorder or add RNG draws
 # ---------------------------------------------------------------------------
