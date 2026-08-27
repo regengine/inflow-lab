@@ -28,6 +28,7 @@ Inflow Lab is a simulator. Its security boundary is designed for safe demos, tes
 
 - RegEngine API keys, Basic Auth passwords, and live delivery credentials must not be logged, returned in API payloads, or displayed in the dashboard.
 - Remote smoke tooling must redact configured credentials in failure output.
+- Remote smoke tooling must only send those credentials to an allowlisted host. `scripts/remote_smoke.py` and `scripts/browser_smoke.py` fail closed on any other `base_url` before a credential-carrying config is built, so a `workflow_dispatch` input cannot redirect the shared-demo Basic Auth secrets to an attacker-controlled server. Loopback is exempt (local runs); plaintext `http://` to a non-loopback host is refused because Basic Auth would be on the wire. Override with `REGENGINE_REMOTE_ALLOWED_HOSTS` (space/comma separated) for a different deployment - it is an environment variable, not a workflow input, so changing it takes a reviewed commit.
 
 ## Evidence Boundary
 

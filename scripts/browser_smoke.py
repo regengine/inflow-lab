@@ -18,6 +18,7 @@ if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
 from app.build_info import APP_VERSION
+from scripts.remote_smoke import assert_base_url_allowed
 
 
 CSV_WITH_KDE_WARNINGS = """cte_type,traceability_lot_code,product_description,quantity,unit_of_measure,location_name,timestamp,kdes
@@ -52,8 +53,19 @@ def _load_config() -> BrowserSmokeConfig:
             "REGENGINE_BROWSER_USERNAME and REGENGINE_BROWSER_PASSWORD must be provided together"
         )
 
+    base_url = _env_text("REGENGINE_BROWSER_BASE_URL") or _env_text("REGENGINE_REMOTE_BASE_URL")
+    if base_url is not None and username and password:
+        # #124: same exposure as remote_smoke.py, one workflow over --
+        # remote-browser-smoke.yml takes the same unconstrained base_url
+        # input, and these credentials are attached to every request via
+        # Playwright's http_credentials context option (see
+        # _browser_context_options). Guarded here, before the config that
+        # carries them is built. A base_url of None is the local-spawn path
+        # in _base_url(), which starts its own uvicorn on loopback.
+        assert_base_url_allowed(base_url.rstrip("/"))
+
     return BrowserSmokeConfig(
-        base_url=_env_text("REGENGINE_BROWSER_BASE_URL") or _env_text("REGENGINE_REMOTE_BASE_URL"),
+        base_url=base_url,
         headless=os.getenv("REGENGINE_BROWSER_HEADLESS", "1").lower() not in {"0", "false", "no"},
         username=username,
         password=password,

@@ -3,9 +3,13 @@ import pytest
 
 from app.build_info import APP_VERSION
 from scripts.browser_smoke import _browser_context_options, _check_healthz_build, _load_config
+from scripts.remote_smoke import RemoteSmokeFailure
 
 
 def test_browser_smoke_config_uses_browser_env(monkeypatch):
+    # #124: _load_config refuses an off-allowlist host once credentials are
+    # present. These tests cover env precedence, not host policy.
+    monkeypatch.setenv("REGENGINE_REMOTE_ALLOWED_HOSTS", "demo.example.test")
     monkeypatch.setenv("REGENGINE_BROWSER_BASE_URL", "https://demo.example.test/")
     monkeypatch.setenv("REGENGINE_BROWSER_USERNAME", "demo-user")
     monkeypatch.setenv("REGENGINE_BROWSER_PASSWORD", "demo-pass")
@@ -29,6 +33,7 @@ def test_browser_smoke_config_uses_browser_env(monkeypatch):
 
 
 def test_browser_smoke_config_falls_back_to_remote_env(monkeypatch):
+    monkeypatch.setenv("REGENGINE_REMOTE_ALLOWED_HOSTS", "railway.example.test")
     monkeypatch.setenv("REGENGINE_REMOTE_BASE_URL", "https://railway.example.test")
     monkeypatch.setenv("REGENGINE_REMOTE_USERNAME", "remote-user")
     monkeypatch.setenv("REGENGINE_REMOTE_PASSWORD", "remote-pass")
@@ -92,3 +97,33 @@ def test_browser_smoke_rejects_stale_healthz_build(monkeypatch):
 
     with pytest.raises(RuntimeError, match="build commit mismatch"):
         _check_healthz_build("https://demo.example.test", "fedcba9876543210")
+
+
+def test_browser_smoke_refuses_an_off_allowlist_base_url(monkeypatch):
+    """#124: remote-browser-smoke.yml takes the same unconstrained base_url
+    input, and _browser_context_options attaches the shared-demo credentials
+    to every request via Playwright's http_credentials. The guard has to run
+    at config load, before that context is ever built.
+    """
+    monkeypatch.delenv("REGENGINE_REMOTE_ALLOWED_HOSTS", raising=False)
+    monkeypatch.setenv("REGENGINE_BROWSER_BASE_URL", "https://attacker.example")
+    monkeypatch.setenv("REGENGINE_BROWSER_USERNAME", "demo-user")
+    monkeypatch.setenv("REGENGINE_BROWSER_PASSWORD", "demo-pass")
+
+    with pytest.raises(RemoteSmokeFailure, match="Refusing to send credentials"):
+        _load_config()
+
+
+def test_browser_smoke_still_allows_the_local_spawn_path(monkeypatch):
+    """base_url unset is the local-spawn path in _base_url(), which starts
+    its own uvicorn on loopback -- it must not be caught by the allowlist.
+    """
+    monkeypatch.delenv("REGENGINE_REMOTE_ALLOWED_HOSTS", raising=False)
+    monkeypatch.delenv("REGENGINE_BROWSER_BASE_URL", raising=False)
+    monkeypatch.delenv("REGENGINE_REMOTE_BASE_URL", raising=False)
+    monkeypatch.setenv("REGENGINE_BROWSER_USERNAME", "demo-user")
+    monkeypatch.setenv("REGENGINE_BROWSER_PASSWORD", "demo-pass")
+
+    config = _load_config()
+
+    assert config.base_url is None
