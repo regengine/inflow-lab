@@ -385,6 +385,8 @@ The dashboard fixture loader resets the current event log before loading the sel
 
 If a lot code is supplied, the export is scoped to that lot's transitive lineage before applying the preset filter. `GET /api/mock/regengine/export/presets` returns the preset catalog used by the dashboard. The dashboard export panel builds CSV and EPCIS download links from the same lot and date filters.
 
+**Export size limit.** Both export endpoints (`export/fda-request` and `export/epcis`) refuse a request matching more than **5,000 records** with HTTP 413, naming the matched count and how to narrow the request. They read the full persisted JSONL history, so a broad date range or a wide lineage graph is otherwise unbounded. The response is refused rather than truncated on purpose: these are `Content-Disposition: attachment` downloads, so a shortened file is indistinguishable from a complete one once it is saved — and it is evidence handed to a regulator. A successful export carries `X-Export-Record-Count`, so a count under the limit is proof nothing was left out. (`/api/lineage`, which is read in the browser rather than downloaded, caps and reports truncation in `X-Lineage-Truncated` instead.)
+
 ## EPCIS 2.0 export scaffolding
 
 `GET /api/mock/regengine/export/epcis` derives a scaffolded EPCIS 2.0 JSON-LD document from stored simulator records. This is intentionally additive: it does not change live RegEngine ingest payloads, the mock ingest route, or the FDA CSV export shape.

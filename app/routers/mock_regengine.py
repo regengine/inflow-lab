@@ -28,6 +28,50 @@ from ..schemas.ingestion import IngestPayload, MockIngestResponse
 
 router = APIRouter(prefix="/api/mock/regengine", tags=["Mock RegEngine"])
 
+# Hard ceiling on how many records one export may render (#145). Matches
+# EventStore's default in-memory ring size, which is the largest window the
+# rest of the app is built to hold at once -- but the exports do not read
+# that ring: store.all_between()/store.lineage() go through _all_records(),
+# which reads the whole persisted JSONL log from disk, so an export is
+# unbounded by anything else in the system. A broad date range, or a lot
+# code with a wide trace graph, otherwise renders an arbitrarily large CSV
+# or JSON-LD document in one response.
+EXPORT_MAX_RECORDS = 5000
+
+
+def _enforce_export_record_cap(records: list[Any], *, scoped_by_lot_code: bool) -> None:
+    """Refuse an export that would exceed EXPORT_MAX_RECORDS.
+
+    Refuse, not truncate -- unlike /api/lineage, which caps and reports the
+    truncation in response headers (see app/routers/events.py). These two
+    endpoints are file downloads: they answer with Content-Disposition
+    attachment, so whatever a browser saves is what the operator reads, and
+    response headers are invisible by the time anyone opens the file. A
+    silently shortened FDA request CSV is indistinguishable from a complete
+    one, and it is handed to a regulator. That failure -- evidence that
+    looks whole and is not -- is worse than no file at all, and it is
+    exactly the class of silent partial success this simulator exists to
+    surface rather than commit.
+
+    413 rather than 400: the request is well-formed, the response is what is
+    too large.
+    """
+    if len(records) <= EXPORT_MAX_RECORDS:
+        return
+    narrowing = (
+        "Narrow start_date/end_date"
+        if scoped_by_lot_code
+        else "Narrow start_date/end_date, or scope the export to a traceability_lot_code"
+    )
+    raise HTTPException(
+        status_code=413,
+        detail=(
+            f"This export matches {len(records)} records, over the {EXPORT_MAX_RECORDS}-record "
+            f"limit. {narrowing} and request it again. The limit is refused rather than "
+            "truncated so a partial export can never be mistaken for a complete one."
+        ),
+    )
+
 
 def _ingest_request_body_schema() -> dict[str, Any]:
     """OpenAPI requestBody for /ingest, derived from IngestPayload itself.
@@ -203,11 +247,19 @@ async def mock_fda_request_export(
             end_date=end_filter.isoformat() if end_filter else None,
         )
     records = apply_fda_export_preset(records, preset)
+    _enforce_export_record_cap(records, scoped_by_lot_code=bool(traceability_lot_code))
     csv_text = render_fda_request_csv(records, location_gln=active_controller.engine.location_gln)
     return PlainTextResponse(
         content=csv_text,
         media_type="text/csv",
-        headers={"Content-Disposition": f"attachment; filename={export_filename(preset)}"},
+        headers={
+            "Content-Disposition": f"attachment; filename={export_filename(preset)}",
+            # How many records the attachment actually holds. The file itself
+            # cannot say whether it is the whole answer, so the response says
+            # it -- and with the cap above, a count below the limit is proof
+            # that nothing was left out.
+            "X-Export-Record-Count": str(len(records)),
+        },
     )
 
 
@@ -230,6 +282,7 @@ async def mock_epcis_export(
             end_date=end_filter.isoformat() if end_filter else None,
         )
 
+    _enforce_export_record_cap(records, scoped_by_lot_code=bool(traceability_lot_code))
     document = render_epcis_document(
         records,
         source=active_controller.config.source,
@@ -238,7 +291,10 @@ async def mock_epcis_export(
     return JSONResponse(
         content=document,
         media_type="application/ld+json",
-        headers={"Content-Disposition": f"attachment; filename={epcis_filename()}"},
+        headers={
+            "Content-Disposition": f"attachment; filename={epcis_filename()}",
+            "X-Export-Record-Count": str(len(records)),
+        },
     )
 
 

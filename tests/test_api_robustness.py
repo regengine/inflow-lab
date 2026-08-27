@@ -10,6 +10,7 @@ import pytest
 from fastapi.testclient import TestClient
 
 from app.main import app, controller
+from app.routers import mock_regengine as mock_regengine_router
 from app.schemas.domain import CTEType, DestinationMode, RegEngineEvent, StoredEventRecord
 from app.schemas.simulation import SimulationConfig
 
@@ -567,3 +568,96 @@ def test_ingest_route_still_documents_its_request_body() -> None:
     assert not referenced - set(document["components"]["schemas"]), (
         "requestBody references a schema the document does not define"
     )
+
+
+# ---------------------------------------------------------------------------
+# #145 -- the FDA-request and EPCIS export endpoints are bounded too.
+# ---------------------------------------------------------------------------
+
+
+def _seed_export_records(count: int) -> None:
+    controller.store.add_many(
+        [
+            _make_stored_record(
+                f"TLC-EXPORT-{index:04d}",
+                minutes=index,
+                kdes={
+                    "harvest_date": "2026-03-01",
+                    "reference_document": f"Harvest Log HL-EXPORT-{index:04d}",
+                },
+            )
+            for index in range(count)
+        ]
+    )
+
+
+@pytest.mark.parametrize(
+    "path",
+    ["/api/mock/regengine/export/fda-request", "/api/mock/regengine/export/epcis"],
+)
+def test_export_refuses_a_response_past_the_record_cap(path: str, monkeypatch: Any) -> None:
+    """Both exports read through store._all_records(), which loads the whole
+    persisted JSONL log from disk -- so neither was bounded by anything.
+    /api/events caps at 500 and /api/lineage now caps too; these two returned
+    however many records a broad date range or a wide lineage graph matched.
+
+    The cap is patched down rather than seeding 5000 records: the number is
+    pinned separately below, and what needs testing here is the mechanism.
+    """
+    monkeypatch.setattr(mock_regengine_router, "EXPORT_MAX_RECORDS", 3)
+    _seed_export_records(5)
+
+    response = client.get(path)
+
+    assert response.status_code == 413, response.text
+    detail = response.json()["detail"]
+    assert "5 records" in detail
+    assert "3-record limit" in detail
+    assert "start_date" in detail, "the refusal must say how to narrow the request"
+
+
+@pytest.mark.parametrize(
+    "path",
+    ["/api/mock/regengine/export/fda-request", "/api/mock/regengine/export/epcis"],
+)
+def test_export_at_exactly_the_cap_still_succeeds(path: str, monkeypatch: Any) -> None:
+    # The boundary is inclusive: refusing at the limit rather than past it
+    # would make the documented cap off by one.
+    monkeypatch.setattr(mock_regengine_router, "EXPORT_MAX_RECORDS", 3)
+    _seed_export_records(3)
+
+    response = client.get(path)
+
+    assert response.status_code == 200, response.text
+    assert response.headers["X-Export-Record-Count"] == "3"
+
+
+def test_export_refusal_mentions_lot_scoping_only_when_not_already_scoped(
+    monkeypatch: Any,
+) -> None:
+    # An export already scoped to one lot cannot be narrowed further by lot,
+    # so telling the caller to do that would be useless advice.
+    monkeypatch.setattr(mock_regengine_router, "EXPORT_MAX_RECORDS", 1)
+    controller.store.add_many(
+        [
+            _make_stored_record("TLC-EXPORT-WIDE-0", minutes=0),
+            _make_stored_record(
+                "TLC-EXPORT-WIDE-1", minutes=1, parent_lot_codes=["TLC-EXPORT-WIDE-0"]
+            ),
+        ]
+    )
+
+    unscoped = client.get("/api/mock/regengine/export/fda-request")
+    scoped = client.get(
+        "/api/mock/regengine/export/fda-request?traceability_lot_code=TLC-EXPORT-WIDE-1"
+    )
+
+    assert unscoped.status_code == scoped.status_code == 413
+    assert "traceability_lot_code" in unscoped.json()["detail"]
+    assert "traceability_lot_code" not in scoped.json()["detail"]
+
+
+def test_export_record_cap_is_the_documented_value() -> None:
+    # Pins the constant itself, so the number in the README and the number
+    # the routes enforce cannot drift apart unnoticed.
+    assert mock_regengine_router.EXPORT_MAX_RECORDS == 5000
