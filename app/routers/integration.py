@@ -98,6 +98,7 @@ async def integration_test(
     }
     stored_origin = _delivery_origin(config)
     probe_origin = _origin(str(request.endpoint)) if request.endpoint is not None else stored_origin
+    withheld: list[str] = []
     if probe_origin != stored_origin:
         # Caller is pointing the probe at a different origin than the stored/
         # default RegEngine endpoint. Never let the stored api_key/tenant_id
@@ -106,8 +107,15 @@ async def integration_test(
         # they did; the setdefault below is then a no-op). Otherwise the
         # probe runs uncredentialed and reports not_configured instead of
         # leaking them.
-        updates.setdefault("api_key", None)
-        updates.setdefault("tenant_id", None)
+        #
+        # Which stored credentials that suppressed is recorded, because the
+        # generic "no credentials configured" wording is factually false in
+        # this case and the caller cannot act on it: they DID configure a
+        # key, it just was not this origin's (#210).
+        for field in ("api_key", "tenant_id"):
+            if field not in updates and getattr(config.delivery, field):
+                withheld.append(field)
+            updates.setdefault(field, None)
     delivery = config.delivery.model_copy(update=updates, deep=True)
     if config.delivery.mode == DestinationMode.MOCK and not (
         request.api_key or request.tenant_id or request.endpoint
@@ -119,6 +127,30 @@ async def integration_test(
                 "stand-in, no credentials required. Enter live credentials to "
                 "test a real connection."
             ),
+            mode=config.delivery.mode,
+        )
+
+    if withheld and not (delivery.api_key and delivery.tenant_id):
+        # #210: check_connection's own not_configured detail -- "Both an API
+        # key and a tenant id are required before testing the connection" --
+        # names a condition that is not the one that failed here. Something
+        # IS configured; it was withheld on purpose because this request
+        # points somewhere else. Reporting the generic reason sent the
+        # operator off to re-enter credentials that were already correct.
+        # The verdict stays not_configured (nothing was probed, and the UI
+        # and this suite both key off it); only the explanation changes.
+        names = " and ".join(
+            {"api_key": "API key", "tenant_id": "tenant id"}[field] for field in withheld
+        )
+        return ConnectionTestResponse(
+            verdict="not_configured",
+            detail=(
+                f"Nothing was probed. The stored {names} belongs to {stored_origin}, "
+                f"and this test targets {probe_origin}, so it was not reused — a "
+                "credential is never sent to an origin it was not issued for. "
+                "Supply an API key and tenant id for this origin to test it."
+            ),
+            endpoint_host=urlparse(str(delivery.endpoint)).netloc if delivery.endpoint else "",
             mode=config.delivery.mode,
         )
 

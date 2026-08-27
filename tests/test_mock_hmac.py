@@ -552,3 +552,67 @@ def test_service_rejects_a_non_ascii_signature_without_raising_type_error(
         service.ingest(payload, raw_body=raw_body, signature_header="sha256=café")
 
     assert exc_info.value.status_code == 401
+
+
+# ---------------------------------------------------------------------------
+# #210: an unknown X-Mock-Friction code must be rejected, not ignored
+# ---------------------------------------------------------------------------
+
+
+def test_route_rejects_an_unknown_mock_friction_code() -> None:
+    """A misspelled friction code returned 200 and injected nothing.
+
+    That is the exact silent no-op this simulator exists to surface, in the
+    feature whose entire purpose is rehearsing failure: the operator types
+    "rate-limit" instead of "rate_limit", sees a clean 200, and concludes
+    they have exercised a rate-limit path they never touched (#210).
+    """
+    response = client.post(
+        INGEST_URL, json=_payload_dict(lot="TLC-FRICTION-TYPO"), headers={"X-Mock-Friction": "rate-limit"}
+    )
+
+    assert response.status_code == 400, response.text
+    detail = response.json()["detail"]
+    assert "rate-limit" in detail
+    assert "rate_limit" in detail, "the rejection should name the codes that do work"
+
+
+def test_route_rejects_an_unknown_code_even_alongside_a_valid_one() -> None:
+    """The whole header is refused rather than just the bad code. A valid
+    code raising first would mask the typo behind a plausible-looking 401,
+    which is the same silent no-op one layer down."""
+    response = client.post(
+        INGEST_URL,
+        json=_payload_dict(lot="TLC-FRICTION-MIXED"),
+        headers={"X-Mock-Friction": "invalid_key, subscription-inactive"},
+    )
+
+    assert response.status_code == 400, response.text
+    assert "subscription-inactive" in response.json()["detail"]
+
+
+def test_every_documented_friction_code_is_still_accepted() -> None:
+    # The rejection must be scoped to genuinely unknown codes: every code
+    # DeliveryConfig.mock_friction accepts still injects its failure.
+    for code, expected_status in (
+        ("invalid_key", 401),
+        ("subscription_inactive", 402),
+        ("rate_limit", 429),
+    ):
+        response = client.post(
+            INGEST_URL, json=_payload_dict(lot=f"TLC-FRICTION-{code}"), headers={"X-Mock-Friction": code}
+        )
+        assert response.status_code == expected_status, (code, response.text)
+
+
+def test_service_rejects_an_unknown_friction_code() -> None:
+    """Same guarantee at the service level, so every caller of ingest()
+    gets it -- not only the HTTP route."""
+    service = MockRegEngineService()
+    payload = IngestPayload(source="unit-test", events=[_valid_event()])
+
+    with pytest.raises(MockRegEngineHTTPError) as exc_info:
+        service.ingest(payload, friction=("not_a_real_code",))
+
+    assert exc_info.value.status_code == 400
+    assert "not_a_real_code" in exc_info.value.detail

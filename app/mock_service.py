@@ -265,10 +265,25 @@ class MockRegEngineService:
         # call remains the gate for callers that reach ingest() directly.
         verify_webhook_signature(raw_body, signature_header)
 
-        for code in friction:
-            failure = FRICTION_RESPONSES.get(code)
-            if failure is not None:
-                raise MockRegEngineHTTPError(*failure)
+        # An unrecognized friction code is rejected, never skipped (#210).
+        # Silently ignoring it produced the exact failure this simulator
+        # exists to surface: an operator rehearsing a failure mode types
+        # "rate-limit" or "subscription-inactive", the request returns a
+        # clean 200, and they conclude they have exercised a path they have
+        # not. The whole header is refused rather than just the bad code,
+        # so a typo alongside a valid code cannot be masked by the valid
+        # one raising first.
+        unknown = [code for code in friction if code not in FRICTION_RESPONSES]
+        if unknown:
+            raise MockRegEngineHTTPError(
+                400,
+                f"Unknown mock friction code(s): {', '.join(sorted(unknown))}. "
+                f"Supported codes: {', '.join(sorted(FRICTION_RESPONSES))}.",
+            )
+        if friction:
+            # First listed code wins, as before -- every code is known to
+            # map to a response by the time we get here.
+            raise MockRegEngineHTTPError(*FRICTION_RESPONSES[friction[0]])
 
         if len(payload.events) < MIN_BATCH_EVENTS:
             raise MockRegEngineHTTPError(
