@@ -473,6 +473,26 @@ jobs:
           REGENGINE_CONTRACT_ARTIFACT_PATH="${RUNNER_TEMP}/regengine-required-kdes.json" \
             uv run --frozen --no-dev python -m app.contract
 
+      # #211: contract.md asserted it mirrored RegEngine's contract with nothing
+      # checking it, and five of its claims turned out to be wrong -- including a
+      # sample payload whose GLN check digit fails, which RegEngine would 422 with
+      # STRICT_GLN_VALIDATION on (its default). tests/test_contract_document.py's
+      # cross-repo half is the only thing that can catch a wrong upstream path or
+      # symbol, and it self-skips unless REGENGINE_CHECKOUT is set. This job is
+      # the one place both repositories are on disk, so it is where that half runs.
+      #
+      # UV_PROJECT_ENVIRONMENT puts pytest in a SEPARATE venv on purpose: the
+      # steps below start the simulator from `.venv`, which is deliberately
+      # installed --no-dev so the contract is exercised against the dependency
+      # set that actually deploys. Syncing the dev group into that venv would
+      # quietly cost this job the deployed-fidelity it exists for.
+      - name: Check contract.md against RegEngine's source
+        working-directory: inflow-lab
+        env:
+          REGENGINE_CHECKOUT: ${{ github.workspace }}/regengine
+          UV_PROJECT_ENVIRONMENT: .venv-contract-doc
+        run: uv run --frozen --group dev pytest tests/test_contract_document.py -q
+
       - name: Install RegEngine dependencies
         working-directory: regengine
         run: |
