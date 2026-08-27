@@ -136,7 +136,17 @@ def pop_tenant_controller(tenant_id: str) -> SimulationController | None:
     """
     with _tenant_lock:
         _tenants_being_deleted.add(tenant_id)
-        return _tenant_controllers.pop(tenant_id, None)
+        popped = _tenant_controllers.pop(tenant_id, None)
+        if popped is not None:
+            # Removing it from the registry only stops NEW lookups. A request
+            # that resolved this controller before the delete started still
+            # holds the object, and every EventStore write path mkdirs its own
+            # directory -- so a write through it after the rmtree recreated the
+            # tenant tree, and known_tenant_ids() listed the tenant as present
+            # again. Retiring the store makes those in-flight writes fail
+            # loudly instead of silently resurrecting it (#175).
+            popped.store.retire()
+        return popped
 
 
 def finish_tenant_delete(tenant_id: str) -> None:
@@ -158,6 +168,10 @@ def known_tenant_ids() -> list[str]:
         tenant_ids.update(
             tenant_id for tenant_id in _tenant_controllers if tenant_id != DEFAULT_TENANT_ID
         )
+        # Snapshot under the same lock the registry is mutated under, so the
+        # directory scan below cannot re-add a tenant whose delete is
+        # mid-flight (#175).
+        being_deleted = set(_tenants_being_deleted)
 
     if TENANT_DATA_ROOT.exists():
         for path in TENANT_DATA_ROOT.iterdir():
@@ -166,7 +180,10 @@ def known_tenant_ids() -> list[str]:
                     tenant_ids.add(normalize_tenant_id(path.name))
                 except ValueError:
                     continue
-    return sorted(tenant_ids)
+    # A directory that a pending rmtree has not reached yet -- or that an
+    # in-flight write recreated before its store was retired -- must not be
+    # reported as a live tenant.
+    return sorted(tenant_ids - being_deleted)
 
 
 def tenant_summary(tenant_id: str) -> dict[str, Any]:

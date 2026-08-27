@@ -19,6 +19,14 @@ logger = logging.getLogger("inflow_lab")
 
 
 # Sentinel that replaces secrets in scrubbed output. Not a credential.
+class RetiredStoreError(ValueError):
+    """Raised when a write is attempted through a deleted tenant's store (#175).
+
+    Subclasses ValueError so main.py's app-wide handler turns it into a clean
+    4xx rather than an unhandled 500.
+    """
+
+
 MASKED_SECRET = "***MASKED***"  # nosec B105
 SECRET_FIELD_NAMES = {"api_key", "apikey", "x_regengine_api_key", "authorization"}
 
@@ -105,6 +113,7 @@ class EventStore:
         self._records = deque(reversed(newest_last), maxlen=self.max_records)
 
     def _load_from_disk(self) -> None:
+        self.retired = False
         self.persist_path.parent.mkdir(parents=True, exist_ok=True)
         records = self.read_persisted_records(str(self.persist_path))
         counter = max((record.sequence_no for record in records), default=0)
@@ -245,8 +254,33 @@ class EventStore:
         committed_max = max((record.sequence_no for record in self._records), default=0)
         self._counter = max(persisted_max, committed_max)
 
+    def retire(self) -> None:
+        """Mark this store dead because its tenant is being deleted (#175).
+
+        A request that resolved its controller *before* the delete started
+        still holds that controller object, and every EventStore write path
+        does ``mkdir(parents=True)`` on its own -- so a write through the
+        popped controller recreated the tenant directory after the rmtree, and
+        ``known_tenant_ids()`` then listed the tenant as present again. The
+        controller was a zombie: the next request for that tenant minted a
+        second EventStore over the same file with an independent ``_counter``.
+
+        Retiring makes those in-flight writes fail loudly instead of silently
+        resurrecting the tenant.
+        """
+        with self._lock:
+            self.retired = True
+
+    def _refuse_if_retired(self) -> None:
+        if self.retired:
+            raise RetiredStoreError(
+                "This tenant has been deleted; its event store is no longer writable. "
+                "Retry the request to work against a freshly created tenant."
+            )
+
     def add_many(self, records: Iterable[StoredEventRecord]) -> list[StoredEventRecord]:
         stored: list[StoredEventRecord] = []
+        self._refuse_if_retired()
         try:
             return self._append_many(records, stored)
         except OSError:
@@ -298,6 +332,7 @@ class EventStore:
         return stored
 
     def update_many(self, records: Iterable[StoredEventRecord]) -> list[StoredEventRecord]:
+        self._refuse_if_retired()
         replacements = {record.record_id: record for record in records}
         if not replacements:
             return []
@@ -325,6 +360,7 @@ class EventStore:
         return [record for record in updated_records if record.record_id in replacements]
 
     def replace_all(self, records: Iterable[StoredEventRecord]) -> list[StoredEventRecord]:
+        self._refuse_if_retired()
         persisted_records = sorted(list(records), key=lambda record: record.sequence_no)
         with self._lock:
             self._write_records(persisted_records)

@@ -58,6 +58,13 @@ def _store_write_error(store: EventStore) -> str | None:
     EOF, which would turn a health check into a hang rather than a fast,
     correct "unhealthy".
     """
+    if store.retired:
+        # The tenant was deleted while this request was in flight (#175). The
+        # probe mkdirs its parent, so probing here would recreate the tenant
+        # tree the delete just removed and put it back in the operator
+        # listing. Report unwritable, which is the truth.
+        return "tenant has been deleted"
+
     probe_path, mode = _write_probe_target(store)
     try:
         probe_path.parent.mkdir(parents=True, exist_ok=True)
