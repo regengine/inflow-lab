@@ -4,7 +4,6 @@ import base64
 import shutil
 import sys
 from collections import Counter
-from pathlib import Path
 from typing import Any
 
 from fastapi.testclient import TestClient
@@ -12,9 +11,14 @@ from fastapi.testclient import TestClient
 from app.cte_rules import validate_event_kdes
 from app.main import app
 from app.schemas.domain import RegEngineEvent
+# Ask tenancy where this tenant's directory is instead of assuming
+# ./data: the app resolves its root from REGENGINE_DATA_DIR, so a
+# hardcoded REPO_ROOT/data deleted a path the app never wrote and left
+# the real golden-path-demo directory behind in the configured store
+# (#108).
+from app.tenancy import tenant_dir
 
 
-REPO_ROOT = Path(__file__).resolve().parent
 TENANT_ID = "golden-path-demo"
 LOT_CODE = "TLC-DEMO-FC-OUT-001"
 
@@ -202,7 +206,7 @@ def print_report(
 
 
 def cleanup_demo_tenant() -> None:
-    shutil.rmtree(REPO_ROOT / "data" / "tenants" / TENANT_ID, ignore_errors=True)
+    shutil.rmtree(tenant_dir(TENANT_ID), ignore_errors=True)
 
 
 def assert_json(response, expected_status: int) -> dict[str, Any]:

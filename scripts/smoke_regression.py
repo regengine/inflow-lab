@@ -14,6 +14,14 @@ sys.path.insert(0, str(REPO_ROOT))
 
 from app.main import app
 
+# The app resolves its data root from REGENGINE_DATA_DIR at import time
+# (app.tenancy.DATA_ROOT), so this script must ask tenancy where a tenant
+# lives rather than assume the default ./data. Hardcoding it made the
+# persist_path assertion below fail on a literal string mismatch, and made
+# the cleanup rmtree miss -- leaving release-smoke tenants behind in
+# whatever store the operator's shell actually pointed at (#108).
+from app.tenancy import tenant_dir, tenant_events_path
+
 
 TENANTS = ["release-smoke-main", "release-smoke-other"]
 
@@ -72,7 +80,7 @@ def run_smoke(client: TestClient) -> None:
     assert_equal(status["stats"]["total_records"], 13, "fixture status total")
     assert_equal(
         status["config"]["persist_path"],
-        "data/tenants/release-smoke-main/events.jsonl",
+        str(tenant_events_path(TENANTS[0])),
         "tenant persist path",
     )
 
@@ -170,7 +178,7 @@ def request_headers(tenant_id: str) -> dict[str, str]:
 
 def cleanup_smoke_tenants() -> None:
     for tenant_id in TENANTS:
-        shutil.rmtree(Path("data") / "tenants" / tenant_id, ignore_errors=True)
+        shutil.rmtree(tenant_dir(tenant_id), ignore_errors=True)
 
 
 def assert_json(response, expected_status: int) -> dict[str, Any]:
