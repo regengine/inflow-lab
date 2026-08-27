@@ -466,3 +466,88 @@ def test_run_loop_ignores_a_later_generations_stop_event(monkeypatch):
     # ITS OWN stop_event set, not kept going because self._stop_event
     # (by then a different, never-set object) still read as unset.
     assert step_calls == 1
+
+
+# ---------------------------------------------------------------------------
+# #158: stop() must be able to SIGNAL while a delivery holds the data plane.
+# ---------------------------------------------------------------------------
+
+
+def test_stop_can_signal_while_a_delivery_holds_the_data_plane_lock():
+    """#156's lock fix is correct on its own terms, but it moved stop()'s
+    signalling behind `self._lock` -- the same lock every delivery path holds
+    while awaiting the network. On `main`, stop() took no lock there at all
+    and could always signal immediately.
+
+    #103's chunking made that materially worse: one lock-held HTTP call became
+    `ceil(N/500)` sequential ones. At the real 30s timeout a 25k-record replay
+    pins the lock for roughly 25 minutes, during which stop() could not even
+    set the stop event -- which is #158's acceptance criterion, verbatim.
+
+    stop() now takes `_lifecycle_lock`, which is never held across a network
+    await, so signalling never queues behind data-plane work. It still cannot
+    RETURN until the run loop finishes its current step -- that is inherent,
+    and `await task` is deliberately outside every lock -- but the loop is
+    told to stop at the first opportunity rather than at the end of a
+    multi-minute replay.
+    """
+
+    async def scenario():
+        release_delivery = asyncio.Event()
+        spawned = []
+        try:
+            # A long interval so the loop parks in its wait rather than
+            # competing for the lock we are about to pin.
+            await controller.start(SimulationConfig(interval_seconds=60.0))
+            assert controller.running is True
+
+            async def hold_data_plane_lock():
+                # Stands in for a delivery awaiting the network inside
+                # self._lock -- exactly what step()/replay()/import_csv()/
+                # retry() all do.
+                async with controller._lock:
+                    await release_delivery.wait()
+
+            holder = asyncio.create_task(hold_data_plane_lock())
+            spawned.append(holder)
+            for _ in range(100):
+                await asyncio.sleep(0)
+                if controller._lock.locked():
+                    break
+            assert controller._lock.locked(), "test setup failed to hold the data-plane lock"
+
+            stop_task = asyncio.create_task(controller.stop())
+            spawned.append(stop_task)
+
+            # The signal must land promptly even though the data plane is
+            # pinned. Before the fix this never happened: stop() was queued on
+            # self._lock and could not reach stop_event.set() at all.
+            for _ in range(200):
+                await asyncio.sleep(0)
+                if controller._stop_event.is_set():
+                    break
+            assert controller._stop_event.is_set(), (
+                "stop() could not signal while a delivery held the data-plane lock"
+            )
+
+            # And releasing the data plane lets it complete normally.
+            release_delivery.set()
+            await asyncio.wait_for(stop_task, timeout=5.0)
+            assert controller.running is False
+            assert controller._task is None
+        finally:
+            release_delivery.set()
+            for task in spawned:
+                if not task.done():
+                    task.cancel()
+            if spawned:
+                await asyncio.gather(*spawned, return_exceptions=True)
+            if controller._task is not None and not controller._task.done():
+                controller._task.cancel()
+                await asyncio.gather(controller._task, return_exceptions=True)
+            # This file shares the app.main singleton -- never leave a
+            # dangling task or a stale stop_event for the next test.
+            controller._task = None
+            controller._stop_event = asyncio.Event()
+
+    asyncio.run(scenario())

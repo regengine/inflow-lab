@@ -91,6 +91,19 @@ class SimulationController:
         self._task: asyncio.Task[None] | None = None
         self._stop_event = asyncio.Event()
         self._lock = asyncio.Lock()
+        # Guards ONLY _task/_stop_event, and is never held across a network
+        # await (#158). self._lock is the data-plane lock: every delivery path
+        # awaits HTTP inside it, and #103's chunking turned one lock-held call
+        # into ceil(N/500) sequential ones. If stop() had to take self._lock
+        # just to signal, a large replay could make it unreachable for
+        # minutes -- so stop() takes this lock instead and can always signal
+        # immediately, which is what #158 asks for.
+        #
+        # Lock ordering, to keep this deadlock-free: self._lock -> this one,
+        # never the reverse. start() holds self._lock and then briefly takes
+        # this; stop() takes ONLY this and never self._lock. Since no path
+        # acquires self._lock while holding this, there is no cycle.
+        self._lifecycle_lock = asyncio.Lock()
         self._revision = 0
         self._change_condition = asyncio.Condition()
 
@@ -149,14 +162,20 @@ class SimulationController:
             if not self.running and _engine_shaping_fields_changed(previous_config, config):
                 self.engine.reset(config.seed, scenario=config.scenario, scale=config.scale)
             if not self.running:
-                stop_event = asyncio.Event()
-                self._stop_event = stop_event
-                self._task = asyncio.create_task(self._run_loop(stop_event))
+                # Both fields assigned together under _lifecycle_lock, so
+                # stop() always reads a matched generation (#156). Held only
+                # across the assignment and create_task, never an await of
+                # real work.
+                async with self._lifecycle_lock:
+                    stop_event = asyncio.Event()
+                    self._stop_event = stop_event
+                    self._task = asyncio.create_task(self._run_loop(stop_event))
         await self._publish_update()
 
     async def stop(self) -> None:
         # #156: the _task/_stop_event mutation below must happen under
-        # self._lock -- the same lock start() uses -- or a concurrent
+        # _lifecycle_lock -- the same lock start() assigns them under -- or a
+        # concurrent
         # start() can land in the gap this used to leave open. The old
         # body read self.running, set self._stop_event, and unconditionally
         # cleared self._task with no lock at all, so a start() landing
@@ -164,7 +183,7 @@ class SimulationController:
         # would install its own task/event and then have both silently
         # discarded by this method's own `self._task = None` -- orphaning
         # a live run loop that nothing could ever reach again.
-        async with self._lock:
+        async with self._lifecycle_lock:
             task = self._task
             if task is None or task.done():
                 return
@@ -183,7 +202,7 @@ class SimulationController:
         # is holding, while stop() blocks forever on a task that can now
         # never finish stepping.
         await task
-        async with self._lock:
+        async with self._lifecycle_lock:
             # The other half of #156's fix. While the lock was open across
             # the `await task` above, a concurrent start() could have
             # observed `running is False` (this task had just finished) and
