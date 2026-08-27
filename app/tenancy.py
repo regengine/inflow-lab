@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import logging
 import os
 from pathlib import Path
@@ -75,8 +76,33 @@ _tenants_being_deleted: set[str] = set()
 
 
 async def shutdown_tenant_controllers() -> None:
-    for tenant_controller in set(_tenant_controllers.values()):
-        await tenant_controller.shutdown()
+    """Stop every live tenant controller, concurrently (#208, criterion 5).
+
+    Each ``shutdown()`` awaits that tenant's run-loop task, which may be
+    mid-step and therefore mid-delivery. Awaiting them one at a time made
+    container shutdown the *sum* of every tenant's in-flight delivery; with
+    MAX_TENANT_CONTROLLERS at 50 that is long enough for the platform to
+    SIGKILL the process partway through, leaving later tenants' loops
+    killed rather than stopped. Running them together makes it the max
+    instead of the sum.
+
+    ``return_exceptions=True`` so one tenant failing to stop cannot skip
+    the shutdown of every tenant behind it -- the previous serial loop
+    abandoned the rest on the first raise. Failures are logged and the
+    first is re-raised afterwards, so nothing is silently swallowed.
+    """
+    tenant_controllers = list(set(_tenant_controllers.values()))
+    if not tenant_controllers:
+        return
+    results = await asyncio.gather(
+        *(tenant_controller.shutdown() for tenant_controller in tenant_controllers),
+        return_exceptions=True,
+    )
+    failures = [result for result in results if isinstance(result, BaseException)]
+    for failure in failures:
+        logger.error("tenant controller shutdown failed: %s", failure)
+    if failures:
+        raise failures[0]
 
 
 def active_controller_for_context(context: TenantContext) -> SimulationController:

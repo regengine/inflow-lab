@@ -60,6 +60,22 @@ from .store import EventStore, mask_secret_in_payload, mask_secret_in_string
 logger = logging.getLogger("inflow_lab")
 
 
+# Reported on a delivery response whose store write was dropped because the
+# store was reset/reloaded/repointed while the delivery was in flight (#208).
+# See SimulationController._store_epoch.
+STALE_COMMIT_MESSAGE = (
+    "Delivery completed, but the event store was reset, reloaded or repointed "
+    "while it was in flight, so these records were not stored."
+)
+
+
+def _with_stale_commit_note(error_message: str | None) -> str:
+    """Append the dropped-commit note to whatever the delivery itself reported."""
+    if not error_message:
+        return STALE_COMMIT_MESSAGE
+    return f"{error_message}; {STALE_COMMIT_MESSAGE}"
+
+
 @dataclass(slots=True)
 class DeliveryOutcome:
     response: dict[str, Any] | None = None
@@ -104,8 +120,47 @@ class SimulationController:
         # this; stop() takes ONLY this and never self._lock. Since no path
         # acquires self._lock while holding this, there is no cycle.
         self._lifecycle_lock = asyncio.Lock()
+        # Serializes retry_failed_delivery against itself, and nothing else
+        # (#208). Every other delivery path builds its own events before
+        # posting them, so two concurrent calls simply deliver two different
+        # batches -- but retry *reads shared mutable state* (the store's
+        # failed records) and then acts on it. self._lock used to provide
+        # that mutual exclusion for free by being held across the whole
+        # call; now that the POSTs happen with it released, two overlapping
+        # retries would both select the same failed records and both post
+        # them. This lock restores exactly that one guarantee without
+        # putting step/reset/configure_integration back behind a delivery.
+        #
+        # Lock ordering: this one -> self._lock -> _lifecycle_lock, never
+        # the reverse. Nothing but retry_failed_delivery takes this, and it
+        # takes it first and outermost, so no cycle is possible.
+        self._retry_lock = asyncio.Lock()
         self._revision = 0
         self._change_condition = asyncio.Condition()
+        # Bumped whenever the store's *contents or identity* are replaced
+        # wholesale: reset(), load_scenario_save()'s replace_all,
+        # load_demo_fixture()'s reset, and any configure() that repoints
+        # persist_path at a different file (#208).
+        #
+        # This is what makes releasing self._lock around a delivery safe.
+        # A delivery path snapshots this value under the lock alongside the
+        # records it is about to post, posts with the lock released, then
+        # re-acquires and compares before committing. A mismatch means an
+        # operator cleared, reloaded or repointed the store while the batch
+        # was in flight, so the batch's records belong to a store that no
+        # longer exists -- writing them would resurrect history the operator
+        # just asked to be rid of, which is the one outcome #208 names as
+        # unacceptable. The commit is dropped instead and reported on the
+        # response's `error` field, so the caller learns the delivery
+        # happened but nothing was stored rather than silently believing
+        # either half.
+        #
+        # Deliberately NOT bumped by ordinary appends (add_many/update_many)
+        # or by config changes: an append does not invalidate another
+        # batch's records, and a config change mid-delivery is recorded
+        # faithfully by each path using its own snapshot of the config it
+        # actually delivered with.
+        self._store_epoch = 0
 
     @property
     def running(self) -> bool:
@@ -229,13 +284,27 @@ class SimulationController:
             await self._store_configure(self.config.persist_path)
             self.engine.reset(self.config.seed, scenario=self.config.scenario, scale=self.config.scale)
             self.store.reset()
+            # The operator asked for an empty store. Any delivery already in
+            # flight must not repopulate it when it comes back (#208) -- the
+            # acceptance criterion this issue names explicitly.
+            self._invalidate_store_epoch()
             self.mock_service.reset()
         await self._publish_update()
 
     async def step(self, batch_size: int | None = None, config: SimulationConfig | None = None) -> StepResponse:
+        # --- Snapshot phase, under self._lock -------------------------------
+        # Everything that touches shared mutable state -- reading the config,
+        # pulling events off the engine -- happens here. `active_config` is
+        # the one config this whole call uses from now on: SimulationConfig
+        # is only ever replaced wholesale via model_copy, never mutated in
+        # place, so this reference cannot be changed under us by a concurrent
+        # start()/configure_integration(). A config change landing mid-flight
+        # therefore applies to the *next* step, and this step's response and
+        # stored records describe the config it actually delivered with (#208).
         async with self._lock:
-            _validate_live_delivery(self.config.delivery)
-            size = batch_size or self.config.batch_size
+            active_config = self.config
+            _validate_live_delivery(active_config.delivery)
+            size = batch_size or active_config.batch_size
             events = []
             lineages = []
             for _ in range(size):
@@ -243,36 +312,50 @@ class SimulationController:
                 events.append(event)
                 lineages.append(parent_lot_codes)
 
-            payload = IngestPayload(source=self.config.source, events=events)
-            outcome = await self._deliver_payload(
-                payload,
-                self.config,
-                idempotency_key=uuid.uuid4().hex,
-            )
+            payload = IngestPayload(source=active_config.source, events=events)
+            store_epoch = self._store_epoch
 
-            stored_records = _build_stored_records(
-                self.config.source, events, lineages, self.config.delivery.mode, outcome
-            )
-            await self._store_add_many(stored_records)
+        # --- Delivery phase, with self._lock RELEASED (#208) ----------------
+        # This is the await that used to pin the lock for a full 30s live
+        # timeout, blocking start/reset/configure_integration/save_scenario
+        # for this tenant behind one HTTP request.
+        outcome = await self._deliver_payload(
+            payload,
+            active_config,
+            idempotency_key=uuid.uuid4().hex,
+        )
 
-            result = StepResponse(
-                generated=len(events),
-                posted=outcome.posted,
-                accepted=(outcome.response or {}).get("accepted", 0),
-                rejected=(outcome.response or {}).get("rejected", 0),
-                failed=outcome.failed,
-                lot_codes=[event.traceability_lot_code for event in events],
-                delivery_status=outcome.delivery_status,
-                delivery_mode=self.config.delivery.mode,
-                delivery_attempts=outcome.delivery_attempts,
-                response=outcome.response,
-                error=outcome.error_message,
-            )
+        # Pure CPU, no shared state -- build the records before re-acquiring
+        # so the commit phase holds the lock for the store write alone.
+        stored_records = _build_stored_records(
+            active_config.source, events, lineages, active_config.delivery.mode, outcome
+        )
+
+        # --- Commit phase, back under self._lock ----------------------------
+        stale = await self._commit_delivered_records(stored_records, store_epoch, "step")
+        result = StepResponse(
+            generated=len(events),
+            posted=outcome.posted,
+            accepted=(outcome.response or {}).get("accepted", 0),
+            rejected=(outcome.response or {}).get("rejected", 0),
+            failed=outcome.failed,
+            lot_codes=[event.traceability_lot_code for event in events],
+            delivery_status=outcome.delivery_status,
+            delivery_mode=active_config.delivery.mode,
+            delivery_attempts=outcome.delivery_attempts,
+            response=outcome.response,
+            error=_with_stale_commit_note(outcome.error_message) if stale else outcome.error_message,
+        )
         await self._publish_update()
         return result
 
     async def replay(self, request: ReplayRequest | None = None) -> ReplayResponse:
         request = request or ReplayRequest()
+        # --- Snapshot phase, under self._lock -------------------------------
+        # Read the config and the persisted log, then let go. This is the
+        # path #208 measures: at MAX_BATCH_EVENTS per chunk, a 25k-record
+        # store is 50 sequential POSTs, so holding the lock across the loop
+        # below pinned it for ~50 x the live timeout.
         async with self._lock:
             persist_path = request.persist_path or self.config.persist_path
             source = request.source or self.config.source
@@ -288,53 +371,65 @@ class SimulationController:
             records = await self._store_read_persisted_records(persist_path)
             events = [record.event for record in records]
 
-            if not events:
-                result = ReplayResponse(
-                    status="empty",
-                    read=0,
-                    replayed=0,
-                    posted=0,
-                    failed=0,
-                    source=source,
-                    persist_path=persist_path,
-                    delivery_mode=delivery.mode,
-                    delivery_attempts=0,
-                )
-            else:
-                # #103: RegEngine caps a batch at MAX_BATCH_EVENTS events and
-                # 422s the whole request past that -- a persisted store
-                # replayed here has no such bound, so once it grows past the
-                # cap a bare single _deliver_payload call would fail the
-                # entire replay every time (permanently, since the store
-                # only grows). _deliver_in_chunks splits `events` into
-                # slices at that same cap and posts each as its own
-                # request; _aggregate_outcomes rolls the per-chunk results
-                # back into one summary so an early chunk's posted events
-                # are still reported even if a later chunk fails.
-                chunks = await self._deliver_in_chunks(source, events, replay_config)
-                outcome = _aggregate_outcomes([chunk_outcome for _, chunk_outcome in chunks])
-                replay_status = {
-                    "posted": "posted",
-                    "failed": "failed",
-                    "generated": "rebuilt",
-                }[outcome.delivery_status]
-                result = ReplayResponse(
-                    status=replay_status,
-                    read=len(records),
-                    replayed=len(events),
-                    posted=outcome.posted,
-                    failed=outcome.failed,
-                    source=source,
-                    persist_path=persist_path,
-                    delivery_mode=delivery.mode,
-                    delivery_attempts=outcome.delivery_attempts,
-                    response=outcome.response,
-                    error=outcome.error_message,
-                )
+        if not events:
+            result = ReplayResponse(
+                status="empty",
+                read=0,
+                replayed=0,
+                posted=0,
+                failed=0,
+                source=source,
+                persist_path=persist_path,
+                delivery_mode=delivery.mode,
+                delivery_attempts=0,
+            )
+        else:
+            # --- Delivery phase, with self._lock RELEASED (#208) ------------
+            # replay() needs no commit phase and takes no store-epoch
+            # snapshot, because it is the one delivery path that writes
+            # nothing back: it re-posts records that are already persisted
+            # and reports what RegEngine said. A reset() landing mid-replay
+            # therefore has nothing of this call's to overwrite, and the
+            # response stays truthful about what was actually POSTed -- the
+            # events really were read from disk and really were sent, and
+            # suppressing that afterwards would under-report deliveries the
+            # remote side has already accepted.
+            #
+            # #103: RegEngine caps a batch at MAX_BATCH_EVENTS events and
+            # 422s the whole request past that -- a persisted store
+            # replayed here has no such bound, so once it grows past the
+            # cap a bare single _deliver_payload call would fail the
+            # entire replay every time (permanently, since the store
+            # only grows). _deliver_in_chunks splits `events` into
+            # slices at that same cap and posts each as its own
+            # request; _aggregate_outcomes rolls the per-chunk results
+            # back into one summary so an early chunk's posted events
+            # are still reported even if a later chunk fails.
+            chunks = await self._deliver_in_chunks(source, events, replay_config)
+            outcome = _aggregate_outcomes([chunk_outcome for _, chunk_outcome in chunks])
+            replay_status = {
+                "posted": "posted",
+                "failed": "failed",
+                "generated": "rebuilt",
+            }[outcome.delivery_status]
+            result = ReplayResponse(
+                status=replay_status,
+                read=len(records),
+                replayed=len(events),
+                posted=outcome.posted,
+                failed=outcome.failed,
+                source=source,
+                persist_path=persist_path,
+                delivery_mode=delivery.mode,
+                delivery_attempts=outcome.delivery_attempts,
+                response=outcome.response,
+                error=outcome.error_message,
+            )
         await self._publish_update()
         return result
 
     async def import_csv(self, request: CSVImportRequest) -> CSVImportResponse:
+        # --- Snapshot phase, under self._lock -------------------------------
         async with self._lock:
             source = request.source or self.config.source
             delivery = request.delivery or self.config.delivery
@@ -346,76 +441,88 @@ class SimulationController:
                 },
                 deep=True,
             )
-            # CPU-bound parsing (#136): offload it too, same reasoning as
-            # the store calls above -- a large csv_text body would
-            # otherwise tie up the event loop for the whole parse before
-            # the store write even starts.
-            parsed = await asyncio.to_thread(
-                parse_csv_import,
-                request.import_type,
-                request.csv_text,
-                default_timestamp=datetime.now(UTC),
-            )
+            store_epoch = self._store_epoch
 
-            outcome = DeliveryOutcome()
-            stored_records: list[StoredEventRecord] = []
-            if parsed.events:
-                # #103: same MAX_BATCH_EVENTS cap as replay() -- a CSV
-                # import has no row-count bound of its own, so a batch
-                # parsed from a large file used to be posted as one
-                # oversized request and 422 in full. Chunk here and build
-                # stored records per chunk (each chunk keeps its own
-                # outcome, so a record's delivery_attempts reflects the one
-                # real POST it was actually part of, not the whole
-                # import's chunk count).
-                chunks = await self._deliver_in_chunks(source, parsed.events, import_config)
-                lineage_offset = 0
-                for chunk_events, chunk_outcome in chunks:
-                    chunk_len = len(chunk_events)
-                    stored_records.extend(
-                        _build_stored_records(
-                            source,
-                            chunk_events,
-                            parsed.parent_lot_codes[lineage_offset : lineage_offset + chunk_len],
-                            delivery.mode,
-                            chunk_outcome,
-                        )
+        # CPU-bound parsing (#136): offloaded to a worker thread so a large
+        # csv_text body does not tie up the event loop for the whole parse.
+        # Now also outside self._lock (#208) -- it reads only the request
+        # body, touches no controller state, and a multi-second parse is
+        # exactly as good a reason to not be holding the lock as a
+        # multi-second POST is.
+        parsed = await asyncio.to_thread(
+            parse_csv_import,
+            request.import_type,
+            request.csv_text,
+            default_timestamp=datetime.now(UTC),
+        )
+
+        outcome = DeliveryOutcome()
+        stored_records: list[StoredEventRecord] = []
+        stale = False
+        if parsed.events:
+            # --- Delivery phase, with self._lock RELEASED (#208) ------------
+            # #103: same MAX_BATCH_EVENTS cap as replay() -- a CSV
+            # import has no row-count bound of its own, so a batch
+            # parsed from a large file used to be posted as one
+            # oversized request and 422 in full. Chunk here and build
+            # stored records per chunk (each chunk keeps its own
+            # outcome, so a record's delivery_attempts reflects the one
+            # real POST it was actually part of, not the whole
+            # import's chunk count). Every one of those chunk POSTs is now
+            # awaited with the lock released, not just the first.
+            chunks = await self._deliver_in_chunks(source, parsed.events, import_config)
+            lineage_offset = 0
+            for chunk_events, chunk_outcome in chunks:
+                chunk_len = len(chunk_events)
+                stored_records.extend(
+                    _build_stored_records(
+                        source,
+                        chunk_events,
+                        parsed.parent_lot_codes[lineage_offset : lineage_offset + chunk_len],
+                        delivery.mode,
+                        chunk_outcome,
                     )
-                    lineage_offset += chunk_len
-                await self._store_add_many(stored_records)
-                # Response-level counts only, aggregated across every chunk
-                # (#103) -- per-record fields above already used each
-                # chunk's own outcome instead.
-                outcome = _aggregate_outcomes([chunk_outcome for _, chunk_outcome in chunks])
+                )
+                lineage_offset += chunk_len
+            # --- Commit phase, back under self._lock ------------------------
+            stale = await self._commit_delivered_records(stored_records, store_epoch, "import_csv")
+            if stale:
+                # Nothing was persisted, so `stored` must report 0 rather
+                # than the number of records this call built and threw away.
+                stored_records = []
+            # Response-level counts only, aggregated across every chunk
+            # (#103) -- per-record fields above already used each
+            # chunk's own outcome instead.
+            outcome = _aggregate_outcomes([chunk_outcome for _, chunk_outcome in chunks])
 
-            rejected = parsed.total - len(parsed.events)
-            if outcome.delivery_status == "failed":
-                status = "delivery_failed"
-            elif parsed.events and parsed.errors:
-                status = "partial"
-            elif parsed.events:
-                status = "accepted"
-            else:
-                status = "rejected"
+        rejected = parsed.total - len(parsed.events)
+        if outcome.delivery_status == "failed":
+            status = "delivery_failed"
+        elif parsed.events and parsed.errors:
+            status = "partial"
+        elif parsed.events:
+            status = "accepted"
+        else:
+            status = "rejected"
 
-            result = CSVImportResponse(
-                status=status,
-                import_type=request.import_type,
-                total=parsed.total,
-                accepted=len(parsed.events),
-                rejected=rejected,
-                stored=len(stored_records),
-                posted=outcome.posted,
-                failed=outcome.failed,
-                source=source,
-                delivery_mode=delivery.mode,
-                delivery_attempts=outcome.delivery_attempts,
-                lot_codes=[event.traceability_lot_code for event in parsed.events],
-                errors=parsed.errors,
-                warnings=parsed.warnings,
-                response=outcome.response,
-                error=outcome.error_message,
-            )
+        result = CSVImportResponse(
+            status=status,
+            import_type=request.import_type,
+            total=parsed.total,
+            accepted=len(parsed.events),
+            rejected=rejected,
+            stored=len(stored_records),
+            posted=outcome.posted,
+            failed=outcome.failed,
+            source=source,
+            delivery_mode=delivery.mode,
+            delivery_attempts=outcome.delivery_attempts,
+            lot_codes=[event.traceability_lot_code for event in parsed.events],
+            errors=parsed.errors,
+            warnings=parsed.warnings,
+            response=outcome.response,
+            error=_with_stale_commit_note(outcome.error_message) if stale else outcome.error_message,
+        )
         await self._publish_update()
         return result
 
@@ -428,6 +535,11 @@ class SimulationController:
         fixture = get_demo_fixture(fixture_id)
         await self.stop()
 
+        # --- Snapshot phase, under self._lock -------------------------------
+        # The config/engine/store mutations this fixture load performs stay
+        # here, committed before the delivery starts -- they are the load,
+        # not a consequence of it, and a caller who sees this call return
+        # must see them applied whatever the remote endpoint did.
         async with self._lock:
             source = request.source or self.config.source
             delivery = request.delivery or self.config.delivery
@@ -440,37 +552,51 @@ class SimulationController:
                 },
                 deep=True,
             )
-            await self._store_configure(self.config.persist_path)
-            self.engine.reset(self.config.seed, scenario=fixture.scenario, scale=self.config.scale)
+            active_config = self.config
+            await self._store_configure(active_config.persist_path)
+            self.engine.reset(active_config.seed, scenario=fixture.scenario, scale=active_config.scale)
             if request.reset:
                 self.store.reset()
+                # This call's own clearing of the store must not make its own
+                # commit look stale, so the epoch is snapshotted *after* it.
+                self._invalidate_store_epoch()
                 self.mock_service.reset()
 
             events = [fixture_event.event for fixture_event in fixture.events]
             payload = IngestPayload(source=source, events=events)
-            outcome = await self._deliver_payload(payload, self.config)
-            fixture_parent_lot_codes = [
-                list(fixture_event.parent_lot_codes) for fixture_event in fixture.events
-            ]
-            stored_records = _build_stored_records(
-                source, events, fixture_parent_lot_codes, delivery.mode, outcome
-            )
-            await self._store_add_many(stored_records)
-            result = DemoFixtureLoadResponse(
-                status="delivery_failed" if outcome.delivery_status == "failed" else "loaded",
-                fixture_id=fixture.id,
-                scenario=fixture.scenario,
-                loaded=len(events),
-                stored=len(stored_records),
-                posted=outcome.posted,
-                failed=outcome.failed,
-                source=source,
-                delivery_mode=delivery.mode,
-                delivery_attempts=outcome.delivery_attempts,
-                lot_codes=fixture.lot_codes,
-                response=outcome.response,
-                error=outcome.error_message,
-            )
+            store_epoch = self._store_epoch
+
+        # --- Delivery phase, with self._lock RELEASED (#208) ----------------
+        outcome = await self._deliver_payload(payload, active_config)
+        fixture_parent_lot_codes = [
+            list(fixture_event.parent_lot_codes) for fixture_event in fixture.events
+        ]
+        stored_records = _build_stored_records(
+            source, events, fixture_parent_lot_codes, delivery.mode, outcome
+        )
+
+        # --- Commit phase, back under self._lock ----------------------------
+        # A reset() (or a scenario load, or a start() repointing persist_path)
+        # landing while the fixture was in flight wins: the fixture's records
+        # are dropped rather than written into the store the operator just
+        # cleared, and `stored` reports 0 so the caller is not told a fixture
+        # is loaded that is not there.
+        stale = await self._commit_delivered_records(stored_records, store_epoch, "load_demo_fixture")
+        result = DemoFixtureLoadResponse(
+            status="delivery_failed" if outcome.delivery_status == "failed" else "loaded",
+            fixture_id=fixture.id,
+            scenario=fixture.scenario,
+            loaded=len(events),
+            stored=0 if stale else len(stored_records),
+            posted=outcome.posted,
+            failed=outcome.failed,
+            source=source,
+            delivery_mode=delivery.mode,
+            delivery_attempts=outcome.delivery_attempts,
+            lot_codes=fixture.lot_codes,
+            response=outcome.response,
+            error=_with_stale_commit_note(outcome.error_message) if stale else outcome.error_message,
+        )
         await self._publish_update()
         return result
 
@@ -515,6 +641,11 @@ class SimulationController:
             self.config = snapshot.config
             await self._store_configure(self.config.persist_path)
             loaded_records = await self._store_replace_all(snapshot.records)
+            # replace_all swaps the store's entire contents for the saved
+            # snapshot's. A delivery in flight is holding records that belong
+            # to the history this just replaced, so its commit is dropped
+            # rather than allowed to append into the loaded scenario (#208).
+            self._invalidate_store_epoch()
             self.engine.reset(self.config.seed, scenario=self.config.scenario, scale=self.config.scale)
             result = ScenarioLoadResponse(
                 status="loaded",
@@ -530,8 +661,24 @@ class SimulationController:
         request: DeliveryRetryRequest | None = None,
     ) -> DeliveryRetryResponse:
         request = request or DeliveryRetryRequest()
+        # --- Snapshot phase, under _retry_lock then self._lock --------------
+        # _retry_lock is held for the whole call, delivery included: unlike
+        # every other delivery path, this one selects the batch it posts from
+        # shared mutable state (the store's failed records), so two
+        # overlapping calls would otherwise both select and both post the
+        # same records now that the POSTs happen with self._lock released
+        # (#208). It blocks nothing but another retry.
+        async with self._retry_lock:
+            result = await self._retry_failed_delivery_locked(request)
+        await self._publish_update()
+        return result
+
+    async def _retry_failed_delivery_locked(
+        self, request: DeliveryRetryRequest
+    ) -> DeliveryRetryResponse:
         async with self._lock:
-            delivery = request.delivery or self.config.delivery
+            base_config = self.config
+            delivery = request.delivery or base_config.delivery
             # record_ids distinguishes "omitted" (None -- no filter, retry
             # every failed record up to limit) from "present but empty"
             # ([] -- retry nothing). EventStore.failed_delivery_records()
@@ -551,38 +698,12 @@ class SimulationController:
             requested = len(request.record_ids) if request.record_ids is not None else len(candidates)
             skipped = max(0, requested - len(candidates))
 
-            if not candidates:
-                result = DeliveryRetryResponse(
-                    status="empty",
-                    requested=requested,
-                    retryable=0,
-                    attempted=0,
-                    posted=0,
-                    failed=0,
-                    skipped=skipped,
-                    delivery_mode=delivery.mode,
-                    record_ids=[],
-                )
-            elif delivery.mode == DestinationMode.NONE:
-                result = DeliveryRetryResponse(
-                    status="skipped",
-                    requested=requested,
-                    retryable=len(candidates),
-                    attempted=0,
-                    posted=0,
-                    failed=0,
-                    skipped=skipped + len(candidates),
-                    delivery_mode=delivery.mode,
-                    record_ids=[record.record_id for record in candidates],
-                    error="Retry requires mock or live delivery mode.",
-                )
-            else:
+            # Group the candidates while still under the lock, so the
+            # delivery loop below has everything it needs and touches no
+            # controller state at all (#208).
+            grouped_records: dict[tuple[str, str | None], list[StoredEventRecord]] = {}
+            if candidates and delivery.mode != DestinationMode.NONE:
                 _validate_live_delivery(delivery)
-                posted = 0
-                failed = 0
-                updated_records: list[StoredEventRecord] = []
-                responses: list[dict[str, Any]] = []
-                grouped_records: dict[tuple[str, str | None], list[StoredEventRecord]] = {}
                 for record in candidates:
                     source = request.source or record.payload_source
                     idempotency_key = (
@@ -591,105 +712,218 @@ class SimulationController:
                         else None
                     )
                     grouped_records.setdefault((source, idempotency_key), []).append(record)
+            store_epoch = self._store_epoch
 
-                for (source, idempotency_key), records in grouped_records.items():
-                    retry_config = self.config.model_copy(
+        # Both of these answer without delivering anything, so they need no
+        # lock of their own -- every value they read was snapshotted above.
+        if not candidates:
+            return DeliveryRetryResponse(
+                status="empty",
+                requested=requested,
+                retryable=0,
+                attempted=0,
+                posted=0,
+                failed=0,
+                skipped=skipped,
+                delivery_mode=delivery.mode,
+                record_ids=[],
+            )
+        if delivery.mode == DestinationMode.NONE:
+            return DeliveryRetryResponse(
+                status="skipped",
+                requested=requested,
+                retryable=len(candidates),
+                attempted=0,
+                posted=0,
+                failed=0,
+                skipped=skipped + len(candidates),
+                delivery_mode=delivery.mode,
+                record_ids=[record.record_id for record in candidates],
+                error="Retry requires mock or live delivery mode.",
+            )
+
+        # --- Delivery phase, with self._lock RELEASED (#208) ----------------
+        # One POST per (source, idempotency_key) group; this loop is the
+        # "minutes across a multi-group retry" #158 describes, and none of
+        # it holds the data-plane lock any more.
+        posted = 0
+        failed = 0
+        updated_records: list[StoredEventRecord] = []
+        responses: list[dict[str, Any]] = []
+        for (source, idempotency_key), records in grouped_records.items():
+            retry_config = base_config.model_copy(
+                update={
+                    "source": source,
+                    "delivery": delivery,
+                },
+                deep=True,
+            )
+            payload = IngestPayload(source=source, events=[record.event for record in records])
+            # #95: the stored key is only safe to reuse when the
+            # original attempt produced no response at all --
+            # record.delivery_response is None -- a pure transport
+            # failure, where retrying under the same key is a
+            # legitimate "did this already land" idempotency check.
+            # A record carrying a per-event verdict (accepted or
+            # rejected) already has an authoritative response on
+            # file; reusing its key would have RegEngine's
+            # idempotency cache answer this retry from that stale
+            # response without ever revalidating the corrected
+            # event -- exactly the bug #95 reports. `all(...)` over
+            # the whole group, not a per-record check: every record
+            # here shares this one original idempotency_key (that's
+            # what grouped them together above), so if even one of
+            # them did get a response, that key's original attempt
+            # was not "no response at all" and nothing in the group
+            # is safe to replay under it. Passing None makes
+            # _deliver_payload mint a fresh key, same as a record
+            # with no stored key at all already got before this fix.
+            reuse_original_key = idempotency_key is not None and all(
+                record.delivery_response is None for record in records
+            )
+            outcome = await self._deliver_payload(
+                payload,
+                retry_config,
+                idempotency_key=idempotency_key if reuse_original_key else None,
+            )
+            response_events = (outcome.response or {}).get("events", []) if outcome.response else []
+            responses.append(
+                {
+                    "source": source,
+                    "delivery_status": outcome.delivery_status,
+                    "posted": outcome.posted,
+                    "failed": outcome.failed,
+                    "response": outcome.response,
+                    "error": outcome.error_message,
+                }
+            )
+
+            paired_responses = _pair_event_responses(
+                [record.event for record in records], response_events
+            )
+            for index, record in enumerate(records):
+                event_response = paired_responses[index]
+                next_attempts = record.delivery_attempts + outcome.delivery_attempts
+                fields = _event_delivery_fields(outcome, event_response)
+                if fields["delivery_status"] == "posted":
+                    fields["error"] = None
+                else:
+                    fields["last_delivery_success_at"] = record.last_delivery_success_at
+                updated_records.append(
+                    record.model_copy(
                         update={
-                            "source": source,
-                            "delivery": delivery,
+                            "destination_mode": delivery.mode,
+                            "delivery_attempts": next_attempts,
+                            "last_delivery_attempt_at": outcome.attempted_at
+                            or record.last_delivery_attempt_at,
+                            "delivery_response": event_response,
+                            "delivery_metadata": outcome.metadata,
+                            **fields,
                         },
                         deep=True,
                     )
-                    payload = IngestPayload(source=source, events=[record.event for record in records])
-                    # #95: the stored key is only safe to reuse when the
-                    # original attempt produced no response at all --
-                    # record.delivery_response is None -- a pure transport
-                    # failure, where retrying under the same key is a
-                    # legitimate "did this already land" idempotency check.
-                    # A record carrying a per-event verdict (accepted or
-                    # rejected) already has an authoritative response on
-                    # file; reusing its key would have RegEngine's
-                    # idempotency cache answer this retry from that stale
-                    # response without ever revalidating the corrected
-                    # event -- exactly the bug #95 reports. `all(...)` over
-                    # the whole group, not a per-record check: every record
-                    # here shares this one original idempotency_key (that's
-                    # what grouped them together above), so if even one of
-                    # them did get a response, that key's original attempt
-                    # was not "no response at all" and nothing in the group
-                    # is safe to replay under it. Passing None makes
-                    # _deliver_payload mint a fresh key, same as a record
-                    # with no stored key at all already got before this fix.
-                    reuse_original_key = idempotency_key is not None and all(
-                        record.delivery_response is None for record in records
-                    )
-                    outcome = await self._deliver_payload(
-                        payload,
-                        retry_config,
-                        idempotency_key=idempotency_key if reuse_original_key else None,
-                    )
-                    response_events = (outcome.response or {}).get("events", []) if outcome.response else []
-                    responses.append(
-                        {
-                            "source": source,
-                            "delivery_status": outcome.delivery_status,
-                            "posted": outcome.posted,
-                            "failed": outcome.failed,
-                            "response": outcome.response,
-                            "error": outcome.error_message,
-                        }
-                    )
-
-                    paired_responses = _pair_event_responses(
-                        [record.event for record in records], response_events
-                    )
-                    for index, record in enumerate(records):
-                        event_response = paired_responses[index]
-                        next_attempts = record.delivery_attempts + outcome.delivery_attempts
-                        fields = _event_delivery_fields(outcome, event_response)
-                        if fields["delivery_status"] == "posted":
-                            fields["error"] = None
-                        else:
-                            fields["last_delivery_success_at"] = record.last_delivery_success_at
-                        updated_records.append(
-                            record.model_copy(
-                                update={
-                                    "destination_mode": delivery.mode,
-                                    "delivery_attempts": next_attempts,
-                                    "last_delivery_attempt_at": outcome.attempted_at
-                                    or record.last_delivery_attempt_at,
-                                    "delivery_response": event_response,
-                                    "delivery_metadata": outcome.metadata,
-                                    **fields,
-                                },
-                                deep=True,
-                            )
-                        )
-                    posted += outcome.posted
-                    failed += outcome.failed
-
-                await self._store_update_many(updated_records)
-                if posted and failed:
-                    status = "partial"
-                elif failed:
-                    status = "failed"
-                else:
-                    status = "posted"
-                result = DeliveryRetryResponse(
-                    status=status,
-                    requested=requested,
-                    retryable=len(candidates),
-                    attempted=len(candidates),
-                    posted=posted,
-                    failed=failed,
-                    skipped=skipped,
-                    delivery_mode=delivery.mode,
-                    record_ids=[record.record_id for record in candidates],
-                    responses=responses,
-                    error=next((item["error"] for item in responses if item.get("error")), None),
                 )
-        await self._publish_update()
-        return result
+            posted += outcome.posted
+            failed += outcome.failed
+        # --- Commit phase, back under self._lock ----------------------------
+        # A reset()/scenario-load/repoint landing mid-retry wins: the patched
+        # records describe rows that no longer exist, and update_many would
+        # rewrite the whole log from _all_records() on their behalf. Drop the
+        # update instead; the POSTs themselves stay reported truthfully.
+        stale = await self._commit_retried_records(updated_records, store_epoch)
+        if posted and failed:
+            status = "partial"
+        elif failed:
+            status = "failed"
+        else:
+            status = "posted"
+        delivery_error = next((item["error"] for item in responses if item.get("error")), None)
+        return DeliveryRetryResponse(
+            status=status,
+            requested=requested,
+            retryable=len(candidates),
+            attempted=len(candidates),
+            posted=posted,
+            failed=failed,
+            skipped=skipped,
+            delivery_mode=delivery.mode,
+            record_ids=[record.record_id for record in candidates],
+            responses=responses,
+            error=_with_stale_commit_note(delivery_error) if stale else delivery_error,
+        )
+
+    # -- Committing a delivery whose await happened outside the lock (#208) --
+    #
+    # Every delivery path follows the same three phases: snapshot the config,
+    # the events and self._store_epoch under self._lock; await the POST(s)
+    # with the lock RELEASED; re-acquire to write the resulting records.
+    # The helpers below are phase three, and exist so the "did the world
+    # move underneath us" decision is made in exactly one place rather than
+    # re-derived at four call sites.
+    #
+    # The epoch comparison and the store write happen under the same
+    # uninterrupted hold of self._lock, which is what makes the check
+    # meaningful: reset(), load_scenario_save() and load_demo_fixture() all
+    # take self._lock to invalidate, so none of them can slip between the
+    # comparison and the write.
+    #
+    # `await self._store_*` inside that hold is deliberate and is NOT what
+    # #208 is about: it is a local-disk write offloaded to a worker thread,
+    # bounded by disk speed, not a 30-second network timeout multiplied by
+    # ceil(N/500) chunks.
+    def _invalidate_store_epoch(self) -> None:
+        """Mark every in-flight delivery's pending commit as stale (#208).
+
+        Callers must already hold ``self._lock`` -- every one of them is
+        inside a lock block that is also performing the wholesale store
+        change this is announcing.
+        """
+        self._store_epoch += 1
+
+    async def _commit_delivered_records(
+        self,
+        records: list[StoredEventRecord],
+        store_epoch: int,
+        path_name: str,
+    ) -> bool:
+        """Append *records* unless the store moved on; True if the commit was dropped."""
+        async with self._lock:
+            if self._store_epoch != store_epoch:
+                logger.error(
+                    "%s: discarding %d delivered record(s) -- the event store was reset, "
+                    "reloaded or repointed while the delivery was in flight",
+                    path_name,
+                    len(records),
+                )
+                return True
+            if records:
+                await self._store_add_many(records)
+            return False
+
+    async def _commit_retried_records(
+        self,
+        records: list[StoredEventRecord],
+        store_epoch: int,
+    ) -> bool:
+        """Patch *records* in place unless the store moved on; True if dropped.
+
+        Separate from ``_commit_delivered_records`` because retry updates
+        existing rows rather than appending new ones, and the stale case is
+        sharper here: ``EventStore.update_many`` rewrites the entire log
+        from ``_all_records()``, so letting it run against a store that was
+        cleared mid-retry would rewrite a freshly emptied file on behalf of
+        records that no longer exist.
+        """
+        async with self._lock:
+            if self._store_epoch != store_epoch:
+                logger.error(
+                    "retry_failed_delivery: discarding %d retried record update(s) -- the "
+                    "event store was reset, reloaded or repointed while the retry was in flight",
+                    len(records),
+                )
+                return True
+            await self._store_update_many(records)
+            return False
 
     # -- Running EventStore's blocking calls off the event loop (#136) -----
     #
@@ -765,7 +999,21 @@ class SimulationController:
         return await asyncio.to_thread(self.store.read_persisted_records, persist_path)
 
     async def _store_configure(self, persist_path: str) -> None:
+        # A configure() that lands on a *different* file replaces the whole
+        # in-memory ring from that file's contents, so any delivery in
+        # flight is now holding records for a store that is no longer the
+        # one on disk (#208). Bump the epoch so its commit is dropped.
+        #
+        # Only when the path actually changes: start() calls this on every
+        # press of Start, almost always with the same persist_path, and
+        # bumping unconditionally would let a plain start() throw away a
+        # concurrent import's records for no reason. Compared before and
+        # after rather than against the raw string so this tracks whatever
+        # normalization EventStore.configure applies to it.
+        previous_path = str(self.store.persist_path)
         await asyncio.to_thread(self.store.configure, persist_path)
+        if str(self.store.persist_path) != previous_path:
+            self._invalidate_store_epoch()
 
     async def _deliver_payload(
         self,
