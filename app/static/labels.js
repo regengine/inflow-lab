@@ -22,6 +22,11 @@ export const DELIVERY_RECOVERY_HINTS = {
 export const CONNECTION_VERDICT_TONES = {
   connected: 'success',
   mock: 'success',
+  // Nothing was sent: the endpoint is not an allowed egress destination, or it
+  // is not the configured one so the stored credentials were withheld. Both
+  // need an operator fix, so neither may fall through to the 'neutral' default.
+  blocked_endpoint: 'error',
+  credentials_withheld: 'error',
   contract_mismatch: 'error',
   signature_mismatch: 'error',
   unauthorized: 'error',

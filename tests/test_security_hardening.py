@@ -20,6 +20,7 @@ from app.auth import auth_required_from_env, enforce_auth_requirement, BasicAuth
 from app.main import app
 from app.regengine_client import (
     BLOCKED_ENDPOINT_VERDICT,
+    ALLOW_CLEARTEXT_DELIVERY_ENV,
     ALLOW_PRIVATE_DELIVERY_ENV,
     ALLOWED_DELIVERY_HOSTS_ENV,
     BlockedDeliveryEndpointError,
@@ -131,6 +132,47 @@ def test_optional_strict_host_allowlist_rejects_other_hosts(monkeypatch: Any) ->
 def test_local_stack_opt_out_allows_loopback(monkeypatch: Any) -> None:
     monkeypatch.setenv(ALLOW_PRIVATE_DELIVERY_ENV, "1")
     assert_delivery_endpoint_allowed("http://localhost:8000/api/v1/webhooks/ingest")
+
+
+# --- cleartext delivery ----------------------------------------------------
+
+
+def test_cleartext_delivery_to_a_public_host_is_refused() -> None:
+    """The API key rides in an `Authorization` header; `http` sends it in clear."""
+    with pytest.raises(BlockedDeliveryEndpointError) as excinfo:
+        assert_delivery_endpoint_allowed("http://www.regengine.co/api/v1/webhooks/ingest")
+
+    assert "cleartext" in str(excinfo.value)
+
+
+def test_cleartext_opt_in_allows_a_public_http_endpoint(monkeypatch: Any) -> None:
+    monkeypatch.setenv(ALLOW_CLEARTEXT_DELIVERY_ENV, "1")
+    assert_delivery_endpoint_allowed("http://www.regengine.co/api/v1/webhooks/ingest")
+
+
+def test_cleartext_opt_in_does_not_unblock_private_hosts(monkeypatch: Any) -> None:
+    """It relaxes the scheme and nothing else."""
+    monkeypatch.setenv(ALLOW_CLEARTEXT_DELIVERY_ENV, "1")
+    with pytest.raises(BlockedDeliveryEndpointError):
+        assert_delivery_endpoint_allowed("http://169.254.169.254/latest/meta-data/")
+
+
+def test_local_stack_opt_out_still_permits_cleartext(monkeypatch: Any) -> None:
+    """`REGENGINE_ALLOW_PRIVATE_DELIVERY_HOSTS` already implies a trusted network.
+
+    The customer-journey harness points at `http://localhost:8000`; requiring a
+    second flag for that would break the documented local workflow.
+    """
+    monkeypatch.setenv(ALLOW_PRIVATE_DELIVERY_ENV, "1")
+    assert_delivery_endpoint_allowed("http://localhost:8000/api/v1/webhooks/ingest")
+
+
+def test_a_local_endpoint_is_reported_as_local_not_as_cleartext() -> None:
+    """The finding an operator must act on is the destination, not the scheme."""
+    with pytest.raises(BlockedDeliveryEndpointError) as excinfo:
+        assert_delivery_endpoint_allowed("http://169.254.169.254/latest/meta-data/")
+
+    assert "not an allowed destination" in str(excinfo.value)
 
 
 def test_live_ingest_refuses_metadata_endpoint_without_sending(monkeypatch: Any) -> None:

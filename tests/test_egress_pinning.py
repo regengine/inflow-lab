@@ -492,6 +492,11 @@ def test_rebinding_resolver_never_reaches_loopback_without_interception(
         )
         monkeypatch.setattr(socket, "getaddrinfo", resolver)
         monkeypatch.setenv("REGENGINE_LIVE_TIMEOUT_SECONDS", "1")
+        # The attacker's listener is plain HTTP (no TLS to terminate), so this
+        # endpoint has to be `http`. That is the scheme policy's business, not
+        # this test's: opt in so the pinning behaviour under test is what the
+        # guard actually reaches.
+        monkeypatch.setenv("REGENGINE_ALLOW_CLEARTEXT_DELIVERY", "1")
         # Dial a public literal on a port nothing answers: the request fails,
         # and crucially it fails *there* rather than succeeding on loopback.
         endpoint = f"http://{HOSTILE_HOST}:{dead_port}/api/v1/webhooks/ingest"

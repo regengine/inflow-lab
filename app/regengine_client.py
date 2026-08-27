@@ -57,6 +57,12 @@ ALLOWED_DELIVERY_HOSTS_ENV = "REGENGINE_ALLOWED_DELIVERY_HOSTS"
 ALLOW_PRIVATE_DELIVERY_ENV = "REGENGINE_ALLOW_PRIVATE_DELIVERY_HOSTS"
 # DNS resolution of non-literal hosts can be disabled in sealed environments.
 DELIVERY_DNS_GUARD_ENV = "REGENGINE_DELIVERY_DNS_GUARD"
+# Opt back in to cleartext (`http://`) delivery to a public host. Off by
+# default: every live delivery and probe carries the API key in an
+# `Authorization` header, and over `http` that header crosses the network in
+# the clear. `REGENGINE_ALLOW_PRIVATE_DELIVERY_HOSTS` already implies it, so a
+# local stack on `http://localhost:8000` needs nothing new.
+ALLOW_CLEARTEXT_DELIVERY_ENV = "REGENGINE_ALLOW_CLEARTEXT_DELIVERY"
 
 _TRUTHY = frozenset({"1", "true", "yes", "on"})
 _BLOCKED_HOSTNAMES = frozenset(
@@ -194,6 +200,22 @@ def _static_endpoint_checks(endpoint: str) -> str | None:
             "and is not an allowed destination. Set "
             f"{ALLOW_PRIVATE_DELIVERY_ENV}=1 only for a trusted local stack."
         )
+    if parsed.scheme == "http" and not _env_flag(ALLOW_CLEARTEXT_DELIVERY_ENV):
+        # Every check that names a *specific* unsafe destination has run and
+        # passed, so this is an ordinary public host and the only thing wrong
+        # with it is the scheme. Ordered last of the static checks deliberately:
+        # a metadata or loopback endpoint that also happens to be cleartext
+        # should be reported as the local/internal destination it is, because
+        # that is the finding the operator has to act on.
+        #
+        # Refused before any credential header is built and before the name is
+        # resolved -- over `http` the API key crosses the network in the clear.
+        raise BlockedDeliveryEndpointError(
+            f"Delivery endpoint {endpoint!r} is cleartext http. The API key "
+            "would be sent unencrypted. Use https, or set "
+            f"{ALLOW_CLEARTEXT_DELIVERY_ENV}=1 for a trusted network."
+        )
+
     try:
         ipaddress.ip_address(literal)
     except ValueError:
