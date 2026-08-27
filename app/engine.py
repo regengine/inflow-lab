@@ -184,7 +184,13 @@ class LegitFlowEngine:
             quantity_high * self.quantity_multiplier,
         )
         timestamp = self._advance_time(15, 90)
-        reference_prefix = "LAND" if self.scenario.source_cte_type == CTEType.FIRST_LAND_BASED_RECEIVING else "HAR"
+        # #164: source CTE type comes from the adapter, which is the single
+        # owner of it. self.adapter is derived from self.scenario.industry_type
+        # (see __init__), so adapter and scenario can never be paired
+        # inconsistently -- which is exactly what a second copy of this value
+        # on ScenarioPreset made possible.
+        source_cte_type = self.adapter.source_cte_type
+        reference_prefix = "LAND" if source_cte_type == CTEType.FIRST_LAND_BASED_RECEIVING else "HAR"
         reference_number = self._reference(reference_prefix)
         next_location = self._default_next_location()
 
@@ -212,7 +218,7 @@ class LegitFlowEngine:
         self.harvested.append(lot)
 
         event = RegEngineEvent(
-            cte_type=self.scenario.source_cte_type,
+            cte_type=source_cte_type,
             traceability_lot_code=lot.lot_code,
             product_description=lot.product_description,
             quantity=lot.quantity,
