@@ -12,6 +12,10 @@ the image actually does.
 - #180 -- the `exec` in the CMD is what makes uvicorn the container's PID 1.
           Drop it and the shell stays PID 1, does not forward SIGTERM, and the
           lifespan shutdown never runs on stop or redeploy.
+- #161 -- `WEB_CONCURRENCY=1` pins the single-process requirement into the
+          image instead of leaving it to uvicorn's implicit default. Simulation
+          run/stop state is per-process, so a second worker serves a control
+          plane that cannot stop the first one's run loop.
 
 These are one-word deletions a future edit could make by accident, with no
 failing test to catch either. Hence this file.
@@ -48,6 +52,43 @@ def test_container_image_requires_basic_auth(dockerfile_text):
         "image binds 0.0.0.0 and boots without Basic Auth on nothing but a log warning. "
         "app/main.py's fail-closed check is opt-in by design so a local `uvicorn --reload` "
         "still starts; the Dockerfile is what opts the shared/remote profile in."
+    )
+
+
+def test_container_image_pins_a_single_worker_process(dockerfile_text):
+    # Same ENV-instruction match as above, so the explanatory comment sitting
+    # above the ENV block cannot satisfy this on its own.
+    env_block = re.search(
+        r"^ENV\s+(.*?)(?=^\s*(?:FROM|RUN|COPY|WORKDIR|EXPOSE|CMD|ENTRYPOINT|HEALTHCHECK|ARG|USER)\b)",
+        dockerfile_text,
+        re.MULTILINE | re.DOTALL,
+    )
+    assert env_block is not None, "no ENV instruction found in the Dockerfile"
+    assert "WEB_CONCURRENCY=1" in env_block.group(1), (
+        "The container profile must set WEB_CONCURRENCY=1 (#161). The CMD passes no "
+        "--workers flag, so uvicorn takes its worker count straight from this variable; "
+        "pinning it states the single-process requirement in the image instead of relying "
+        "on uvicorn's implicit default. Simulation run/stop state is per-process, so a "
+        "second worker answers Stop with a 200 while the first keeps delivering events."
+    )
+
+
+def test_container_cmd_leaves_the_worker_count_to_the_environment(dockerfile_text):
+    """The CMD must NOT hard-code --workers, even to 1 (#161).
+
+    An explicit `--workers 1` outranks WEB_CONCURRENCY in both uvicorn and
+    gunicorn. That would look safer while actually being worse: an operator
+    who sets WEB_CONCURRENCY=4 on the platform would silently get one worker
+    and no error, instead of the startup refusal that tells them this app
+    cannot be scaled that way. Keeping the flag out is what lets the variable
+    reach app/worker_guard.py and fail loudly.
+    """
+    cmd_lines = [line for line in dockerfile_text.splitlines() if line.strip().startswith("CMD [")]
+    assert cmd_lines, "no exec-form CMD instruction found in the Dockerfile"
+
+    assert not re.search(r"--workers|\s-w\b", cmd_lines[-1]), (
+        "The Dockerfile CMD must not pass a worker-count flag; set WEB_CONCURRENCY in ENV "
+        f"instead so the startup guard can see it. Got: {cmd_lines[-1]}"
     )
 
 

@@ -1,9 +1,16 @@
 FROM python:3.12-slim
 
+# WEB_CONCURRENCY=1 pins the single-process requirement (#161) instead of
+# leaning on uvicorn's implicit default. Simulation run/stop state lives in
+# per-process memory, so a second worker serves a control plane that cannot
+# stop the first one's run loop. Stating it here makes the safe value part of
+# the image rather than an absence, and a platform variable that overrides it
+# to something above 1 is refused at startup by app/worker_guard.py.
 ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \
     REGENGINE_DATA_DIR=/data \
-    REGENGINE_REQUIRE_AUTH=1
+    REGENGINE_REQUIRE_AUTH=1 \
+    WEB_CONCURRENCY=1
 
 WORKDIR /app
 ENV PATH="/app/.venv/bin:$PATH"
