@@ -15,6 +15,7 @@ Covers three things:
 from __future__ import annotations
 
 import socket
+import threading
 
 import asyncio
 import ipaddress
@@ -548,3 +549,146 @@ def test_guard_resolves_separately_from_the_dial_so_rebinding_is_not_closed(monk
     # -- returns loopback, and nothing re-checks it.
     second = rebinding_resolver("rebind.example.test")
     assert second[0][4][0] == "127.0.0.1"
+
+
+# ---------------------------------------------------------------------------
+# #209: the /api/integration/test credential guard compares the full ORIGIN
+# ---------------------------------------------------------------------------
+
+
+def test_integration_test_route_does_not_send_a_tls_key_over_cleartext(monkeypatch: Any) -> None:
+    """A scheme downgrade is a different origin, so stored credentials must
+    not ride along.
+
+    The guard compared hostnames only, so http://www.regengine.co looked
+    like the same destination as the stored https://www.regengine.co --
+    and an API key issued for a TLS endpoint was sent in cleartext to
+    whoever was on the path. Same host, same port, different scheme: the
+    one case host-only comparison could not see (#209).
+    """
+    SpyAsyncClient.calls = []
+    SpyAsyncClient.status_code = 200
+    monkeypatch.setattr("app.regengine_client.httpx.AsyncClient", SpyAsyncClient)
+    monkeypatch.setattr(
+        simulation_schemas,
+        "_resolved_addresses",
+        lambda host: [ipaddress.ip_address("8.8.8.8")],
+    )
+
+    configured = client.post(
+        "/api/integration/configure",
+        json={
+            "mode": "live",
+            "endpoint": "https://www.regengine.co/api/v1/webhooks/ingest",
+            "api_key": "rge_live_super_secret_key",
+            "tenant_id": "11111111-1111-1111-1111-111111111111",
+        },
+    )
+    assert configured.status_code == 200
+
+    response = client.post(
+        "/api/integration/test",
+        json={"endpoint": "http://www.regengine.co/api/v1/webhooks/ingest"},
+    )
+
+    assert response.status_code == 200
+    assert "rge_live_super_secret_key" not in response.text
+    assert SpyAsyncClient.calls == [], (
+        "a key issued for https was sent to the same host over http"
+    )
+
+
+def test_integration_test_route_still_probes_the_stored_origin_with_stored_credentials(
+    monkeypatch: Any,
+) -> None:
+    """The tightening must not break the ordinary case: re-stating the
+    stored endpoint verbatim is the same origin, so the stored credentials
+    are still used and a probe still goes out."""
+    SpyAsyncClient.calls = []
+    SpyAsyncClient.status_code = 200
+    monkeypatch.setattr("app.regengine_client.httpx.AsyncClient", SpyAsyncClient)
+    monkeypatch.setattr(
+        simulation_schemas,
+        "_resolved_addresses",
+        lambda host: [ipaddress.ip_address("8.8.8.8")],
+    )
+
+    client.post(
+        "/api/integration/configure",
+        json={
+            "mode": "live",
+            "endpoint": "https://www.regengine.co/api/v1/webhooks/ingest",
+            "api_key": "rge_live_super_secret_key",
+            "tenant_id": "11111111-1111-1111-1111-111111111111",
+        },
+    )
+
+    response = client.post(
+        "/api/integration/test",
+        json={"endpoint": "https://www.regengine.co/api/v1/webhooks/ingest"},
+    )
+
+    assert response.status_code == 200
+    assert response.json()["verdict"] == "connected", response.text
+    assert SpyAsyncClient.calls, "the stored origin should still be probed"
+
+
+def test_origin_treats_an_implicit_and_explicit_default_port_as_the_same_place() -> None:
+    # Adding the port to the comparison must not make two spellings of the
+    # same endpoint look like different origins.
+    from app.routers.integration import _origin
+
+    assert _origin("https://www.regengine.co/x") == _origin("https://www.regengine.co:443/x")
+    assert _origin("http://example.test/x") == _origin("http://example.test:80/x")
+    assert _origin("https://example.test/x") != _origin("http://example.test/x")
+    assert _origin("https://example.test/x") != _origin("https://example.test:8443/x")
+    # Already-closed cases that must stay closed: a trailing dot and a
+    # different host are still different origins.
+    assert _origin("https://example.test/x") != _origin("https://example.test./x")
+    assert _origin("https://example.test/x") != _origin("https://other.test/x")
+
+
+# ---------------------------------------------------------------------------
+# #209: the guard's blocking getaddrinfo must not run on the event loop
+# ---------------------------------------------------------------------------
+
+
+def test_egress_guard_resolves_off_the_event_loop(monkeypatch: Any) -> None:
+    """``socket.getaddrinfo`` is blocking C code with no yield point, so
+    running it inside ``async def ingest`` pinned the whole event loop for
+    the length of a DNS lookup -- one slow resolver stalling every other
+    request in the process, including the console's SSE stream. This
+    asserts the resolution happens on a worker thread, the way #136 moved
+    store I/O off the loop.
+    """
+    resolver_threads: list[int] = []
+
+    def recording_resolver(host: str) -> list[Any]:
+        resolver_threads.append(threading.get_ident())
+        return [ipaddress.ip_address("8.8.8.8")]
+
+    monkeypatch.setattr(simulation_schemas, "_resolved_addresses", recording_resolver)
+
+    async def scenario() -> int:
+        await simulation_schemas.validate_egress_endpoint_async(
+            HttpUrl("https://partner.example.net/webhooks/ingest")
+        )
+        return threading.get_ident()
+
+    loop_thread = asyncio.run(scenario())
+
+    assert resolver_threads, "the guard never resolved at all"
+    assert loop_thread not in resolver_threads, (
+        "getaddrinfo ran on the event loop thread; it must be offloaded"
+    )
+
+
+def test_async_guard_still_raises_for_a_blocked_endpoint() -> None:
+    # Offloading must not swallow the refusal: the EgressBlockedError has to
+    # propagate back out of the worker thread to the awaiting caller.
+    with pytest.raises(EgressBlockedError):
+        asyncio.run(
+            simulation_schemas.validate_egress_endpoint_async(
+                HttpUrl("http://169.254.169.254/latest/meta-data/")
+            )
+        )

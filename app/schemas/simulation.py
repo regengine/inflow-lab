@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import ipaddress
 import os
 import socket
@@ -142,6 +143,26 @@ def validate_egress_endpoint(url: HttpUrl | None) -> None:
             f"SSRF. Set {PRIVATE_ENDPOINTS_ENV}=1 to allow this for local "
             "development."
         )
+
+
+async def validate_egress_endpoint_async(url: HttpUrl | None) -> None:
+    """``validate_egress_endpoint`` for callers running on the event loop.
+
+    The guard's one expensive step is ``socket.getaddrinfo``, which is
+    blocking C code: called straight from ``async def ingest`` /
+    ``check_connection`` it pinned the whole event loop for the duration of
+    a DNS lookup, so one slow or timing-out resolver stalled every other
+    request in the process -- including the SSE stream the console renders
+    from (#209). Offloaded to a worker thread the same way #136 moved store
+    I/O off the loop (``asyncio.to_thread`` throughout app/controller.py).
+
+    The synchronous function stays the single implementation and remains
+    the entry point for synchronous callers and tests; this only changes
+    which thread it runs on. Module-level lookups inside it (notably
+    ``_resolved_addresses``) still resolve through this module's globals on
+    the worker thread, so monkeypatching them in a test works unchanged.
+    """
+    await asyncio.to_thread(validate_egress_endpoint, url)
 
 
 class DeliveryConfig(BaseModel):

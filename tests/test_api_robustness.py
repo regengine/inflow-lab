@@ -540,3 +540,30 @@ def test_body_level_tenant_id_never_reaches_the_live_wire_payload() -> None:
 
     assert payload.tenant_id == "acme-tenant", "the field must still be populated on input"
     assert "tenant_id" not in payload.model_dump(mode="json")
+
+
+def test_ingest_route_still_documents_its_request_body() -> None:
+    """The ingest route reads its body by hand so HMAC verification can
+    precede parsing (#209), which takes the body out of FastAPI's sight --
+    and a body FastAPI cannot see is one it cannot document. The schema is
+    reattached via openapi_extra; this pins that it is there, that it is
+    the IngestPayload contract, and that every model it references resolves
+    in the document's own components (the generator drops $defs on the
+    assumption that they do).
+    """
+    import json as _json
+    import re as _re
+
+    document = client.get("/openapi.json").json()
+    operation = document["paths"]["/api/mock/regengine/ingest"]["post"]
+
+    schema = operation["requestBody"]["content"]["application/json"]["schema"]
+    assert schema["title"] == "IngestPayload"
+    assert schema["additionalProperties"] is False, "#143's extra='forbid' must stay documented"
+    assert set(schema["properties"]) == {"source", "tenant_id", "events"}
+
+    referenced = set(_re.findall(r'"#/components/schemas/([^"]+)"', _json.dumps(schema)))
+    assert referenced, "the events array should reference the event model"
+    assert not referenced - set(document["components"]["schemas"]), (
+        "requestBody references a schema the document does not define"
+    )

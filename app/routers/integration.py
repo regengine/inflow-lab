@@ -21,11 +21,48 @@ from ..schemas.simulation import EgressBlockedError, SimulationConfig
 router = APIRouter(prefix="/api/integration", tags=["RegEngine Integration"])
 
 
-def _delivery_host(config: SimulationConfig) -> str:
-    """Host the stored config would actually deliver to right now (falls
+# Ports a scheme reaches when the URL does not spell one out, so
+# "https://host" and "https://host:443" compare equal while "https://host"
+# and "https://host:8443" do not.
+_DEFAULT_SCHEME_PORTS = {"http": 80, "https": 443}
+
+
+def _origin(endpoint: str) -> str:
+    """scheme://host:port for *endpoint* -- the identity a credential is issued for.
+
+    Compared instead of the bare hostname (#209). Host-only comparison
+    treated ``http://www.regengine.co`` as the same destination as
+    ``https://www.regengine.co``, so a caller could hand the probe a
+    downgraded URL and the stored API key -- issued for a TLS endpoint --
+    would ride along over cleartext to anyone on the path. Scheme and port
+    are part of what a credential was scoped to, so they are part of the
+    comparison.
+
+    Deliberately NOT normalized beyond the default-port case: a trailing
+    dot ("www.regengine.co.") stays distinct from the bare host, and
+    userinfo is already dropped by urlparse().hostname. Both of those are
+    closed today and folding them together here would reopen them.
+    """
+    parsed = urlparse(endpoint)
+    scheme = (parsed.scheme or "").lower()
+    host = (parsed.hostname or "").lower()
+    try:
+        port = parsed.port
+    except ValueError:
+        # An unparseable port is not a port we can prove matches, so give it
+        # a value nothing else can equal rather than falling back to the
+        # scheme default and calling it a match.
+        return f"{scheme}://{host}:<invalid>"
+    if port is None:
+        port = _DEFAULT_SCHEME_PORTS.get(scheme)
+    return f"{scheme}://{host}:{port}"
+
+
+def _delivery_origin(config: SimulationConfig) -> str:
+    """Origin the stored config would actually deliver to right now (falls
     back to the documented default when no endpoint is configured)."""
     endpoint = str(config.delivery.endpoint) if config.delivery.endpoint else DEFAULT_LIVE_INGEST_ENDPOINT
-    return (urlparse(endpoint).hostname or "").lower()
+    return _origin(endpoint)
 
 
 @router.get("/status", response_model=IntegrationStatusResponse)
@@ -59,14 +96,16 @@ async def integration_test(
         }.items()
         if value is not None
     }
-    if request.endpoint is not None and (request.endpoint.host or "").lower() != _delivery_host(config):
-        # Caller is pointing the probe at a different host than the stored/
+    stored_origin = _delivery_origin(config)
+    probe_origin = _origin(str(request.endpoint)) if request.endpoint is not None else stored_origin
+    if probe_origin != stored_origin:
+        # Caller is pointing the probe at a different origin than the stored/
         # default RegEngine endpoint. Never let the stored api_key/tenant_id
-        # ride along to a host they were never issued for — the caller must
-        # supply fresh credentials for THIS host (already captured above if
+        # ride along to an origin they were never issued for — the caller must
+        # supply fresh credentials for THIS origin (already captured above if
         # they did; the setdefault below is then a no-op). Otherwise the
-        # probe runs uncredentialed and check_connection reports
-        # not_configured instead of leaking them.
+        # probe runs uncredentialed and reports not_configured instead of
+        # leaking them.
         updates.setdefault("api_key", None)
         updates.setdefault("tenant_id", None)
     delivery = config.delivery.model_copy(update=updates, deep=True)

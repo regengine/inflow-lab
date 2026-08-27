@@ -13,7 +13,7 @@ import httpx
 
 from .contract import INFLOW_CONTRACT_VERSION
 from .schemas.ingestion import IngestPayload
-from .schemas.simulation import SimulationConfig, validate_egress_endpoint
+from .schemas.simulation import SimulationConfig, validate_egress_endpoint_async
 # Same masking convention store.py persists with and controller.py logs
 # with -- see _extract_error_body below (#138).
 from .store import mask_secret_in_payload, mask_secret_in_string
@@ -132,7 +132,9 @@ class LiveRegEngineClient:
         # NOT see the address httpx dials: httpx resolves the hostname again
         # on its own, so this stops a statically hostile endpoint but not DNS
         # rebinding. The docstring explains what closing that would take.
-        validate_egress_endpoint(config.delivery.endpoint)
+        # Awaited rather than called: the guard's getaddrinfo() is blocking,
+        # and this is an async def on the event loop (#209).
+        await validate_egress_endpoint_async(config.delivery.endpoint)
 
         idempotency_key = idempotency_key or uuid.uuid4().hex
         # Serialize the body exactly once so the bytes we sign are the same
@@ -220,8 +222,10 @@ class LiveRegEngineClient:
         # address dialed -- httpx resolves independently -- so this stops a
         # statically hostile endpoint but not DNS rebinding. The caller (the
         # /test route) turns a raised EgressBlockedError into a clean 4xx
-        # rather than letting it become an unhandled 500.
-        validate_egress_endpoint(config.delivery.endpoint)
+        # rather than letting it become an unhandled 500. Awaited for the
+        # same reason as ingest()'s call above: blocking getaddrinfo() must
+        # not run on the event loop (#209).
+        await validate_egress_endpoint_async(config.delivery.endpoint)
 
         probe_url = f"{parsed.scheme}://{parsed.netloc}/api/v1/webhooks/recent"
         headers = {
