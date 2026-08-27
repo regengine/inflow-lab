@@ -79,8 +79,9 @@ def _is_unsafe_address(address: ipaddress.IPv4Address | ipaddress.IPv6Address) -
     return mapped is not None and _is_unsafe_address(mapped)
 
 
-def validate_egress_endpoint(url: HttpUrl | None) -> None:
-    """Reject a RegEngine delivery endpoint before it is ever dialed.
+def resolve_egress_endpoint(url: HttpUrl | None) -> str | None:
+    """Reject a RegEngine delivery endpoint before it is ever dialed, and
+    return the ONE address the caller must dial it at.
 
     Enforced at request time, from check_connection() and ingest() in
     regengine_client.py, immediately before the outbound call. Deliberately
@@ -91,51 +92,60 @@ def validate_egress_endpoint(url: HttpUrl | None) -> None:
     as well as the model_copy(update=...) path /api/integration/test and
     /api/integration/configure use.
 
-    WHAT THIS DOES NOT STOP: DNS rebinding. This function performs its OWN
-    getaddrinfo() and then returns; httpx resolves the hostname a second time,
-    independently, when it actually dials. A hostile authoritative server can
-    answer the first lookup with a public address and the second with
-    127.0.0.1, and the request lands on loopback with the caller's credential
-    attached. An earlier version of this docstring claimed the opposite --
-    that guarding "where the socket is actually opened covers both" -- which
-    was wrong: this is one frame earlier than the dial, not at it.
+    WHAT THE RETURN VALUE IS FOR (#207). This function used to resolve, check,
+    and then throw the answer away -- httpx resolved the hostname a second
+    time, independently, when it opened the socket. A hostile authoritative
+    server with a zero/short TTL could answer the guard's lookup with a public
+    address and httpx's with 127.0.0.1, and the request landed on loopback
+    with the caller's credential attached. Returning the address closes that:
+    the caller dials this exact address (see _pinned_dial in
+    regengine_client.py), carrying the original hostname through as the Host
+    header and the TLS SNI/verification name, so the address that was checked
+    is the address that is connected to and there is only ever one lookup.
 
-    So the guard raises the bar without closing the hole. It blocks a
-    statically hostile endpoint (someone typing http://127.0.0.1 or a
-    metadata IP), which is the common case; it does not block an attacker who
-    controls a DNS zone. Closing that needs the validated address pinned at
-    connect time -- resolving once, dialing the IP directly, and carrying the
-    original hostname through as the Host header and TLS SNI so certificate
-    verification still applies. Tracked as issue #207; see the rebinding test in
-    tests/test_egress_guard.py, which documents the gap rather than asserting
-    it is closed.
+    Returns None -- meaning "dial by hostname, there is nothing to pin" -- in
+    the four cases where pinning is either impossible or not the guard's
+    business, each of which still resolves at most once in total:
 
-    The documented RegEngine host is allowlisted outright, which is cheap
-    and keeps this offline-safe for anything that already targets it. Every
-    other host must resolve to public addresses only: loopback, private,
-    link-local, reserved, unspecified and multicast addresses are refused. A
-    host that does not resolve is allowed through to fail as an ordinary
-    connection error, because it cannot be dialed and so cannot be a pivot.
+      * ``url is None``: no endpoint configured, so nothing to check or dial.
+      * REGENGINE_ALLOW_PRIVATE_ENDPOINTS is set: the operator has explicitly
+        opted out of this guard for local development, so it does not resolve
+        at all. Pinning here would also cost the dual-stack fallback httpx
+        gets for free from ``localhost`` (::1 then 127.0.0.1) and buy nothing
+        -- loopback is the intended destination.
+      * The documented RegEngine host: allowlisted by name and never resolved
+        here, so httpx's lookup is the only one. Pinning our own first answer
+        could not defend it anyway -- rebinding needs two lookups to disagree,
+        and forcing a lookup here would tie every default-endpoint test and
+        offline demo to a working resolver.
+      * The host does not resolve: it cannot be dialed, so it is not a pivot.
+        Rejecting here would instead tie the guard to resolver availability,
+        so an offline or sandboxed environment would classify every endpoint
+        as hostile and fail all live delivery closed at once.
+
+    Otherwise every resolved address must be public: loopback, private,
+    link-local (this is where 169.254.169.254 cloud metadata lives),
+    reserved, unspecified and multicast are refused, and the first address is
+    returned to be pinned. Only the first: a host with several A records
+    loses httpx's connect-time failover across the rest, which is the
+    deliberate price of pinning -- an address that was never validated must
+    never be dialed, and "try the next one" is exactly the door rebinding
+    walks through.
 
     Escape hatch: set REGENGINE_ALLOW_PRIVATE_ENDPOINTS=1 to allow loopback/
     private/link-local endpoints for local development against
     http://localhost:... or the built-in mock service. Off by default.
     """
     if url is None or _private_endpoints_allowed():
-        return
+        return None
     host = (url.host or "").strip("[]").lower()
     if not host:
         raise EgressBlockedError("Delivery endpoint is missing a host.")
     if host == _TRUSTED_REGENGINE_HOST:
-        return
+        return None
     addresses = _resolved_addresses(host)
     if not addresses:
-        # A host that does not resolve cannot be dialed, so it is not an SSRF
-        # vector: the connection attempt fails on its own a moment later.
-        # Rejecting here would instead tie the guard to resolver availability,
-        # so an offline or sandboxed environment would classify every endpoint
-        # as hostile and fail all live delivery closed at once.
-        return
+        return None
     if any(_is_unsafe_address(address) for address in addresses):
         raise EgressBlockedError(
             f"Delivery endpoint host {host!r} resolves to a loopback, private, "
@@ -143,10 +153,23 @@ def validate_egress_endpoint(url: HttpUrl | None) -> None:
             f"SSRF. Set {PRIVATE_ENDPOINTS_ENV}=1 to allow this for local "
             "development."
         )
+    return str(addresses[0])
 
 
-async def validate_egress_endpoint_async(url: HttpUrl | None) -> None:
-    """``validate_egress_endpoint`` for callers running on the event loop.
+def validate_egress_endpoint(url: HttpUrl | None) -> None:
+    """``resolve_egress_endpoint`` for callers that only need the verdict.
+
+    Same check, same exception; the resolved address is discarded. Kept as
+    the named entry point because most callers (and the DeliveryConfig-level
+    tests) care only about "is this endpoint allowed", and because a caller
+    that discards the address is a caller that is NOT pinning -- which is a
+    property worth being able to see at the call site.
+    """
+    resolve_egress_endpoint(url)
+
+
+async def resolve_egress_endpoint_async(url: HttpUrl | None) -> str | None:
+    """``resolve_egress_endpoint`` for callers running on the event loop.
 
     The guard's one expensive step is ``socket.getaddrinfo``, which is
     blocking C code: called straight from ``async def ingest`` /
@@ -162,7 +185,16 @@ async def validate_egress_endpoint_async(url: HttpUrl | None) -> None:
     ``_resolved_addresses``) still resolve through this module's globals on
     the worker thread, so monkeypatching them in a test works unchanged.
     """
-    await asyncio.to_thread(validate_egress_endpoint, url)
+    return await asyncio.to_thread(resolve_egress_endpoint, url)
+
+
+async def validate_egress_endpoint_async(url: HttpUrl | None) -> None:
+    """``validate_egress_endpoint`` for callers running on the event loop.
+
+    Discards the pinned address, exactly as the synchronous wrapper does.
+    See ``resolve_egress_endpoint_async`` for why this runs off the loop.
+    """
+    await resolve_egress_endpoint_async(url)
 
 
 class DeliveryConfig(BaseModel):

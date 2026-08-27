@@ -195,6 +195,10 @@ class FailingAsyncClient:
         *,
         headers: dict[str, str],
         content: bytes | None = None,
+        # extensions: the live client attaches {"sni_hostname": ...} when it
+        # pins the validated address for the dial (#207). Accepted and
+        # ignored here so this fake keeps working on either path.
+        extensions: dict[str, Any] | None = None,
     ) -> Any:
         assert FailingAsyncClient.response is not None
         return FailingAsyncClient.response
@@ -360,7 +364,15 @@ class ConnectionProbeAsyncClient:
         return None
 
     async def get(
-        self, url: str, *, headers: dict[str, str] | None = None, params: Any = None
+        self,
+        url: str,
+        *,
+        headers: dict[str, str] | None = None,
+        params: Any = None,
+        # extensions: the live client attaches {"sni_hostname": ...} when it
+        # pins the validated address for the dial (#207). Accepted and
+        # ignored here so this fake keeps working on either path.
+        extensions: dict[str, Any] | None = None,
     ) -> Any:
         if url.endswith("/health"):
             return FailingResponse(200, json_body={}, has_json_body=True)
