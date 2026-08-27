@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import logging
 import os
+from functools import lru_cache
 from urllib.parse import urlparse
 
 
@@ -31,6 +32,30 @@ def resolve_cors_origins() -> list[str]:
     -- degrade, don't crash, while the ASGI app is being constructed.
     """
     return _with_platform_origin(_parsed_env_origins(strict=False))
+
+
+@lru_cache(maxsize=16)
+def _resolved_origins_for_env(_raw_origins: str | None, _platform_domain: str | None) -> tuple[str, ...]:
+    # The two arguments are the cache KEY only -- resolve_cors_origins() reads
+    # both back out of os.environ itself. Passing them in is precisely what
+    # makes the cache invalidate the moment either variable changes, so a test
+    # (or an operator editing the deployment) never sees a stale answer.
+    return tuple(resolve_cors_origins())
+
+
+def resolve_cors_origins_cached() -> list[str]:
+    """resolve_cors_origins(), memoized on the environment it derives from.
+
+    For the request path (#200). auth_middleware consults the trusted-origin
+    list on every authenticated state-changing request; parsing the variable
+    from scratch each time is pure waste, since it only changes when the
+    process is reconfigured.
+    """
+    return list(
+        _resolved_origins_for_env(
+            os.getenv("REGENGINE_CORS_ORIGINS"), os.getenv("RAILWAY_PUBLIC_DOMAIN")
+        )
+    )
 
 
 def _parsed_env_origins(*, strict: bool) -> list[str]:

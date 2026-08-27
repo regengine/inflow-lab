@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import os
 from collections import Counter, deque
 from pathlib import Path
 from threading import RLock
@@ -153,8 +154,100 @@ class EventStore:
                 handle.write(_serialize_record(record) + "\n")
         tmp_path.replace(self.persist_path)
 
+    def _truncate_torn_tail(self) -> None:
+        """Drop a trailing fragment left behind by a partially written append.
+
+        ``add_many`` writes ``json + "\n"`` in a single call, so a write that
+        fails partway through (ENOSPC, a detached volume) can leave JSON on
+        disk with no terminating newline. The next append opens the file in
+        ``"a"`` and writes straight onto that same physical line -- so the
+        fragment silently swallows the *next* record, one that was fully
+        written, flushed, and already acknowledged to the API caller. For a
+        traceability tool, losing a record the API confirmed is the worst
+        available failure mode.
+
+        Dropping the fragment confines the damage to the record whose write
+        actually failed. A healthy file always ends in a newline, so this is a
+        no-op on every normal call.
+        """
+        path = self.persist_path
+        # Regular files only. The persist path can legitimately point at a
+        # character device (tests use /dev/full to force ENOSPC), which has no
+        # tail to repair -- and reading one back streams zeros forever.
+        if not path.is_file():
+            return
+        with path.open("rb+") as handle:
+            handle.seek(0, os.SEEK_END)
+            size = handle.tell()
+            if size == 0:
+                return
+            handle.seek(size - 1)
+            if handle.read(1) == b"\n":
+                return
+            # Scan backwards in bounded chunks -- an event log can be large and
+            # this must not pull the whole file into memory to find one newline.
+            chunk_size = 64 * 1024
+            position = size
+            while position > 0:
+                start = max(0, position - chunk_size)
+                handle.seek(start)
+                block = handle.read(position - start)
+                newline_index = block.rfind(b"\n")
+                if newline_index != -1:
+                    handle.truncate(start + newline_index + 1)
+                    return
+                position = start
+            # No newline anywhere: the entire file is one torn fragment.
+            handle.truncate(0)
+
+    def _resync_counter_from_disk(self) -> None:
+        """Re-derive ``_counter`` from what is actually persisted.
+
+        ``add_many`` advances ``_counter`` only after ``flush()`` returns.
+        That is right for the common failure -- nothing reached disk -- but
+        wrong when the bytes landed and the flush still raised: the record sits
+        on disk holding sequence N while ``_counter`` still reads N-1, so the
+        next append hands out N a second time and the log carries a duplicate
+        ``sequence_no``.
+        """
+        # Same constraint as _truncate_torn_tail: never read back a path that
+        # is not a regular file. /dev/full answers reads with an unbounded
+        # stream of NUL bytes and no newline, so this would buffer until the
+        # process is OOM-killed rather than raising.
+        if not self.persist_path.is_file():
+            return
+        try:
+            persisted = self.read_persisted_records()
+        except ValueError:
+            # An unreadable line elsewhere in the file is a separate problem,
+            # surfaced by the read path. Do not compound a write failure by
+            # raising a different error out of the recovery path.
+            return
+        # Never move the counter *backwards* below a record already committed
+        # to memory: those sequence numbers have been handed out, and reissuing
+        # one would put two different records under the same sequence_no. Take
+        # the high-water mark of both sides.
+        persisted_max = max((record.sequence_no for record in persisted), default=0)
+        committed_max = max((record.sequence_no for record in self._records), default=0)
+        self._counter = max(persisted_max, committed_max)
+
     def add_many(self, records: Iterable[StoredEventRecord]) -> list[StoredEventRecord]:
         stored: list[StoredEventRecord] = []
+        with self._lock:
+            # Repair before writing, so a fragment left by an earlier failed
+            # append -- possibly in a previous process -- cannot corrupt the
+            # good records this call is about to write.
+            self._truncate_torn_tail()
+            try:
+                return self._append_locked(records, stored)
+            except OSError:
+                self._truncate_torn_tail()
+                self._resync_counter_from_disk()
+                raise
+
+    def _append_locked(
+        self, records: Iterable[StoredEventRecord], stored: list[StoredEventRecord]
+    ) -> list[StoredEventRecord]:
         with self._lock:
             with self.persist_path.open("a", encoding="utf-8") as handle:
                 for record in records:
