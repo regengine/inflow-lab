@@ -8,6 +8,7 @@ from pathlib import Path
 from threading import RLock
 from typing import Any, Iterable, NamedTuple
 
+from .fda_export import normalize_to_utc
 from .schemas.domain import LineageEdge, LineageNode, StoredEventRecord
 
 
@@ -624,7 +625,16 @@ class EventStore:
             return sorted(records, key=lambda record: record.event.timestamp)
         filtered: list[StoredEventRecord] = []
         for record in records:
-            day = record.event.timestamp.date().isoformat()
+            # Normalize before taking .date(), using the SAME helper the FDA
+            # export uses to build its Date column (#157). event.timestamp
+            # keeps whatever offset the source carried -- a CSV row's explicit
+            # "+05:00" survives import -- so filtering on the raw local date
+            # while the export prints the UTC one desynced the two: a
+            # day-scoped request could omit exactly the rows whose exported
+            # Date column reads that day, and return rows printing a different
+            # one. Before #157 both sides read the raw local date and agreed;
+            # normalizing only the column is what split them.
+            day = normalize_to_utc(record.event.timestamp).date().isoformat()
             if start_date and day < start_date:
                 continue
             if end_date and day > end_date:
