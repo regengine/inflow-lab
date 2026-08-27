@@ -648,3 +648,200 @@ def test_export_preset_list_still_advertises_the_lot_code_requirement() -> None:
     by_id = {preset["id"]: preset for preset in presets}
     assert by_id["lot_trace"]["requires_lot_code"] is True
     assert by_id["all_records"]["requires_lot_code"] is False
+
+
+# ---------------------------------------------------------------------------
+# #195 -- a live snapshot must not destroy the rows the operator is using
+# ---------------------------------------------------------------------------
+
+_SHIFT_LOG_PRELUDE = """
+function record(sequence, overrides = {}) {
+  return {
+    record_id: `rec-${sequence}`,
+    sequence_no: sequence,
+    delivery_status: 'posted',
+    delivery_attempts: 1,
+    destination_mode: 'mock',
+    event: {
+      cte_type: 'harvesting',
+      traceability_lot_code: `TLC-${sequence}`,
+      product_description: 'Romaine Lettuce',
+      location_name: 'Valley Fresh Farms',
+      quantity: 10,
+      unit_of_measure: 'cases',
+      timestamp: '2026-02-10T08:00:00Z',
+      kdes: {},
+    },
+    ...overrides,
+  };
+}
+function lotButton(lot) {
+  return ids.eventsBody.querySelectorAll('[data-lot]').find((node) => node.dataset.lot === lot) || null;
+}
+function activeLot() {
+  return document.activeElement && document.activeElement.dataset
+    ? document.activeElement.dataset.lot || '<body>'
+    : '<body>';
+}
+"""
+
+
+def test_running_line_snapshots_keep_focus_and_row_identity() -> None:
+    """The shift log was rebuilt with innerHTML on every snapshot -- about
+    every 1.5s while the line runs -- so a focused lot-code button was
+    destroyed mid-interaction and focus reverted to <body>."""
+    result = run_console(
+        _SHIFT_LOG_PRELUDE
+        + """
+        const first = [record(1), record(2), record(3)];
+        renderEvents(first);
+        const rowBefore = lotButton('TLC-2').closest('tr');
+
+        lotButton('TLC-2').focus();
+        const focusBefore = activeLot();
+
+        // Three more snapshots, each appending a batch, as a running line does.
+        renderEvents([...first, record(4)]);
+        const afterOne = activeLot();
+        renderEvents([...first, record(4), record(5)]);
+        renderEvents([...first, record(4), record(5), record(6)]);
+
+        return {
+          focusBefore,
+          afterOne,
+          focusAfterThree: activeLot(),
+          // Identity, not markup: a text selection survives a snapshot exactly
+          // when the nodes it spans are never replaced.
+          sameRowNode: lotButton('TLC-2').closest('tr') === rowBefore,
+          rowCount: ids.eventsBody.querySelectorAll('tr').length,
+          listeners: ids.eventsBody.listenerCount('click'),
+        };
+        """
+    )
+    assert result["focusBefore"] == "TLC-2"
+    assert result["afterOne"] == "TLC-2"
+    assert result["focusAfterThree"] == "TLC-2"
+    assert result["sameRowNode"] is True
+    assert result["rowCount"] == 6
+    # One delegated listener on #eventsBody, not one per row per tick.
+    assert result["listeners"] == 1
+
+
+def test_changed_row_still_repaints_and_returns_focus() -> None:
+    """A row whose delivery outcome changed has to repaint -- and the focused
+    lot-code button inside it must come back, not vanish to <body>."""
+    result = run_console(
+        _SHIFT_LOG_PRELUDE
+        + """
+        const before = [record(1), record(2)];
+        renderEvents(before);
+        lotButton('TLC-2').focus();
+        const after = [record(1), record(2, { delivery_status: 'failed', error: 'HTTP 429', delivery_attempts: 3 })];
+        renderEvents(after);
+        return {
+          focus: activeLot(),
+          markup: ids.eventsBody.innerHTML || ids.eventsBody.querySelectorAll('tr').map((row) => row.innerHTML).join(''),
+          status: ids.eventsBody.querySelectorAll('.status-pill').map((pill) => pill.textContent),
+        };
+        """
+    )
+    assert result["focus"] == "TLC-2"
+    assert "failed" in result["status"]
+    assert "HTTP 429" in result["markup"]
+
+
+def test_delegated_lot_click_still_traces_the_lot() -> None:
+    """The delegated listener has to keep the lot buttons working, including
+    on rows added by a later snapshot."""
+    result = run_console(
+        _SHIFT_LOG_PRELUDE
+        + """
+        const requested = [];
+        __dom.setFetch((url) => {
+          requested.push(url);
+          return __dom.makeResponse({ body: { traceability_lot_code: 'TLC-9', records: [], nodes: [], edges: [] } });
+        });
+        renderEvents([record(1)]);
+        renderEvents([record(1), record(9)]);
+        await lotButton('TLC-9').dispatchEvent('click');
+        return { lotLookup: ids.lotLookup.value, requested };
+        """
+    )
+    assert result["lotLookup"] == "TLC-9"
+    assert result["requested"] == ["/api/lineage/TLC-9"]
+
+
+def test_overlapping_refreshes_cannot_render_an_older_snapshot() -> None:
+    """startFallbackPolling() is a bare 2s setInterval, so a slow response
+    could land after a newer one and repaint stale state."""
+    result = run_console(
+        """
+        const pending = [];
+        let counter = 0;
+        __dom.setFetch((url) => new Promise((resolve) => {
+          const total = counter;
+          pending.push(() => resolve(__dom.makeResponse({
+            body: url.startsWith('/api/events')
+              ? { events: [] }
+              : url.startsWith('/api/simulate/status')
+                ? {
+                    running: false,
+                    config: { scenario: 'leafy_greens_supplier', delivery: { mode: 'mock', mock_friction: [] } },
+                    stats: { total_records: total, unique_lots: total, delivery: {}, engine: {} },
+                  }
+                : { status: 'ok', tenant: 'local-demo', build: { version: '0.1.0' }, auth: {} },
+          })));
+        }));
+
+        counter = 1;
+        const older = refresh();
+        counter = 2;
+        const newer = refresh();
+
+        // The newer round-trip finishes first; the older one lands afterwards.
+        pending.splice(3).forEach((resolve) => resolve());
+        await newer;
+        pending.splice(0).forEach((resolve) => resolve());
+        await older;
+
+        const rendered = ids.statsGrid.innerHTML;
+        const totalCard = /Total records<\\/span>\\s*<strong>(\\d+)<\\/strong>/.exec(rendered);
+        return { totalRecords: totalCard ? Number(totalCard[1]) : null };
+        """
+    )
+    assert result["totalRecords"] == 2, "an older refresh repainted over a newer snapshot"
+
+
+def test_fallback_poll_does_not_stack_overlapping_refreshes() -> None:
+    """The poller fires on a fixed interval regardless of whether the previous
+    round-trip finished; without a guard those pile up."""
+    result = run_console(
+        """
+        let calls = 0;
+        const pending = [];
+        __dom.setFetch((url) => new Promise((resolve) => {
+          calls += 1;
+          pending.push(() => resolve(__dom.makeResponse({
+            body: url.startsWith('/api/events')
+              ? { events: [] }
+              : url.startsWith('/api/simulate/status')
+                ? {
+                    running: false,
+                    config: { scenario: 'leafy_greens_supplier', delivery: { mode: 'mock', mock_friction: [] } },
+                    stats: { delivery: {}, engine: {} },
+                  }
+                : { status: 'ok', build: {}, auth: {} },
+          })));
+        }));
+
+        const firstTick = pollForFreshness();
+        const duringFlight = calls;
+        const secondTick = pollForFreshness();
+        const afterSecondTick = calls;
+        pending.splice(0).forEach((resolve) => resolve());
+        await Promise.all([firstTick, secondTick]);
+        return { duringFlight, afterSecondTick };
+        """
+    )
+    assert result["duringFlight"] == 3, "one poll should issue exactly the three refresh() requests"
+    assert result["afterSecondTick"] == 3, "a second poll fired while one was in flight"

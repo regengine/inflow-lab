@@ -185,7 +185,13 @@ class El {
   }
 
   get innerHTML() {
-    return this._innerHTML;
+    // Serialize live when the subtree was built imperatively (createElement +
+    // insertBefore), the way a browser's innerHTML getter does; fall back to
+    // the assigned string when there is nothing to serialize.
+    if (this.childNodes.length) {
+      return this.childNodes.map(serialize).join('');
+    }
+    return this._text ? escapeText(this._text) : this._innerHTML;
   }
   set innerHTML(html) {
     this._detachSubtree();
@@ -218,15 +224,30 @@ class El {
   listenerCount(type) {
     return (this._listeners[type] || []).length;
   }
+  // Events bubble, as they do in a browser -- the console relies on that for
+  // its delegated shift-log listener.
   dispatchEvent(type, event = {}) {
     const evt = { type, target: event.target || this, ...event };
-    evt.currentTarget = this;
     if (!evt.preventDefault) {
       evt.preventDefault = () => {
         evt.defaultPrevented = true;
       };
     }
-    const results = (this._listeners[type] || []).map((fn) => fn(evt));
+    evt.stopPropagation = () => {
+      evt.propagationStopped = true;
+    };
+    const results = [];
+    let node = this;
+    while (node) {
+      evt.currentTarget = node;
+      for (const handler of node._listeners[type] || []) {
+        results.push(handler(evt));
+      }
+      if (evt.propagationStopped) {
+        break;
+      }
+      node = node.parentNode;
+    }
     return Promise.all(results).then(() => evt);
   }
 
@@ -242,6 +263,19 @@ class El {
   appendChild(child) {
     child.parentNode = this;
     this.childNodes.push(child);
+    return child;
+  }
+  insertBefore(child, reference) {
+    if (child.parentNode) {
+      child.parentNode.removeChild(child);
+    }
+    child.parentNode = this;
+    const at = reference ? this.childNodes.indexOf(reference) : -1;
+    if (at === -1) {
+      this.childNodes.push(child);
+    } else {
+      this.childNodes.splice(at, 0, child);
+    }
     return child;
   }
   removeChild(child) {
@@ -275,6 +309,27 @@ class El {
     }
     return null;
   }
+}
+
+function escapeText(text) {
+  return String(text)
+    .replaceAll('&', '&amp;')
+    .replaceAll('<', '&lt;')
+    .replaceAll('>', '&gt;');
+}
+
+function serialize(node) {
+  const tag = node.tagName.toLowerCase();
+  const attrs = Object.entries(node.attributes)
+    .map(([name, value]) => (value === '' ? ` ${name}` : ` ${name}="${value}"`))
+    .join('');
+  if (VOID_TAGS.has(tag)) {
+    return `<${tag}${attrs} />`;
+  }
+  const inner = node.childNodes.length
+    ? node.childNodes.map(serialize).join('')
+    : escapeText(node._text || '');
+  return `<${tag}${attrs}>${inner}</${tag}>`;
 }
 
 function descendants(root) {

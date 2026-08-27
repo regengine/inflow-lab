@@ -35,6 +35,8 @@ const state = {
     all_records: 'Full FDA-request export for the selected date range.',
   },
   exportPresetRequiresLot: {},
+  eventRows: null,
+  streamRevision: null,
 };
 
 const DEFAULT_LIVE_INGEST_ENDPOINT = 'https://www.regengine.co/api/v1/webhooks/ingest';
@@ -1269,54 +1271,115 @@ function formatKdeValue(value) {
   return value ?? '';
 }
 
+function eventRowClass(audit) {
+  if (audit.messages.length) {
+    return 'has-audit-warning';
+  }
+  return audit.evaluated ? '' : 'audit-not-evaluated';
+}
+
+function eventRowCells(record, audit) {
+  const event = record.event;
+  return `
+    <td>${record.sequence_no}</td>
+    <td><span class="pill">${escapeHtml(event.cte_type)}</span></td>
+    <td><button class="link-button" data-lot="${escapeHtml(event.traceability_lot_code)}">${escapeHtml(event.traceability_lot_code)}</button></td>
+    <td>${escapeHtml(event.product_description)}</td>
+    <td>${escapeHtml(event.location_name)}</td>
+    <td>${escapeHtml(new Date(event.timestamp).toLocaleString())}</td>
+    <td>${escapeHtml(record.destination_mode)}</td>
+    <td>
+      ${escapeHtml(record.delivery_attempts || 0)}
+      ${audit.messages.length ? `<small class="status-warning">${escapeHtml(audit.messages[0])}</small>` : ''}
+      ${audit.evaluated ? '' : '<small class="status-muted">Audit not evaluated</small>'}
+    </td>
+    <td>
+      <span class="status-pill" data-tone="${deliveryTone(record.delivery_status)}">${escapeHtml(record.delivery_status)}</span>
+      ${record.error ? `<small class="status-error">${escapeHtml(record.error)}</small>` : ''}
+    </td>
+  `;
+}
+
+// Everything about a row that can change between snapshots. A row whose
+// signature is unchanged is left alone entirely, which is what keeps focus
+// and text selection alive across a tick (#195).
+function eventRowSignature(record, audit) {
+  return JSON.stringify([
+    record.sequence_no,
+    record.delivery_status,
+    record.delivery_attempts || 0,
+    record.destination_mode,
+    record.error || '',
+    audit.evaluated,
+    audit.messages[0] || '',
+    record.event.cte_type,
+    record.event.traceability_lot_code,
+    record.event.product_description,
+    record.event.location_name,
+    record.event.timestamp,
+  ]);
+}
+
+// #195: this used to be one `ids.eventsBody.innerHTML = events.map(...)` per
+// snapshot -- about every 1.5s while the line runs. That destroys the row a
+// keyboard operator is on (focus reverts to <body>), clears any text
+// selection, and re-attaches one click listener per row every tick. Rows are
+// now keyed by record_id and patched: an unchanged row keeps its DOM node.
 function renderEvents(events) {
   const summary = activeScenarioSummary();
+  const body = ids.eventsBody;
   if (!events.length) {
-    ids.eventsBody.innerHTML = `
-      <tr>
-        <td colspan="9" class="empty-state">No events yet. Load a fixture or run a single batch.</td>
-      </tr>
-    `;
-    return;
-  }
-  ids.eventsBody.innerHTML = events
-    .map((record) => {
-      const event = record.event;
-      const audit = recordAudit(record, summary);
-      const rowClass = audit.messages.length
-        ? 'has-audit-warning'
-        : audit.evaluated
-          ? ''
-          : 'audit-not-evaluated';
-      return `
-        <tr class="${rowClass}">
-          <td>${record.sequence_no}</td>
-          <td><span class="pill">${escapeHtml(event.cte_type)}</span></td>
-          <td><button class="link-button" data-lot="${escapeHtml(event.traceability_lot_code)}">${escapeHtml(event.traceability_lot_code)}</button></td>
-          <td>${escapeHtml(event.product_description)}</td>
-          <td>${escapeHtml(event.location_name)}</td>
-          <td>${escapeHtml(new Date(event.timestamp).toLocaleString())}</td>
-          <td>${escapeHtml(record.destination_mode)}</td>
-          <td>
-            ${escapeHtml(record.delivery_attempts || 0)}
-            ${audit.messages.length ? `<small class="status-warning">${escapeHtml(audit.messages[0])}</small>` : ''}
-            ${audit.evaluated ? '' : '<small class="status-muted">Audit not evaluated</small>'}
-          </td>
-          <td>
-            <span class="status-pill" data-tone="${deliveryTone(record.delivery_status)}">${escapeHtml(record.delivery_status)}</span>
-            ${record.error ? `<small class="status-error">${escapeHtml(record.error)}</small>` : ''}
-          </td>
+    if (!body.querySelector('.empty-state')) {
+      body.innerHTML = `
+        <tr>
+          <td colspan="9" class="empty-state">No events yet. Load a fixture or run a single batch.</td>
         </tr>
       `;
-    })
-    .join('');
+    }
+    state.eventRows = new Map();
+    return;
+  }
+  if (!state.eventRows || !state.eventRows.size) {
+    // Clears the empty-state placeholder before the first real row lands.
+    body.innerHTML = '';
+    state.eventRows = new Map();
+  }
+  const rows = state.eventRows;
+  const focusedLot = document.activeElement?.dataset?.lot;
 
-  ids.eventsBody.querySelectorAll('[data-lot]').forEach((button) => {
-    button.addEventListener('click', async () => {
-      ids.lotLookup.value = button.dataset.lot;
-      await lookupLineage();
-    });
+  const wanted = new Set(events.map((record) => record.record_id));
+  for (const [recordId, entry] of [...rows]) {
+    if (!wanted.has(recordId)) {
+      entry.node.remove();
+      rows.delete(recordId);
+    }
+  }
+
+  events.forEach((record, index) => {
+    const audit = recordAudit(record, summary);
+    const signature = eventRowSignature(record, audit);
+    let entry = rows.get(record.record_id);
+    if (!entry) {
+      entry = { node: document.createElement('tr'), signature: null };
+      rows.set(record.record_id, entry);
+    }
+    if (entry.signature !== signature) {
+      entry.node.setAttribute('class', eventRowClass(audit));
+      entry.node.innerHTML = eventRowCells(record, audit);
+      entry.signature = signature;
+    }
+    if (body.children[index] !== entry.node) {
+      body.insertBefore(entry.node, body.children[index] || null);
+    }
   });
+
+  // Only reachable when the focused row was one of the few that repainted.
+  if (focusedLot && document.activeElement?.dataset?.lot !== focusedLot) {
+    const restored = Array.from(body.querySelectorAll('[data-lot]')).find(
+      (button) => button.dataset.lot === focusedLot,
+    );
+    restored?.focus();
+  }
 }
 
 function renderLineage(payload, traceabilityLotCode) {
@@ -1491,13 +1554,38 @@ function renderSnapshot(status, events, health = state.health) {
   }
 }
 
+// #195: refresh() is called from the 2s fallback poller, the Refresh button,
+// and the tail of every mutating action, so two can easily overlap. Without
+// a token the slower one repaints stale state over the newer one.
+let refreshSeq = 0;
+
 async function refresh() {
+  const requestId = ++refreshSeq;
   const [health, status, events] = await Promise.all([
     api('/api/health'),
     api('/api/simulate/status'),
     api('/api/events?limit=100'),
   ]);
+  if (requestId !== refreshSeq) {
+    return;
+  }
   renderSnapshot(status, events.events, health);
+}
+
+// The poller's entry point: skips the tick entirely while a poll is still in
+// flight, so a slow backend cannot make polls pile up.
+let pollInFlight = false;
+
+async function pollForFreshness() {
+  if (pollInFlight) {
+    return;
+  }
+  pollInFlight = true;
+  try {
+    await refresh();
+  } finally {
+    pollInFlight = false;
+  }
 }
 
 function stopFallbackPolling() {
@@ -1512,7 +1600,7 @@ function startFallbackPolling() {
     return;
   }
   state.fallbackTimer = setInterval(() => {
-    refresh().catch((error) => {
+    pollForFreshness().catch((error) => {
       setStatus(error.message, 'error', 5000);
     });
   }, 2000);
@@ -1521,6 +1609,17 @@ function startFallbackPolling() {
 function applyStreamSnapshot(payload) {
   if (!payload || !payload.status || !Array.isArray(payload.events)) {
     return;
+  }
+  // The stream stamps every snapshot with the controller's monotonic
+  // revision. After a reconnect the server replays from its current
+  // revision, so an in-flight older frame must not repaint over a newer
+  // one (#195).
+  const revision = Number(payload.revision);
+  if (Number.isFinite(revision)) {
+    if (state.streamRevision !== null && revision < state.streamRevision) {
+      return;
+    }
+    state.streamRevision = revision;
   }
   renderSnapshot(payload.status, payload.events);
 }
@@ -1987,6 +2086,18 @@ ids.lotLookup.addEventListener('keydown', (event) => {
     event.preventDefault();
     runWithBusy(ids.lineageBtn, lookupLineage);
   }
+});
+
+// One delegated listener for the whole shift log (#195). The rows are
+// patched rather than rebuilt now, but binding here also means a rebuilt row
+// can never arrive without its handler, and nothing is re-bound per tick.
+ids.eventsBody.addEventListener('click', async (event) => {
+  const button = event.target?.closest?.('[data-lot]');
+  if (!button) {
+    return;
+  }
+  ids.lotLookup.value = button.dataset.lot;
+  await lookupLineage();
 });
 
 document.getElementById('nextActionGo')?.addEventListener('click', goToNextAction);
