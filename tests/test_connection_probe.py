@@ -132,6 +132,10 @@ def _fake_probe_client(*, status_code: int, health_payload: Any = None) -> type:
             *,
             headers: dict[str, str] | None = None,
             params: dict[str, Any] | None = None,
+            # extensions: the live client attaches {"sni_hostname": ...} when
+            # it pins the validated address for the dial (#207). Accepted and
+            # ignored here so this fake keeps working on either path.
+            extensions: dict[str, Any] | None = None,
         ) -> _FakeResponse:
             if url.endswith("/health"):
                 return _FakeResponse(200, health_payload)
