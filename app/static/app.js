@@ -323,8 +323,53 @@ const welcomeEls = {
   skip: document.getElementById('welcomeSkipBtn'),
 };
 
+// #151: the overlay declares role="dialog" aria-modal="true" and covers the
+// viewport, but nothing enforced that -- Tab walked straight into the config
+// form hidden behind the backdrop. Marking the page inert takes the
+// background out of the tab order (and out of the accessibility tree) for
+// browsers that support it; the Tab handler below is the behaviour guarantee
+// for the ones that don't.
+function setPageInert(inert) {
+  const page = document.querySelector('main.page');
+  if (!page) {
+    return;
+  }
+  if (inert) {
+    page.inert = true;
+    page.setAttribute('aria-hidden', 'true');
+  } else {
+    page.inert = false;
+    page.removeAttribute('aria-hidden');
+  }
+}
+
+function welcomeFocusables() {
+  return [welcomeEls.tour, welcomeEls.sample, welcomeEls.skip].filter(
+    (button) => button && !button.disabled && !button.hidden,
+  );
+}
+
+// Keeps Tab/Shift+Tab inside the dialog's own buttons. Focus that is already
+// outside the dialog (a background control, or <body>) is pulled back to the
+// leading edge rather than allowed to continue through the page.
+function trapWelcomeFocus(event) {
+  const focusable = welcomeFocusables();
+  if (!focusable.length) {
+    return;
+  }
+  event.preventDefault();
+  const current = focusable.indexOf(document.activeElement);
+  if (current === -1) {
+    focusable[event.shiftKey ? focusable.length - 1 : 0].focus();
+    return;
+  }
+  const delta = event.shiftKey ? -1 : 1;
+  focusable[(current + delta + focusable.length) % focusable.length].focus();
+}
+
 function hideWelcome() {
   welcomeEls.overlay.hidden = true;
+  setPageInert(false);
   markOnboarded();
 }
 
@@ -333,6 +378,7 @@ function maybeShowWelcome() {
     return;
   }
   welcomeEls.overlay.hidden = false;
+  setPageInert(true);
   welcomeEls.tour.focus();
 }
 
@@ -1678,6 +1724,12 @@ async function resetState() {
       body: JSON.stringify(buildConfig()),
     });
     ids.lineageResults.innerHTML = '';
+    // The records those filters name are gone, so leaving them in place
+    // points both export links (and the trace box) at a lot code that no
+    // longer exists -- an export that silently returns nothing (#150).
+    ids.lotLookup.value = '';
+    ids.exportLot.value = '';
+    updateExportLink();
     setStatus('Cleared line state and shift log.', 'success', 2500);
     await refresh();
   } catch (error) {
@@ -1685,19 +1737,35 @@ async function resetState() {
   }
 }
 
+// #149: four independent surfaces call lookupLineage() -- the events-table
+// lot buttons, the lineage-flow node/edge links, the record spotlight, and
+// the trace box itself -- none of them guarded. Two lots clicked in quick
+// succession therefore leave two fetches in flight, and whichever resolved
+// last used to win the panel regardless of click order, so the trace on
+// screen could belong to a different lot than the one the input names.
+// A monotonic token makes any superseded response a no-op.
+let lineageRequestSeq = 0;
+
 async function lookupLineage() {
   const lotCode = ids.lotLookup.value.trim();
   if (!lotCode) {
     setStatus('Enter a lot code first.', 'error', 5000);
     return;
   }
+  const requestId = ++lineageRequestSeq;
   try {
     const payload = await api(`/api/lineage/${encodeURIComponent(lotCode)}`);
+    if (requestId !== lineageRequestSeq) {
+      return;
+    }
     renderLineage(payload, lotCode);
     journey.traced = true;
     renderGuide();
     setStatus(`Loaded lineage for ${lotCode}.`, 'success', 2500);
   } catch (error) {
+    if (requestId !== lineageRequestSeq) {
+      return;
+    }
     ids.lineageResults.innerHTML = `<p class="note">${escapeHtml(error.message)}</p>`;
     setStatus(error.message, 'error', 5000);
   }
@@ -1789,6 +1857,10 @@ welcomeEls.sample.addEventListener('click', () => {
 });
 welcomeEls.skip.addEventListener('click', hideWelcome);
 document.addEventListener('keydown', (event) => {
+  if (event.key === 'Tab' && !welcomeEls.overlay.hidden) {
+    trapWelcomeFocus(event);
+    return;
+  }
   if (event.key !== 'Escape') {
     return;
   }
