@@ -67,15 +67,18 @@ app/
   controller.py          # Simulator lifecycle (start/stop/step/reset) and delivery fan-out
   csv_importer.py        # CSV parsing for scheduled events and seed lots
   cte_rules.py           # Required/recommended KDEs per CTE (pinned to RegEngine's contract)
+  delivery.py            # Delivery outcomes, batching, and the POST mechanics
   demo_fixtures.py       # Deterministic demo playback fixtures (RegEngine-canonical KDEs)
   engine.py              # CTE generation and lot lineage logic
   epcis_export.py        # EPCIS 2.0 JSON-LD export scaffolding
   fda_export.py          # FDA-request CSV export presets and rendering
   industry_adapters.py   # Industry-specific event shaping (produce, seafood, dairy)
+  integration_config.py  # Delivery-config projections: validation, merge, sanitize, status
   main.py                # FastAPI app and route wiring
   mock_service.py        # RegEngine stand-in mirroring the live webhook's validation
   regengine_client.py    # HTTP client for live delivery + connection-check probe
   routers/               # API routers (simulation, integration, events, exports, ...)
+  runtime_guard.py       # Startup check refusing a multi-worker or multi-replica runtime
   scenario_saves.py      # Per-scenario saved config and event-log snapshots
   scenarios.py           # Named scenario presets for product/location/flow mixes
   schemas/               # Pydantic models (domain, simulation, ingestion, integration, ...)
