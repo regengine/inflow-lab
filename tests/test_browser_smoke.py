@@ -53,6 +53,45 @@ def test_browser_smoke_config_requires_username_password_pair(monkeypatch):
         _load_config()
 
 
+def test_browser_smoke_config_rejects_a_cross_source_credential_pair(monkeypatch):
+    # A freshly set browser username plus a REMOTE password left exported by
+    # an earlier remote_smoke or live_trial session (#191). Each field is
+    # present, but they never appeared together in one source.
+    monkeypatch.setenv("REGENGINE_BROWSER_USERNAME", "local-test-user")
+    monkeypatch.delenv("REGENGINE_BROWSER_PASSWORD", raising=False)
+    monkeypatch.delenv("REGENGINE_REMOTE_USERNAME", raising=False)
+    monkeypatch.setenv("REGENGINE_REMOTE_PASSWORD", "stale-demo-password-from-a-different-job")
+
+    with pytest.raises(
+        RuntimeError,
+        match="REGENGINE_BROWSER_USERNAME and REGENGINE_BROWSER_PASSWORD must be provided together",
+    ):
+        _load_config()
+
+
+def test_browser_smoke_config_rejects_the_reverse_cross_source_pair(monkeypatch):
+    monkeypatch.delenv("REGENGINE_BROWSER_USERNAME", raising=False)
+    monkeypatch.setenv("REGENGINE_BROWSER_PASSWORD", "browser-pass")
+    monkeypatch.setenv("REGENGINE_REMOTE_USERNAME", "remote-user")
+    monkeypatch.delenv("REGENGINE_REMOTE_PASSWORD", raising=False)
+
+    with pytest.raises(RuntimeError, match="must be provided together"):
+        _load_config()
+
+
+def test_browser_smoke_config_takes_the_browser_pair_whole(monkeypatch):
+    # Both pairs complete: the browser pair wins, and no field is sourced
+    # from the remote one.
+    monkeypatch.setenv("REGENGINE_BROWSER_USERNAME", "browser-user")
+    monkeypatch.setenv("REGENGINE_BROWSER_PASSWORD", "browser-pass")
+    monkeypatch.setenv("REGENGINE_REMOTE_USERNAME", "remote-user")
+    monkeypatch.setenv("REGENGINE_REMOTE_PASSWORD", "remote-pass")
+
+    config = _load_config()
+
+    assert (config.username, config.password) == ("browser-user", "browser-pass")
+
+
 def test_browser_smoke_checks_expected_healthz_build(monkeypatch):
     def fake_get(url, timeout):
         assert url == "https://demo.example.test/api/healthz"

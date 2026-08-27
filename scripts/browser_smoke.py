@@ -44,13 +44,43 @@ def main() -> int:
     return 0
 
 
+# The Basic Auth pairs this smoke accepts, most specific first. Order is
+# the fallback order; each tuple is resolved as a unit.
+_CREDENTIAL_ENV_PAIRS = (
+    ("REGENGINE_BROWSER_USERNAME", "REGENGINE_BROWSER_PASSWORD"),
+    ("REGENGINE_REMOTE_USERNAME", "REGENGINE_REMOTE_PASSWORD"),
+)
+
+
+def _credentials_from_env() -> tuple[str | None, str | None]:
+    """Resolve the Basic Auth pair as a unit rather than field by field.
+
+    Resolving each field independently -- browser username or else remote
+    username, browser password or else remote password -- let a freshly set
+    REGENGINE_BROWSER_USERNAME combine with a REGENGINE_REMOTE_PASSWORD left
+    exported from an earlier remote_smoke or live_trial session. The old
+    check compared presence only (bool(username) != bool(password)), saw one
+    of each, and was satisfied, so the run built a credential pair that had
+    never appeared together in any single source. Playwright then 401s on
+    the first page load, which reads as "the console is broken" rather than
+    "your environment variables do not match" (#191).
+
+    The first pair with either field set is the pair selected; a half-set
+    pair is the error, and a later pair is not consulted to fill the gap.
+    """
+    for username_var, password_var in _CREDENTIAL_ENV_PAIRS:
+        username = _env_text(username_var)
+        password = _env_text(password_var)
+        if not username and not password:
+            continue
+        if not username or not password:
+            raise RuntimeError(f"{username_var} and {password_var} must be provided together")
+        return username, password
+    return None, None
+
+
 def _load_config() -> BrowserSmokeConfig:
-    username = _env_text("REGENGINE_BROWSER_USERNAME") or _env_text("REGENGINE_REMOTE_USERNAME")
-    password = _env_text("REGENGINE_BROWSER_PASSWORD") or _env_text("REGENGINE_REMOTE_PASSWORD")
-    if bool(username) != bool(password):
-        raise RuntimeError(
-            "REGENGINE_BROWSER_USERNAME and REGENGINE_BROWSER_PASSWORD must be provided together"
-        )
+    username, password = _credentials_from_env()
 
     return BrowserSmokeConfig(
         base_url=_env_text("REGENGINE_BROWSER_BASE_URL") or _env_text("REGENGINE_REMOTE_BASE_URL"),
