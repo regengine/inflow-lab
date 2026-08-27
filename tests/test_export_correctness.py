@@ -14,6 +14,7 @@ still run through the real render functions.
 
 from __future__ import annotations
 
+import json
 import csv
 import io
 from datetime import UTC, datetime, timedelta, timezone
@@ -377,3 +378,51 @@ def test_fda_day_filter_agrees_with_the_exported_date_column(tmp_path):
     local_day = offset_timestamp.date().isoformat()
     assert local_day == "2026-02-05"
     assert store.all_between(start_date=local_day, end_date=local_day) == []
+
+
+# ---------------------------------------------------------------------------
+# #162 — an imported location_gln must reach both exports, not just the model
+# ---------------------------------------------------------------------------
+
+
+def test_imported_location_gln_reaches_both_exports():
+    """#162 was only half done.
+
+    ``csv_importer`` correctly threads a GLN column into
+    ``RegEngineEvent.location_gln``, and a test asserted that parsed field. But
+    both exporters keyed solely on the engine's static name->GLN registry --
+    which an imported location is not in -- so the FDA "Location Identifier
+    (GLN)" cell came out empty and the GLN never appeared in the EPCIS
+    document at all. The half that was dropped is the half a regulator sees.
+    """
+    gln = "0812345000013"
+    record = _transformation_record(None)
+    record.event.location_name = "Nowhere Farm"
+    record.event.location_gln = gln
+
+    def _registry_miss(_location_name: str) -> str:
+        # The engine's registry does not know an imported location, which is
+        # exactly the condition under test.
+        return ""
+
+    csv_text = render_fda_request_csv([record], location_gln=_registry_miss)
+    rows = list(csv.DictReader(io.StringIO(csv_text)))
+    assert rows, "no rows exported"
+    assert rows[0]["Location Identifier (GLN)"] == gln, (
+        "the imported GLN did not reach the FDA export column"
+    )
+
+    document = render_epcis_document(
+        [record],
+        source="test",
+        location_gln=_registry_miss,
+        creation_date=datetime(2026, 2, 5, tzinfo=UTC),
+    )
+    assert gln in json.dumps(document), "the imported GLN never appeared in the EPCIS document"
+
+    # The registry still wins when it does know the location -- the event's
+    # own value is a fallback, not an override.
+    known_gln = "0899999000017"
+    csv_text = render_fda_request_csv([record], location_gln=lambda _name: known_gln)
+    rows = list(csv.DictReader(io.StringIO(csv_text)))
+    assert rows[0]["Location Identifier (GLN)"] == known_gln

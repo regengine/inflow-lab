@@ -122,7 +122,15 @@ def render_fda_request_csv(
                 "Quantity": event.quantity,
                 "Unit of Measure": event.unit_of_measure,
                 "Location Description": event.location_name,
-                "Location Identifier (GLN)": location_gln(event.location_name),
+                # Registry lookup first, then the event's own GLN (#162).
+                # csv_importer threads a GLN column into
+                # RegEngineEvent.location_gln, but this column only ever
+                # consulted the engine's static name->GLN registry -- which an
+                # imported location is not in -- so an operator who supplied a
+                # GLN got an empty cell in the regulatory export.
+                "Location Identifier (GLN)": (
+                    location_gln(event.location_name) or event.location_gln or ""
+                ),
                 "Ship-To / Previous Source Location Description": _linked_location_description(event),
                 "TLC Source Reference": _tlc_source_reference(event),
                 "Date": normalized_timestamp.date().isoformat(),

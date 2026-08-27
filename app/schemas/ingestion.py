@@ -18,7 +18,59 @@ class IngestPayload(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     source: str = "codex-simulator"
+    # Declared explicitly rather than left to be refused as an extra. The
+    # contract reference states RegEngine "resolves tenant from body, then
+    # API-key lookup, then RBAC principal", so a body-level tenant id is part
+    # of the shape real RegEngine accepts -- and this route exists to mirror
+    # live validation for external callers. Rejecting it made the mock
+    # stricter than the thing it simulates, which is a parity break in the
+    # direction that produces false confidence.
+    # exclude=True is serialization-only in pydantic: the field is still
+    # populated from an incoming body, but never appears in model_dump(). That
+    # matters because this same model builds the OUTBOUND payload in
+    # LiveRegEngineClient.ingest -- adding a field that serialized would have
+    # silently changed the bytes sent to real RegEngine (and the bytes the
+    # HMAC is computed over). Tenant is carried to live RegEngine in the
+    # X-Tenant-ID header, which is unchanged.
+    tenant_id: str | None = Field(default=None, exclude=True)
     events: list[RegEngineEvent]
+
+    @field_validator("events", mode="before")
+    @classmethod
+    def _reject_unknown_event_fields(cls, value: Any) -> Any:
+        """Forbid unknown keys on each EVENT, not just the envelope.
+
+        The envelope's extra="forbid" catches a misspelled "events" key. It
+        does nothing about the far likelier integration typo -- a misspelled
+        field inside an event ("product_desc", "traceability_lot_codes") --
+        because RegEngineEvent itself is permissive, so those were silently
+        dropped and the event ingested as if it were complete. Surfacing
+        exactly that is what this simulator exists for.
+
+        Enforced here rather than by putting extra="forbid" on RegEngineEvent,
+        because that model is also what StoredEventRecord persists and reloads.
+        Forbidding there would make an event written by a version carrying one
+        extra field unreadable on the way back in -- silently skipped, since
+        the read path logs and continues -- turning a typo guard into data
+        loss.
+
+        Only raw dicts are checked, so internal construction from already-built
+        RegEngineEvent instances is untouched.
+        """
+        if not isinstance(value, list):
+            return value
+        known_fields = set(RegEngineEvent.model_fields)
+        for index, event in enumerate(value):
+            if not isinstance(event, dict):
+                continue
+            unknown = sorted(set(event) - known_fields)
+            if unknown:
+                raise ValueError(
+                    f"events[{index}] has unknown field(s) {unknown}. Allowed fields: "
+                    f"{sorted(known_fields)}. Per-event data that is not a defined KDE "
+                    "field belongs inside 'kdes'."
+                )
+        return value
 
 
 class IngestResponseEvent(BaseModel):
