@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import logging
 from datetime import UTC, datetime
+from pathlib import Path
 from typing import Any
 
 from fastapi import APIRouter, Depends
@@ -42,13 +43,14 @@ def _store_write_error(store: EventStore) -> str | None:
     what would make a real ingest fail (full disk, detached volume,
     permission change), not a proxy for it.
 
-    Cheap and non-destructive, so it's safe to run on every ``/healthz``
-    poll (every 30s, from the Docker ``HEALTHCHECK`` / railway.json
-    ``healthcheckPath``): it appends a single blank line, and
-    ``EventStore.read_persisted_records()`` already skips blank lines on
-    load, so the probe never shows up as a phantom record and never needs
-    cleanup or its own locking -- an ``O_APPEND`` write of one line can't
-    clobber a concurrent real write either.
+    Writes a fixed-size SENTINEL FILE beside the event log, never the event
+    log itself. Appending a blank line to ``persist_path`` on every poll -- as
+    this first did -- is an unauthenticated, unbounded append to the tenant's
+    real data file: the Docker ``HEALTHCHECK --interval=30s`` alone grows the
+    persistent volume forever, and an unauthenticated caller can drive it far
+    faster than that. The sentinel is opened with ``"w"``, so it is truncated
+    on every probe and can never exceed one line, while still exercising the
+    same mount, permission bits and free space a real ingest needs.
 
     Deliberately write-only: never reads ``persist_path`` back. A device
     standing in for "can't write" (like ``/dev/full``) often doesn't fail a
@@ -56,14 +58,40 @@ def _store_write_error(store: EventStore) -> str | None:
     EOF, which would turn a health check into a hang rather than a fast,
     correct "unhealthy".
     """
+    probe_path, mode = _write_probe_target(store)
     try:
-        store.persist_path.parent.mkdir(parents=True, exist_ok=True)
-        with store.persist_path.open("a", encoding="utf-8") as handle:
-            handle.write("\n")
+        probe_path.parent.mkdir(parents=True, exist_ok=True)
+        with probe_path.open(mode, encoding="utf-8") as handle:
+            handle.write("ok\n")
             handle.flush()
     except OSError as exc:
         return str(exc)
     return None
+
+
+def _write_probe_target(store: EventStore) -> tuple[Path, str]:
+    """Where the health probe writes, and in which mode.
+
+    Normally a fixed SENTINEL file beside the tenant's event log, opened with
+    ``"w"`` so it is truncated on every probe and can never exceed one line.
+    Same directory as ``persist_path`` on purpose: the probe has to fail on
+    whatever would make a real ingest fail, which means the same filesystem,
+    mount, free space and directory permissions. A dotfile, so it never looks
+    like tenant data, and a fixed name, so it is reused rather than
+    accumulated.
+
+    The exception is a ``persist_path`` that already exists and is NOT a
+    regular file -- a character device, as in #184's own reproduction against
+    ``/dev/full``. A sibling sentinel there would probe the containing
+    directory (``/dev``) rather than the device, and would happily succeed
+    while every real ingest write failed with ENOSPC. So a device is probed
+    directly, in append mode: it is the only meaningful target, and a device
+    cannot grow.
+    """
+    persist_path = store.persist_path
+    if persist_path.exists() and not persist_path.is_file():
+        return persist_path, "a"
+    return persist_path.parent / ".healthz-write-probe", "w"
 
 
 @router.get("/health", response_model=None)
