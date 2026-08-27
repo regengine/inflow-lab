@@ -9,7 +9,11 @@ from fastapi.responses import StreamingResponse
 
 from .. import tenancy
 from ..auth import TenantContext
-from ..controller import SimulationController
+from ..controller import (
+    SimulationController,
+    config_with_stored_delivery_secrets,
+    request_with_stored_delivery_secrets,
+)
 from ..dependencies import get_active_controller, get_tenant_context
 from ..schemas.ingestion import ReplayRequest, ReplayResponse
 from ..schemas.simulation import ResetResponse, SimulationConfig, StartRequest, StatusResponse, StepResponse
@@ -69,7 +73,10 @@ async def simulate_start(
     context: TenantContext = Depends(get_tenant_context),
     active_controller: SimulationController = Depends(get_active_controller),
 ) -> StatusResponse:
-    await active_controller.start(tenancy.scope_config(context, start_request.config))
+    # #148: the console's form cannot round-trip the API key (status() masks
+    # it), so an omitted credential here means "unchanged", not "clear it".
+    config = config_with_stored_delivery_secrets(active_controller, start_request.config)
+    await active_controller.start(tenancy.scope_config(context, config))
     return StatusResponse.model_validate(active_controller.status())
 
 
@@ -87,7 +94,12 @@ async def simulate_reset(
     context: TenantContext = Depends(get_tenant_context),
     active_controller: SimulationController = Depends(get_active_controller),
 ) -> ResetResponse:
-    await active_controller.reset(tenancy.scope_config(context, config) if config else None)
+    scoped = (
+        tenancy.scope_config(context, config_with_stored_delivery_secrets(active_controller, config))
+        if config
+        else None
+    )
+    await active_controller.reset(scoped)
     return ResetResponse(status="reset")
 
 
@@ -105,7 +117,8 @@ async def simulate_replay(
     context: TenantContext = Depends(get_tenant_context),
     active_controller: SimulationController = Depends(get_active_controller),
 ) -> ReplayResponse:
-    return await active_controller.replay(tenancy.scope_replay_request(context, replay_request))
+    merged = request_with_stored_delivery_secrets(active_controller, replay_request)
+    return await active_controller.replay(tenancy.scope_replay_request(context, merged))
 
 
 def sse_message(event_name: str, payload: dict[str, Any]) -> str:

@@ -413,6 +413,48 @@ function setStatus(message, tone = 'neutral', holdMs = 0) {
   state.statusHoldUntil = holdMs > 0 ? Date.now() + holdMs : 0;
 }
 
+// #148: deliveryMode/endpoint/apiKey/tenantId were only ever written by
+// applyConfigToForm(), which runs from "Load saved" and nowhere else. On a
+// plain page load, a reload, or in a second tab they fell back to their raw
+// HTML defaults -- Sandbox, blank endpoint, blank tenant -- even while the
+// server was delivering live. buildConfig() reads those same raw fields into
+// every Start / Clear shift / Retry / fixture load / CSV import, and the
+// server used to replace its whole delivery config with whatever arrived, so
+// one reload was enough to silently downgrade live delivery to the sandbox.
+//
+// Hydrating from the server's own status on every snapshot keeps the form
+// honest. The dirty flag is what stops a 1.5s snapshot tick from stomping an
+// edit in progress: any change to a delivery control sets it, and it clears
+// once that edit has actually been pushed to the server.
+let deliveryFormDirty = false;
+
+function markDeliveryFormDirty() {
+  deliveryFormDirty = true;
+}
+
+function deliveryFormPushed() {
+  deliveryFormDirty = false;
+}
+
+function hydrateDeliveryForm(status = state.status) {
+  const delivery = status?.config?.delivery;
+  if (!delivery || deliveryFormDirty) {
+    return;
+  }
+  if (delivery.mode) {
+    ids.deliveryMode.value = delivery.mode;
+  }
+  // Only write back what the server actually reported. api_key is never
+  // returned, and tenant_id is withheld in live mode, so blanking these from
+  // an absent value would be the very wipe this fixes.
+  if (delivery.endpoint) {
+    ids.endpoint.value = delivery.endpoint;
+  }
+  if (delivery.tenant_id) {
+    ids.tenantId.value = delivery.tenant_id;
+  }
+}
+
 function buildConfig() {
   const endpoint = ids.endpoint.value.trim() || DEFAULT_LIVE_INGEST_ENDPOINT;
   const apiKey = ids.apiKey.value.trim();
@@ -1541,6 +1583,7 @@ function renderSnapshot(status, events, health = state.health) {
   state.status = status;
   state.health = health;
   state.events = events;
+  hydrateDeliveryForm(status);
   updateShellStatus(status, events, health);
   renderGuide(status, events);
   renderReadinessBanner(activeScenarioSummary(), events, status);
@@ -1737,6 +1780,7 @@ async function saveIntegrationSettings() {
       body: JSON.stringify(request),
     });
     renderConnectionStatus(integration);
+    deliveryFormPushed();
     setStatus('Saved RegEngine connection settings.', 'success', 2500);
     await refresh();
   } catch (error) {
@@ -1791,6 +1835,7 @@ async function startLoop() {
       method: 'POST',
       body: JSON.stringify({ config: buildConfig() }),
     });
+    deliveryFormPushed();
     setStatus('Started production line.', 'success', 2500);
     await refresh();
   } catch (error) {
@@ -1839,6 +1884,7 @@ async function retryFailedDeliveries() {
       method: 'POST',
       body: JSON.stringify({ delivery: config.delivery, source: config.source }),
     });
+    deliveryFormPushed();
     if (result.status === 'empty') {
       setStatus('No failed deliveries are waiting to retry.', 'success', 2500);
     } else if (result.status === 'skipped') {
@@ -1905,6 +1951,7 @@ async function loadSelectedDemoFixture() {
         delivery: config.delivery,
       }),
     });
+    deliveryFormPushed();
     const fixtureScenario = state.scenarioCatalog[result.scenario];
     renderScenarioOptions(
       state.allScenarios.length ? state.allScenarios : Object.values(state.scenarioCatalog),
@@ -1967,6 +2014,7 @@ async function importCsv() {
         delivery: config.delivery,
       }),
     });
+    deliveryFormPushed();
     renderImportResult(result);
     if (result.status === 'delivery_failed') {
       setStatus(`Imported ${result.accepted} row(s), but delivery failed: ${result.error || 'delivery error'}`, 'error', 7000);
@@ -1996,6 +2044,7 @@ async function resetState() {
     ids.lotLookup.value = '';
     ids.exportLot.value = '';
     updateExportLink();
+    deliveryFormPushed();
     setStatus('Cleared line state and shift log.', 'success', 2500);
     await refresh();
   } catch (error) {
@@ -2155,6 +2204,12 @@ ids.exportLot.addEventListener('input', updateExportLink);
 ids.exportStartDate.addEventListener('change', updateExportLink);
 ids.exportEndDate.addEventListener('change', updateExportLink);
 ids.deliveryMode.addEventListener('change', () => updateShellStatus());
+// Any edit to a delivery control wins over server hydration until it has been
+// submitted -- a snapshot tick must never overwrite what the operator typed.
+for (const control of [ids.deliveryMode, ids.endpoint, ids.apiKey, ids.tenantId]) {
+  control?.addEventListener('input', markDeliveryFormDirty);
+  control?.addEventListener('change', markDeliveryFormDirty);
+}
 ids.operationType.addEventListener('change', () => {
   renderScenarioOptions(state.allScenarios, ids.scenario.value, ids.operationType.value);
 });

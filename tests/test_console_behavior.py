@@ -845,3 +845,313 @@ def test_fallback_poll_does_not_stack_overlapping_refreshes() -> None:
     )
     assert result["duringFlight"] == 3, "one poll should issue exactly the three refresh() requests"
     assert result["afterSecondTick"] == 3, "a second poll fired while one was in flight"
+
+
+# ---------------------------------------------------------------------------
+# #148 -- a stale form must not downgrade or misdirect live delivery
+#
+# Two halves, because the defect has two: the console's form did not reflect
+# the server's real delivery config after a reload, and the server treated an
+# omitted credential in a request body as "clear it".
+# ---------------------------------------------------------------------------
+
+_LIVE_ENDPOINT = "https://staging.regengine.example/api/v1/webhooks/ingest"
+_LIVE_TENANT = "11111111-1111-1111-1111-111111111111"
+_LIVE_KEY = "rge_live_reload_secret"
+
+
+def test_reloaded_console_form_agrees_with_the_servers_delivery_config() -> None:
+    """The header badges always read "Connected" from server status, but the
+    Delivery dropdown fell back to its raw HTML default of Sandbox -- and the
+    form is what buildConfig() sends on the next Start/Clear shift/Retry."""
+    result = run_console(
+        f"""
+        const routes = __dom.snapshotRoutes();
+        routes['/api/simulate/status'] = {{
+          running: false,
+          config: {{
+            source: 'codex-simulator',
+            scenario: 'leafy_greens_supplier',
+            scale: 'midsize',
+            interval_seconds: 1.5,
+            batch_size: 3,
+            seed: null,
+            persist_path: 'data/events.jsonl',
+            delivery: {{
+              mode: 'live',
+              endpoint: {json.dumps(_LIVE_ENDPOINT)},
+              api_key: null,
+              tenant_id: null,
+              mock_friction: [],
+            }},
+          }},
+          stats: {{ total_records: 0, unique_lots: 0, delivery: {{}}, engine: {{}}, audit: null }},
+        }};
+        __dom.routes(routes);
+
+        const onLoad = {{ mode: ids.deliveryMode.value, endpoint: ids.endpoint.value }};
+        await refresh();
+        const afterReload = {{
+          mode: ids.deliveryMode.value,
+          endpoint: ids.endpoint.value,
+          headerPill: ids.deliveryModePill.textContent,
+          connectionPill: ids.connectionPill.textContent,
+          submitted: buildConfig().delivery,
+        }};
+
+        // An operator mid-edit must win over the next snapshot tick.
+        ids.deliveryMode.value = 'none';
+        await ids.deliveryMode.dispatchEvent('change');
+        ids.apiKey.value = 'typed-but-not-submitted';
+        await ids.apiKey.dispatchEvent('input');
+        await refresh();
+        const afterEdit = {{ mode: ids.deliveryMode.value, apiKey: ids.apiKey.value }};
+
+        return {{ onLoad, afterReload, afterEdit }};
+        """
+    )
+    # The raw markup default, before any hydration -- this is what used to win.
+    assert result["onLoad"] == {"mode": "mock", "endpoint": ""}
+
+    assert result["afterReload"]["mode"] == "live"
+    assert result["afterReload"]["endpoint"] == _LIVE_ENDPOINT
+    assert result["afterReload"]["headerPill"] == "connected"
+    assert result["afterReload"]["connectionPill"] == "Connected"
+    # The form is what gets submitted, so this is the criterion that matters.
+    assert result["afterReload"]["submitted"]["mode"] == "live"
+    assert result["afterReload"]["submitted"]["endpoint"] == _LIVE_ENDPOINT
+    # api_key is never returned by status(); the client must send null, not "".
+    assert result["afterReload"]["submitted"]["api_key"] is None
+
+    assert result["afterEdit"] == {"mode": "none", "apiKey": "typed-but-not-submitted"}
+
+
+def _connect_live_workspace(client) -> None:
+    response = client.post(
+        "/api/integration/configure",
+        json={
+            "mode": "live",
+            "endpoint": _LIVE_ENDPOINT,
+            "api_key": _LIVE_KEY,
+            "tenant_id": _LIVE_TENANT,
+        },
+    )
+    assert response.status_code == 200, response.text
+
+
+def _post_reload_delivery_block() -> dict:
+    """Exactly what buildConfig() sends after a reload: mode and endpoint
+    hydrated from status, credentials null because status never returns them."""
+    return {
+        "mode": "live",
+        "endpoint": _LIVE_ENDPOINT,
+        "api_key": None,
+        "tenant_id": None,
+        "mock_friction": [],
+    }
+
+
+def test_clear_shift_after_reload_keeps_the_live_credentials() -> None:
+    """reset() replaced the whole stored config with the submitted one, so the
+    console's post-reload body -- which cannot carry the API key -- wiped it."""
+    import asyncio
+
+    from fastapi.testclient import TestClient
+
+    from app.main import app, controller
+    from app.schemas.simulation import SimulationConfig
+
+    asyncio.run(controller.reset(SimulationConfig()))
+    try:
+        with TestClient(app) as client:
+            _connect_live_workspace(client)
+
+            status = client.get("/api/simulate/status").json()
+            assert status["config"]["delivery"]["api_key"] is None, "status must keep masking the key"
+
+            response = client.post(
+                "/api/simulate/reset",
+                json={
+                    "source": "codex-simulator",
+                    "scenario": "leafy_greens_supplier",
+                    "scale": "midsize",
+                    "interval_seconds": 1.5,
+                    "batch_size": 3,
+                    "seed": None,
+                    "persist_path": "data/events.jsonl",
+                    "delivery": _post_reload_delivery_block(),
+                },
+            )
+            assert response.status_code == 200, response.text
+
+            integration = client.get("/api/integration/status").json()
+            assert integration["mode"] == "live"
+            assert integration["api_key_configured"] is True
+            assert integration["tenant_configured"] is True
+    finally:
+        asyncio.run(controller.reset(SimulationConfig()))
+
+
+def test_retry_after_reload_posts_to_the_live_endpoint_not_the_sandbox() -> None:
+    """The console promises "Retry failed is always safe". A retry built from a
+    post-reload form must still reach RegEngine with the stored credentials --
+    not be quietly absorbed by the built-in mock and reported as posted."""
+    import asyncio
+
+    from fastapi.testclient import TestClient
+
+    from app.main import app, controller
+    from app.schemas.domain import CTEType, DestinationMode, RegEngineEvent, StoredEventRecord
+    from app.schemas.simulation import SimulationConfig
+
+    seen: list[dict] = []
+
+    class _RecordingLiveResult:
+        response = {"accepted": 1, "rejected": 0, "events": []}
+        metadata = {"delivery_mode": "live"}
+
+    async def _recording_ingest(payload, config, idempotency_key=None):
+        seen.append(
+            {
+                "endpoint": str(config.delivery.endpoint),
+                "api_key": config.delivery.api_key,
+                "tenant_id": config.delivery.tenant_id,
+            }
+        )
+        return _RecordingLiveResult()
+
+    asyncio.run(controller.reset(SimulationConfig()))
+    original_ingest = controller.live_client.ingest
+    controller.live_client.ingest = _recording_ingest
+    try:
+        with TestClient(app) as client:
+            _connect_live_workspace(client)
+            controller.store.add_many(
+                [
+                    StoredEventRecord(
+                        payload_source="console-reload-suite",
+                        event=RegEngineEvent(
+                            cte_type=CTEType.HARVESTING,
+                            traceability_lot_code="TLC-RELOAD-0001",
+                            product_description="Romaine Lettuce",
+                            quantity=100,
+                            unit_of_measure="cases",
+                            location_name="Valley Fresh Farms",
+                            timestamp="2026-03-01T08:00:00Z",
+                            kdes={
+                                "harvest_date": "2026-03-01",
+                                "reference_document": "Harvest Log HL-RELOAD",
+                            },
+                        ),
+                        destination_mode=DestinationMode.LIVE,
+                        delivery_status="failed",
+                        error="temporary outage",
+                    )
+                ]
+            )
+
+            response = client.post(
+                "/api/delivery/retry",
+                json={"delivery": _post_reload_delivery_block(), "source": "codex-simulator"},
+            )
+            assert response.status_code == 200, response.text
+            assert response.json()["delivery_mode"] == "live"
+    finally:
+        controller.live_client.ingest = original_ingest
+        asyncio.run(controller.reset(SimulationConfig()))
+
+    assert seen, "the retry never reached the live client -- it went to the sandbox"
+    assert seen[0]["endpoint"] == _LIVE_ENDPOINT
+    assert seen[0]["api_key"] == _LIVE_KEY
+    assert seen[0]["tenant_id"] == _LIVE_TENANT
+
+
+def test_credentials_are_never_carried_across_to_a_different_endpoint() -> None:
+    """"Omitted means unchanged" must not become "inherit this key for
+    whatever host you just typed in"."""
+    import asyncio
+
+    from fastapi.testclient import TestClient
+
+    from app.main import app, controller
+    from app.schemas.simulation import SimulationConfig
+
+    asyncio.run(controller.reset(SimulationConfig()))
+    try:
+        with TestClient(app) as client:
+            _connect_live_workspace(client)
+
+            response = client.post(
+                "/api/simulate/reset",
+                json={
+                    "delivery": {
+                        "mode": "mock",
+                        "endpoint": "https://someone-elses.regengine.example/api/v1/webhooks/ingest",
+                        "api_key": None,
+                        "tenant_id": None,
+                        "mock_friction": [],
+                    },
+                },
+            )
+            assert response.status_code == 200, response.text
+
+            integration = client.get("/api/integration/status").json()
+            assert integration["endpoint_host"] == "someone-elses.regengine.example"
+            assert integration["api_key_configured"] is False
+            assert integration["tenant_configured"] is False
+    finally:
+        asyncio.run(controller.reset(SimulationConfig()))
+
+
+def test_a_directly_submitted_credential_still_replaces_the_stored_one() -> None:
+    """The merge only fills gaps; an operator who types a new key must get it."""
+    import asyncio
+
+    from fastapi.testclient import TestClient
+
+    from app.main import app, controller
+    from app.schemas.simulation import SimulationConfig
+
+    asyncio.run(controller.reset(SimulationConfig()))
+    try:
+        with TestClient(app) as client:
+            _connect_live_workspace(client)
+            response = client.post(
+                "/api/simulate/reset",
+                json={
+                    "delivery": {
+                        "mode": "live",
+                        "endpoint": _LIVE_ENDPOINT,
+                        "api_key": "rge_live_rotated_key",
+                        "tenant_id": "22222222-2222-2222-2222-222222222222",
+                        "mock_friction": [],
+                    },
+                },
+            )
+            assert response.status_code == 200, response.text
+            assert controller.config.delivery.api_key == "rge_live_rotated_key"
+            assert controller.config.delivery.tenant_id == "22222222-2222-2222-2222-222222222222"
+    finally:
+        asyncio.run(controller.reset(SimulationConfig()))
+
+
+def test_a_direct_controller_reset_still_clears_everything() -> None:
+    """The merge lives at the HTTP boundary on purpose: controller.reset(
+    SimulationConfig()) is how every test file returns to a clean default, and
+    it must keep clearing credentials outright."""
+    import asyncio
+
+    from fastapi.testclient import TestClient
+
+    from app.main import app, controller
+    from app.schemas.simulation import SimulationConfig
+
+    asyncio.run(controller.reset(SimulationConfig()))
+    with TestClient(app) as client:
+        _connect_live_workspace(client)
+        assert controller.config.delivery.api_key == _LIVE_KEY
+
+    asyncio.run(controller.reset(SimulationConfig()))
+    assert controller.config.delivery.api_key is None
+    assert controller.config.delivery.tenant_id is None
+    assert controller.config.delivery.mode.value == "mock"

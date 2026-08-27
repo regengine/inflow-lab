@@ -1206,6 +1206,75 @@ def _build_stored_records(
     return stored_records
 
 
+def merge_omitted_delivery_secrets(
+    stored: DeliveryConfig, requested: DeliveryConfig
+) -> DeliveryConfig:
+    """Carry forward credentials a *request body* left out (#148).
+
+    The console cannot round-trip these fields: ``status()`` runs every
+    config through ``_sanitize_public_config``, which always strips
+    ``api_key`` and also strips ``tenant_id`` in live mode, and
+    ``applyConfigToForm()`` blanks the API-key input deliberately. So a
+    ``delivery`` block that arrives with ``api_key=None`` means "I was not
+    given one to send", never "clear the stored one" -- and treating it as
+    the latter let a page reload silently strip a live credential on the
+    operator's next Start / Clear shift / Retry / fixture load, downgrading
+    or misdirecting delivery with no confirmation.
+
+    This is the same contract ``/api/integration/configure`` already honors
+    for its partial updates. It is applied at the HTTP boundary rather than
+    inside the controller on purpose: a direct ``controller.reset(
+    SimulationConfig())`` call means "give me a clean default" and must keep
+    clearing everything.
+
+    Credentials are never carried across to a *different* destination -- if
+    the request names an endpoint that is not the stored one, the caller is
+    pointing somewhere new and gets only what it sent.
+    """
+    if requested.api_key is not None and requested.tenant_id is not None:
+        return requested
+    if (
+        requested.endpoint is not None
+        and stored.endpoint is not None
+        and str(requested.endpoint) != str(stored.endpoint)
+    ):
+        return requested
+    updates: dict[str, Any] = {}
+    if requested.api_key is None and stored.api_key:
+        updates["api_key"] = stored.api_key
+    if requested.tenant_id is None and stored.tenant_id:
+        updates["tenant_id"] = stored.tenant_id
+    if not updates:
+        return requested
+    return requested.model_copy(update=updates, deep=True)
+
+
+def config_with_stored_delivery_secrets(
+    active_controller: "SimulationController", config: SimulationConfig
+) -> SimulationConfig:
+    """``merge_omitted_delivery_secrets`` for a whole submitted config (#148)."""
+    delivery = merge_omitted_delivery_secrets(active_controller.config.delivery, config.delivery)
+    if delivery is config.delivery:
+        return config
+    return config.model_copy(update={"delivery": delivery}, deep=True)
+
+
+def request_with_stored_delivery_secrets(
+    active_controller: "SimulationController", request: Any | None
+) -> Any | None:
+    """``merge_omitted_delivery_secrets`` for a request body carrying an
+    optional inline ``delivery`` block (retry, CSV import, fixture load,
+    replay). A request that omits ``delivery`` entirely already falls back to
+    the stored config inside the controller, so it is left untouched (#148).
+    """
+    if request is None or getattr(request, "delivery", None) is None:
+        return request
+    delivery = merge_omitted_delivery_secrets(active_controller.config.delivery, request.delivery)
+    if delivery is request.delivery:
+        return request
+    return request.model_copy(update={"delivery": delivery}, deep=True)
+
+
 def _validate_live_delivery(delivery: DeliveryConfig) -> None:
     if delivery.mode == DestinationMode.LIVE and (not delivery.api_key or not delivery.tenant_id):
         raise ValueError("Live delivery requires both api_key and tenant_id")
