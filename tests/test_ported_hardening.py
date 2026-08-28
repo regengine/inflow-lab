@@ -114,3 +114,60 @@ def test_a_reused_key_with_a_mismatched_count_is_still_a_replay() -> None:
 
     payload = IngestPayload(events=[])
     assert _is_idempotency_replay({"events": [1, 2]}, payload, reused_key=True)
+
+
+# --- spreadsheet formula injection in the FDA export (#65) ------------------
+
+
+@pytest.mark.parametrize("payload", ["=cmd|'/c calc'!A1", "+1+1", "-1+1", "@SUM(A1)"])
+def test_formula_leaders_are_neutralised_in_the_export(payload: str) -> None:
+    """A lot code reaches this export from CSV import and from the API.
+
+    Excel, LibreOffice and Sheets evaluate a cell beginning with one of these,
+    so an unescaped value executes when a reviewer opens the regulatory export.
+    """
+    from app.fda_export import _sanitize_cell
+
+    assert _sanitize_cell(payload) == "'" + payload
+
+
+def test_ordinary_values_are_untouched() -> None:
+    from app.fda_export import _sanitize_cell
+
+    assert _sanitize_cell("LOT-2026-001") == "LOT-2026-001"
+    assert _sanitize_cell(42) == 42
+
+
+# --- Basic Auth comparison does not short-circuit (#89) --------------------
+
+
+def test_both_credential_comparisons_run_for_a_wrong_username(monkeypatch: Any) -> None:
+    """`and` short-circuited, so a wrong username skipped the password compare.
+
+    The response then came back measurably sooner, which tells an attacker
+    when they have found the username -- the exact signal compare_digest
+    exists to hide.
+    """
+    import secrets as secrets_module
+
+    from app import auth
+
+    monkeypatch.setenv("REGENGINE_BASIC_AUTH_USERNAME", "admin")
+    monkeypatch.setenv("REGENGINE_BASIC_AUTH_PASSWORD", "hunter2")
+
+    calls: list[tuple[str, str]] = []
+    real = secrets_module.compare_digest
+
+    def counting(a: Any, b: Any) -> bool:
+        calls.append((a, b))
+        return real(a, b)
+
+    monkeypatch.setattr(auth.secrets, "compare_digest", counting)
+
+    with TestClient(app) as client:
+        response = client.get(
+            "/api/health", headers={"Authorization": "Basic d3Jvbmc6d3Jvbmc="}
+        )
+
+    assert response.status_code == 401
+    assert len(calls) == 2, f"expected both comparisons to run, saw {calls}"
