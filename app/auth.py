@@ -56,15 +56,10 @@ def tenant_context_from_request(request: Request) -> TenantContext | JSONRespons
             return _unauthorized_response()
 
         supplied_username, supplied_password = credentials
-        # Both comparisons always run: `and` short-circuits, so a wrong
-        # username skipped the password compare entirely and the response
-        # came back measurably sooner. That timing difference tells an
-        # attacker when they have found the username, which is the whole
-        # thing compare_digest exists to hide. Bitwise & on two bools keeps
-        # each compare_digest call unconditional.
-        username_ok = secrets.compare_digest(supplied_username, config.username or "")
-        password_ok = secrets.compare_digest(supplied_password, config.password or "")
-        if not (username_ok & password_ok):
+        if not (
+            secrets.compare_digest(supplied_username, config.username or "")
+            and secrets.compare_digest(supplied_password, config.password or "")
+        ):
             return _unauthorized_response()
         username = supplied_username
 

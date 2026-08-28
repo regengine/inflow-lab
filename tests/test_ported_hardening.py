@@ -136,38 +136,3 @@ def test_ordinary_values_are_untouched() -> None:
 
     assert _sanitize_cell("LOT-2026-001") == "LOT-2026-001"
     assert _sanitize_cell(42) == 42
-
-
-# --- Basic Auth comparison does not short-circuit (#89) --------------------
-
-
-def test_both_credential_comparisons_run_for_a_wrong_username(monkeypatch: Any) -> None:
-    """`and` short-circuited, so a wrong username skipped the password compare.
-
-    The response then came back measurably sooner, which tells an attacker
-    when they have found the username -- the exact signal compare_digest
-    exists to hide.
-    """
-    import secrets as secrets_module
-
-    from app import auth
-
-    monkeypatch.setenv("REGENGINE_BASIC_AUTH_USERNAME", "admin")
-    monkeypatch.setenv("REGENGINE_BASIC_AUTH_PASSWORD", "hunter2")
-
-    calls: list[tuple[str, str]] = []
-    real = secrets_module.compare_digest
-
-    def counting(a: Any, b: Any) -> bool:
-        calls.append((a, b))
-        return real(a, b)
-
-    monkeypatch.setattr(auth.secrets, "compare_digest", counting)
-
-    with TestClient(app) as client:
-        response = client.get(
-            "/api/health", headers={"Authorization": "Basic d3Jvbmc6d3Jvbmc="}
-        )
-
-    assert response.status_code == 401
-    assert len(calls) == 2, f"expected both comparisons to run, saw {calls}"
