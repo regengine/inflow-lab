@@ -4,6 +4,7 @@ import asyncio
 import ipaddress
 import os
 import socket
+from pathlib import Path
 from typing import Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, HttpUrl, field_validator, model_validator
@@ -26,6 +27,13 @@ _TRUSTED_REGENGINE_HOST = "www.regengine.co"
 # environment, since it disables the SSRF guard entirely.
 PRIVATE_ENDPOINTS_ENV = "REGENGINE_ALLOW_PRIVATE_ENDPOINTS"
 
+# Optional strict egress allowlist, comma-separated. A leading dot matches
+# subdomains (".regengine.co" allows "www.regengine.co"). Unset means any
+# public host is permitted.
+ALLOWED_DELIVERY_HOSTS_ENV = "REGENGINE_ALLOWED_DELIVERY_HOSTS"
+# Opt back in to cleartext http delivery to a public host. Off by default.
+ALLOW_CLEARTEXT_DELIVERY_ENV = "REGENGINE_ALLOW_CLEARTEXT_DELIVERY"
+
 
 class EgressBlockedError(ValueError):
     """A delivery endpoint failed the egress guard (see validate_egress_endpoint).
@@ -35,6 +43,27 @@ class EgressBlockedError(ValueError):
     it escapes. The /api/integration/test route also catches it explicitly,
     to answer a refused probe with a 400 that names the blocked host.
     """
+
+
+def _allowed_delivery_hosts() -> list[str]:
+    raw = os.getenv(ALLOWED_DELIVERY_HOSTS_ENV, "")
+    return [item.strip().lower() for item in raw.split(",") if item.strip()]
+
+
+def _host_matches_allowlist(host: str, allowlist: list[str]) -> bool:
+    for entry in allowlist:
+        if entry.startswith("."):
+            if host == entry[1:] or host.endswith(entry):
+                return True
+        elif host == entry:
+            return True
+    return False
+
+
+def _cleartext_delivery_allowed() -> bool:
+    return os.getenv(ALLOW_CLEARTEXT_DELIVERY_ENV, "").strip().lower() in {
+        "1", "true", "yes", "on",
+    }
 
 
 def _private_endpoints_allowed() -> bool:
@@ -136,11 +165,39 @@ def resolve_egress_endpoint(url: HttpUrl | None) -> str | None:
     private/link-local endpoints for local development against
     http://localhost:... or the built-in mock service. Off by default.
     """
-    if url is None or _private_endpoints_allowed():
+    if url is None:
         return None
     host = (url.host or "").strip("[]").lower()
     if not host:
         raise EgressBlockedError("Delivery endpoint is missing a host.")
+
+    # Gates on the NAME, so it holds even when DNS fails or answers hostilely,
+    # and it is checked before the private-endpoint opt-out: an operator who
+    # pins egress to their own RegEngine host means it, and a local-dev flag
+    # must not widen it.
+    allowlist = _allowed_delivery_hosts()
+    if allowlist and not _host_matches_allowlist(host, allowlist):
+        raise EgressBlockedError(
+            f"Delivery endpoint host {host!r} is not in {ALLOWED_DELIVERY_HOSTS_ENV}."
+        )
+
+    if _private_endpoints_allowed():
+        return None
+
+    if url.scheme == "http" and not _cleartext_delivery_allowed():
+        # Ordered after the private-endpoint opt-out (a local stack on
+        # http://localhost is the documented dev workflow) but before the
+        # address checks, so a public host is refused for its scheme while a
+        # metadata or loopback host below is still reported as what it is.
+        #
+        # Every live delivery and probe carries the API key in a header; over
+        # http that header crosses the network in the clear.
+        raise EgressBlockedError(
+            f"Delivery endpoint host {host!r} is cleartext http. The API key "
+            "would be sent unencrypted. Use https, or set "
+            f"{ALLOW_CLEARTEXT_DELIVERY_ENV}=1 for a trusted network."
+        )
+
     if host == _TRUSTED_REGENGINE_HOST:
         return None
     addresses = _resolved_addresses(host)
@@ -225,6 +282,20 @@ _CONFIG_SHAPE_GUIDANCE = (
 )
 
 
+def _default_persist_path() -> str:
+    """The default event log, derived from REGENGINE_DATA_DIR at call time.
+
+    A literal "data/events.jsonl" default put the default scope's events
+    outside a mounted volume on any deployment that sets REGENGINE_DATA_DIR,
+    so they were lost on restart. Read here rather than imported from
+    app.tenancy, which imports this module.
+
+    Deliberately a default_factory, not a module-level constant: the tests and
+    the tenancy layer both set REGENGINE_DATA_DIR after import.
+    """
+    return str(Path(os.getenv("REGENGINE_DATA_DIR", "data")) / "events.jsonl")
+
+
 class SimulationConfig(BaseModel):
     # extra="forbid" (#143): POST /api/simulate/reset validates the raw body
     # directly as this model, so a caller who wrapped it as {"config": {...}}
@@ -267,7 +338,7 @@ class SimulationConfig(BaseModel):
     interval_seconds: float = 1.5
     batch_size: int = 3
     seed: int | None = 204
-    persist_path: str = "data/events.jsonl"
+    persist_path: str = Field(default_factory=_default_persist_path)
     delivery: DeliveryConfig = Field(default_factory=DeliveryConfig)
 
     @field_validator("interval_seconds")

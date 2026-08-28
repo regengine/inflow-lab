@@ -758,6 +758,10 @@ def test_a_proxy_for_a_different_scheme_does_not_disable_the_pin(monkeypatch: An
     # a common corporate one) must still pin: nothing proxies plain http here.
     monkeypatch.setenv("HTTPS_PROXY", "http://proxy.internal:3128")
     monkeypatch.setenv(PRIVATE_ENDPOINTS_ENV, "")
+    # The endpoint under test is plain http by construction -- that is the
+    # shape being exercised. Scheme policy is a separate guard with its own
+    # tests, so opt in rather than let it pre-empt the pinning assertion.
+    monkeypatch.setenv("REGENGINE_ALLOW_CLEARTEXT_DELIVERY", "1")
     monkeypatch.setattr(
         simulation_schemas, "_resolved_addresses", lambda host: [ipaddress.ip_address("8.8.8.8")]
     )

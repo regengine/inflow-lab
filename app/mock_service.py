@@ -20,6 +20,10 @@ from .store import EventStore
 # Mirrors RegEngine's WebhookPayload constraint: events accepts 1-500 items.
 MIN_BATCH_EVENTS = 1
 MAX_BATCH_EVENTS = 500
+# Ceiling on one ingest request body. This is the mock's own resource bound,
+# not a mirrored live constraint: a caller that stays inside MAX_BATCH_EVENTS
+# never approaches it.
+MAX_INGEST_BODY_BYTES = 4 * 1024 * 1024
 # Mirrors RegEngine's Pydantic timestamp validator: >24h in the future is rejected.
 MAX_FUTURE_HOURS = 24
 # Mirrors RegEngine's replay-window floor (webhook_router_v2/security.py's

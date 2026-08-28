@@ -135,7 +135,14 @@ async function runWithBusy(button, handler) {
 }
 
 function bindAsyncClick(button, handler) {
-  button?.addEventListener('click', () => runWithBusy(button, handler));
+  // The handler is async, so a rejection here has nowhere to go unless it is
+  // caught: the operator got an unhandled rejection and no status message at
+  // all. Every other bound handler try/catches internally; refresh() did not.
+  button?.addEventListener('click', () => {
+    runWithBusy(button, handler).catch((error) => {
+      setStatus(error?.message || 'Action failed.', 'error', 5000);
+    });
+  });
 }
 
 const DELIVERY_MODE_LABELS = {
@@ -465,7 +472,9 @@ function buildConfig() {
     interval_seconds: Number(ids.interval.value || 1.5),
     batch_size: Number(ids.batchSize.value || 3),
     seed: seedValue === '' ? null : Number(seedValue),
-    persist_path: 'data/events.jsonl',
+    // Deliberately omitted: the server derives the default log path from
+    // REGENGINE_DATA_DIR. Sending a literal here overrode that and put the
+    // default scope's events outside a mounted volume, losing them on restart.
     delivery: {
       mode: ids.deliveryMode.value,
       endpoint: endpoint || null,
@@ -934,7 +943,7 @@ function renderReadinessBanner(summary, events, status = state.status) {
   }
   const readiness = backendAudit(status, summary) || pendingAuditModel(summary, status);
   ids.readinessBanner.innerHTML = `
-    <div class="readiness-banner-shell" data-tone="${readiness.tone}">
+    <div class="readiness-banner-shell" data-tone="${escapeHtml(readiness.tone)}">
       <div class="readiness-score">
         <span>Readiness</span>
         <strong>${escapeHtml(readiness.score)}</strong>

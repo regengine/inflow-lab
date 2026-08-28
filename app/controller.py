@@ -1219,7 +1219,9 @@ class SimulationController:
             # overstate what this retry actually accomplished (#95's
             # second bug).
             masked_response = mask_secret_in_payload(response, api_key)
-            if _is_idempotency_replay(response, payload):
+            if _is_idempotency_replay(
+                response, payload, reused_key=idempotency_key is not None
+            ):
                 return DeliveryOutcome(
                     response=masked_response,
                     delivery_status="failed",
@@ -1769,7 +1771,9 @@ def _stored_idempotency_key(record: StoredEventRecord) -> str | None:
     return None
 
 
-def _is_idempotency_replay(response: dict[str, Any], payload: IngestPayload) -> bool:
+def _is_idempotency_replay(
+    response: dict[str, Any], payload: IngestPayload, *, reused_key: bool
+) -> bool:
     """True when *response* answers a differently-sized request than *payload* (#95).
 
     A genuinely fresh RegEngine response -- mock or live -- carries
@@ -1783,8 +1787,25 @@ def _is_idempotency_replay(response: dict[str, Any], payload: IngestPayload) -> 
     resending fewer events than the original batch that owned the key).
     The subset case is exactly what a mismatched event count catches:
     nothing about a legitimate, matching replay ever trips it.
+
+    Two narrowings, both required to avoid condemning honest deliveries:
+
+    ``reused_key`` -- a request that minted a fresh key cannot have replayed
+    anything, because nothing has ever been cached under it. Every step(),
+    import and replay is in that position, so an unnarrowed check judged them
+    all against a receiver contract they had no reason to satisfy.
+
+    A missing or empty ``events`` list -- a receiver that answers with a
+    summary body ("accepted": n) rather than per-event verdicts is answering
+    a shape no cache could have produced for a subset. Reading that as a
+    replay marked every event of a successful delivery ``failed``.
     """
-    return len(response.get("events", [])) != len(payload.events)
+    if not reused_key:
+        return False
+    events = response.get("events")
+    if not isinstance(events, list) or not events:
+        return False
+    return len(events) != len(payload.events)
 
 
 def _aggregate_outcomes(outcomes: list[DeliveryOutcome]) -> DeliveryOutcome:

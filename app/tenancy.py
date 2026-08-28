@@ -18,6 +18,7 @@ from .scenario_saves import ScenarioSaveStore
 from .schemas.ingestion import ReplayRequest
 from .schemas.scenarios import ScenarioSaveRequest
 from .schemas.simulation import SimulationConfig
+from .auth import TENANT_HEADER
 from .store import EventStore
 
 
@@ -273,12 +274,31 @@ def _ensure_persist_path_within_root(persist_path: str) -> str:
     resolved = candidate.resolve()
     root = DATA_ROOT.resolve()
     if resolved == root or root in resolved.parents:
+        _reject_tenant_storage_path(resolved)
         return persist_path
     if not candidate.is_absolute():
         cwd = Path.cwd().resolve()
         if resolved == cwd or cwd in resolved.parents:
+            _reject_tenant_storage_path(resolved)
             return persist_path
     raise ValueError("persist_path must stay within the permitted data directory")
+
+
+def _reject_tenant_storage_path(resolved: Path) -> None:
+    """Refuse a persist_path that points into per-tenant storage.
+
+    Being inside DATA_ROOT is not enough: ``data/tenants/`` is inside it, and
+    every other tenant's event log lives there. A caller on the default tenant
+    that can name one reads it back through the exports, and ``EventStore``'s
+    own reset unlinks it. Tenant storage is reachable only by selecting the
+    tenant, never by naming its file.
+    """
+    tenant_root = TENANT_DATA_ROOT.resolve()
+    if resolved == tenant_root or tenant_root in resolved.parents:
+        raise ValueError(
+            "persist_path must not point into tenant storage; select a tenant "
+            f"with the {TENANT_HEADER} header instead"
+        )
 
 
 def scope_config(context: TenantContext, config: SimulationConfig) -> SimulationConfig:

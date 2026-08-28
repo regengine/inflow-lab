@@ -21,6 +21,8 @@ from ..fda_export import (
     render_fda_request_csv,
 )
 from ..mock_service import (
+    MAX_BATCH_EVENTS,
+    MAX_INGEST_BODY_BYTES,
     MockRegEngineHTTPError,
     parse_signature_digest,
     verify_webhook_signature,
@@ -163,7 +165,7 @@ async def mock_regengine_ingest(
                 await _discard_body(request)
                 raise
 
-        raw_body = await request.body()
+        raw_body = await _read_bounded_body(request)
 
         verify_webhook_signature(raw_body, x_webhook_signature)
     except MockRegEngineHTTPError as exc:
@@ -202,6 +204,37 @@ async def mock_regengine_ingest(
         )
     except MockRegEngineHTTPError as exc:
         raise HTTPException(status_code=exc.status_code, detail=exc.detail) from exc
+
+
+async def _read_bounded_body(request: Request) -> bytes:
+    """The raw request body, refused above ``MAX_INGEST_BODY_BYTES``.
+
+    Unconditional, unlike the signature pre-checks above: those only run when
+    a signing secret is configured, and an unsigned deployment is the default.
+    Without a ceiling this route read an arbitrarily large body into memory
+    for any unauthenticated caller.
+
+    Checked against ``Content-Length`` first so an oversized body is refused
+    without being read at all. The post-read check covers callers that send no
+    length (chunked transfer encoding), where the bytes have to arrive before
+    they can be counted.
+    """
+    declared = request.headers.get("content-length")
+    if declared is not None and declared.isdigit() and int(declared) > MAX_INGEST_BODY_BYTES:
+        raise _body_too_large(int(declared))
+    raw_body = await request.body()
+    if len(raw_body) > MAX_INGEST_BODY_BYTES:
+        raise _body_too_large(len(raw_body))
+    return raw_body
+
+
+def _body_too_large(size: int) -> MockRegEngineHTTPError:
+    return MockRegEngineHTTPError(
+        413,
+        f"Request body is {size} bytes, above the {MAX_INGEST_BODY_BYTES} byte "
+        f"ingest ceiling. Batches are capped at {MAX_BATCH_EVENTS} events; "
+        "split the batch and retry.",
+    )
 
 
 async def _discard_body(request: Request) -> None:
