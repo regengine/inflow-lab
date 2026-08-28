@@ -135,14 +135,7 @@ async function runWithBusy(button, handler) {
 }
 
 function bindAsyncClick(button, handler) {
-  // The handler is async, so a rejection here has nowhere to go unless it is
-  // caught: the operator got an unhandled rejection and no status message at
-  // all. Every other bound handler try/catches internally; refresh() did not.
-  button?.addEventListener('click', () => {
-    runWithBusy(button, handler).catch((error) => {
-      setStatus(error?.message || 'Action failed.', 'error', 5000);
-    });
-  });
+  button?.addEventListener('click', () => runWithBusy(button, handler));
 }
 
 const DELIVERY_MODE_LABELS = {
@@ -943,7 +936,7 @@ function renderReadinessBanner(summary, events, status = state.status) {
   }
   const readiness = backendAudit(status, summary) || pendingAuditModel(summary, status);
   ids.readinessBanner.innerHTML = `
-    <div class="readiness-banner-shell" data-tone="${escapeHtml(readiness.tone)}">
+    <div class="readiness-banner-shell" data-tone="${readiness.tone}">
       <div class="readiness-score">
         <span>Readiness</span>
         <strong>${escapeHtml(readiness.score)}</strong>
