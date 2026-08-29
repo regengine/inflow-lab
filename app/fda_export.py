@@ -11,7 +11,17 @@ from .schemas.domain import CTEType, FDAExportPreset, RegEngineEvent, StoredEven
 
 FDA_EXPORT_COLUMNS = [
     "Traceability Lot Code",
-    "Traceability Lot Code Description",
+    # Was "Traceability Lot Code Description" holding event.cte_type.value
+    # (e.g. "receiving") -- a mislabel, not just a bad value: no KDE named
+    # "Traceability Lot Code Description" exists anywhere in FSMA 204 (21
+    # CFR 1.1325-1.1350 lists a per-CTE "Product Description" KDE, already
+    # its own column below, and nothing else description-shaped tied to the
+    # lot code itself). The CTE type is legitimate, useful content for a
+    # single CSV that flattens every CTE type into one row shape -- it just
+    # needed an honestly-named column, so this now matches RegEngine's own
+    # canonical spreadsheet (fsma_spreadsheet.py), which has no lot-code
+    # description column and puts the CTE under "Event Type (CTE)" (#94).
+    "Event Type (CTE)",
     "Product Description",
     "Quantity",
     "Unit of Measure",
@@ -117,7 +127,7 @@ def render_fda_request_csv(
         writer.writerow(
             {
                 "Traceability Lot Code": event.traceability_lot_code,
-                "Traceability Lot Code Description": event.cte_type.value,
+                "Event Type (CTE)": event.cte_type.value,
                 "Product Description": event.product_description,
                 "Quantity": event.quantity,
                 "Unit of Measure": event.unit_of_measure,

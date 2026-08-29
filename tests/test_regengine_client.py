@@ -149,6 +149,7 @@ def test_live_client_sends_required_headers_and_contract_payload(monkeypatch: An
     event = payload["events"][0]
     assert set(event) == {
         "cte_type",
+        "input_traceability_lot_codes",
         "traceability_lot_code",
         "product_description",
         "quantity",
@@ -166,6 +167,7 @@ def test_live_client_sends_required_headers_and_contract_payload(monkeypatch: An
         "unit_of_measure": "cases",
         "location_name": "Distribution Center #4",
         "location_gln": None,
+        "input_traceability_lot_codes": None,
         "timestamp": "2026-02-05T08:30:00Z",
         "kdes": {
             "receive_date": "2026-02-05",

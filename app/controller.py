@@ -16,7 +16,7 @@ from .csv_importer import parse_csv_import
 from .demo_fixtures import get_demo_fixture
 from .engine import LegitFlowEngine
 from .mock_service import MockRegEngineHTTPError, MockRegEngineService
-from .schemas.domain import DemoFixtureId, DestinationMode, StoredEventRecord
+from .schemas.domain import DemoFixtureId, DestinationMode, RegEngineEvent, StoredEventRecord
 from .schemas.ingestion import (
     CSVImportRequest,
     CSVImportResponse,
@@ -160,24 +160,9 @@ class SimulationController:
                 idempotency_key=uuid.uuid4().hex,
             )
 
-            stored_records: list[StoredEventRecord] = []
-            response_events = (outcome.response or {}).get("events", []) if outcome.response else []
-            paired_responses = _pair_event_responses(events, response_events)
-            for index, event in enumerate(events):
-                event_response = paired_responses[index]
-                stored_records.append(
-                    StoredEventRecord(
-                        payload_source=self.config.source,
-                        event=event,
-                        parent_lot_codes=lineages[index],
-                        destination_mode=self.config.delivery.mode,
-                        delivery_attempts=outcome.delivery_attempts,
-                        last_delivery_attempt_at=outcome.attempted_at,
-                        delivery_response=event_response,
-                        delivery_metadata=outcome.metadata,
-                        **_event_delivery_fields(outcome, event_response),
-                    )
-                )
+            stored_records = _build_stored_records(
+                self.config.source, events, lineages, self.config.delivery.mode, outcome
+            )
             await self._store_add_many(stored_records)
 
             result = StepResponse(
@@ -277,23 +262,9 @@ class SimulationController:
             if parsed.events:
                 payload = IngestPayload(source=source, events=parsed.events)
                 outcome = await self._deliver_payload(payload, import_config)
-                response_events = (outcome.response or {}).get("events", []) if outcome.response else []
-                paired_responses = _pair_event_responses(parsed.events, response_events)
-                for index, event in enumerate(parsed.events):
-                    event_response = paired_responses[index]
-                    stored_records.append(
-                        StoredEventRecord(
-                            payload_source=source,
-                            event=event,
-                            parent_lot_codes=parsed.parent_lot_codes[index],
-                            destination_mode=delivery.mode,
-                            delivery_attempts=outcome.delivery_attempts,
-                            last_delivery_attempt_at=outcome.attempted_at,
-                            delivery_response=event_response,
-                            delivery_metadata=outcome.metadata,
-                            **_event_delivery_fields(outcome, event_response),
-                        )
-                    )
+                stored_records = _build_stored_records(
+                    source, parsed.events, parsed.parent_lot_codes, delivery.mode, outcome
+                )
                 await self._store_add_many(stored_records)
 
             rejected = parsed.total - len(parsed.events)
@@ -357,24 +328,12 @@ class SimulationController:
             events = [fixture_event.event for fixture_event in fixture.events]
             payload = IngestPayload(source=source, events=events)
             outcome = await self._deliver_payload(payload, self.config)
-            response_events = (outcome.response or {}).get("events", []) if outcome.response else []
-            paired_responses = _pair_event_responses(events, response_events)
-            stored_records = []
-            for index, fixture_event in enumerate(fixture.events):
-                event_response = paired_responses[index]
-                stored_records.append(
-                    StoredEventRecord(
-                        payload_source=source,
-                        event=fixture_event.event,
-                        parent_lot_codes=list(fixture_event.parent_lot_codes),
-                        destination_mode=delivery.mode,
-                        delivery_attempts=outcome.delivery_attempts,
-                        last_delivery_attempt_at=outcome.attempted_at,
-                        delivery_response=event_response,
-                        delivery_metadata=outcome.metadata,
-                        **_event_delivery_fields(outcome, event_response),
-                    )
-                )
+            fixture_parent_lot_codes = [
+                list(fixture_event.parent_lot_codes) for fixture_event in fixture.events
+            ]
+            stored_records = _build_stored_records(
+                source, events, fixture_parent_lot_codes, delivery.mode, outcome
+            )
             await self._store_add_many(stored_records)
             result = DemoFixtureLoadResponse(
                 status="delivery_failed" if outcome.delivery_status == "failed" else "loaded",
@@ -967,6 +926,57 @@ def _event_delivery_fields(outcome: DeliveryOutcome, event_response: dict[str, A
         "last_delivery_success_at": outcome.completed_at if status == "posted" else None,
         "error": error,
     }
+
+
+def _build_stored_records(
+    source: str,
+    events: list[RegEngineEvent],
+    parent_lot_codes: list[list[str]],
+    delivery_mode: DestinationMode,
+    outcome: DeliveryOutcome,
+) -> list[StoredEventRecord]:
+    """Build one fresh ``StoredEventRecord`` per event from one ``DeliveryOutcome`` (#165).
+
+    ``step``, ``import_csv``, and ``load_demo_fixture`` each post a freshly
+    generated batch of events through a single ``DeliveryOutcome`` and need
+    the same event-to-response pairing (``_pair_event_responses``) plus
+    per-event field derivation (``_event_delivery_fields``) before
+    persisting -- this was copy-pasted three times with only the
+    source/events/parent_lot_codes/delivery_mode inputs differing per call
+    site, risking silent drift between the copies.
+
+    ``events[i]`` and ``parent_lot_codes[i]`` must correspond to the same
+    event -- callers zip their own per-event lineage against their own
+    event list before calling in, since where that lineage comes from
+    (engine.next_event, CSV parsing, a demo fixture) differs per call site.
+
+    ``retry_failed_delivery`` does NOT go through this helper: it patches
+    *existing* records via ``model_copy`` and adds the new outcome's
+    ``delivery_attempts`` onto each record's prior count instead of
+    building fresh records, and does its own per-record idempotency-key
+    grouping besides -- differently shaped enough that forcing it through
+    here would trade the duplication this removes for a pile of
+    conditionals undoing most of what the helper buys.
+    """
+    response_events = (outcome.response or {}).get("events", []) if outcome.response else []
+    paired_responses = _pair_event_responses(events, response_events)
+    stored_records: list[StoredEventRecord] = []
+    for index, event in enumerate(events):
+        event_response = paired_responses[index]
+        stored_records.append(
+            StoredEventRecord(
+                payload_source=source,
+                event=event,
+                parent_lot_codes=parent_lot_codes[index],
+                destination_mode=delivery_mode,
+                delivery_attempts=outcome.delivery_attempts,
+                last_delivery_attempt_at=outcome.attempted_at,
+                delivery_response=event_response,
+                delivery_metadata=outcome.metadata,
+                **_event_delivery_fields(outcome, event_response),
+            )
+        )
+    return stored_records
 
 
 def _validate_live_delivery(delivery: DeliveryConfig) -> None:

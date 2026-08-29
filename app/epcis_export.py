@@ -277,11 +277,20 @@ def _input_lot_codes(record: StoredEventRecord) -> list[str]:
     if isinstance(source_lot_code, str) and source_lot_code not in lot_codes:
         lot_codes.append(source_lot_code)
 
+    # The kdes copy first, then the top-level field. Reading only the kdes
+    # copy meant an event that carried the value where the contract says to
+    # carry it -- top-level -- rendered an empty inputQuantityList, losing the
+    # input-to-output lineage link that is the entire point of a
+    # transformation CTE.
     input_lot_codes = record.event.kdes.get("input_traceability_lot_codes", [])
     if isinstance(input_lot_codes, list):
         for lot_code in input_lot_codes:
             if isinstance(lot_code, str) and lot_code not in lot_codes:
                 lot_codes.append(lot_code)
+
+    for lot_code in record.event.input_traceability_lot_codes or []:
+        if isinstance(lot_code, str) and lot_code not in lot_codes:
+            lot_codes.append(lot_code)
 
     return lot_codes
 
