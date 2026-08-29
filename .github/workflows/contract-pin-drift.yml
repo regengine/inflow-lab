@@ -1,0 +1,283 @@
+name: Contract Pin Drift
+
+# #104 -- neither side of the inflow-lab <-> RegEngine ingest contract is
+# tested against the other's current code by default. Each repository
+# names a commit in the other, and a pin nobody advances is worse than no
+# pin at all: it goes on reporting green about code that shipped weeks
+# ago.
+#
+# Two pins, watched in both directions:
+#
+#   1. RegEngine's .github/workflows/inflow-contract-ci.yml pins
+#      INFLOW_LAB_REF -- the simulator commit its contract test actually
+#      runs. That is the pin #104 was filed about: it sat far enough
+#      behind main that the controller-side verdict-pairing rewrite (#85)
+#      had never run against a real RegEngine. Only RegEngine maintainers
+#      can advance it, so on pull requests here it is REPORTED (annotation
+#      plus job summary) and on the scheduled run it FAILS and files an
+#      issue, which is where someone who can act on it will see it.
+#
+#   2. The RegEngine ref this repository's own cross-repo job checks out
+#      (.github/workflows/ci.yml). It defaults to `main` -- this side
+#      tracks upstream rather than pinning it, so there is normally
+#      nothing to drift. It only becomes a pin when a maintainer sets the
+#      REGENGINE_CONTRACT_REF variable to a SHA to ride out an upstream
+#      breakage, and then this check FAILS once that workaround goes
+#      stale, in every event type, because this repository can fix it.
+#
+# Why N = 10 commits, and why a commit count is only half the test:
+# inflow-lab's main branch has averaged roughly one commit every two days
+# (75 commits over its first four months; 15 in the last 30 days), so ten
+# commits is about three weeks -- long enough to absorb an ordinary review
+# and release cycle without nagging, short enough that a pin cannot go a
+# quarter stale unnoticed. It is denominated in commits rather than days
+# because the pin is a commit; it is the same intent as the 90-day
+# staleness window in app/contract.py, measured in the unit that actually
+# moves.
+#
+# The count alone would have been too weak to catch #104 (the pin was
+# ~11 commits behind, right at any plausible threshold). What made that
+# pin dangerous was WHICH commits it missed, so scripts/contract_pin_drift.py
+# also fails on a single commit touching the contract surface, whatever
+# the count -- and treats a truncated GitHub compare response as drifted
+# rather than assuming it is clean.
+#
+# Requires the same access as the contract job in ci.yml:
+# secrets.REGENGINE_CONTRACT_TOKEN (contents: read on regengine/regengine),
+# or vars.REGENGINE_CONTRACT_PUBLIC=true if that repository is public.
+# Without it every step below skips with a warning rather than failing.
+
+on:
+  pull_request:
+  schedule:
+    - cron: '0 8 * * 1'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: contract-pin-drift-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  MAX_PIN_DRIFT_COMMITS: '10'
+
+jobs:
+  drift:
+    name: Cross-repo pin drift
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    outputs:
+      checked: ${{ steps.access.outputs.has_access }}
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+
+      - name: Set up Python
+        uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6.3.0
+        with:
+          python-version: '3.11'
+
+      - name: Resolve RegEngine access and ref
+        id: access
+        env:
+          # The `secrets` context is unavailable in step-level `if:`, so
+          # presence has to become a step output first.
+          REGENGINE_CONTRACT_TOKEN: ${{ secrets.REGENGINE_CONTRACT_TOKEN }}
+          REGENGINE_CONTRACT_PUBLIC: ${{ vars.REGENGINE_CONTRACT_PUBLIC }}
+          REGENGINE_CONTRACT_REPOSITORY: ${{ vars.REGENGINE_CONTRACT_REPOSITORY }}
+          REGENGINE_CONTRACT_REF: ${{ vars.REGENGINE_CONTRACT_REF }}
+          EVENT_NAME: ${{ github.event_name }}
+        run: |
+          set -euo pipefail
+
+          repository="${REGENGINE_CONTRACT_REPOSITORY:-regengine/regengine}"
+          ref="${REGENGINE_CONTRACT_REF:-main}"
+
+          # Whether an inability to reach the other repository (a revoked
+          # token, a deleted commit, an API outage) is fatal. On a pull
+          # request it is not: none of those are the contributor's to fix,
+          # and a check that reddens for them gets ignored for the ones
+          # that matter. The scheduled run treats them as failures.
+          if [ "${EVENT_NAME}" = "pull_request" ]; then
+            enforce=false
+          else
+            enforce=true
+          fi
+
+          if [ -n "${REGENGINE_CONTRACT_TOKEN:-}" ] || [ "${REGENGINE_CONTRACT_PUBLIC:-}" = "true" ]; then
+            has_access=true
+          else
+            has_access=false
+            echo "::warning::Cross-repo pin drift NOT checked: add the repository secret REGENGINE_CONTRACT_TOKEN (contents:read on regengine/regengine), or set the repository variable REGENGINE_CONTRACT_PUBLIC=true if that repository is public. Pull requests from forks never receive secrets."
+            {
+              echo "### Contract pin drift: NOT CHECKED"
+              echo
+              echo "No cross-repo access is configured for this run, so neither pin was compared."
+            } >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+          {
+            echo "has_access=${has_access}"
+            echo "enforce=${enforce}"
+            echo "regengine_repository=${repository}"
+            echo "regengine_ref=${ref}"
+          } >> "$GITHUB_OUTPUT"
+
+      # Direction 1: the simulator commit RegEngine's contract test pins.
+      - name: Read the simulator ref RegEngine pins
+        id: upstream_pin
+        if: steps.access.outputs.has_access == 'true'
+        env:
+          GH_TOKEN: ${{ secrets.REGENGINE_CONTRACT_TOKEN || github.token }}
+          REGENGINE_REPOSITORY: ${{ steps.access.outputs.regengine_repository }}
+          ENFORCE: ${{ steps.access.outputs.enforce }}
+        run: |
+          set -euo pipefail
+
+          unreachable() {
+            if [ "${ENFORCE}" = "true" ]; then
+              echo "::error::$1"
+              exit 1
+            fi
+            echo "::warning::$1"
+            echo "pin=" >> "$GITHUB_OUTPUT"
+            exit 0
+          }
+
+          if ! gh api "repos/${REGENGINE_REPOSITORY}/contents/.github/workflows/inflow-contract-ci.yml" \
+              -H "Accept: application/vnd.github.raw" > "${RUNNER_TEMP}/inflow-contract-ci.yml"; then
+            unreachable "Could not read ${REGENGINE_REPOSITORY}'s inflow-contract-ci.yml; the pin it holds on this repository was not checked."
+          fi
+
+          # Parsed by the tested helper rather than an inline regex: if
+          # upstream renames or moves the pin this exits non-zero, which
+          # is itself the news this job exists to deliver.
+          # stderr is captured rather than inherited so its ::error::
+          # annotation does not surface on a pull request the warning path
+          # deliberately lets pass.
+          if ! pin="$(python scripts/contract_pin_drift.py pinned-ref \
+              --workflow "${RUNNER_TEMP}/inflow-contract-ci.yml" 2> "${RUNNER_TEMP}/pinned-ref.err")"; then
+            sed 's/^::error:://' "${RUNNER_TEMP}/pinned-ref.err"
+            unreachable "${REGENGINE_REPOSITORY} no longer pins INFLOW_LAB_REF where this check looks for it; the pin was not checked."
+          fi
+
+          echo "pin=${pin}" >> "$GITHUB_OUTPUT"
+          echo "RegEngine pins this repository at ${pin}"
+
+      - name: Check drift of RegEngine's simulator pin
+        if: steps.access.outputs.has_access == 'true' && steps.upstream_pin.outputs.pin != ''
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PIN: ${{ steps.upstream_pin.outputs.pin }}
+          ENFORCE: ${{ steps.access.outputs.enforce }}
+        run: |
+          set -euo pipefail
+
+          default_branch="$(gh api "repos/${GITHUB_REPOSITORY}" --jq .default_branch)"
+
+          if ! gh api "repos/${GITHUB_REPOSITORY}/compare/${PIN}...${default_branch}" \
+              > "${RUNNER_TEMP}/inflow-comparison.json"; then
+            message="Could not compare ${PIN}...${default_branch}; the commit RegEngine pins may no longer exist here."
+            if [ "${ENFORCE}" = "true" ]; then
+              echo "::error::${message}"
+              exit 1
+            fi
+            echo "::warning::${message}"
+            exit 0
+          fi
+
+          # A pull request here cannot advance a pin that lives in the
+          # other repository, so blocking one on it would only train
+          # people to ignore the check. The scheduled run enforces it and
+          # files an issue for someone who can act.
+          if [ "${ENFORCE}" = "true" ]; then
+            on_breach=fail
+          else
+            on_breach=warn
+          fi
+
+          python scripts/contract_pin_drift.py check \
+            --comparison "${RUNNER_TEMP}/inflow-comparison.json" \
+            --label "RegEngine's INFLOW_LAB_REF pin on this repository" \
+            --base-ref "${PIN}" \
+            --head-ref "${default_branch}" \
+            --max-commits "${MAX_PIN_DRIFT_COMMITS}" \
+            --surface-preset inflow-lab \
+            --on-breach "${on_breach}"
+
+      # Direction 2: the RegEngine ref this repository's contract job uses.
+      - name: Check drift of this repository's RegEngine ref
+        if: steps.access.outputs.has_access == 'true'
+        env:
+          GH_TOKEN: ${{ secrets.REGENGINE_CONTRACT_TOKEN || github.token }}
+          REGENGINE_REPOSITORY: ${{ steps.access.outputs.regengine_repository }}
+          REGENGINE_REF: ${{ steps.access.outputs.regengine_ref }}
+          ENFORCE: ${{ steps.access.outputs.enforce }}
+        run: |
+          set -euo pipefail
+
+          if ! printf '%s' "${REGENGINE_REF}" | grep -Eq '^[0-9a-fA-F]{7,40}$'; then
+            echo "::notice::This repository tracks '${REGENGINE_REPOSITORY}' at ref '${REGENGINE_REF}' rather than pinning a commit, so there is no pin to drift. A pinned SHA (repository variable REGENGINE_CONTRACT_REF) would be checked here."
+            {
+              echo "### Contract pin drift: this repository's RegEngine ref"
+              echo
+              echo "Tracking \`${REGENGINE_REF}\` -- no pinned commit to drift."
+            } >> "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+
+          default_branch="$(gh api "repos/${REGENGINE_REPOSITORY}" --jq .default_branch)"
+
+          if ! gh api "repos/${REGENGINE_REPOSITORY}/compare/${REGENGINE_REF}...${default_branch}" \
+              > "${RUNNER_TEMP}/regengine-comparison.json"; then
+            message="Could not compare ${REGENGINE_REF}...${default_branch} in ${REGENGINE_REPOSITORY}; the pinned commit may no longer exist there."
+            if [ "${ENFORCE}" = "true" ]; then
+              echo "::error::${message}"
+              exit 1
+            fi
+            echo "::warning::${message}"
+            exit 0
+          fi
+
+          # This pin lives here, so a failure is actionable here: clear
+          # REGENGINE_CONTRACT_REF to go back to tracking, or move it
+          # forward.
+          python scripts/contract_pin_drift.py check \
+            --comparison "${RUNNER_TEMP}/regengine-comparison.json" \
+            --label "this repository's REGENGINE_CONTRACT_REF pin" \
+            --base-ref "${REGENGINE_REF}" \
+            --head-ref "${default_branch}" \
+            --max-commits "${MAX_PIN_DRIFT_COMMITS}" \
+            --surface-preset regengine \
+            --on-breach fail
+
+  # A red scheduled run is invisible; a filed issue is not. Same reasoning
+  # and same reusable workflow as the smoke checks.
+  report-failure:
+    needs: drift
+    if: failure() && github.event_name == 'schedule'
+    uses: ./.github/workflows/smoke-failure-issue.yml
+    permissions:
+      contents: read
+      issues: write
+    with:
+      smoke_name: Contract Pin Drift
+      run_url: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+
+  # The other edge, so the tracker's open/closed state says whether the
+  # pins are stale *now*. Only meaningful when the pins were actually
+  # compared, hence the `checked` guard.
+  report-recovery:
+    needs: drift
+    if: success() && github.event_name == 'schedule' && needs.drift.outputs.checked == 'true'
+    uses: ./.github/workflows/smoke-failure-issue.yml
+    permissions:
+      contents: read
+      issues: write
+    with:
+      smoke_name: Contract Pin Drift
+      run_url: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+      resolved: true

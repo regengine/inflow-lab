@@ -3,15 +3,21 @@ from __future__ import annotations
 import json
 
 import asyncio
-from datetime import UTC, datetime, timedelta
+from datetime import timedelta
 from typing import Any
 
 import pytest
 from fastapi.testclient import TestClient
 
 from app.main import app, controller
+from app.routers import mock_regengine as mock_regengine_router
 from app.schemas.domain import CTEType, DestinationMode, RegEngineEvent, StoredEventRecord
 from app.schemas.simulation import SimulationConfig
+from tests.support.timestamps import (
+    CANONICAL_EVENT_DATE,
+    CANONICAL_EVENT_TIME,
+    CANONICAL_EVENT_TIMESTAMP,
+)
 
 
 # Regression tests for #143 (reject unknown/misplaced request body fields),
@@ -22,7 +28,10 @@ from app.schemas.simulation import SimulationConfig
 
 client = TestClient(app)
 
-_BASE_TIME = datetime(2026, 3, 1, 8, 0, tzinfo=UTC)
+# The suite's canonical valid-event time, relative to now rather than a
+# fixed literal: the mock enforces RegEngine's 90-day replay window, so a
+# hardcoded date here would silently age these records out of it (#209).
+_BASE_TIME = CANONICAL_EVENT_TIME
 
 
 def setup_function() -> None:
@@ -89,7 +98,7 @@ def _make_stored_record(
                         "quantity": 100,
                         "unit_of_measure": "cases",
                         "location_name": "Valley Fresh Farms",
-                        "timestamp": "2026-03-01T08:00:00Z",
+                        "timestamp": CANONICAL_EVENT_TIMESTAMP,
                         "kdes": {},
                     }
                 ],
@@ -160,8 +169,8 @@ def test_ingest_with_well_formed_body_still_succeeds() -> None:
                     "quantity": 100,
                     "unit_of_measure": "cases",
                     "location_name": "Valley Fresh Farms",
-                    "timestamp": "2026-03-01T08:00:00Z",
-                    "kdes": {"harvest_date": "2026-03-01", "reference_document": "Harvest Log HL-ROBUST-001"},
+                    "timestamp": CANONICAL_EVENT_TIMESTAMP,
+                    "kdes": {"harvest_date": CANONICAL_EVENT_DATE, "reference_document": "Harvest Log HL-ROBUST-001"},
                 }
             ],
         },
@@ -182,7 +191,7 @@ def test_ingest_with_well_formed_body_still_succeeds() -> None:
 def test_retry_with_explicit_empty_record_ids_retries_nothing() -> None:
     failed = _make_stored_record(
         "TLC-RETRY-EMPTY-001",
-        kdes={"harvest_date": "2026-03-01", "reference_document": "Harvest Log HL-EMPTY-001"},
+        kdes={"harvest_date": CANONICAL_EVENT_DATE, "reference_document": "Harvest Log HL-EMPTY-001"},
         delivery_status="failed",
         error="temporary outage",
     )
@@ -212,14 +221,14 @@ def test_retry_with_omitted_record_ids_retries_all_failed_records() -> None:
     first = _make_stored_record(
         "TLC-RETRY-ALL-001",
         minutes=0,
-        kdes={"harvest_date": "2026-03-01", "reference_document": "Harvest Log HL-ALL-001"},
+        kdes={"harvest_date": CANONICAL_EVENT_DATE, "reference_document": "Harvest Log HL-ALL-001"},
         delivery_status="failed",
         error="temporary outage",
     )
     second = _make_stored_record(
         "TLC-RETRY-ALL-002",
         minutes=1,
-        kdes={"harvest_date": "2026-03-01", "reference_document": "Harvest Log HL-ALL-002"},
+        kdes={"harvest_date": CANONICAL_EVENT_DATE, "reference_document": "Harvest Log HL-ALL-002"},
         delivery_status="failed",
         error="temporary outage",
     )
@@ -244,14 +253,14 @@ def test_retry_with_nonempty_record_ids_still_filters_to_that_subset() -> None:
     target = _make_stored_record(
         "TLC-RETRY-FILTER-TARGET",
         minutes=0,
-        kdes={"harvest_date": "2026-03-01", "reference_document": "Harvest Log HL-FILTER-001"},
+        kdes={"harvest_date": CANONICAL_EVENT_DATE, "reference_document": "Harvest Log HL-FILTER-001"},
         delivery_status="failed",
         error="temporary outage",
     )
     other = _make_stored_record(
         "TLC-RETRY-FILTER-OTHER",
         minutes=1,
-        kdes={"harvest_date": "2026-03-01", "reference_document": "Harvest Log HL-FILTER-002"},
+        kdes={"harvest_date": CANONICAL_EVENT_DATE, "reference_document": "Harvest Log HL-FILTER-002"},
         delivery_status="failed",
         error="temporary outage",
     )
@@ -473,7 +482,7 @@ def _ingest_event_body(**overrides) -> dict:
         "quantity": 100,
         "unit_of_measure": "cases",
         "location_name": "Valley Fresh Farms",
-        "timestamp": "2026-02-05T08:30:00Z",
+        "timestamp": CANONICAL_EVENT_TIMESTAMP,
         "kdes": {},
     }
     event.update(overrides)
@@ -540,3 +549,201 @@ def test_body_level_tenant_id_never_reaches_the_live_wire_payload() -> None:
 
     assert payload.tenant_id == "acme-tenant", "the field must still be populated on input"
     assert "tenant_id" not in payload.model_dump(mode="json")
+
+
+def test_ingest_route_still_documents_its_request_body() -> None:
+    """The ingest route reads its body by hand so HMAC verification can
+    precede parsing (#209), which takes the body out of FastAPI's sight --
+    and a body FastAPI cannot see is one it cannot document. The schema is
+    reattached via openapi_extra; this pins that it is there, that it is
+    the IngestPayload contract, and that every model it references resolves
+    in the document's own components (the generator drops $defs on the
+    assumption that they do).
+    """
+    import json as _json
+    import re as _re
+
+    document = client.get("/openapi.json").json()
+    operation = document["paths"]["/api/mock/regengine/ingest"]["post"]
+
+    schema = operation["requestBody"]["content"]["application/json"]["schema"]
+    assert schema["title"] == "IngestPayload"
+    assert schema["additionalProperties"] is False, "#143's extra='forbid' must stay documented"
+    assert set(schema["properties"]) == {"source", "tenant_id", "events"}
+
+    referenced = set(_re.findall(r'"#/components/schemas/([^"]+)"', _json.dumps(schema)))
+    assert referenced, "the events array should reference the event model"
+    assert not referenced - set(document["components"]["schemas"]), (
+        "requestBody references a schema the document does not define"
+    )
+
+
+# ---------------------------------------------------------------------------
+# #145 -- the FDA-request and EPCIS export endpoints are bounded too.
+# ---------------------------------------------------------------------------
+
+
+def _seed_export_records(count: int) -> None:
+    controller.store.add_many(
+        [
+            _make_stored_record(
+                f"TLC-EXPORT-{index:04d}",
+                minutes=index,
+                kdes={
+                    "harvest_date": CANONICAL_EVENT_DATE,
+                    "reference_document": f"Harvest Log HL-EXPORT-{index:04d}",
+                },
+            )
+            for index in range(count)
+        ]
+    )
+
+
+@pytest.mark.parametrize(
+    "path",
+    ["/api/mock/regengine/export/fda-request", "/api/mock/regengine/export/epcis"],
+)
+def test_export_refuses_a_response_past_the_record_cap(path: str, monkeypatch: Any) -> None:
+    """Both exports read through store._all_records(), which loads the whole
+    persisted JSONL log from disk -- so neither was bounded by anything.
+    /api/events caps at 500 and /api/lineage now caps too; these two returned
+    however many records a broad date range or a wide lineage graph matched.
+
+    The cap is patched down rather than seeding 5000 records: the number is
+    pinned separately below, and what needs testing here is the mechanism.
+    """
+    monkeypatch.setattr(mock_regengine_router, "EXPORT_MAX_RECORDS", 3)
+    _seed_export_records(5)
+
+    response = client.get(path)
+
+    assert response.status_code == 413, response.text
+    detail = response.json()["detail"]
+    assert "5 records" in detail
+    assert "3-record limit" in detail
+    assert "start_date" in detail, "the refusal must say how to narrow the request"
+
+
+@pytest.mark.parametrize(
+    "path",
+    ["/api/mock/regengine/export/fda-request", "/api/mock/regengine/export/epcis"],
+)
+def test_export_at_exactly_the_cap_still_succeeds(path: str, monkeypatch: Any) -> None:
+    # The boundary is inclusive: refusing at the limit rather than past it
+    # would make the documented cap off by one.
+    monkeypatch.setattr(mock_regengine_router, "EXPORT_MAX_RECORDS", 3)
+    _seed_export_records(3)
+
+    response = client.get(path)
+
+    assert response.status_code == 200, response.text
+    assert response.headers["X-Export-Record-Count"] == "3"
+
+
+def test_export_refusal_mentions_lot_scoping_only_when_not_already_scoped(
+    monkeypatch: Any,
+) -> None:
+    # An export already scoped to one lot cannot be narrowed further by lot,
+    # so telling the caller to do that would be useless advice.
+    monkeypatch.setattr(mock_regengine_router, "EXPORT_MAX_RECORDS", 1)
+    controller.store.add_many(
+        [
+            _make_stored_record("TLC-EXPORT-WIDE-0", minutes=0),
+            _make_stored_record(
+                "TLC-EXPORT-WIDE-1", minutes=1, parent_lot_codes=["TLC-EXPORT-WIDE-0"]
+            ),
+        ]
+    )
+
+    unscoped = client.get("/api/mock/regengine/export/fda-request")
+    scoped = client.get(
+        "/api/mock/regengine/export/fda-request?traceability_lot_code=TLC-EXPORT-WIDE-1"
+    )
+
+    assert unscoped.status_code == scoped.status_code == 413
+    assert "traceability_lot_code" in unscoped.json()["detail"]
+    assert "traceability_lot_code" not in scoped.json()["detail"]
+
+
+def test_export_record_cap_is_the_documented_value() -> None:
+    # Pins the constant itself, so the number in the README and the number
+    # the routes enforce cannot drift apart unnoticed.
+    assert mock_regengine_router.EXPORT_MAX_RECORDS == 5000
+
+
+# ---------------------------------------------------------------------------
+# #143 AC2 -- /start and /reset keep DIFFERENT body shapes on purpose, so
+# each one's rejection has to teach the other's shape.
+# ---------------------------------------------------------------------------
+
+
+def test_reset_rejection_names_the_shape_reset_actually_wants() -> None:
+    """The exact body #143 was filed over.
+
+    Sending /start's wrapper to /reset used to return 200 while silently
+    discarding the override and falling back to hard-coded defaults; it is
+    a 422 now. But "Extra inputs are not permitted" tells a caller their
+    body is wrong and nothing about what right looks like, and the two
+    endpoints genuinely do take different shapes. So the refusal names
+    both.
+    """
+    response = client.post(
+        "/api/simulate/reset", json={"config": {"scenario": "dairy_continuous_flow"}}
+    )
+
+    assert response.status_code == 422
+    message = response.json()["detail"][0]["msg"]
+    assert "/api/simulate/reset takes the same fields unwrapped" in message
+    assert "/api/simulate/start takes its config wrapped" in message
+
+    # And the override really was refused rather than half-applied.
+    status = client.get("/api/simulate/status").json()
+    assert status["config"]["scenario"] == "leafy_greens_supplier"
+
+
+def test_start_rejection_names_the_wrapper_start_actually_wants() -> None:
+    """The mirror mistake. Bare "Field required" against `config` never
+    mentions the fields the caller did send, so it reads as "you sent
+    nothing" rather than "you sent it one level too high"."""
+    response = client.post("/api/simulate/start", json={"scenario": "dairy_continuous_flow"})
+
+    assert response.status_code == 422
+    message = response.json()["detail"][0]["msg"]
+    assert "'scenario'" in message, "the error should name the field that was misplaced"
+    assert "/api/simulate/start takes its config wrapped" in message
+
+
+def test_both_endpoints_still_accept_the_shape_they_document() -> None:
+    # The guidance would be worthless if either shape had stopped working.
+    reset = client.post("/api/simulate/reset", json={"scenario": "dairy_continuous_flow"})
+    assert reset.status_code == 200, reset.text
+    assert client.get("/api/simulate/status").json()["config"]["scenario"] == "dairy_continuous_flow"
+
+    start = client.post(
+        "/api/simulate/start",
+        json={"config": {"scenario": "leafy_greens_supplier", "interval_seconds": 0}},
+    )
+    assert start.status_code == 200, start.text
+    assert start.json()["config"]["scenario"] == "leafy_greens_supplier"
+    client.post("/api/simulate/stop")
+
+
+def test_a_saved_scenario_file_with_an_unknown_config_key_still_loads() -> None:
+    """SimulationConfig's new before-validator must not reach save files.
+
+    ScenarioSaveSnapshot prunes unknown config keys on the way in from disk
+    precisely so an older/newer save stays loadable; if the validator fired
+    there it would turn forward-compatible pruning back into a hard
+    failure.
+    """
+    from app.schemas.scenarios import ScenarioSaveSnapshot
+
+    snapshot = ScenarioSaveSnapshot.model_validate(
+        {
+            "scenario": "leafy_greens_supplier",
+            "config": {"scenario": "leafy_greens_supplier", "a_field_from_the_future": 1},
+            "records": [],
+        }
+    )
+
+    assert snapshot.config.scenario.value == "leafy_greens_supplier"

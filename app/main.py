@@ -18,7 +18,25 @@ from .cors import cors_origins_from_env, resolve_cors_origins
 from .exceptions import handle_value_error
 from .routers import events, health, ingestion, integration, mock_regengine, operator, scenarios, simulation
 from .tenancy import controller, scenario_saves
+from .worker_guard import enforce_single_process_startup
 
+
+# Explicit re-export surface (#137). `cors_origins_from_env`, `controller` and
+# `scenario_saves` are imported above but never referenced in this module --
+# ruff reports them as F401 "imported but unused", and they are not. They are
+# deliberate re-exports: the test suite reaches them through `app.main`
+# (`from app.main import app, controller, cors_origins_from_env,
+# scenario_saves`), and deleting them breaks collection across 11 test
+# modules. Naming them in __all__ is the form ruff accepts for that intent, and
+# it states the contract in code rather than leaving it to be rediscovered by
+# whoever next runs a linter.
+__all__ = [
+    "app",
+    "controller",
+    "cors_origins_from_env",
+    "create_app",
+    "scenario_saves",
+]
 
 static_dir = Path(__file__).parent / "static"
 
@@ -27,6 +45,13 @@ logger = logging.getLogger("inflow_lab")
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    # First, before anything commits state: this app's simulation run/stop
+    # control plane is per-process memory, so a multi-worker deployment can
+    # answer Stop with a 200 while another worker keeps delivering (#161).
+    # Refuse that shape outright rather than serving a control plane that
+    # silently does not control everything it reports on.
+    enforce_single_process_startup()
+
     if not basic_auth_config_from_env().enabled:
         if _shared_deployment_requires_auth():
             # Fail closed (#88): the container binds 0.0.0.0 unconditionally,

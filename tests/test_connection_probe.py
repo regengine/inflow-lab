@@ -132,6 +132,10 @@ def _fake_probe_client(*, status_code: int, health_payload: Any = None) -> type:
             *,
             headers: dict[str, str] | None = None,
             params: dict[str, Any] | None = None,
+            # extensions: the live client attaches {"sni_hostname": ...} when
+            # it pins the validated address for the dial (#207). Accepted and
+            # ignored here so this fake keeps working on either path.
+            extensions: dict[str, Any] | None = None,
         ) -> _FakeResponse:
             if url.endswith("/health"):
                 return _FakeResponse(200, health_payload)
@@ -351,3 +355,63 @@ def test_integration_test_endpoint_forwards_the_reworded_connected_detail(monkey
     assert "subscription" in detail
     assert "webhooks.ingest" in detail
     assert "rge_live_probe_key" not in body["detail"]
+
+
+# ---------------------------------------------------------------------------
+# #100 AC1, as far as it can be taken without RegEngine-side surface:
+# the half of the signature question this side can answer with certainty.
+# ---------------------------------------------------------------------------
+
+
+def test_connected_detail_states_that_this_side_will_send_unsigned(monkeypatch: Any) -> None:
+    """#100's AC1 wants a non-connected verdict naming a signature
+    mismatch. That needs RegEngine's own HMAC posture, which it does not
+    publish -- see this file's module docstring, option 2, and note that
+    guessing a /health field name RegEngine has not agreed to would be
+    inventing exactly the unverified assurance #100 is about.
+
+    One half is not a mystery, though: whether THIS simulator signs is
+    decided entirely by REGENGINE_WEBHOOK_HMAC_SECRET, locally. With it
+    unset, every ingest will be unsigned -- a fact, not an unknown -- and
+    a green probe should say so instead of listing the signature as one
+    generic caveat among three.
+    """
+    monkeypatch.delenv("REGENGINE_WEBHOOK_HMAC_SECRET", raising=False)
+    fake = _fake_probe_client(status_code=200)
+    monkeypatch.setattr("app.regengine_client.httpx.AsyncClient", fake)
+
+    result = asyncio.run(LiveRegEngineClient().check_connection(_live_config()))
+
+    assert result.verdict == "connected"
+    assert "UNSIGNED" in result.detail, result.detail
+    assert "401" in result.detail, result.detail
+    # The three-gate wording must survive -- this sentence is additional
+    # precision on one gate, not a replacement for naming the other two.
+    assert "subscription" in result.detail.lower()
+    assert "webhooks.ingest" in result.detail
+
+
+def test_connected_detail_states_that_this_side_will_sign_when_configured(
+    monkeypatch: Any,
+) -> None:
+    """With the secret set the claim flips, and stays honest: signed, but
+    still 401 if the two secrets differ -- which this side cannot check."""
+    monkeypatch.setenv("REGENGINE_WEBHOOK_HMAC_SECRET", "probe-side-secret")
+    fake = _fake_probe_client(status_code=200)
+    monkeypatch.setattr("app.regengine_client.httpx.AsyncClient", fake)
+
+    result = asyncio.run(LiveRegEngineClient().check_connection(_live_config()))
+
+    assert "will be signed" in result.detail, result.detail
+    assert "UNSIGNED" not in result.detail
+    assert "differs" in result.detail
+
+
+def test_the_signing_posture_note_does_not_leak_the_secret(monkeypatch: Any) -> None:
+    monkeypatch.setenv("REGENGINE_WEBHOOK_HMAC_SECRET", "probe-side-secret-value")
+    fake = _fake_probe_client(status_code=200)
+    monkeypatch.setattr("app.regengine_client.httpx.AsyncClient", fake)
+
+    result = asyncio.run(LiveRegEngineClient().check_connection(_live_config()))
+
+    assert "probe-side-secret-value" not in result.detail

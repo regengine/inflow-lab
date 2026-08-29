@@ -149,7 +149,7 @@ async def health(
             "username": context.username,
             "uses_default_storage": context.uses_default_storage,
         },
-        "status": active_controller.status(),
+        "status": await active_controller.status(),
     }
 
 

@@ -30,6 +30,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import threading
 import time
 from datetime import UTC, datetime
 from pathlib import Path
@@ -52,6 +53,7 @@ from app.schemas.domain import (
     StoredEventRecord,
 )
 from app.schemas.ingestion import CSVImportRequest
+from app.scenarios import ScenarioId
 from app.schemas.simulation import DeliveryConfig, SimulationConfig
 from app.store import EventStore
 
@@ -327,3 +329,222 @@ def test_replay_uses_the_offloaded_read_and_returns_the_persisted_records(tmp_pa
     # DestinationMode.NONE -> DeliveryOutcome.delivery_status == "generated"
     # -> replay's own status mapping -> "rebuilt".
     assert result.status == "rebuilt"
+
+
+# ---------------------------------------------------------------------------
+# #136's OTHER half, found by the #210 review: the read paths.
+#
+# The offload that landed with #136 covered EventStore's writes and left its
+# reads running on the event loop thread. Those reads are not cache lookups:
+# all_between(), stats(), failed_delivery_records() and lineage() all go
+# through EventStore._all_records(), which calls read_persisted_records() and
+# therefore re-reads and re-parses the entire persisted JSONL log every time.
+# recent() is the one genuine in-memory read, and is deliberately excluded --
+# see test_snapshot_keeps_the_in_memory_recent_read_on_the_event_loop below.
+# ---------------------------------------------------------------------------
+
+
+def _slowed(method_name: str, monkeypatch, *, result: Any = None):
+    """Make one EventStore read take SLOW_CALL_SECONDS, like a big log would.
+
+    Same technique the write/parse tests above use: a real multi-megabyte
+    store would make these tests slow and machine-dependent, while what is
+    actually under test is only *which thread* the call runs on.
+    """
+    real_method = getattr(EventStore, method_name)
+
+    def slow_method(self: EventStore, *args: Any, **kwargs: Any) -> Any:
+        time.sleep(SLOW_CALL_SECONDS)
+        if result is not None:
+            return result
+        return real_method(self, *args, **kwargs)
+
+    monkeypatch.setattr(EventStore, method_name, slow_method)
+
+
+def test_status_offloads_its_full_log_reads_so_the_event_loop_stays_responsive(
+    tmp_path, monkeypatch
+):
+    """``status()`` is the most frequently called path in the app -- the
+    console polls /api/simulate/status and every /api/stream revision bump
+    renders it -- and it made TWO whole-log reads (all_between() and
+    stats()) directly on the event loop thread. A concurrent ticker must
+    keep advancing while those reads are in flight.
+    """
+    controller = _build_controller(tmp_path)
+    _slowed("all_between", monkeypatch)
+
+    before, after = asyncio.run(_ticks_during(controller.status()))
+
+    assert after - before >= MIN_EXTRA_TICKS, (
+        "the ticker barely advanced while status() was reading the persisted log -- "
+        "the event loop was blocked by the store read"
+    )
+
+
+def test_status_returns_the_same_payload_through_the_offloaded_reads(tmp_path):
+    """Offloading must not change what status() reports -- the records read
+    on the worker thread have to reach the audit summary and the stats
+    block exactly as they did when the read happened inline.
+    """
+    controller = _build_controller(tmp_path)
+
+    async def scenario() -> dict[str, Any]:
+        await controller._store_add_many(
+            [make_record("TLC-STATUS-A"), make_record("TLC-STATUS-B")]
+        )
+        return await controller.status()
+
+    status = asyncio.run(scenario())
+
+    assert status["stats"]["total_records"] == 2
+    assert status["stats"]["unique_lots"] == 2
+    assert "audit" in status["stats"]
+    assert status["running"] is False
+
+
+def test_save_scenario_offloads_its_full_log_read(tmp_path, monkeypatch):
+    """save_scenario() reads the whole log via all_between() to build the
+    snapshot it writes. That read stays *inside* self._lock deliberately --
+    the snapshot has to be of one instant -- so this also pins that holding
+    the data-plane lock across the offloaded read does not block the loop.
+    """
+    controller = _build_controller(tmp_path)
+    _slowed("all_between", monkeypatch)
+
+    before, after = asyncio.run(
+        _ticks_during(controller.save_scenario(ScenarioId.LEAFY_GREENS_SUPPLIER))
+    )
+
+    assert after - before >= MIN_EXTRA_TICKS, (
+        "the ticker barely advanced while save_scenario() was reading the persisted "
+        "log -- the event loop was blocked by the store read"
+    )
+
+
+def test_retry_failed_delivery_offloads_the_failed_record_read(tmp_path, monkeypatch):
+    """failed_delivery_records() goes through _all_records() too, so
+    selecting the retry batch is a whole-log read, not a filter over the
+    in-memory ring. Like save_scenario's, this read stays under self._lock
+    (it must be atomic with the store-epoch snapshot beside it) and still
+    must not pin the event loop.
+    """
+    controller = _build_controller(tmp_path)
+    _slowed("failed_delivery_records", monkeypatch, result=[])
+
+    before, after = asyncio.run(_ticks_during(controller.retry_failed_delivery()))
+
+    assert after - before >= MIN_EXTRA_TICKS, (
+        "the ticker barely advanced while retry_failed_delivery() was selecting its "
+        "candidates -- the event loop was blocked by the store read"
+    )
+
+
+def test_lineage_read_is_offloaded_for_the_router_paths(tmp_path, monkeypatch):
+    """/api/lineage and both export endpoints take their records through
+    ``_store_lineage``/``_store_all_between`` rather than reaching into
+    ``controller.store`` directly, so their whole-log reads are offloaded
+    by the same one mechanism as everything else.
+    """
+    controller = _build_controller(tmp_path)
+    _slowed("lineage", monkeypatch, result=[])
+
+    before, after = asyncio.run(_ticks_during(controller._store_lineage("TLC-ANY")))
+
+    assert after - before >= MIN_EXTRA_TICKS, (
+        "the ticker barely advanced while store.lineage() was running -- "
+        "the event loop was blocked by the store read"
+    )
+
+
+def test_snapshot_keeps_the_in_memory_recent_read_on_the_event_loop(tmp_path):
+    """The counter-test: ``recent()`` must NOT be offloaded.
+
+    It returns a slice of the in-memory deque and opens no file, so a
+    thread hop would buy nothing and cost something on the hottest read in
+    the app. This pins the split the #210 review's finding turns on --
+    which store reads genuinely block and which only look like they do --
+    by recording the thread each call actually runs on.
+    """
+    threads: dict[str, str] = {}
+    real_recent = EventStore.recent
+    real_all_between = EventStore.all_between
+
+    def recording_recent(self: EventStore, limit: int = 100) -> list[StoredEventRecord]:
+        threads["recent"] = threading.current_thread().name
+        return real_recent(self, limit)
+
+    def recording_all_between(
+        self: EventStore, start_date: Any = None, end_date: Any = None
+    ) -> list[StoredEventRecord]:
+        threads["all_between"] = threading.current_thread().name
+        return real_all_between(self, start_date, end_date)
+
+    controller = _build_controller(tmp_path)
+
+    async def scenario() -> None:
+        loop_thread = threading.current_thread().name
+        with pytest.MonkeyPatch.context() as patch:
+            patch.setattr(EventStore, "recent", recording_recent)
+            patch.setattr(EventStore, "all_between", recording_all_between)
+            await controller.snapshot(event_limit=5)
+        threads["loop"] = loop_thread
+
+    asyncio.run(scenario())
+
+    assert threads["recent"] == threads["loop"], (
+        "recent() was moved onto a worker thread -- it reads only the in-memory "
+        "deque, so that costs a thread hop and fixes no stall"
+    )
+    assert threads["all_between"] != threads["loop"], (
+        "all_between() ran on the event loop thread -- it re-reads the whole "
+        "persisted log and must be offloaded"
+    )
+
+
+# ---------------------------------------------------------------------------
+# The second clause of #210's finding: the write-only offload introduced a
+# NEW stall of its own.
+#
+# EventStore's threading.RLock is taken by writers (now on worker threads)
+# and was still taken by readers on the event loop thread. So the loop
+# thread could block in a *native, uninterruptible* lock acquire waiting for
+# a worker to finish a large write -- something that could not happen while
+# every caller shared one thread. Offloading the reads is what removes it.
+# ---------------------------------------------------------------------------
+
+
+def test_a_worker_thread_write_no_longer_blocks_the_event_loop_on_the_store_lock(
+    tmp_path, monkeypatch
+):
+    controller = _build_controller(tmp_path)
+    real_replace_all = EventStore.replace_all
+
+    def lock_hogging_replace_all(self: EventStore, records: Any) -> list[StoredEventRecord]:
+        # Holds the store's RLock for the whole sleep, exactly as a large
+        # replace_all/import does while it rewrites the log.
+        with self._lock:
+            time.sleep(SLOW_CALL_SECONDS)
+            return real_replace_all(self, records)
+
+    monkeypatch.setattr(EventStore, "replace_all", lock_hogging_replace_all)
+
+    async def scenario() -> tuple[int, int]:
+        await controller._store_add_many([make_record("TLC-LOCKED-000001")])
+        writer = asyncio.create_task(
+            controller._store_replace_all(list(controller.store.recent(limit=10)))
+        )
+        # Let the worker thread actually take the RLock before the read asks
+        # for it, so the read is genuinely contending rather than racing.
+        await asyncio.sleep(TICK_INTERVAL)
+        ticks = await _ticks_during(controller.status())
+        await writer
+        return ticks
+
+    before, after = asyncio.run(scenario())
+
+    assert after - before >= MIN_EXTRA_TICKS, (
+        "the ticker froze while a worker thread held EventStore's RLock -- the event "
+        "loop blocked in a native lock acquire, which is the stall the write-only "
+        "offload introduced"
+    )

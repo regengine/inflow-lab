@@ -4,6 +4,7 @@ import hashlib
 import hmac
 import json
 import os
+import re
 from collections import OrderedDict
 from datetime import UTC, datetime, timedelta
 from typing import Any, Callable, NamedTuple
@@ -19,6 +20,10 @@ from .store import EventStore
 # Mirrors RegEngine's WebhookPayload constraint: events accepts 1-500 items.
 MIN_BATCH_EVENTS = 1
 MAX_BATCH_EVENTS = 500
+# Ceiling on one ingest request body. This is the mock's own resource bound,
+# not a mirrored live constraint: a caller that stays inside MAX_BATCH_EVENTS
+# never approaches it.
+MAX_INGEST_BODY_BYTES = 4 * 1024 * 1024
 # Mirrors RegEngine's Pydantic timestamp validator: >24h in the future is rejected.
 MAX_FUTURE_HOURS = 24
 # Mirrors RegEngine's replay-window floor (webhook_router_v2/security.py's
@@ -31,6 +36,13 @@ MAX_FUTURE_HOURS = 24
 # validate_event_like_regengine's `now` parameter and
 # MockRegEngineService's `enforce_event_age_window` for how the mock
 # applies it.
+#
+# Read against RegEngine's own source at the commit this repo pins for the
+# KDE table (tests/data/regengine_required_kdes.json's provenance commit),
+# which settles a contradiction the docs used to carry: the comparison is
+# `dt < now - timedelta(days=age_cap_days)`, so exactly MAX_EVENT_AGE_DAYS
+# old is INSIDE the window, and the rejection is appended to that one
+# event's `errors` before `continue` -- per event, never batch-fatal.
 MAX_EVENT_AGE_DAYS = 90
 # Mirrors RegEngine's idempotency-replay window: a repeated Idempotency-Key
 # within this many hours replays the stored response; once an entry ages
@@ -46,6 +58,12 @@ LOCATION_KDE_FIELDS = (
     "ship_to_gln",
 )
 _IDEMPOTENCY_CACHE_LIMIT = 1024
+# An HMAC-SHA256 hex digest and nothing else. Enforced BEFORE
+# hmac.compare_digest, which raises TypeError -- not False -- when either
+# argument is a str carrying a non-ASCII character. An unauthenticated
+# caller sending `X-Webhook-Signature: sha256=caf\u00e9...` therefore used to
+# get an unhandled 500 with a traceback instead of a 401 (#209).
+_HEX_DIGEST_PATTERN = re.compile(r"[0-9a-fA-F]+")
 
 # Friction injection codes -> the HTTP failure a real customer hits. Keyed by
 # the DeliveryConfig.mock_friction values so operators can rehearse each
@@ -107,8 +125,62 @@ def _resume_chain_hash(store: EventStore) -> str:
     return ""
 
 
-def _verify_webhook_signature(body: bytes | None, signature_header: str | None) -> None:
+def webhook_signing_secret() -> str:
+    """The configured shared secret, or "" when signing is not enforced.
+
+    Read through a function rather than captured at import time because the
+    env var is monkeypatched per-test and, in a real deployment, is what
+    distinguishes the pre-signing migration ramp from an enforcing one.
+    """
+    return os.getenv(WEBHOOK_HMAC_SECRET_ENV, "").strip()
+
+
+def parse_signature_digest(signature_header: str | None) -> str:
+    """Check everything about X-Webhook-Signature that does not need the body.
+
+    Split out of verify_webhook_signature so the HTTP route can run these
+    checks BEFORE it reads the request body (#209). A missing header, a
+    scheme that is not sha256, and a digest that is not hexadecimal are all
+    rejections no body can rescue: the bytes are never consulted, so
+    reading them first only lets an unauthenticated caller spend the
+    server's memory on a request that was already decided. The route
+    therefore calls this first and reads the body only once a digest exists
+    that could plausibly verify.
+
+    The 401 details are unchanged from when these three checks lived inline,
+    so what a caller sees is exactly what it was.
+    """
+    if not signature_header:
+        raise MockRegEngineHTTPError(401, "Missing X-Webhook-Signature header")
+
+    scheme, _, provided_digest = signature_header.partition("=")
+    if scheme != "sha256" or not provided_digest:
+        raise MockRegEngineHTTPError(
+            401, "Unsupported X-Webhook-Signature scheme (expected 'sha256=<hex>')"
+        )
+
+    # A digest that is not pure hex cannot be a valid signature, so it fails
+    # the same way a wrong one does -- deliberately the SAME 401 detail, so
+    # the rejection reason is not itself an oracle for how the header was
+    # malformed. The check has to happen before compare_digest rather than
+    # after: compare_digest raises TypeError on a str argument containing a
+    # non-ASCII character, which escaped this module as an unhandled 500
+    # with a traceback, unauthenticated (#209).
+    if not _HEX_DIGEST_PATTERN.fullmatch(provided_digest):
+        raise MockRegEngineHTTPError(401, "Invalid X-Webhook-Signature")
+
+    return provided_digest
+
+
+def verify_webhook_signature(body: bytes | None, signature_header: str | None) -> None:
     """Reject a missing/incorrect X-Webhook-Signature the way live RegEngine does (#113).
+
+    Public because the HTTP route calls it directly, on the raw wire bytes,
+    BEFORE those bytes are JSON-decoded or validated into an IngestPayload
+    (#209). ingest() still calls it too -- that is not redundant belt-and-
+    braces, it is what keeps the guarantee for every non-HTTP caller; the
+    second call re-HMACs bytes already in memory and costs nothing next to
+    the parse it now precedes.
 
     Gated by REGENGINE_WEBHOOK_HMAC_SECRET -- the same env var
     LiveRegEngineClient reads (see regengine_client.py's
@@ -135,18 +207,11 @@ def _verify_webhook_signature(body: bytes | None, signature_header: str | None) 
       payload and never serializes or signs anything, so there is nothing
       to verify on that path.
     """
-    secret = os.getenv(WEBHOOK_HMAC_SECRET_ENV, "").strip()
+    secret = webhook_signing_secret()
     if not secret or body is None:
         return
 
-    if not signature_header:
-        raise MockRegEngineHTTPError(401, "Missing X-Webhook-Signature header")
-
-    scheme, _, provided_digest = signature_header.partition("=")
-    if scheme != "sha256" or not provided_digest:
-        raise MockRegEngineHTTPError(
-            401, "Unsupported X-Webhook-Signature scheme (expected 'sha256=<hex>')"
-        )
+    provided_digest = parse_signature_digest(signature_header)
 
     expected_digest = hmac.new(secret.encode("utf-8"), body, hashlib.sha256).hexdigest()
     # hmac.compare_digest, never == -- a time-variable comparison leaks how
@@ -164,9 +229,9 @@ class MockRegEngineService:
     wild: batch-size bounds, request-fatal field constraints that 422 the
     whole batch (#101), strict per-CTE KDE checks (exact key lookup, no
     aliasing), the location-identifier requirement, in-batch duplicate
-    rejection, an opt-in 90-day replay-window floor (#102), 24h idempotency
-    replays, and (when a shared secret is configured) HMAC-SHA256 signature
-    verification.
+    rejection, the 90-day replay-window floor (#102, enforced by default
+    since #209), 24h idempotency replays, and (when a shared secret is
+    configured) HMAC-SHA256 signature verification.
 
     ``chain_hash`` and the idempotency cache otherwise live only in process
     memory. Construct with ``store=`` to seed ``chain_hash`` from a
@@ -184,7 +249,7 @@ class MockRegEngineService:
         *,
         idempotency_ttl: timedelta = timedelta(hours=IDEMPOTENCY_TTL_HOURS),
         clock: Callable[[], datetime] = lambda: datetime.now(UTC),
-        enforce_event_age_window: bool = False,
+        enforce_event_age_window: bool = True,
     ) -> None:
         self._chain_hash = _resume_chain_hash(store) if store is not None else ""
         self._idempotency_cache: OrderedDict[str, _CachedIdempotencyEntry] = OrderedDict()
@@ -194,22 +259,42 @@ class MockRegEngineService:
         # (#120). Production callers get the real 24h window and wall clock.
         self.idempotency_ttl = idempotency_ttl
         self._clock = clock
-        # Off by default -- deliberately, not an oversight (#102). Turning
-        # this on unconditionally against the *default* wall-clock `clock`
-        # would reject every one of this repo's own fixed-date fixtures the
-        # instant real time drifts past them by more than
-        # MAX_EVENT_AGE_DAYS: app/demo_fixtures.py's three shipped
-        # DemoFixture entries, and the "2026-02-05"-style timestamp dozens
-        # of existing tests across the suite use as their canonical valid
-        # event, are already >90 days stale as of this writing. That is
-        # exactly the "green demo, failing live post" failure this
-        # simulator exists to avoid -- just inverted (a demo that now fails
-        # on its own bundled data instead of passing data live would
-        # reject). The check itself is fully implemented and correct (see
-        # validate_event_like_regengine's `now` parameter); a caller that
-        # wants it live -- this test suite, or a future caller with a
-        # source of non-stale demo data -- opts in explicitly here and
-        # supplies `clock=` to control what "now" means for it.
+        # On by default (#209, closing the remaining half of #102). Live
+        # RegEngine applies this floor unconditionally, so a mock whose
+        # default is to skip it accepts batches that live 422s outright --
+        # a historical CSV import or a store replay that passes the demo
+        # and fails the first real post. That is the precise "green demo,
+        # failing live post" divergence this simulator exists to surface,
+        # and it was shipping *inside the simulator itself*.
+        #
+        # The default is what mattered. Both production construction sites
+        # (app/tenancy.py) took it, so the check existed but no deployed
+        # caller ever ran it; making the two of them opt in would have left
+        # the same trap armed for the third. A faithful mock enforces by
+        # default and makes NOT enforcing the explicit, greppable choice.
+        #
+        # Two things had to land first, and both have:
+        #   * #199 rebases app/demo_fixtures.py's shipped fixtures onto the
+        #     current date at load time, so Load Demo Fixture stays inside
+        #     the window however long after they were written the repo runs.
+        #   * The suite's own canonical valid event is now computed relative
+        #     to now (tests/support/timestamps.py) instead of a fixed
+        #     "2026-02-05", which is what #102 left outstanding.
+        #
+        # Scope, stated precisely: this bounds replay, it does not close it.
+        # A captured signed request stays replayable for as long as its
+        # events remain inside the window -- what the floor removes is the
+        # unbounded tail, not replay itself. RegEngine's own
+        # _validate_event_timestamp_window says the same thing ("Separate
+        # from signature-level replay defense: this catches captured
+        # webhooks replayed months later with a freshly-computed
+        # signature"). Closing replay outright needs a signed timestamp
+        # plus a nonce on the request, which neither side has today.
+        #
+        # Pass False to opt out -- for a test whose subject is a
+        # deliberately stale event, or a caller knowingly ingesting
+        # historical data. Supply `clock=` alongside it to control what
+        # "now" means, rather than depending on the wall clock.
         self._enforce_event_age_window = enforce_event_age_window
 
     def reset(self) -> None:
@@ -232,12 +317,34 @@ class MockRegEngineService:
         # API key or an inactive subscription, which is a different
         # concern from "is this request from the holder of the shared
         # secret at all") (#113).
-        _verify_webhook_signature(raw_body, signature_header)
+        #
+        # "Outermost" here means outermost *within this method*, which was
+        # not far enough out: the HTTP route declared `payload:
+        # IngestPayload`, so FastAPI read, JSON-decoded and model-validated
+        # the entire batch before this method was ever entered (#209). The
+        # route now verifies the raw bytes itself, ahead of parsing; this
+        # call remains the gate for callers that reach ingest() directly.
+        verify_webhook_signature(raw_body, signature_header)
 
-        for code in friction:
-            failure = FRICTION_RESPONSES.get(code)
-            if failure is not None:
-                raise MockRegEngineHTTPError(*failure)
+        # An unrecognized friction code is rejected, never skipped (#210).
+        # Silently ignoring it produced the exact failure this simulator
+        # exists to surface: an operator rehearsing a failure mode types
+        # "rate-limit" or "subscription-inactive", the request returns a
+        # clean 200, and they conclude they have exercised a path they have
+        # not. The whole header is refused rather than just the bad code,
+        # so a typo alongside a valid code cannot be masked by the valid
+        # one raising first.
+        unknown = [code for code in friction if code not in FRICTION_RESPONSES]
+        if unknown:
+            raise MockRegEngineHTTPError(
+                400,
+                f"Unknown mock friction code(s): {', '.join(sorted(unknown))}. "
+                f"Supported codes: {', '.join(sorted(FRICTION_RESPONSES))}.",
+            )
+        if friction:
+            # First listed code wins, as before -- every code is known to
+            # map to a response by the time we get here.
+            raise MockRegEngineHTTPError(*FRICTION_RESPONSES[friction[0]])
 
         if len(payload.events) < MIN_BATCH_EVENTS:
             raise MockRegEngineHTTPError(
@@ -283,11 +390,11 @@ class MockRegEngineService:
         # #102: the replay-window floor is handler-level in live RegEngine
         # (checked per event, inside the route, after the request body has
         # already passed Pydantic validation above) -- it rejects only the
-        # stale event, not the batch. Only fed a real `now` when this
-        # instance opted into enforce_event_age_window (reusing the same
-        # `now` this call already resolved above, rather than calling
-        # self._clock() again); see __init__ for why that is off by
-        # default.
+        # stale event, not the batch. Fed a real `now` unless this instance
+        # explicitly opted OUT via enforce_event_age_window=False (reusing
+        # the same `now` this call already resolved above, rather than
+        # calling self._clock() again); see __init__ for why enforcing is
+        # the default.
         age_check_now = now if self._enforce_event_age_window else None
 
         response_events: list[IngestResponseEvent] = []
@@ -426,12 +533,13 @@ def _handler_level_errors(event: RegEngineEvent, *, now: datetime | None = None)
     this one event -- unlike _field_constraint_errors, the rest of the
     batch is unaffected.
 
-    ``now`` gates the replay-window floor specifically: when None (the
-    default), the age check is skipped entirely, matching this codebase's
-    behavior before #102. A caller that wants it enforced passes the
-    reference time to compare against -- MockRegEngineService.ingest()
-    does this only when constructed with enforce_event_age_window=True,
-    using its own injectable clock (#120's pattern) rather than a bare
+    ``now`` gates the replay-window floor specifically: when None, the age
+    check is skipped entirely. This function keeps None as its own default
+    so that direct callers -- the CSV importer's warning path, the audit
+    checks, tests inspecting one event in isolation -- are unaffected by
+    it. MockRegEngineService.ingest() supplies the reference time whenever
+    enforce_event_age_window is set, which since #209 is its default; it
+    passes its own injectable clock (#120's pattern) rather than a bare
     datetime.now(UTC) call, so a test can cross the boundary deterministically.
     """
     errors: list[str] = []

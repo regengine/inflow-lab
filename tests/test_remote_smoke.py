@@ -5,6 +5,7 @@ import pytest
 
 from app.build_info import APP_VERSION
 from scripts.remote_smoke import (
+    DEFAULT_ALLOWED_HOSTS,
     DEFAULT_TENANT,
     FRESH_CUT_OUTPUT_LOT,
     RemoteSmokeConfig,
@@ -23,6 +24,10 @@ def test_config_from_env_requires_connection_and_auth_values():
             "REGENGINE_REMOTE_BASE_URL": "https://demo.example.com/",
             "REGENGINE_REMOTE_USERNAME": "demo",
             "REGENGINE_REMOTE_PASSWORD": "secret-password",
+            # #124: config_from_env now refuses to build a credential-carrying
+            # config for a host outside the allowlist. This test is about env
+            # parsing, not host policy, so it declares its example host.
+            "REGENGINE_REMOTE_ALLOWED_HOSTS": "demo.example.com",
         }
     )
 
@@ -37,6 +42,7 @@ def test_config_from_env_requires_connection_and_auth_values():
             "REGENGINE_REMOTE_USERNAME": "demo",
             "REGENGINE_REMOTE_PASSWORD": "secret-password",
             "REGENGINE_EXPECTED_BUILD_SHA": "abcdef1234567890",
+            "REGENGINE_REMOTE_ALLOWED_HOSTS": "demo.example.com",
         }
     )
     assert expected_config.expected_build_sha == "abcdef1234567890"
@@ -230,3 +236,83 @@ class FakeRemoteServer:
 def decode_json(request: httpx.Request) -> dict:
     body = request.content.decode("utf-8")
     return httpx.Response(200, content=body).json()
+
+
+# ---------------------------------------------------------------------------
+# #124 — the dispatcher-supplied base_url must not be able to walk off with
+# the live shared-demo Basic Auth credentials.
+# ---------------------------------------------------------------------------
+
+
+def _credentialed_env(base_url: str) -> dict[str, str]:
+    return {
+        "REGENGINE_REMOTE_BASE_URL": base_url,
+        "REGENGINE_REMOTE_USERNAME": "demo",
+        "REGENGINE_REMOTE_PASSWORD": "secret-password",
+    }
+
+
+@pytest.mark.parametrize(
+    "base_url",
+    [
+        "https://attacker.example",
+        "http://attacker.example",
+        # netloc contains the allowlisted host as userinfo, but every request
+        # would go to attacker.example -- a netloc substring check would let
+        # this through.
+        "https://regengine-inflow-lab-gh-production.up.railway.app@attacker.example",
+        # Allowlisted host as a subdomain label of an attacker domain.
+        "https://regengine-inflow-lab-gh-production.up.railway.app.attacker.example",
+        # Suffix-style near miss.
+        "https://evil-regengine-inflow-lab-gh-production.up.railway.app",
+    ],
+    ids=["https_offlist", "http_offlist", "userinfo_prefix", "subdomain_prefix", "suffix_near_miss"],
+)
+def test_off_allowlist_base_url_is_refused_before_a_config_carries_secrets(base_url):
+    with pytest.raises(RemoteSmokeFailure) as exc_info:
+        config_from_env(_credentialed_env(base_url))
+
+    message = str(exc_info.value)
+    assert "Refusing to send credentials" in message
+    # The failure message must not leak the password it was protecting.
+    assert "secret-password" not in message
+
+
+def test_the_real_demo_host_is_still_accepted():
+    """Acceptance criterion: existing scheduled runs keep passing."""
+    (demo_host,) = DEFAULT_ALLOWED_HOSTS
+    config = config_from_env(_credentialed_env(f"https://{demo_host}/"))
+
+    assert config.base_url == f"https://{demo_host}"
+
+
+def test_plaintext_http_to_an_allowlisted_host_is_refused():
+    """Basic Auth over http:// puts the shared-demo password on the wire in
+    a base64 header for anyone on the path, so an allowlisted host is not on
+    its own sufficient.
+    """
+    (demo_host,) = DEFAULT_ALLOWED_HOSTS
+    with pytest.raises(RemoteSmokeFailure, match="plaintext HTTP"):
+        config_from_env(_credentialed_env(f"http://{demo_host}"))
+
+
+def test_allowlist_env_var_replaces_rather_than_extends_the_defaults():
+    (demo_host,) = DEFAULT_ALLOWED_HOSTS
+    env = _credentialed_env(f"https://{demo_host}") | {
+        "REGENGINE_REMOTE_ALLOWED_HOSTS": "staging.example.com"
+    }
+
+    with pytest.raises(RemoteSmokeFailure, match="not an allowlisted"):
+        config_from_env(env)
+
+    allowed = config_from_env(
+        _credentialed_env("https://staging.example.com")
+        | {"REGENGINE_REMOTE_ALLOWED_HOSTS": "staging.example.com"}
+    )
+    assert allowed.base_url == "https://staging.example.com"
+
+
+def test_loopback_is_always_permitted_for_local_runs():
+    config = config_from_env(_credentialed_env("http://127.0.0.1:8000"))
+
+    assert config.base_url == "http://127.0.0.1:8000"

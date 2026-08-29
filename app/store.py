@@ -51,8 +51,26 @@ def _serialize_record(record: StoredEventRecord) -> str:
     ``replace_all``). Routing them all through the same function is what
     keeps the ``_scrub_secrets`` pass from drifting out of sync between an
     append and a rewrite of the same record.
+
+    ``allow_nan=False`` (#98) is the last line of defence for the file
+    format. Python's default ``allow_nan=True`` emits bare ``NaN`` /
+    ``Infinity`` tokens, which are *not* RFC 8259: a strict reader
+    (browser ``JSON.parse``, Go ``encoding/json``, Rust serde) rejects the
+    whole line and ``jq`` quietly coerces the value to ``null``. The
+    ``quantity`` field is now guarded at the model (``allow_inf_nan=False``),
+    so a validated record cannot reach here carrying NaN; this keeps the
+    guarantee at the file boundary itself, where it belongs, for any producer
+    that bypasses model validation. It matters specifically for *typed*
+    ``float`` fields: ``model_dump(mode="json")`` passes a non-finite typed
+    float through unchanged, while a non-finite value under an ``Any``-typed
+    field such as ``kdes`` is already coerced to ``None`` by pydantic. Both
+    write paths are safe against the resulting ``ValueError``:
+    ``_write_records`` builds a ``.tmp`` and only ``replace``s it on success,
+    and ``_append_locked`` flushes and commits one record at a time, so a
+    mid-batch failure behaves exactly like the mid-batch ``OSError`` those
+    paths already document.
     """
-    return json.dumps(_scrub_secrets(record.model_dump(mode="json")))
+    return json.dumps(_scrub_secrets(record.model_dump(mode="json")), allow_nan=False)
 
 
 def mask_secret_in_string(message: str | None, secret: str | None) -> str | None:
@@ -211,7 +229,24 @@ class EventStore:
 
         with self._lock:
             if path.exists():
-                with path.open("r", encoding="utf-8") as handle:
+                # Opened in BINARY mode, deliberately (#93). A text-mode
+                # handle decodes as it iterates, so a run of invalid UTF-8
+                # bytes anywhere in the file raises UnicodeDecodeError out
+                # of the `for` statement itself -- outside the try below,
+                # and therefore past every skip-and-log guard here. That is
+                # the same whole-read abort this method exists to prevent,
+                # just triggered by byte corruption instead of a syntax
+                # error: torn writes, a truncated volume restore, or a file
+                # written by something that was not this app.
+                #
+                # Reading bytes and letting model_validate_json do the
+                # decoding moves that failure inside the try, where it
+                # arrives as a pydantic ValidationError (a ValueError) and
+                # is skipped and logged exactly like any other unparseable
+                # line. Iterating a binary handle still splits on b"\n",
+                # which is precisely what _serialize_record writes, so
+                # line numbering is unchanged.
+                with path.open("rb") as handle:
                     for line_number, line in enumerate(handle, start=1):
                         if not line.strip():
                             continue
@@ -449,7 +484,41 @@ class EventStore:
                     self._counter = next_sequence_no
                     self._records.appendleft(record)
                     stored.append(record)
+                if stored:
+                    self._fsync_appended(handle)
         return stored
+
+    def _fsync_appended(self, handle: Any) -> None:
+        """Force this batch's appended bytes to stable storage (#93).
+
+        ``flush()`` in the loop above only pushes the bytes out of Python's
+        buffer into the OS page cache. That is enough to make a write error
+        surface synchronously and enough to survive the process dying, but
+        not enough to survive the machine losing power -- so an
+        acknowledged append could still be missing after a hard restart.
+        ``update_many``/``replace_all`` get their durability from the tmp +
+        ``os.replace`` swap in ``_write_records``; the append path had no
+        equivalent, which is the durability half of #93.
+
+        A tmp + rename would give the same guarantee here only by
+        rewriting the entire log on every append -- turning an O(1) append
+        into O(total records), on the hot path every step() takes. #93
+        names ``fsync`` as the alternative for exactly this reason.
+
+        One fsync per *batch*, not per record: the per-record ``flush()``
+        already supplies the error detection and the write-then-commit
+        ordering the loop depends on, and an fsync per record would make a
+        multi-thousand-row CSV import pay a disk round-trip per row.
+
+        Skipped for anything that is not a regular file: the persist path
+        can legitimately point at a character device (the durability tests
+        use /dev/full to force ENOSPC), which has no durable state to
+        flush. Same constraint ``_truncate_torn_tail`` and
+        ``_resync_counter_from_disk`` already carry, for the same reason.
+        """
+        if not self.persist_path.is_file():
+            return
+        os.fsync(handle.fileno())
 
     def update_many(self, records: Iterable[StoredEventRecord]) -> list[StoredEventRecord]:
         self._refuse_if_retired()
@@ -497,13 +566,28 @@ class EventStore:
         record_ids: list[str] | None = None,
         limit: int = 50,
     ) -> list[StoredEventRecord]:
-        record_id_filter = set(record_ids or [])
+        """Failed records, optionally narrowed to *record_ids*.
+
+        ``record_ids=None`` means "no filter -- every failed record".
+        ``record_ids=[]`` means "this explicitly empty set" and therefore
+        matches nothing. That distinction is #144's, and until #211 it
+        lived only in SimulationController.retry_failed_delivery, which
+        short-circuits the empty list before ever calling this method:
+        this method itself built its filter as ``set(record_ids or [])``
+        and then treated an empty filter as "match everything", so a
+        direct caller passing ``[]`` got every failed record retried --
+        exactly the behaviour #144 is about, one layer down. The
+        controller keeps its short-circuit (it is pinned by tests, and it
+        answers without touching the store at all); this makes the store
+        agree rather than depending on being called from there.
+        """
+        record_id_filter = None if record_ids is None else set(record_ids)
         records = self._all_records()
         failed_records = [
             record
             for record in records
             if record.delivery_status == "failed"
-            and (not record_id_filter or record.record_id in record_id_filter)
+            and (record_id_filter is None or record.record_id in record_id_filter)
         ]
         return failed_records[:limit]
 

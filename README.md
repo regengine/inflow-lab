@@ -85,8 +85,12 @@ app/
   codex/prompts/autobuild.md
   workflows/ci.yml
   workflows/codex-autopilot.yml
+  workflows/contract-pin-drift.yml
   workflows/remote-smoke.yml
 scripts/
+  _smoke_common.py       # Shared assertion/redaction harness for the smoke scripts
+  regengine_kde_contract.py  # Reads RegEngine's required-KDE table out of its source
+  contract_pin_drift.py  # Fails when either repo's pin to the other goes stale
   smoke_regression.py    # End-to-end API smoke for demo-ready release checks
   browser_smoke.py       # Headless Playwright dashboard smoke
   remote_smoke.py        # HTTP smoke harness for deployed shared-demo instances
@@ -206,7 +210,11 @@ simulate -> ingest -> validate -> trace -> export
 The simulator supports three delivery modes, configured via the `delivery.mode` field:
 
 ### `mock` (default)
-No credentials required. Events go to the built-in RegEngine stand-in, which **mirrors the live webhook's validation** rather than accepting everything: strict per-CTE KDE checks (exact key lookup, no aliasing), the location-identifier requirement, a 500-event batch cap, an empty-batch rejection, in-batch duplicate rejection, future-timestamp rejection, and 24-hour idempotency replays. When `REGENGINE_WEBHOOK_HMAC_SECRET` is set, the stand-in also **verifies** `X-Webhook-Signature` over the raw request bytes and 401s a missing, malformed or mismatched signature — so a signing bug fails here rather than only against production. Verification applies to the HTTP route; the in-process delivery path has no wire bytes to check and skips it. The route additionally accepts a mock-only `X-Mock-Friction` header (comma-separated `invalid_key`, `subscription_inactive`, `rate_limit`) so an external caller can rehearse the same failure modes the console's toggles inject. Accepted events return a synthetic `event_id`, `sha256_hash`, and `chain_hash`; rejected events return the same per-event `errors` shape live RegEngine produces. Safe for demos and design-partner testing.
+No credentials required. Events go to the built-in RegEngine stand-in, which **mirrors the live webhook's validation** rather than accepting everything: strict per-CTE KDE checks (exact key lookup, no aliasing), the location-identifier requirement, a 500-event batch cap, an empty-batch rejection, in-batch duplicate rejection, future-timestamp rejection, and 24-hour idempotency replays. When `REGENGINE_WEBHOOK_HMAC_SECRET` is set, the stand-in also **verifies** `X-Webhook-Signature` over the raw request bytes and 401s a missing, malformed or mismatched signature — so a signing bug fails here rather than only against production. Verification runs *before* the body is decoded or validated, so an unsigned caller gets a flat 401 rather than a field-level 422 enumerating the schema, and an unsigned oversized body is never parsed. The checks that need no body at all — a missing header, a scheme that is not `sha256`, a digest that is not hex — are answered before the body is even held in memory: those bytes are drained and discarded, so an unauthenticated caller cannot make the process buffer an arbitrarily large payload, while still receiving the 401 that names what was wrong. Verification applies to the HTTP route; the in-process delivery path has no wire bytes to check and skips it. The route additionally accepts a mock-only `X-Mock-Friction` header (comma-separated `invalid_key`, `subscription_inactive`, `rate_limit`) so an external caller can rehearse the same failure modes the console's toggles inject; an unrecognized code is a 400, never a silent 200 that injects nothing. Accepted events return a synthetic `event_id`, `sha256_hash`, and `chain_hash`; rejected events return the same per-event `errors` shape live RegEngine produces. Safe for demos and design-partner testing.
+
+**The 90-day event-age replay window is enforced by default.** Live RegEngine rejects any event older than `WEBHOOK_MAX_EVENT_AGE_DAYS` (90) with "replay window exceeded", per event, inside its route handler. The stand-in applies the same floor (`MAX_EVENT_AGE_DAYS` in `app/mock_service.py`, pinned by `tests/test_mock_validation_parity.py`) and, since #209, constructs with `enforce_event_age_window=True` at both `app/tenancy.py` sites. It shipped off by default while this repository's own bundled fixtures carried dates already outside the window; #199 rebases those onto the current date at load time and the suite's canonical valid event is now computed relative to now (`tests/support/timestamps.py`), which removed the last reason to keep a documented place where the mock accepted what live rejects. A stale row still **imports and is stored** — pulling historical data into a simulator is legitimate — and **CSV import still warns on every row outside the window before any delivery is attempted**, at `required` severity, naming the limit and live's exact rejection wording. What changed is that delivery now refuses those rows too, so the warning is advance notice of a refusal the simulator itself will issue rather than the only thing standing between a green demo and a wholesale rejection in production. Pass `enforce_event_age_window=False` to opt a service out deliberately.
+
+**What this does and does not do for replay.** An event-age floor **bounds** replay; it does not close it. It caps how long a captured, correctly signed request stays replayable — once its events age past 90 days it stops working — but a capture whose events are still inside the window replays successfully as many times as you send it (`tests/test_replay_window.py::test_the_window_bounds_replay_rather_than_closing_it` pins exactly that). Closing replay outright requires a signed timestamp plus a per-request nonce, which neither this simulator nor RegEngine implements today. RegEngine's own `_validate_event_timestamp_window` draws the same line: "Separate from signature-level replay defense: this catches captured webhooks replayed months later with a freshly-computed signature."
 
 Mock delivery also supports **failure-mode rehearsal** via `delivery.mock_friction` (or the "Rehearse failure modes" toggles in the console): `invalid_key` (401), `subscription_inactive` (402), and `rate_limit` (429) inject the exact failures a live integration hits, so operators can practice diagnosing and retrying — retries reuse the stored idempotency key, so nothing double-ingests.
 
@@ -228,7 +236,7 @@ Every stored record tracks `delivery_status`, `destination_mode`, `delivery_atte
 
 The console treats RegEngine like any third-party integration a customer configures, backed by three endpoints:
 
-- `GET /api/integration/status` — sanitized connection state: mode, endpoint host, whether an API key / tenant are configured, whether HMAC signing is enabled, and active `mock_friction` codes. Secrets are never returned.
+- `GET /api/integration/status` — sanitized connection state: mode, endpoint host, `default_endpoint` (the live ingest URL applied when none is configured — the console reads its endpoint-field placeholder from this rather than hardcoding the URL, so `DEFAULT_LIVE_INGEST_ENDPOINT` in `app/regengine_client.py` stays the single source of truth), whether an API key / tenant are configured, whether HMAC signing is enabled, and active `mock_friction` codes. Secrets are never returned.
 - `POST /api/integration/configure` — partial update of `mode`, `endpoint`, `api_key`, `tenant_id`, and `mock_friction`; omitted fields keep their stored values so the settings page can switch modes without re-entering credentials.
 - `POST /api/integration/test` — probes RegEngine with the configured (or request-supplied) credentials using the cheapest authenticated read (`GET /api/v1/webhooks/recent?limit=1`) and maps the response to an actionable verdict: `connected`, `contract_mismatch` (authenticated read succeeded but the two deploys advertise different ingest contract versions), `unauthorized` (401), `subscription_inactive` (402), `forbidden` (403), `tenant_mismatch` (404), `rate_limited` (429), `service_unavailable` (503), `unreachable`, or `not_configured`. In mock mode with no credentials it reports `mock` without touching the network.
 
@@ -244,7 +252,7 @@ export REGENGINE_REDIS_URL=redis://localhost:6379/0
 uv run python scripts/customer_journey.py --local
 ```
 
-Steps: health probe → tenant + API key provisioning through `/v1/admin` → billing activation (seeds `billing:tenant:{id}` in Redis so the subscription gate passes) → connection test → several canonical CTE batches ingested with the same engine and live client the console uses → friction demos (a KDE-rejected event and an idempotency replay) → verification that RegEngine now holds the evidence (`/api/v1/webhooks/recent`, `/api/v1/webhooks/chain/verify`, `/api/v1/fda/export/all`).
+Steps: health probe → tenant + API key provisioning through `/v1/admin` → billing activation (seeds `billing:tenant:{id}` in Redis so the subscription gate passes) → connection test → several canonical CTE batches ingested with the same engine and live client the console uses → friction demos (a KDE-rejected event and an idempotency replay) → verification that RegEngine now holds the evidence (`/api/v1/webhooks/recent`, `/api/v1/webhooks/chain/verify`, `/api/v1/fda/export/all`) → teardown of the tenant and key it provisioned. The teardown runs from a `finally` block, so a run that fails partway still removes what it created; if the admin API refuses the delete, the journey reports that as a failed step naming the tenant id to remove by hand.
 
 For a deployed RegEngine, the harness follows `scripts/live_trial.py`'s gating: it refuses to run without `--confirm-live`, requires pre-provisioned `REGENGINE_LIVE_ENDPOINT` / `REGENGINE_LIVE_API_KEY` / `REGENGINE_LIVE_TENANT_ID`, never provisions or touches Redis, sends one small batch, and skips the deliberate-failure demos.
 
@@ -307,7 +315,7 @@ Replay responses include `status`, `read`, `replayed`, `posted`, `failed`, `sour
 
 ## CSV import
 
-`POST /api/import/csv` accepts CSV text and imports either scheduled RegEngine-shaped events or seed lots. Valid rows are delivered through the selected delivery mode and persisted as `StoredEventRecord` JSONL entries. Invalid rows are skipped, with deterministic row-level errors in the response. Accepted rows are also checked against CTE-specific KDE expectations and can return warnings for missing lineage, document, location, or date context. The default dashboard/API delivery remains **`mock`** unless you explicitly submit a different `delivery` object.
+`POST /api/import/csv` accepts CSV text and imports either scheduled RegEngine-shaped events or seed lots. Valid rows are delivered through the selected delivery mode and persisted as `StoredEventRecord` JSONL entries. Invalid rows are skipped, with deterministic row-level errors in the response. Accepted rows are also checked against CTE-specific KDE expectations and can return warnings for missing lineage, document, location, or date context. Each warning carries a `severity` of `required` or `recommended`, so an FDA-mandatory KDE (for example a Transformation event's input-lot linkage) is distinguishable from an advisory one in the response and in the console, rather than only in the message text. The audit-readiness summary counts the two tiers separately (`required_warning_count` / `recommended_warning_count`). The default dashboard/API delivery remains **`mock`** unless you explicitly submit a different `delivery` object.
 
 Request body:
 
@@ -385,6 +393,8 @@ The dashboard fixture loader resets the current event log before loading the sel
 
 If a lot code is supplied, the export is scoped to that lot's transitive lineage before applying the preset filter. `GET /api/mock/regengine/export/presets` returns the preset catalog used by the dashboard. The dashboard export panel builds CSV and EPCIS download links from the same lot and date filters.
 
+**Export size limit.** Both export endpoints (`export/fda-request` and `export/epcis`) refuse a request matching more than **5,000 records** with HTTP 413, naming the matched count and how to narrow the request. They read the full persisted JSONL history, so a broad date range or a wide lineage graph is otherwise unbounded. The response is refused rather than truncated on purpose: these are `Content-Disposition: attachment` downloads, so a shortened file is indistinguishable from a complete one once it is saved — and it is evidence handed to a regulator. A successful export carries `X-Export-Record-Count`, so a count under the limit is proof nothing was left out. (`/api/lineage`, which is read in the browser rather than downloaded, caps and reports truncation in `X-Lineage-Truncated` instead.)
+
 ## EPCIS 2.0 export scaffolding
 
 `GET /api/mock/regengine/export/epcis` derives a scaffolded EPCIS 2.0 JSON-LD document from stored simulator records. This is intentionally additive: it does not change live RegEngine ingest payloads, the mock ingest route, or the FDA CSV export shape.
@@ -437,12 +447,14 @@ The service wrapper examples below can be used with any profile; keep the profil
 | `POST` | `/api/simulate/stop` | Stop the loop |
 | `POST` | `/api/simulate/step` | Emit one batch synchronously |
 | `POST` | `/api/simulate/replay` | Replay persisted JSONL events through the configured delivery mode |
-| `POST` | `/api/simulate/reset` | Clear state and persisted events |
+| `POST` | `/api/simulate/reset` | Clear state and persisted events (accepts the config fields **unwrapped**) |
 | `GET` | `/api/simulate/stream` | Server-Sent Events snapshots for live dashboard updates |
 | `POST` | `/api/import/csv` | Bulk import scheduled events or seed lots from CSV text |
 | `POST` | `/api/delivery/retry` | Retry failed stored deliveries with the current or supplied delivery config |
 
 All routes accept optional `X-RegEngine-Tenant` for tenant-scoped storage. If Basic Auth is enabled, include standard HTTP Basic credentials.
+
+**`/start` and `/reset` take a config override in different shapes, on purpose.** `/start` requires one, so it is wrapped: `{"config": {...}}`. `/reset` treats one as optional — an empty body clears state without reconfiguring — so it takes the same fields unwrapped at the top level. Sending either shape to the other endpoint is a 422 whose message names both shapes; neither is ever silently dropped. See the two examples below.
 
 ### Inspection
 
@@ -455,7 +467,7 @@ All routes accept optional `X-RegEngine-Tenant` for tenant-scoped storage. If Ba
 
 | Method | Path | Purpose |
 |---|---|---|
-| `GET` | `/api/integration/status` | Sanitized connection state (mode, endpoint host, key/tenant configured, HMAC, friction) |
+| `GET` | `/api/integration/status` | Sanitized connection state (mode, endpoint host, default endpoint, key/tenant configured, HMAC, friction) |
 | `POST` | `/api/integration/configure` | Partial update of mode/endpoint/api_key/tenant_id/mock_friction |
 | `POST` | `/api/integration/test` | Probe RegEngine with configured or supplied credentials; returns an actionable verdict |
 
@@ -625,7 +637,7 @@ The live delivery client targets the current RegEngine webhook shape:
 }
 ```
 
-Required KDEs per CTE are mirrored in `app/cte_rules.py` and pinned to RegEngine's `REQUIRED_KDES_BY_CTE` by `tests/test_regengine_contract_pin.py`; the detailed contract reference lives in `.agents/skills/regengine-api-contract/references/contract.md`.
+Required KDEs per CTE are mirrored in `app/cte_rules.py` and pinned to RegEngine's `REQUIRED_KDES_BY_CTE` by `tests/test_regengine_contract_pin.py`. That test compares against `tests/data/regengine_required_kdes.json`, which `scripts/regengine_kde_contract.py` generates by parsing the table out of RegEngine's `services/ingestion/app/webhook_models.py` — it records the repository, path, symbol and commit it came from plus a sha256 over the table, so the copy cannot be hand-edited into agreement, and the cross-repo CI job re-extracts it from a real RegEngine checkout. The detailed contract reference lives in `.agents/skills/regengine-api-contract/references/contract.md`; `tests/test_contract_document.py` holds that document's checkable claims — the per-CTE KDE table, the CTE list, the ingest path and headers, the batch/replay/idempotency limits, the sample payload and the export columns — to the same artifact and to the code they describe, and checks the RegEngine paths and symbols it cites when `REGENGINE_CHECKOUT` points at a RegEngine checkout. Everything the document cannot back that way is marked as unverified prose in the document itself.
 
 **Contract version handshake.** Both sides advertise an ingest contract version (`app/contract.py` here, `webhook_models.INFLOW_CONTRACT_VERSION` in RegEngine) — inflow-lab via `/api/healthz`, `/api/health`, and `/api/integration/status`; RegEngine via `/health`. The test-connection probe compares them and reports a `contract_mismatch` verdict when deployed instances have skewed (one side running an older deploy), so version drift is a visible, named state instead of a silent live-post failure. Bump the version in both repos together whenever the wire contract changes. The mock FDA export was RegEngine's documented 11-column request export shape; it now carries two additional columns (Ship-To / Previous Source Location Description, TLC Source Reference) that FSMA 204 requires for Shipping and Receiving but that shape omitted. **RegEngine's mirrored export needs the same two columns before the shapes match again.** The EPCIS 2.0 export is a separate derived JSON-LD scaffold and does not change this webhook contract.
 
@@ -634,7 +646,16 @@ Required KDEs per CTE are mirrored in `app/cte_rules.py` and pinned to RegEngine
 - `assert_contract_pin_is_fresh()` fails an ordinary pytest test once `CONTRACT_LAST_CONFIRMED` is older than 90 days, so a pin nobody has re-checked becomes a build failure rather than a silent assumption. Override the window with `REGENGINE_CONTRACT_STALENESS_WINDOW_DAYS`. This is a deliberate time bomb: it will eventually fail with nothing actually wrong, because "nobody has verified this lately" is the condition it reports. Re-confirm the pin against RegEngine and move the date — do not delete the check.
 - `check_remote_kde_contract()` diffs `REQUIRED_KDES` against a machine-readable upstream artifact, loaded from `REGENGINE_CONTRACT_ARTIFACT_PATH` (local file) or `REGENGINE_CONTRACT_ARTIFACT_URL`. With neither set it raises rather than reporting a match, so an unverifiable check can never read as a passing one.
 
-Run both from the CLI with `uv run python -m app.contract` — exit `0` clean, `1` stale pin, `2` real mismatch, `3` unverifiable. Wiring it into CI is deliberately **not** done yet: it needs RegEngine to publish `REQUIRED_KDES_BY_CTE` as a fetchable JSON artifact first, and until that exists a CI step would just pin the build permanently red on exit `3`. Once published, the natural home is the existing weekly `schedule` trigger in `.github/workflows/ci.yml` rather than every PR, since it depends on an external resource.
+Run both from the CLI with `uv run python -m app.contract` — exit `0` clean, `1` stale pin, `2` real mismatch, `3` unverifiable. RegEngine still publishes no fetchable artifact, so the artifact is produced from source instead: `uv run python scripts/regengine_kde_contract.py extract --regengine-root <regengine checkout> --output kdes.json`, then run `python -m app.contract` with `REGENGINE_CONTRACT_ARTIFACT_PATH=kdes.json`. That is exactly what the cross-repo CI job below does.
+
+**Cross-repo ingest contract CI.** `.github/workflows/ci.yml` has a `regengine-contract` job that checks RegEngine out beside this repository, stands up Postgres, Redis, migrations and the ingestion service, and runs `scripts/live_trial.py --confirm-live` to post one signed batch into it — the only place `app/regengine_client.py` and `app/controller.py` (notably `_pair_event_responses`, written for RegEngine's rejected-first response ordering that `app/mock_service.py` cannot reproduce) meet a real RegEngine response. It runs on changes to the ingest contract surface and needs cross-repo read access:
+
+- `secrets.REGENGINE_CONTRACT_TOKEN` — a token with `contents: read` on `regengine/regengine`. The default `GITHUB_TOKEN` is scoped to this repository and cannot check another private repository out. Required unless that repository is public.
+- `vars.REGENGINE_CONTRACT_PUBLIC` — set to `true` if `regengine/regengine` is public, to use the default `GITHUB_TOKEN` instead.
+- `vars.REGENGINE_CONTRACT_REPOSITORY` — optional, defaults to `regengine/regengine`.
+- `vars.REGENGINE_CONTRACT_REF` — optional, defaults to `main`; this side tracks RegEngine rather than pinning it. Set a SHA only to ride out an upstream breakage.
+
+Without that access — including every pull request from a fork, which GitHub never gives secrets to — the job skips and the `contract-status-gate` job says so as a warning and in the job summary rather than failing the contributor. `.github/workflows/contract-pin-drift.yml` separately watches how far each repository's pin to the other has fallen behind, failing beyond 10 commits or on any commit touching the contract surface.
 
 ## Deployment
 
@@ -740,13 +761,19 @@ docker run --rm \
 
 `railway.json` uses the same Dockerfile and healthcheck for Railway deployments. Mount persistent storage at `/data` and keep `REGENGINE_DATA_DIR=/data`.
 
-Expose non-secret build metadata so stale shared-demo deployments are obvious from `/api/healthz` and remote smoke failures:
+The shared demo deploys from Railway's GitHub connection, which injects `RAILWAY_GIT_COMMIT_SHA`, so its build identity needs no manual variable. Leave `REGENGINE_BUILD_SHA` and `REGENGINE_BUILD_BRANCH` **unset** there: they take precedence over the injected metadata (`app/build_info.py`), so setting them makes `/api/healthz` report a hand-typed commit rather than what is running, which is exactly the stale-demo blindness the nightly smoke exists to catch. Confirm with `build.commit_source: RAILWAY_GIT_COMMIT_SHA`.
+
+#### Manual CLI deploy (fallback)
+
+Only for a service deployed by hand with `railway up`. There is no GitHub connection injecting metadata, and `.dockerignore` excludes `.git`, so these variables are the container's only source of build identity:
 
 ```bash
 railway variable set --skip-deploys REGENGINE_BUILD_SHA="$(git rev-parse HEAD)" \
   REGENGINE_BUILD_BRANCH="$(git branch --show-current)"
 railway up --ci -m "Deploy $(git rev-parse --short HEAD)"
 ```
+
+A stale value makes `/api/healthz` report a commit that is not deployed. If the service is later switched to Railway's GitHub integration, delete both variables again. `DEPLOYMENT_PROFILES.md` -> "Manual CLI deploy (fallback)" carries the same instruction, and `scripts/cutover_preflight.sh` fails a service whose `commit_source` is anything but `RAILWAY_GIT_COMMIT_SHA`.
 
 The health responses always include `build.version`; `build.commit_sha`, `build.commit_sha_short`, `build.branch`, and `build.deployment_id` are populated from whitelisted environment variables when available, or from local `.git` metadata during local development.
 
@@ -792,7 +819,7 @@ Common failure patterns:
 - Auth failures: request logs show `status=401` on `/api/...`; confirm `REGENGINE_BASIC_AUTH_USERNAME` and `REGENGINE_BASIC_AUTH_PASSWORD` are set as intended.
 - CORS failures: Railway HTTP logs may show successful `OPTIONS` but the browser blocks a follow-up request; confirm `REGENGINE_CORS_ORIGINS` is the exact HTTPS dashboard origin.
 - Volume/storage failures: `/api/health` should report tenant-scoped paths under `REGENGINE_DATA_DIR`; confirm Railway has a volume mounted at `/data` and `REGENGINE_DATA_DIR=/data`.
-- Stale deployment failures: `/api/healthz` should report the expected `build.commit_sha_short`; if it does not, redeploy current `main` and update `REGENGINE_BUILD_SHA`.
+- Stale deployment failures: `/api/healthz` should report the expected `build.commit_sha_short` **and** `build.commit_source: RAILWAY_GIT_COMMIT_SHA`. If `commit_source` is `REGENGINE_BUILD_SHA`, that variable is masking the real commit on the GitHub-connected service — delete it (and `REGENGINE_BUILD_BRANCH`) rather than refreshing it. If the source is already `RAILWAY_GIT_COMMIT_SHA` and the SHA is still behind `main`, the deploy itself did not land: redeploy current `main`.
 - Live delivery failures: request logs identify the route and tenant while dashboard delivery stats show the sanitized delivery error; confirm endpoint, API key, and tenant id before retrying.
 - Local dependency conflicts: remove `.venv`, run `uv sync --group dev`, and retry before diagnosing app failures; global Python packages such as OpenTelemetry or Semgrep can drift independently of this repo.
 - Railway startup log noise: Uvicorn startup messages may appear with `level=error` in Railway logs. Treat them as noise unless there is a traceback, failed deployment, or HTTP 5xx.
