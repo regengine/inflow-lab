@@ -113,6 +113,35 @@ def apply_fda_export_preset(
     return sorted(filtered, key=lambda record: record.event.timestamp)
 
 
+_FORMULA_LEADERS = ("=", "+", "-", "@", "\t", "\r")
+
+
+def _sanitize_cell(value: object) -> object:
+    """Neutralise spreadsheet formula injection in an exported cell.
+
+    Excel, LibreOffice and Sheets evaluate a cell whose text begins with
+    ``=``, ``+``, ``-``, ``@``, a tab or a carriage return. Lot codes,
+    product and location descriptions all reach this export from CSV import
+    or the API, so an operator-supplied ``=cmd|'/c calc'!A1`` would execute
+    when a reviewer opens the regulatory export.
+
+    Prefixing an apostrophe is the standard mitigation: spreadsheets treat
+    the rest as literal text and do not display the apostrophe. It does
+    change the byte a non-spreadsheet parser sees, which is the accepted
+    trade for a file whose whole purpose is to be opened in a spreadsheet.
+
+    Numbers are left alone -- they are not str, so they cannot carry a
+    leading formula character.
+    """
+    if isinstance(value, str) and value.startswith(_FORMULA_LEADERS):
+        return "'" + value
+    return value
+
+
+def _sanitize_row(row: dict[str, object]) -> dict[str, object]:
+    return {key: _sanitize_cell(value) for key, value in row.items()}
+
+
 def render_fda_request_csv(
     records: Iterable[StoredEventRecord],
     location_gln: Callable[[str], str],
@@ -125,7 +154,7 @@ def render_fda_request_csv(
         # Normalize before splitting -- see normalize_to_utc below (issue #157).
         normalized_timestamp = normalize_to_utc(event.timestamp)
         writer.writerow(
-            {
+            _sanitize_row({
                 "Traceability Lot Code": event.traceability_lot_code,
                 "Event Type (CTE)": event.cte_type.value,
                 "Product Description": event.product_description,
@@ -147,7 +176,7 @@ def render_fda_request_csv(
                 "Time": normalized_timestamp.time().isoformat(timespec="seconds"),
                 "Reference Document Type": event.kdes.get("reference_document_type", ""),
                 "Reference Document Number": event.kdes.get("reference_document_number", ""),
-            }
+            })
         )
     return output.getvalue()
 

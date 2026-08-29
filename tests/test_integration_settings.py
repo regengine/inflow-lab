@@ -55,6 +55,10 @@ class ProbeAsyncClient:
         *,
         headers: dict[str, str] | None = None,
         params: dict[str, Any] | None = None,
+        # extensions: the live client attaches {"sni_hostname": ...} when it
+        # pins the validated address for the dial (#207). Accepted and
+        # ignored here so this fake keeps working on either path.
+        extensions: dict[str, Any] | None = None,
     ) -> FakeProbeResponse:
         if url.endswith("/health"):
             return FakeProbeResponse(200, ProbeAsyncClient.health_payload)
@@ -258,3 +262,53 @@ def test_mock_idempotency_replay_returns_cached_response() -> None:
     first_ids = [event.event_id for event in first.events]
     fresh_ids = [event.event_id for event in fresh.events]
     assert first_ids != fresh_ids
+
+
+def test_not_configured_detail_names_the_origin_mismatch_not_missing_credentials() -> None:
+    """The verdict was right and the reason was false (#210).
+
+    With credentials stored for one origin, probing a different one
+    correctly withholds them -- but the detail that came back was
+    check_connection's generic "Both an API key and a tenant id are
+    required before testing the connection." Both ARE configured. An
+    operator reading that goes and re-enters credentials that were already
+    correct, and never learns that what actually happened is that this
+    request pointed somewhere the stored key was not issued for.
+    """
+    configured = client.post(
+        "/api/integration/configure",
+        json={
+            "mode": "live",
+            "endpoint": "https://www.regengine.co/api/v1/webhooks/ingest",
+            "api_key": "rge_live_configured_key",
+            "tenant_id": "11111111-1111-1111-1111-111111111111",
+        },
+    )
+    assert configured.status_code == 200
+
+    body = client.post(
+        "/api/integration/test",
+        json={"endpoint": "https://staging.regengine.example/api/v1/webhooks/ingest"},
+    ).json()
+
+    assert body["verdict"] == "not_configured"
+    detail = body["detail"]
+    assert "Both an API key and a tenant id are required" not in detail, (
+        "reported missing credentials that are in fact configured"
+    )
+    assert "https://www.regengine.co:443" in detail, "should name where the stored key belongs"
+    assert "https://staging.regengine.example:443" in detail, "should name what was targeted"
+    assert "rge_live_configured_key" not in detail
+
+
+def test_not_configured_detail_is_unchanged_when_nothing_is_actually_configured() -> None:
+    # The generic wording is correct in the case it was written for, and
+    # must survive. setup_function has reset to a default config, so
+    # nothing is stored and nothing is supplied.
+    body = client.post(
+        "/api/integration/test",
+        json={"endpoint": "https://staging.regengine.example/api/v1/webhooks/ingest"},
+    ).json()
+
+    assert body["verdict"] == "not_configured"
+    assert "Both an API key and a tenant id are required" in body["detail"]

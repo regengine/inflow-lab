@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import logging
 import os
 from pathlib import Path
@@ -17,6 +18,7 @@ from .scenario_saves import ScenarioSaveStore
 from .schemas.ingestion import ReplayRequest
 from .schemas.scenarios import ScenarioSaveRequest
 from .schemas.simulation import SimulationConfig
+from .auth import TENANT_HEADER
 from .store import EventStore
 
 
@@ -48,7 +50,14 @@ store = EventStore(persist_path=str(DATA_ROOT / "events.jsonl"))
 scenario_saves = ScenarioSaveStore(save_dir=str(DATA_ROOT / "scenario_saves"))
 # Seed the mock's hash chain from what is already persisted, so a restart
 # continues the chain instead of forking a second one from an empty hash.
-mock_service = MockRegEngineService(store=store)
+#
+# enforce_event_age_window is spelled out rather than inherited (#209): it
+# is MockRegEngineService's default, but this is the deployed stand-in real
+# customers post at, and "does the thing we ship enforce live's 90-day
+# replay window?" should be answerable from this line without chasing a
+# default. See app/mock_service.py's __init__ for why the default moved --
+# and for why the floor bounds replay rather than closing it.
+mock_service = MockRegEngineService(store=store, enforce_event_age_window=True)
 controller = SimulationController(
     engine=engine,
     store=store,
@@ -75,8 +84,33 @@ _tenants_being_deleted: set[str] = set()
 
 
 async def shutdown_tenant_controllers() -> None:
-    for tenant_controller in set(_tenant_controllers.values()):
-        await tenant_controller.shutdown()
+    """Stop every live tenant controller, concurrently (#208, criterion 5).
+
+    Each ``shutdown()`` awaits that tenant's run-loop task, which may be
+    mid-step and therefore mid-delivery. Awaiting them one at a time made
+    container shutdown the *sum* of every tenant's in-flight delivery; with
+    MAX_TENANT_CONTROLLERS at 50 that is long enough for the platform to
+    SIGKILL the process partway through, leaving later tenants' loops
+    killed rather than stopped. Running them together makes it the max
+    instead of the sum.
+
+    ``return_exceptions=True`` so one tenant failing to stop cannot skip
+    the shutdown of every tenant behind it -- the previous serial loop
+    abandoned the rest on the first raise. Failures are logged and the
+    first is re-raised afterwards, so nothing is silently swallowed.
+    """
+    tenant_controllers = list(set(_tenant_controllers.values()))
+    if not tenant_controllers:
+        return
+    results = await asyncio.gather(
+        *(tenant_controller.shutdown() for tenant_controller in tenant_controllers),
+        return_exceptions=True,
+    )
+    failures = [result for result in results if isinstance(result, BaseException)]
+    for failure in failures:
+        logger.error("tenant controller shutdown failed: %s", failure)
+    if failures:
+        raise failures[0]
 
 
 def active_controller_for_context(context: TenantContext) -> SimulationController:
@@ -240,12 +274,31 @@ def _ensure_persist_path_within_root(persist_path: str) -> str:
     resolved = candidate.resolve()
     root = DATA_ROOT.resolve()
     if resolved == root or root in resolved.parents:
+        _reject_tenant_storage_path(resolved)
         return persist_path
     if not candidate.is_absolute():
         cwd = Path.cwd().resolve()
         if resolved == cwd or cwd in resolved.parents:
+            _reject_tenant_storage_path(resolved)
             return persist_path
     raise ValueError("persist_path must stay within the permitted data directory")
+
+
+def _reject_tenant_storage_path(resolved: Path) -> None:
+    """Refuse a persist_path that points into per-tenant storage.
+
+    Being inside DATA_ROOT is not enough: ``data/tenants/`` is inside it, and
+    every other tenant's event log lives there. A caller on the default tenant
+    that can name one reads it back through the exports, and ``EventStore``'s
+    own reset unlinks it. Tenant storage is reachable only by selecting the
+    tenant, never by naming its file.
+    """
+    tenant_root = TENANT_DATA_ROOT.resolve()
+    if resolved == tenant_root or tenant_root in resolved.parents:
+        raise ValueError(
+            "persist_path must not point into tenant storage; select a tenant "
+            f"with the {TENANT_HEADER} header instead"
+        )
 
 
 def scope_config(context: TenantContext, config: SimulationConfig) -> SimulationConfig:
@@ -322,6 +375,10 @@ def _create_tenant_controller(tenant_id: str) -> SimulationController:
         engine=tenant_engine,
         store=tenant_store,
         scenario_saves=tenant_saves,
-        mock_service=MockRegEngineService(store=tenant_store),
+        # Explicit for the same reason as the default tenant's service
+        # above: a per-tenant stand-in that quietly accepted what live
+        # rejects would put every tenant demo back on the wrong side of
+        # the parity gap (#209).
+        mock_service=MockRegEngineService(store=tenant_store, enforce_event_age_window=True),
         live_client=LiveRegEngineClient(),
     )

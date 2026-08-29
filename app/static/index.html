@@ -211,7 +211,9 @@
               </label>
               <label class="wide-field">
                 Ingest endpoint
-                <input id="endpoint" name="endpoint" placeholder="https://www.regengine.co/api/v1/webhooks/ingest" />
+                <!-- The placeholder is filled from /api/integration/status.default_endpoint
+                     by app.js (#155); the live ingest URL is not repeated here. -->
+                <input id="endpoint" name="endpoint" />
               </label>
               <label class="wide-field">
                 API key

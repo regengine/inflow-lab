@@ -18,6 +18,19 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 20
 
+    # #126: this job used to run 3.11 only, while the image Railway deploys is
+    # `FROM python:3.12-slim`. Anything that breaks on 3.12 alone -- a
+    # dependency, a stdlib removal -- passed CI green and surfaced as a failed
+    # deploy. 3.11 stays because pyproject's `requires-python = ">=3.11"` still
+    # claims it, and ruff's target-version is py311; dropping it would trade
+    # one blind spot for another rather than close this one.
+    # tests/test_container_profile.py asserts this matrix still contains the
+    # Dockerfile's base-image version, so a base bump cannot silently outrun CI.
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ['3.11', '3.12']
+
     steps:
       - name: Check out repository
         uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
@@ -25,14 +38,17 @@ jobs:
       - name: Set up Python
         uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6.3.0
         with:
-          python-version: '3.11'
+          python-version: ${{ matrix.python-version }}
 
       - name: Cache uv
         uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
         with:
           path: ~/.cache/uv
-          key: uv-${{ runner.os }}-${{ hashFiles('uv.lock') }}
-          restore-keys: uv-${{ runner.os }}-
+          # The interpreter is part of the key: the two matrix legs resolve
+          # different wheels for the same uv.lock, so a shared key would let
+          # one leg restore the other's cache.
+          key: uv-${{ runner.os }}-py${{ matrix.python-version }}-${{ hashFiles('uv.lock') }}
+          restore-keys: uv-${{ runner.os }}-py${{ matrix.python-version }}-
 
       - name: Install uv
         run: python -m pip install --upgrade uv
@@ -42,6 +58,32 @@ jobs:
 
       - name: Run tests
         run: uv run --frozen --group dev pytest
+
+      # #211 moved the contract pin's wall-clock verdict out of pytest, because
+      # asserting it there scheduled the whole suite to fail on a fixed calendar
+      # date (2026-10-28) with nothing wrong and nothing to fix but the date. The
+      # suite now drives the guard through an injected clock and warns on a real
+      # staleness; `python -m app.contract` is what still exits 1 on it. Without
+      # this step that exit code runs nowhere, so defusing the time bomb would
+      # have left the pin with no hard enforcement at all.
+      #
+      # Exit codes (see app/contract.py::_main): 0 clean, 1 dated pin stale,
+      # 2 mismatch against the upstream artifact, 3 the remote half could not
+      # run. 3 is the NORMAL result here -- this job has no RegEngine checkout,
+      # so no artifact is configured, and #140 is precisely that reporting
+      # "still matches" against nothing is worse than not checking. The
+      # regengine-contract job below is where the remote half actually runs.
+      # So: fail on 1 and 2, accept 0 and 3.
+      - name: Check the RegEngine contract pin is fresh
+        run: |
+          set +e
+          uv run --frozen --group dev python -m app.contract
+          status=$?
+          set -e
+          case "$status" in
+            0|3) exit 0 ;;
+            *)   exit "$status" ;;
+          esac
 
       - name: Check dependency health
         run: |
@@ -85,3 +127,582 @@ jobs:
 
       - name: Run browser smoke
         run: uv run --frozen --no-dev --group browser python scripts/browser_smoke.py
+
+      # #133: scripts/browser_smoke.py already screenshots the failing page to
+      # output/playwright/, but the file died with the runner, so a red job
+      # left nothing to look at but an assertion message. `if: failure()` keeps
+      # this off passing runs entirely, and if-no-files-found: ignore makes it
+      # a clean no-op rather than a second error on the failures that happen
+      # before there is a page to screenshot -- a build-SHA mismatch, a server
+      # that never came up, playwright not installed.
+      - name: Upload browser smoke failure screenshots
+        if: failure()
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6.0.0
+        with:
+          name: browser-smoke-failure-${{ github.run_number }}
+          if-no-files-found: ignore
+          path: output/playwright/
+
+  # #126: no job built the image Railway actually deploys. `Dockerfile` is the
+  # deploy artifact (railway.json pins builder DOCKERFILE), so a broken COPY
+  # path, a base-image change, or a dependency that only fails under the
+  # image's Python passed this workflow green and surfaced as a failed deploy.
+  # This job builds that exact file and boots the result, so the failure lands
+  # on the pull request instead of on production.
+  docker-build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+
+      # Plain `docker build` on purpose: the point is to exercise the same
+      # single-stage Dockerfile Railway hands to its builder, with no registry
+      # push, no cache backend and no extra action in the trust surface.
+      - name: Build the deployed image
+        run: docker build --tag inflow-lab:ci .
+
+      # Building proves the Dockerfile parses and its layers succeed. It does
+      # not prove the result runs -- a bad CMD, a missing runtime dependency or
+      # an entrypoint that cannot drop privileges all build clean and then
+      # crash-loop on Railway. Hence the boot below.
+      - name: Start the built image
+        run: |
+          docker run --detach --name inflow-lab-ci --publish 8000:8000 \
+            --env REGENGINE_BASIC_AUTH_USERNAME=ci-docker-smoke \
+            --env REGENGINE_BASIC_AUTH_PASSWORD=ci-docker-smoke-password \
+            inflow-lab:ci
+
+      # /api/healthz is the container's own HEALTHCHECK target and
+      # railway.json's healthcheckPath, so this is the same signal the deploy
+      # gates on. Credentials are supplied above because the image sets
+      # REGENGINE_REQUIRE_AUTH=1 (#88) and app/main.py refuses to boot without
+      # them; the probe itself is unauthenticated by design.
+      - name: Probe /api/healthz
+        run: |
+          for _ in $(seq 1 60); do
+            if curl --fail --silent --show-error --output healthz.json \
+                http://127.0.0.1:8000/api/healthz; then
+              healthy=1
+              break
+            fi
+            sleep 2
+          done
+          if [ "${healthy:-0}" != "1" ]; then
+            echo "The built image never served /api/healthz"
+            exit 1
+          fi
+          cat healthz.json
+          test "$(jq -r '.ok' healthz.json)" = "true"
+
+      # The runtime half of the invariant tests/test_container_profile.py pins
+      # textually (#180): `exec uvicorn` is what makes uvicorn PID 1. Without
+      # it a shell sits at PID 1, never forwards SIGTERM, and every stop and
+      # redeploy skips the graceful shutdown -- which the Dockerfile text can
+      # promise but only a running container can demonstrate.
+      - name: Assert uvicorn is PID 1
+        run: |
+          cmdline=$(docker exec inflow-lab-ci cat /proc/1/cmdline | tr '\0' ' ')
+          echo "PID 1: ${cmdline}"
+          case "${cmdline}" in
+            *uvicorn*) ;;
+            *) echo "Expected uvicorn at PID 1 (#180), got: ${cmdline}"; exit 1 ;;
+          esac
+
+      # A crash-looping container is unreadable from the step that timed out.
+      - name: Container logs
+        if: always()
+        run: docker logs inflow-lab-ci || true
+
+      - name: Stop the container
+        if: always()
+        run: docker rm --force inflow-lab-ci || true
+
+  # ---------------------------------------------------------------------
+  # #104 -- cross-repo ingest contract.
+  #
+  # Until now the ONLY test exercising both systems lived in RegEngine
+  # (.github/workflows/inflow-contract-ci.yml), checking inflow-lab out at
+  # a hardcoded INFLOW_LAB_REF and running scripts/live_trial.py against a
+  # throwaway RegEngine instance. Its path filter lists RegEngine paths
+  # only, so no change made HERE could ever trigger it, and the pinned ref
+  # sat far enough behind main that the controller-side verdict-pairing
+  # rewrite (#85, app/controller.py::_pair_event_responses) had never once
+  # run against a real RegEngine. That function exists precisely because
+  # RegEngine answers a batch rejected-first rather than in request order
+  # -- something app/mock_service.py cannot reproduce, since it appends
+  # accepted and rejected in a single pass. The unit suite is structurally
+  # blind to it.
+  #
+  # These three jobs are that workflow inverted: RegEngine is checked out
+  # at a tracked ref, this repository at the pull request, and the same
+  # signed one-batch live trial runs with the roles swapped.
+  #
+  # WHAT A MAINTAINER MUST CONFIGURE for this to actually run:
+  #
+  #   secrets.REGENGINE_CONTRACT_TOKEN  (required unless RegEngine is
+  #       public) -- a token with `contents: read` on regengine/regengine.
+  #       The default GITHUB_TOKEN is scoped to this repository only and
+  #       cannot check another private repo out. A fine-grained PAT or a
+  #       GitHub App installation token is enough; it needs no write scope.
+  #   vars.REGENGINE_CONTRACT_PUBLIC    (optional) -- set to "true" if
+  #       regengine/regengine is public, to use the default GITHUB_TOKEN
+  #       instead of a PAT.
+  #   vars.REGENGINE_CONTRACT_REPOSITORY (optional) -- defaults to
+  #       regengine/regengine; point it at a fork to test against one.
+  #   vars.REGENGINE_CONTRACT_REF       (optional) -- defaults to `main`,
+  #       i.e. this side TRACKS RegEngine rather than pinning it. Set a SHA
+  #       only to work around an upstream breakage; the drift check in
+  #       .github/workflows/contract-pin-drift.yml then fails once that
+  #       workaround goes stale, so it cannot become permanent silently.
+  #
+  # With none of that configured -- including every pull request from a
+  # fork, which GitHub never gives secrets to -- the contract job is
+  # skipped and the status gate below says so loudly in the job summary
+  # and as a workflow warning, rather than failing a contributor for
+  # infrastructure they cannot reach. When it IS configured, the job runs
+  # for real and a contract break fails the build.
+  contract-changes:
+    name: Contract change detection
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    outputs:
+      should_run: ${{ steps.filter.outputs.should_run }}
+      has_access: ${{ steps.access.outputs.has_access }}
+      regengine_repository: ${{ steps.access.outputs.regengine_repository }}
+      regengine_ref: ${{ steps.access.outputs.regengine_ref }}
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+        with:
+          fetch-depth: 0
+
+      - name: Detect contract-impacting changes
+        id: filter
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          PR_BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          PR_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          PUSH_BEFORE: ${{ github.event.before }}
+          PUSH_HEAD: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+
+          if [ "${EVENT_NAME}" != "pull_request" ] && [ "${EVENT_NAME}" != "push" ]; then
+            echo "should_run=true" >> "$GITHUB_OUTPUT"
+            echo "Event ${EVENT_NAME} always runs the cross-repo contract job."
+            exit 0
+          fi
+
+          if [ "${EVENT_NAME}" = "pull_request" ]; then
+            base="${PR_BASE_SHA:-}"
+            head="${PR_HEAD_SHA:-}"
+          else
+            base="${PUSH_BEFORE:-}"
+            head="${PUSH_HEAD:-}"
+          fi
+
+          if [ -z "${base}" ] || [ "${base}" = "0000000000000000000000000000000000000000" ]; then
+            git diff-tree --no-commit-id --name-only -r "${head}" > "${RUNNER_TEMP}/changed-files.txt"
+          else
+            git diff --name-only "${base}" "${head}" > "${RUNNER_TEMP}/changed-files.txt"
+          fi
+
+          should_run=false
+          while IFS= read -r file; do
+            case "${file}" in
+              app/regengine_client.py|\
+              app/controller.py|\
+              app/mock_service.py|\
+              app/contract.py|\
+              app/cte_rules.py|\
+              app/schemas/*|\
+              scripts/live_trial.py|\
+              scripts/regengine_kde_contract.py|\
+              tests/data/regengine_required_kdes.json|\
+              .github/workflows/ci.yml)
+                should_run=true
+                echo "Contract-impacting change: ${file}"
+                ;;
+            esac
+          done < "${RUNNER_TEMP}/changed-files.txt"
+
+          echo "should_run=${should_run}" >> "$GITHUB_OUTPUT"
+          if [ "${should_run}" != "true" ]; then
+            echo "No contract-impacting changes; the cross-repo contract job will be skipped."
+          fi
+
+      - name: Resolve RegEngine access and ref
+        id: access
+        env:
+          # Read into the environment rather than tested inline: the
+          # `secrets` context is not available in a job-level `if:`, so
+          # presence has to become a job output for the contract job to
+          # key off.
+          REGENGINE_CONTRACT_TOKEN: ${{ secrets.REGENGINE_CONTRACT_TOKEN }}
+          REGENGINE_CONTRACT_PUBLIC: ${{ vars.REGENGINE_CONTRACT_PUBLIC }}
+          REGENGINE_CONTRACT_REPOSITORY: ${{ vars.REGENGINE_CONTRACT_REPOSITORY }}
+          REGENGINE_CONTRACT_REF: ${{ vars.REGENGINE_CONTRACT_REF }}
+        run: |
+          set -euo pipefail
+
+          repository="${REGENGINE_CONTRACT_REPOSITORY:-regengine/regengine}"
+          ref="${REGENGINE_CONTRACT_REF:-main}"
+
+          if [ -n "${REGENGINE_CONTRACT_TOKEN:-}" ] || [ "${REGENGINE_CONTRACT_PUBLIC:-}" = "true" ]; then
+            has_access=true
+          else
+            has_access=false
+          fi
+
+          {
+            echo "has_access=${has_access}"
+            echo "regengine_repository=${repository}"
+            echo "regengine_ref=${ref}"
+          } >> "$GITHUB_OUTPUT"
+
+          echo "RegEngine repository: ${repository}"
+          echo "RegEngine ref: ${ref}"
+          echo "Cross-repo access available: ${has_access}"
+
+  regengine-contract:
+    name: Signed ingest contract against a real RegEngine
+    needs: contract-changes
+    if: needs.contract-changes.outputs.should_run == 'true' && needs.contract-changes.outputs.has_access == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    env:
+      # Throwaway values for the RegEngine instance this job starts and
+      # destroys inside the runner. They are not credentials to anything
+      # that outlives the job, and nothing outside it can reach them.
+      CONTRACT_TENANT_ID: 11111111-1111-1111-1111-111111111111
+      CONTRACT_API_KEY: ci-inflow-contract-key
+      CONTRACT_HMAC_SECRET: ci-inflow-contract-hmac-secret
+
+    services:
+      postgres:
+        image: postgres:17
+        env:
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: regengine_contract
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+      redis:
+        image: redis:7-alpine
+        ports:
+          - 6379:6379
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+
+    steps:
+      - name: Check out this repository
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+        with:
+          path: inflow-lab
+
+      - name: Check out RegEngine
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+        with:
+          repository: ${{ needs.contract-changes.outputs.regengine_repository }}
+          ref: ${{ needs.contract-changes.outputs.regengine_ref }}
+          token: ${{ secrets.REGENGINE_CONTRACT_TOKEN || github.token }}
+          path: regengine
+
+      - name: Record which RegEngine commit is under test
+        env:
+          REGENGINE_REPOSITORY: ${{ needs.contract-changes.outputs.regengine_repository }}
+          REGENGINE_REF: ${{ needs.contract-changes.outputs.regengine_ref }}
+        run: |
+          set -euo pipefail
+          sha="$(git -C regengine rev-parse HEAD)"
+          {
+            echo "### Cross-repo ingest contract"
+            echo
+            echo "- RegEngine: \`${REGENGINE_REPOSITORY}\` ref \`${REGENGINE_REF}\` @ \`${sha}\`"
+            echo "- Simulator: this pull request"
+          } >> "$GITHUB_STEP_SUMMARY"
+          echo "RegEngine commit under test: ${sha}"
+
+      - name: Set up Python
+        uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6.3.0
+        with:
+          python-version: '3.11'
+
+      - name: Cache uv and pip
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
+        with:
+          path: |
+            ~/.cache/uv
+            ~/.cache/pip
+          key: contract-${{ runner.os }}-${{ hashFiles('inflow-lab/uv.lock', 'regengine/requirements.lock') }}
+          restore-keys: contract-${{ runner.os }}-
+
+      - name: Install uv
+        run: python -m pip install --upgrade uv
+
+      - name: Install simulator dependencies
+        working-directory: inflow-lab
+        run: uv sync --frozen --no-dev
+
+      # Fail before spending 10 minutes on services if the tables already
+      # disagree. This is the half of #104 that the offline pin test
+      # cannot do: here BOTH sides are on disk, so the vendored snapshot
+      # in tests/data/ is checked against the file it claims to come from
+      # instead of against another copy stored in this repo.
+      - name: Assert the pinned KDE table still matches RegEngine's source
+        working-directory: inflow-lab
+        run: |
+          set -euo pipefail
+          uv run --frozen --no-dev python scripts/regengine_kde_contract.py verify \
+            --regengine-root "${GITHUB_WORKSPACE}/regengine"
+          uv run --frozen --no-dev python scripts/regengine_kde_contract.py extract \
+            --regengine-root "${GITHUB_WORKSPACE}/regengine" \
+            --output "${RUNNER_TEMP}/regengine-required-kdes.json"
+          REGENGINE_CONTRACT_ARTIFACT_PATH="${RUNNER_TEMP}/regengine-required-kdes.json" \
+            uv run --frozen --no-dev python -m app.contract
+
+      # #211: contract.md asserted it mirrored RegEngine's contract with nothing
+      # checking it, and five of its claims turned out to be wrong -- including a
+      # sample payload whose GLN check digit fails, which RegEngine would 422 with
+      # STRICT_GLN_VALIDATION on (its default). tests/test_contract_document.py's
+      # cross-repo half is the only thing that can catch a wrong upstream path or
+      # symbol, and it self-skips unless REGENGINE_CHECKOUT is set. This job is
+      # the one place both repositories are on disk, so it is where that half runs.
+      #
+      # UV_PROJECT_ENVIRONMENT puts pytest in a SEPARATE venv on purpose: the
+      # steps below start the simulator from `.venv`, which is deliberately
+      # installed --no-dev so the contract is exercised against the dependency
+      # set that actually deploys. Syncing the dev group into that venv would
+      # quietly cost this job the deployed-fidelity it exists for.
+      - name: Check contract.md against RegEngine's source
+        working-directory: inflow-lab
+        env:
+          REGENGINE_CHECKOUT: ${{ github.workspace }}/regengine
+          UV_PROJECT_ENVIRONMENT: .venv-contract-doc
+        run: uv run --frozen --group dev pytest tests/test_contract_document.py -q
+
+      - name: Install RegEngine dependencies
+        working-directory: regengine
+        run: |
+          pip install --require-hashes -r requirements.lock
+          pip install uvicorn
+
+      - name: Prepare RegEngine database roles
+        env:
+          PGPASSWORD: postgres
+        run: |
+          psql -h localhost -U postgres -d regengine_contract -v ON_ERROR_STOP=1 \
+            -c "DO \$\$ BEGIN CREATE ROLE regengine LOGIN; EXCEPTION WHEN duplicate_object THEN NULL; END \$\$;" \
+            -c "DO \$\$ BEGIN CREATE ROLE regengine_sysadmin LOGIN INHERIT; EXCEPTION WHEN duplicate_object THEN NULL; END \$\$;" \
+            -c "GRANT regengine TO regengine_sysadmin;" \
+            -c "CREATE OR REPLACE FUNCTION get_tenant_context() RETURNS UUID AS \$\$ DECLARE tid TEXT; BEGIN tid := NULLIF(current_setting('app.tenant_id', TRUE), ''); IF tid IS NULL THEN RAISE EXCEPTION 'app.tenant_id not set - tenant context required for RLS'; END IF; RETURN tid::UUID; END; \$\$ LANGUAGE plpgsql;"
+
+      - name: Apply RegEngine migrations
+        working-directory: regengine
+        env:
+          DATABASE_URL: postgresql://postgres:postgres@localhost:5432/regengine_contract
+        run: alembic upgrade head
+
+      - name: Start the RegEngine ingestion service
+        working-directory: regengine
+        env:
+          DATABASE_URL: postgresql://postgres:postgres@localhost:5432/regengine_contract
+          COMPLIANCE_DATABASE_URL: postgresql://postgres:postgres@localhost:5432/regengine_contract
+          ADMIN_DATABASE_URL: postgresql://postgres:postgres@localhost:5432/regengine_contract
+          REDIS_URL: redis://localhost:6379/0
+          REGENGINE_ENV: test
+          API_KEY: ${{ env.CONTRACT_API_KEY }}
+          AUTH_TEST_BYPASS_TOKEN: ${{ env.CONTRACT_API_KEY }}
+          AUTH_TEST_BYPASS_TENANT_ID: ${{ env.CONTRACT_TENANT_ID }}
+          SUBSCRIPTION_GATE_FAIL_OPEN: 'true'
+          WEBHOOK_HMAC_SECRET: ${{ env.CONTRACT_HMAC_SECRET }}
+          JWT_SECRET: test-secret-key-for-ci
+          SUPABASE_URL: http://localhost:54321
+          SUPABASE_KEY: test-key-for-ci
+          PYTHONDONTWRITEBYTECODE: 1
+        run: |
+          PYTHONPATH="$(pwd):$(pwd)/services:${PYTHONPATH:-}"
+          export PYTHONPATH
+          python -m uvicorn services.ingestion.main:app --host 127.0.0.1 --port 8002 > /tmp/regengine-ingestion.log 2>&1 &
+          echo $! > /tmp/regengine-ingestion.pid
+          for _ in $(seq 1 60); do
+            if curl -fsS http://127.0.0.1:8002/health >/dev/null 2>&1; then
+              exit 0
+            fi
+            if ! kill -0 "$(cat /tmp/regengine-ingestion.pid)" 2>/dev/null; then
+              cat /tmp/regengine-ingestion.log
+              exit 1
+            fi
+            sleep 1
+          done
+          cat /tmp/regengine-ingestion.log
+          exit 1
+
+      - name: Start the simulator from this pull request
+        working-directory: inflow-lab
+        env:
+          REGENGINE_DATA_DIR: /tmp/inflow-lab-data
+          REGENGINE_CORS_ORIGINS: http://127.0.0.1:8010
+          REGENGINE_WEBHOOK_HMAC_SECRET: ${{ env.CONTRACT_HMAC_SECRET }}
+          PYTHONDONTWRITEBYTECODE: 1
+        run: |
+          uv run --frozen --no-dev python -m uvicorn app.main:app --host 127.0.0.1 --port 8010 > /tmp/inflow-lab.log 2>&1 &
+          echo $! > /tmp/inflow-lab.pid
+          for _ in $(seq 1 60); do
+            if curl -fsS http://127.0.0.1:8010/api/healthz >/dev/null 2>&1; then
+              exit 0
+            fi
+            if ! kill -0 "$(cat /tmp/inflow-lab.pid)" 2>/dev/null; then
+              cat /tmp/inflow-lab.log
+              exit 1
+            fi
+            sleep 1
+          done
+          cat /tmp/inflow-lab.log
+          exit 1
+
+      - name: Assert both sides advertise the same contract version
+        run: |
+          set -euo pipefail
+          curl -fsS -o "${RUNNER_TEMP}/regengine-health.json" http://127.0.0.1:8002/health
+          curl -fsS -o "${RUNNER_TEMP}/inflow-healthz.json" http://127.0.0.1:8010/api/healthz
+          regengine_version="$(python -c "import json,os; print(json.load(open(os.environ['RUNNER_TEMP'] + '/regengine-health.json')).get('inflow_contract_version',''))")"
+          inflow_version="$(python -c "import json,os; print(json.load(open(os.environ['RUNNER_TEMP'] + '/inflow-healthz.json')).get('contract_version',''))")"
+          echo "RegEngine advertises inflow_contract_version=${regengine_version}"
+          echo "Simulator advertises contract_version=${inflow_version}"
+          if [ -z "${regengine_version}" ] || [ -z "${inflow_version}" ]; then
+            echo "::error::One side advertises no contract version (RegEngine webhook_models.INFLOW_CONTRACT_VERSION / this repo's app/contract.py)."
+            exit 1
+          fi
+          if [ "${regengine_version}" != "${inflow_version}" ]; then
+            echo "::error::Contract version skew: RegEngine v${regengine_version} vs simulator v${inflow_version}. Bump both repos together."
+            exit 1
+          fi
+
+      # The actual point of the job. This is the only path in either
+      # repository that drives app/regengine_client.py and
+      # app/controller.py against a real RegEngine response -- including
+      # the rejected-first ordering _pair_event_responses was written for.
+      - name: Post one signed batch to RegEngine
+        working-directory: inflow-lab
+        env:
+          REGENGINE_REMOTE_BASE_URL: http://127.0.0.1:8010
+          REGENGINE_REMOTE_USERNAME: unused
+          REGENGINE_REMOTE_PASSWORD: unused
+          REGENGINE_REMOTE_TENANT: inflow-contract
+          REGENGINE_LIVE_ENDPOINT: http://localhost:8002/api/v1/webhooks/ingest
+          REGENGINE_LIVE_API_KEY: ${{ env.CONTRACT_API_KEY }}
+          REGENGINE_LIVE_TENANT_ID: ${{ env.CONTRACT_TENANT_ID }}
+          REGENGINE_WEBHOOK_HMAC_SECRET: ${{ env.CONTRACT_HMAC_SECRET }}
+        run: uv run --frozen --no-dev python scripts/live_trial.py --confirm-live
+
+      - name: Verify the ingested evidence actually persisted
+        env:
+          PGPASSWORD: postgres
+        run: |
+          set -euo pipefail
+          # A 200 "accepted" is not the contract. RegEngine has returned
+          # 200 while a poisoned transaction rolled every evidence row
+          # back; the contract is only honored when the accepted events
+          # are durable.
+          for table in fsma.cte_events fsma.cte_kdes fsma.hash_chain fsma.traceability_events; do
+            count="$(psql -h localhost -U postgres -d regengine_contract -tA \
+              -c "SELECT COUNT(*) FROM ${table} WHERE tenant_id = '${CONTRACT_TENANT_ID}';")"
+            echo "${table}: ${count} row(s)"
+            if [ "${count}" -lt 1 ]; then
+              echo "::error::${table} has no rows for the contract tenant -- RegEngine acknowledged the ingest but persisted nothing."
+              exit 1
+            fi
+          done
+
+      - name: Dump service logs on failure
+        if: failure()
+        run: |
+          echo "== Simulator stored events =="
+          curl -fsS -H "X-RegEngine-Tenant: inflow-contract" "http://127.0.0.1:8010/api/events?limit=5" || true
+          echo
+          echo "== RegEngine ingestion log =="
+          cat /tmp/regengine-ingestion.log || true
+          echo "== Simulator log =="
+          cat /tmp/inflow-lab.log || true
+
+      - name: Stop local services
+        if: always()
+        run: |
+          if [ -f /tmp/inflow-lab.pid ]; then kill "$(cat /tmp/inflow-lab.pid)" 2>/dev/null || true; fi
+          if [ -f /tmp/regengine-ingestion.pid ]; then kill "$(cat /tmp/regengine-ingestion.pid)" 2>/dev/null || true; fi
+
+  contract-status-gate:
+    name: Cross-repo contract status
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    needs:
+      - contract-changes
+      - regengine-contract
+    if: always()
+
+    steps:
+      - name: Require a contract decision
+        env:
+          CHANGES_RESULT: ${{ needs.contract-changes.result }}
+          CONTRACT_RESULT: ${{ needs.regengine-contract.result }}
+          SHOULD_RUN: ${{ needs.contract-changes.outputs.should_run }}
+          HAS_ACCESS: ${{ needs.contract-changes.outputs.has_access }}
+        run: |
+          set -euo pipefail
+
+          echo "Change detection: ${CHANGES_RESULT}"
+          echo "Contract-impacting change: ${SHOULD_RUN}"
+          echo "Cross-repo access: ${HAS_ACCESS}"
+          echo "Contract job: ${CONTRACT_RESULT}"
+
+          if [ "${CHANGES_RESULT}" != "success" ]; then
+            echo "::error::Contract change detection did not complete."
+            exit 1
+          fi
+
+          if [ "${SHOULD_RUN}" != "true" ]; then
+            echo "No contract-impacting change; nothing to verify across repositories."
+            exit 0
+          fi
+
+          if [ "${HAS_ACCESS}" != "true" ]; then
+            # Visible and specific, but not fatal: a fork contributor
+            # cannot add an organization secret, and failing them for it
+            # would only teach everyone to ignore this check.
+            echo "::warning::Contract-impacting change NOT verified against a real RegEngine: no cross-repo access. Add the repository secret REGENGINE_CONTRACT_TOKEN (contents:read on regengine/regengine), or set the repository variable REGENGINE_CONTRACT_PUBLIC=true if that repository is public. Pull requests from forks never receive secrets and will always land here."
+            {
+              echo "### Cross-repo ingest contract: NOT RUN"
+              echo
+              echo "This change touches the ingest contract surface, but the job that posts a"
+              echo "signed batch to a real RegEngine could not run: no cross-repo access is"
+              echo "configured for this run."
+              echo
+              echo "A maintainer enables it with:"
+              echo
+              echo "- \`secrets.REGENGINE_CONTRACT_TOKEN\` -- \`contents: read\` on \`regengine/regengine\`"
+              echo "- or \`vars.REGENGINE_CONTRACT_PUBLIC=true\` if that repository is public"
+              echo
+              echo "Pull requests from forks are never given secrets, so they always skip this."
+            } >> "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+
+          if [ "${CONTRACT_RESULT}" != "success" ]; then
+            echo "::error::A change to the ingest contract surface must pass the signed live ingest contract test."
+            exit 1
+          fi
+
+          echo "Cross-repo ingest contract verified."

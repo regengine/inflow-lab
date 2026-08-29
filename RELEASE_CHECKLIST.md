@@ -42,8 +42,10 @@ Use this checklist before tagging a demo-ready build or handing the simulator to
 - [ ] For shared-demo releases, `uv run --no-dev python scripts/remote_smoke.py` passes against the deployed HTTPS URL.
 - [ ] For shared-demo releases, the manual GitHub **Remote Smoke** workflow passes with repository secrets `REGENGINE_REMOTE_USERNAME` and `REGENGINE_REMOTE_PASSWORD`.
 - [ ] For shared-demo releases, the manual GitHub **Remote Browser Smoke** workflow passes with repository secrets `REGENGINE_REMOTE_USERNAME` and `REGENGINE_REMOTE_PASSWORD`.
-- [ ] For shared-demo releases, nightly GitHub **Remote Smoke** and **Remote Browser Smoke** schedules are enabled after those repository secrets are configured and `REGENGINE_BUILD_SHA` is kept current on Railway.
+- [ ] For shared-demo releases, nightly GitHub **Remote Smoke** and **Remote Browser Smoke** schedules are enabled after those repository secrets are configured.
+- [ ] The shared demo's `/api/healthz` reports `build.commit_source: RAILWAY_GIT_COMMIT_SHA`. That service deploys from Railway's GitHub connection, so `REGENGINE_BUILD_SHA` must be **absent** on it: it outranks the injected `RAILWAY_GIT_COMMIT_SHA` (`app/build_info.py`), so leaving it set makes `/api/healthz` report a hand-typed commit and the nightly drift check compares `github.sha` against a constant instead of what is deployed. Set it only for a manual CLI deploy — see `DEPLOYMENT_PROFILES.md` -> "Manual CLI deploy (fallback)".
 - [ ] For live-trial prep, `uv run python scripts/live_trial.py --dry-run-only` passes before any confirmed live batch.
+- [ ] After any `scripts/live_trial.py --confirm-live` run the trial tenant is disarmed. The script reverts delivery from a `finally` block, so it runs on the failure path too, and prints `delivery reverted to mock for tenant <id>` once the revert is confirmed. If it instead exits with `CRITICAL: failed to revert ...`, treat the tenant as still armed: `/api/simulate/status` must report `config.delivery.mode: mock` and `/api/integration/status` must report `api_key_configured: false` before anyone else touches that demo.
 
 ## Handoff Notes
 

@@ -5,6 +5,7 @@ from typing import Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
+from ..cte_rules import WarningSeverity
 from .domain import CSVImportType, CTEType, DestinationMode, RegEngineEvent
 from .simulation import DeliveryConfig
 
@@ -162,6 +163,29 @@ class ReplayResponse(BaseModel):
     error: str | None = None
 
 
+# Enforced ceiling on one CSV import body (#136). The parse behind this
+# field is CPU-bound; app/controller.py's import_csv offloads it to a worker
+# thread so it no longer blocks the event loop, but an unbounded body still
+# makes the worst case unbounded -- one request can pin a pool thread and
+# hold several copies of the text in memory (raw body, decoded str, parsed
+# rows, built events) for as long as it takes.
+#
+# 2,000,000 characters is roughly 15k rows of the shipped seed_lots/
+# scheduled_events shapes (~130 characters each) -- far past anything this
+# simulator is for, and past the demo fixtures and README examples by orders
+# of magnitude, while still bounding a single request. Counted in characters
+# rather than encoded bytes deliberately: a str of N characters costs at most
+# 4N bytes however it is measured, so the character count is the same bound
+# without paying for an encode() of the whole body just to check it.
+#
+# NOTE this caps the *field*, which is where #136 asks for it. It is not a
+# request-body cap: the ASGI server has already read and decoded the whole
+# body by the time this runs, so an oversized upload is still read once
+# before being refused. A body-size limit belongs in middleware and is a
+# separate change.
+MAX_CSV_TEXT_CHARS = 2_000_000
+
+
 class CSVImportRequest(BaseModel):
     # extra="forbid" (#143): request body for POST /api/import/csv.
     model_config = ConfigDict(extra="forbid")
@@ -170,6 +194,26 @@ class CSVImportRequest(BaseModel):
     csv_text: str
     source: str | None = None
     delivery: DeliveryConfig | None = None
+
+    @field_validator("csv_text")
+    @classmethod
+    def validate_csv_text_size(cls, value: str) -> str:
+        """Refuse an oversized import body outright (#136).
+
+        A ``field_validator`` rather than ``Field(max_length=...)`` to match
+        this module's existing convention (see
+        ``DeliveryRetryRequest.validate_limit``) and, more usefully, so the
+        422 tells an operator what actually happened and what to do about
+        it -- the generic constraint message names neither the size they
+        sent nor the remedy.
+        """
+        if len(value) > MAX_CSV_TEXT_CHARS:
+            raise ValueError(
+                f"csv_text is {len(value)} characters, above the "
+                f"{MAX_CSV_TEXT_CHARS}-character import limit. Split the file "
+                "and import it in several requests."
+            )
+        return value
 
 
 class CSVImportError(BaseModel):
@@ -182,6 +226,13 @@ class CSVImportWarning(BaseModel):
     row: int
     field: str | None = None
     message: str
+    # Carried through from CTEValidationWarning (#189). Without it the
+    # import panel could only tell a required-tier gap from an advisory one
+    # by string-matching the message, which no consumer did -- so an FDA-
+    # mandatory KDE and a nice-to-have read identically in the response and
+    # in the console. Defaulted so a warning raised by the importer itself,
+    # about the file rather than the event's KDEs, needs no new argument.
+    severity: WarningSeverity = "recommended"
 
 
 class CSVImportResponse(BaseModel):

@@ -39,6 +39,10 @@ class RecordingAsyncClient:
         headers: dict[str, str],
         content: bytes | None = None,
         json: dict[str, Any] | None = None,
+        # extensions: the live client attaches {"sni_hostname": ...} when it
+        # pins the validated address for the dial (#207). Accepted and
+        # ignored here so this fake keeps working on either path.
+        extensions: dict[str, Any] | None = None,
     ) -> FakeResponse:
         # The live client now serializes the body once and sends it via
         # `content=` so the bytes we sign equal the bytes on the wire.

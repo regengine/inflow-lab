@@ -10,6 +10,61 @@ This guide gives concrete run profiles for local development, shared design-part
 | Shared demo | `0.0.0.0` behind TLS/proxy | Basic Auth on | `data/tenants/{tenant_id}/` | `mock` | Design partners, multiple tenants, non-live workshops |
 | Live ingest trial | Prefer private host or VPN | Basic Auth on | Tenant-scoped | `mock`; switch request to `live` | Controlled RegEngine workspace validation |
 
+## Single-Process Requirement (applies to every profile)
+
+**inflow-lab must run as exactly one process: one web worker, one replica, one container.** This is not a performance recommendation — it is a correctness requirement, and the app now refuses to start when it can tell the requirement is being violated.
+
+### Why
+
+The simulation's run/stop control plane lives entirely in the memory of the process that serves the request:
+
+- `SimulationController.running` is a property over `self._task`; `self._task` and `self._stop_event` are ordinary instance attributes (`app/controller.py`).
+- `tenancy.controller` and `tenancy._tenant_controllers` are module-level singletons, built once per interpreter (`app/tenancy.py`).
+
+Nothing about a run is persisted or shared between processes. A second worker does not join the first one's simulation — it gets its own controller, with its own (empty) run state.
+
+### What breaks
+
+With more than one process behind a load balancer:
+
+- `POST /api/simulate/start` starts a run loop **in whichever worker served that request**.
+- `POST /api/simulate/stop` routed to any *other* worker finds no task in its own memory, signals its own unused stop event, and **returns 200**. The worker that actually holds the loop is never touched: it keeps stepping the engine and keeps delivering events — including live RegEngine traffic on the live-ingest profile.
+- `GET /api/simulate/status` and the tenant summaries report the `running` flag of whichever worker answered, so the UI shows "stopped" while the simulation is demonstrably still running.
+
+The operator is told the simulation stopped when it has not. On the live-ingest trial profile that means live traffic to a partner's RegEngine workspace that the Stop button cannot stop.
+
+### How it is enforced
+
+`app/worker_guard.py` runs in the startup lifespan of every worker and raises before the app serves anything. It refuses when the worker count it can observe is above 1:
+
+| Signal | Detected? | How |
+|---|---|---|
+| `WEB_CONCURRENCY` above 1 | Yes | Read from the environment. uvicorn and gunicorn both use it as the default worker count, and the container's `CMD` passes no `--workers` flag, so this is the variable that actually scales the shipped image. |
+| `uvicorn --workers N` / `gunicorn -w N` | Yes | Read from `sys.argv`. Readable even inside a uvicorn worker child, because uvicorn spawns workers through `multiprocessing`'s spawn context, which carries the parent's `sys.argv` across and restores it in the child. |
+| Railway replica count above 1 | **No** | Railway provides `RAILWAY_REPLICA_ID` and `RAILWAY_REPLICA_REGION` per replica but **no replica-count variable at all**, so a replica cannot tell whether it is 1 of 1 or 1 of 4. Railway also load-balances across replicas randomly, with no sticky sessions. Keeping the replica count at 1 is an operator responsibility; the app logs the requirement at startup when it detects it is on Railway, and can do nothing more. |
+| Separate containers behind a load balancer | **No** | Each is a healthy single-worker process; nothing inside one is aware of the others. |
+| `GUNICORN_CMD_ARGS` | **No** | gunicorn is not a dependency of this project, so a guard for it could not be exercised. Its `-w` on the actual command line *is* covered by the `sys.argv` row above. |
+| `uvicorn.run(..., workers=N)` from a custom entrypoint | **No** | The count is a function argument — it appears in neither `sys.argv` nor the environment. |
+
+The refusal looks like this:
+
+```
+RuntimeError: inflow-lab refuses to start with 4 worker processes (configured by the
+WEB_CONCURRENCY environment variable). Simulation run/stop state lives in per-process
+memory, so with more than one worker a Stop request can return 200 while a different
+worker keeps running the simulation and delivering events. Run a single process: set
+WEB_CONCURRENCY=1 (and drop any --workers flag above 1). To override deliberately, set
+REGENGINE_ALLOW_MULTIPLE_WORKERS=1. See DEPLOYMENT_PROFILES.md.
+```
+
+The shipped `Dockerfile` sets `WEB_CONCURRENCY=1` in `ENV`, so the safe value is stated in the image rather than inherited from a default. The `CMD` deliberately does **not** pass `--workers 1`: an explicit flag outranks `WEB_CONCURRENCY` in both servers, which would silently reduce an operator's `WEB_CONCURRENCY=4` back to one worker instead of failing loudly and telling them why.
+
+### Overriding it
+
+Set `REGENGINE_ALLOW_MULTIPLE_WORKERS=1` (accepted spellings: `1`, `true`, `yes`, `on`). Startup then proceeds and logs a warning instead of raising.
+
+Only do this if no one will use the Start/Stop controls — for example, a read-only deployment serving exports of an already-populated store. **Start/Stop, the status flag, and live delivery are all unreliable with the override on**, in the exact way described under "What breaks" above. There is no configuration that makes them reliable across processes; fixing that would require a shared run registry and a distributed lock, which is out of scope for a non-production simulator with an in-memory event store (see `REPO_PURPOSE.md`).
+
 ## Common Prerequisites
 
 ```bash
@@ -149,6 +204,25 @@ uv run python scripts/live_trial.py --confirm-live
 
 The script refuses to run without either `--dry-run-only` or `--confirm-live`. It never prints the Basic Auth password, live API key, or live tenant id. Stop after the first live result and review the posted/failed status before any further volume.
 
+**The trial disarms itself, and you should confirm that it did.** `--confirm-live` arms `REGENGINE_REMOTE_TENANT` for live delivery by posting a `delivery.mode: live` reset, and the tenant controller keeps that config — endpoint, API key and tenant id — cached for the lifetime of the server process. Left armed, the next Start or Step from the dashboard posts simulated CTEs into the live endpoint with nobody re-entering a credential. So the script reverts that tenant to `delivery.mode: mock` with an empty endpoint, API key and tenant id from a `finally` block, which also runs when the batch or a later assertion fails. Two outcomes to read for:
+
+- `delivery reverted to mock for tenant <id>` — the revert returned 200. The tenant is disarmed.
+- `CRITICAL: failed to revert ... may still be armed for live delivery` (exit code 1) — treat the tenant as armed and clear it by hand before anyone else uses the demo.
+
+Verify either way before walking away:
+
+```bash
+curl -sS -u "$REGENGINE_REMOTE_USERNAME:$REGENGINE_REMOTE_PASSWORD" \
+  -H "X-RegEngine-Tenant: $REGENGINE_REMOTE_TENANT" \
+  "$REGENGINE_REMOTE_BASE_URL/api/simulate/status"     # config.delivery.mode must be "mock"
+
+curl -sS -u "$REGENGINE_REMOTE_USERNAME:$REGENGINE_REMOTE_PASSWORD" \
+  -H "X-RegEngine-Tenant: $REGENGINE_REMOTE_TENANT" \
+  "$REGENGINE_REMOTE_BASE_URL/api/integration/status"  # api_key_configured must be false
+```
+
+`/api/simulate/status` redacts the stored API key from its response, so it cannot tell you whether one is still held — read `api_key_configured` from `/api/integration/status` for that.
+
 Dry-run the exact scenario without live traffic:
 
 ```bash
@@ -226,11 +300,18 @@ REGENGINE_BASIC_AUTH_PASSWORD=<strong generated password>
 REGENGINE_DEFAULT_TENANT=demo-default
 REGENGINE_CORS_ORIGINS=https://<railway-domain>
 REGENGINE_DATA_DIR=/data
-REGENGINE_BUILD_SHA=<deployed git sha>
-REGENGINE_BUILD_BRANCH=main
 ```
 
+Do not set `REGENGINE_BUILD_SHA` or `REGENGINE_BUILD_BRANCH` here. The shared demo is GitHub-connected, so Railway injects `RAILWAY_GIT_COMMIT_SHA`; those two variables outrank it (`app/build_info.py`) and would make `/api/healthz` report a hand-typed commit instead of the deployed one. They belong only to "Manual CLI deploy (fallback)" below.
+
 Attach a Railway volume at `/data` before using the service for partner demos. After a Railway domain is generated, update `REGENGINE_CORS_ORIGINS` to that exact HTTPS origin.
+
+**Keep this service at one replica, and do not set `WEB_CONCURRENCY` above 1.** See "Single-Process Requirement" above for why. Two specifics for Railway:
+
+- Replica count is set in the service's **Settings → Scale → Regions** field. Railway exposes no replica-count environment variable, so the app cannot detect a scale-up and cannot refuse it — this one is entirely on the operator. Railway distributes traffic across replicas randomly with no sticky sessions, so with two replicas a Stop request has roughly even odds of reaching the wrong one and returning a 200 that stops nothing.
+- A Railway service variable named `WEB_CONCURRENCY` overrides the `Dockerfile`'s `ENV`. Setting it above 1 makes every worker refuse to start, and the deploy fails its healthcheck rather than coming up half-controllable. That is deliberate.
+
+`railway.json` intentionally does not pin `deploy.multiRegionConfig`. The only replica knob config-as-code offers is `multiRegionConfig.<region>.numReplicas`, which requires hard-coding a region id and would override the workspace's preferred region for every deploy — a larger behavior change than this constraint warrants, on a config format Railway has since deprecated.
 
 ### Automated deploys (preferred)
 
@@ -282,7 +363,7 @@ next one starts.
    Verify: `https://<dashboard-host>/api/inflow-lab/api/healthz` reports the
    new commit with `commit_source: RAILWAY_GIT_COMMIT_SHA`.
 4. **Carry the persistent volume across before sending traffic.** The demo
-   writes its event history to `REGENGINE_DATA_DIR` (`app/tenancy.py:22`,
+   writes its event history to `REGENGINE_DATA_DIR` (`DATA_ROOT` in `app/tenancy.py`,
    `/data/tenants/{tenant_id}/events.jsonl` in production), and on Railway that
    path only survives a redeploy if a volume is mounted there. A service
    created fresh has none, and nothing about the running service says so: it
@@ -312,17 +393,41 @@ GitHub-injected build identity rather than a stale `REGENGINE_BUILD_SHA`, and
 the new service trusting its own origin. It is read-only — the demo is shared,
 and the POST routes the dashboard proxies mutate its state.
 
-It deliberately cannot check steps 2 or 4, and says so on success rather than
-implying a clean bill of health. Both are invisible from outside: a service
-with the wrong credentials and a service with the right ones both answer 401,
-and a service with no volume is indistinguishable from one with a volume until
-the next redeploy discards the data. The Basic-auth credentials live as secrets on
-two different platforms, so from outside a service with the *wrong* credentials
-is indistinguishable from one with the right ones — both answer 401 to an
-unauthenticated probe. Vercel's `INFLOW_LAB_BASIC_AUTH_USERNAME` / `_PASSWORD`
-must equal the new service's `REGENGINE_BASIC_AUTH_USERNAME` / `_PASSWORD`, as
-concrete values. If they differ, every proxied call answers 401 the moment
-`INFLOW_LAB_SERVICE_URL` is flipped.
+**Export `REGENGINE_REMOTE_USERNAME` and `REGENGINE_REMOTE_PASSWORD` before you
+run it** — the same pair `remote_smoke.py` and `live_trial.py` use. Basic Auth
+is the shared demo's configuration, so every path in the contract loop answers
+`401 application/json` to an unauthenticated probe on *both* services, and a
+401-vs-401 match is not evidence of an identical contract (#106). The script
+refuses to call that green:
+
+- With no credentials the contract section prints `UNVERIFIABLE` and counts as
+  a failure, so `PRE-FLIGHT PASSED` is unreachable rather than misleading.
+- A path is only usable as a baseline if the OLD service — the known-good one —
+  answers 2xx with the credentials supplied. Anything else (401 wrong or stale
+  credentials, 404 not a mounted route, 000 unreachable) is reported `FAIL`,
+  even when NEW answers identically.
+- The probed paths are only routes `app/main.py` actually mounts. Two earlier
+  entries, `/api/regengine/export/fda-request` and `/api/regengine/export/epcis`,
+  were never mounted here — only `/api/mock/regengine/...` is — and have been
+  removed. RegEngine's `frontend/src/app/api/inflow-lab/[...path]/route.ts` still
+  allows them, so the two repos remain to be reconciled.
+
+A green contract section therefore also proves that the credential pair you
+supplied authenticates against both services, which covers the demo half of
+step 2.
+
+What it still cannot check, and says so on success rather than implying a clean
+bill of health:
+
+- **Step 4, the volume.** A service with no volume is indistinguishable from one
+  with a volume until the next redeploy discards the data. Check the Railway
+  config, not this script.
+- **The Vercel half of step 2.** Vercel keeps its own copy of the credentials as
+  secrets on a different platform. The pre-flight can prove the demo accepts the
+  pair *you* typed; it cannot see what Vercel holds. `INFLOW_LAB_BASIC_AUTH_USERNAME`
+  / `_PASSWORD` must equal the new service's `REGENGINE_BASIC_AUTH_USERNAME` /
+  `_PASSWORD`, as concrete values. If they differ, every proxied call answers 401
+  the moment `INFLOW_LAB_SERVICE_URL` is flipped.
 
 Verify the flip on `/api/simulate/status`, not `/api/healthz`: the proxy
 answers HTTP 200 with `{"offline":true}` when the backend is unreachable

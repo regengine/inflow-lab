@@ -69,6 +69,21 @@ jobs:
           REGENGINE_BROWSER_EXPECTED_BUILD_SHA: ${{ github.sha }}
         run: uv run --frozen --no-dev --group browser python scripts/browser_smoke.py
 
+      # #133: the screenshot scripts/browser_smoke.py takes of the failing page
+      # matters most here, where the run is nightly and unattended and the
+      # deployed dashboard has already moved on by the time anyone reads the
+      # issue this failure files. `if: failure()` keeps it off passing runs;
+      # if-no-files-found: ignore makes it a no-op when the smoke failed before
+      # a page existed -- an unreachable base URL or a build-SHA mismatch,
+      # which is a common way for this particular workflow to fail.
+      - name: Upload browser smoke failure screenshots
+        if: failure()
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6.0.0
+        with:
+          name: remote-browser-smoke-failure-${{ github.run_number }}
+          if-no-files-found: ignore
+          path: output/playwright/
+
   # A red scheduled run is invisible; a filed issue is not. See
   # .github/workflows/smoke-failure-issue.yml.
   report-failure:

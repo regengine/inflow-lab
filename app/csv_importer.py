@@ -3,14 +3,16 @@ from __future__ import annotations
 import csv
 import io
 import json
+import math
 import re
 from dataclasses import dataclass
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from typing import Any
 
 from pydantic import ValidationError
 
 from .cte_rules import validate_event_kdes
+from .mock_service import MAX_EVENT_AGE_DAYS
 from .schemas.domain import CSVImportType, CTEType, RegEngineEvent
 from .schemas.ingestion import CSVImportError, CSVImportWarning
 
@@ -125,6 +127,7 @@ def parse_csv_import(
         events.append(event)
         parent_lot_codes.append(parents)
         warnings.extend(row_warnings)
+        warnings.extend(_replay_window_warnings(event, row_number, now=default_timestamp))
 
     if total == 0 and not errors:
         errors.append(CSVImportError(row=0, field="csv_text", message="CSV contains no data rows"))
@@ -275,10 +278,61 @@ def _build_event(
         return None, [], errors, []
 
     warnings = [
-        CSVImportWarning(row=row_number, field=warning.field, message=warning.message)
+        CSVImportWarning(
+            row=row_number,
+            field=warning.field,
+            message=warning.message,
+            severity=warning.severity,
+        )
         for warning in validate_event_kdes(event)
     ]
     return event, parent_lot_codes, [], warnings
+
+
+def _replay_window_warnings(
+    event: RegEngineEvent, row_number: int, *, now: datetime
+) -> list[CSVImportWarning]:
+    """Warn about rows live RegEngine will reject for being too old (#102).
+
+    RegEngine refuses any event older than WEBHOOK_MAX_EVENT_AGE_DAYS (90)
+    with "replay window exceeded". Historical backfill is a first-class use
+    of a food-traceability tool -- seeding last season's harvest and cooling
+    records is the natural thing to do -- so the import that fails this way
+    is the one a design partner is most likely to try.
+
+    This fires at parse time, before any delivery is attempted, which is
+    the whole point: the operator learns the rows are outside live's window
+    while they are still deciding what to import, not from a pile of
+    per-event rejections afterwards. Since #209 the mock enforces the same
+    floor on delivery, so the warning is advance notice of a refusal the
+    simulator itself will now issue -- not, as it was under the old default,
+    the only thing standing between a green mock result and a wholesale
+    rejection against live.
+
+    A warning rather than an error, deliberately: importing historical data
+    into the simulator is legitimate and useful (export rehearsal, lineage
+    inspection, audit scoring all work on rows live would refuse to ingest),
+    so the rows are still parsed and still stored. Required severity,
+    because unlike a missing recommended KDE this is a row live WILL reject.
+    """
+    timestamp = _ensure_timezone(event.timestamp)
+    cutoff = now - timedelta(days=MAX_EVENT_AGE_DAYS)
+    if timestamp >= cutoff:
+        return []
+    return [
+        CSVImportWarning(
+            row=row_number,
+            field="timestamp",
+            message=(
+                f"timestamp is {(now - timestamp).days} days old, past RegEngine's "
+                f"{MAX_EVENT_AGE_DAYS}-day replay window (WEBHOOK_MAX_EVENT_AGE_DAYS) — live "
+                "ingest rejects this row with 'replay window exceeded'. The built-in mock "
+                "now rejects it the same way, so the row imports and is stored but will "
+                "not deliver."
+            ),
+            severity="required",
+        )
+    ]
 
 
 def _header_errors(fieldnames: list[str] | None) -> list[CSVImportError]:
@@ -351,6 +405,19 @@ def _parse_quantity(value: str, row_number: int, errors: list[CSVImportError]) -
         quantity = float(value)
     except ValueError:
         errors.append(CSVImportError(row=row_number, field="quantity", message="Quantity must be numeric"))
+        return None
+
+    # float() happily accepts the literal tokens "nan", "inf", "-inf" and
+    # overflowing decimals like "1e400", and NaN compares False against every
+    # ordering operator -- so `nan <= 0` is False and the positivity check
+    # below waves it straight through (#98). Non-finite floats have no JSON
+    # representation: json.dumps would emit a bare NaN/Infinity token, which
+    # is not RFC 8259 and is rejected by strict parsers downstream. Reject
+    # here, before the value reaches the model, the store, or the wire.
+    if not math.isfinite(quantity):
+        errors.append(
+            CSVImportError(row=row_number, field="quantity", message="Quantity must be a finite number")
+        )
         return None
 
     if quantity <= 0:
