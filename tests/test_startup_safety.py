@@ -233,3 +233,29 @@ def test_resolve_cors_origins_cached_reparses_when_the_environment_changes(monke
     # And a repeat call at the same environment is still correct (the cache
     # hit path, which is the one that actually runs per request).
     assert resolve_cors_origins_cached() == ["https://second.example.com"]
+
+
+# ---------------------------------------------------------------------------
+# #137 -- app.main's re-export surface is a contract, not dead imports.
+# ---------------------------------------------------------------------------
+
+
+def test_app_main_reexports_stay_importable() -> None:
+    """`cors_origins_from_env`, `controller` and `scenario_saves` are imported
+    into app/main.py and never referenced there, so a linter reports them as
+    unused and the obvious "cleanup" is to delete them. They are not unused:
+    11 test modules reach them through ``app.main``, and deleting them breaks
+    collection across the suite -- a failure that shows up far from the edit
+    that caused it. They are declared in ``app.main.__all__``, which is both
+    what makes ruff accept them and what states the intent; this pins that
+    the declaration and the actual attributes cannot drift apart.
+    """
+    import app.main as main_module
+
+    expected = {"app", "controller", "cors_origins_from_env", "create_app", "scenario_saves"}
+    assert expected <= set(main_module.__all__)
+
+    for name in main_module.__all__:
+        assert hasattr(main_module, name), (
+            f"app.main.__all__ names {name!r}, but the module has no such attribute"
+        )

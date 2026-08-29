@@ -1,0 +1,21 @@
+# See issue #128.
+#
+# codex-autopilot.yml runs unsupervised and holds contents:write and
+# pull-requests:write; its add-paths allowlist keeps it from ever staging
+# changes to .github/workflows/** into the PRs it opens (see the NOTE above
+# add-paths in that file). This CODEOWNERS entry is the backstop for
+# everything add-paths does not cover: a human-authored PR, a third-party
+# PR, or a future change to codex-autopilot.yml itself that widens what it
+# can touch. Any of those still has to pass review from the owner below
+# before a change to CI/CD configuration — permissions, secrets usage,
+# triggers, the Dependabot config that maintains this repo's action pins —
+# can merge.
+#
+# This only has teeth once branch protection for the default branch has
+# "Require review from Code Owners" turned on; this file alone does not
+# block a merge. That is a repo setting, not something a file in this repo
+# can express, so it isn't verified here — confirm it separately.
+#
+# @PetrefiedThunder is this repository's sole collaborator (admin) at the
+# time this file was added; update this line if that changes.
+/.github/  @PetrefiedThunder

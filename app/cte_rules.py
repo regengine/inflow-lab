@@ -1,16 +1,40 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, Literal
 
 from .scenarios import ScenarioPreset
 from .schemas.domain import CTEType, RegEngineEvent, StoredEventRecord
 
 
+# How much weight a warning carries. "required" means FDA's CTE/KDE
+# reference makes the field unconditional for that CTE; "recommended" means
+# it is advisory -- industry practice, scenario realism, or a KDE the
+# contract lists as optional.
+WarningSeverity = Literal["required", "recommended"]
+
+
 @dataclass(frozen=True, slots=True)
 class CTEValidationWarning:
+    """One validation finding for one event field.
+
+    ``severity`` is a real field rather than something a consumer infers by
+    string-matching "Missing expected" against "Missing recommended" (#189).
+    Before it existed, #189's promotion of transformation input-lot linkage
+    to required tier was only a change to message text: no consumer in app/
+    told the two apart, so a required-tier gap and an advisory nudge reached
+    the CSV import panel, the audit summary and the console rendered
+    identically. Message strings are presentation; this is the datum a
+    consumer keys off.
+
+    Defaults to "recommended" so a construction site that has not thought
+    about severity fails in the harmless direction -- understating a nudge,
+    never overstating a gap as mandatory.
+    """
+
     field: str
     message: str
+    severity: WarningSeverity = "recommended"
 
 
 @dataclass(frozen=True, slots=True)
@@ -124,8 +148,30 @@ RECOMMENDED_KDES: dict[CTEType, tuple[str, ...]] = {
     ),
     CTEType.SHIPPING: ("carrier", "reference_document_type"),
     CTEType.RECEIVING: ("reference_document_type",),
-    CTEType.TRANSFORMATION: ("input_traceability_lot_codes", "input_products", "reference_document_type"),
+    CTEType.TRANSFORMATION: ("reference_document_type",),
 }
+
+# FDA's CTE/KDE reference requires, for each FTL food used as an ingredient,
+# that food's traceability lot code and product description linked to the
+# new lot -- unconditionally, not "if applicable" (fda.gov/media/163132/
+# download, cited in issue #189). That makes them stronger than the rest of
+# RECOMMENDED_KDES, but they can't move into REQUIRED_KDES itself: REQUIRED_KDES
+# is pinned byte-for-byte to RegEngine's live webhook contract
+# (tests/test_regengine_contract_pin.py), and promoting these here without a
+# coordinated change on RegEngine's side would just be local drift from what
+# live ingest actually enforces. validate_event_kdes below checks this tuple
+# at required-KDE severity directly, so the gap is real (not silently
+# swallowed as "recommended") without misrepresenting the pinned contract.
+# The per-input quantity/unit-of-measure FDA also requires here is a further,
+# deeper gap: nothing upstream of this module captures it per input lot yet
+# (industry_adapters.transformation_kdes only computes an aggregate
+# yield_ratio), so it isn't listed anywhere below -- flagging an unpopulated
+# KDE as required would fail every transformation event the simulator itself
+# generates. See issue #189's writeup for what emitting it would take.
+TRANSFORMATION_INPUT_LINKAGE_KDES: tuple[str, ...] = (
+    "input_traceability_lot_codes",
+    "input_products",
+)
 
 INDUSTRY_EVENT_REQUIREMENTS: dict[str, tuple[EventRequirement, ...]] = {
     "produce": (
@@ -236,8 +282,20 @@ def validate_event_kdes(event: RegEngineEvent) -> list[CTEValidationWarning]:
                 CTEValidationWarning(
                     field=field,
                     message=f"Missing expected {event.cte_type.value} KDE: {field}",
+                    severity="required",
                 )
             )
+
+    if event.cte_type == CTEType.TRANSFORMATION:
+        for field in TRANSFORMATION_INPUT_LINKAGE_KDES:
+            if not _has_value(available.get(field)):
+                warnings.append(
+                    CTEValidationWarning(
+                        field=field,
+                        message=f"Missing expected {event.cte_type.value} KDE: {field}",
+                        severity="required",
+                    )
+                )
 
     for field in RECOMMENDED_KDES.get(event.cte_type, ()):
         if not _has_value(available.get(field)):
@@ -245,6 +303,7 @@ def validate_event_kdes(event: RegEngineEvent) -> list[CTEValidationWarning]:
                 CTEValidationWarning(
                     field=field,
                     message=f"Missing recommended {event.cte_type.value} KDE: {field}",
+                    severity="recommended",
                 )
             )
 
@@ -254,7 +313,12 @@ def validate_event_kdes(event: RegEngineEvent) -> list[CTEValidationWarning]:
             warnings.append(
                 CTEValidationWarning(
                     field="input_traceability_lot_codes",
+                    # Required tier for the same reason its absence is: this
+                    # is the input-lot linkage FDA makes unconditional, and a
+                    # malformed value satisfies the requirement no better
+                    # than a missing one.
                     message="Transformation input_traceability_lot_codes should be a non-empty list of lot codes",
+                    severity="required",
                 )
             )
 
@@ -322,6 +386,18 @@ def merged_event_values(event: RegEngineEvent) -> dict[str, Any]:
         "product_description": event.product_description,
         "quantity": event.quantity,
         "unit_of_measure": event.unit_of_measure,
+        # Same treatment as location_gln above: this is a top-level field on
+        # RegEngineEvent, so merging only **kdes made it invisible here. The
+        # contract reference declares the top-level field authoritative and
+        # says "the simulator now emits it top-level" -- but only the engine
+        # path does; demo fixtures and CSV imports leave it None. So an
+        # integrator following the contract, sending the field where the
+        # contract says to send it, was flagged at required severity for a
+        # KDE they had in fact supplied.
+        #
+        # Listed BEFORE **event.kdes, so the kdes copy still wins when both
+        # are present -- additive, matching how the field was introduced.
+        "input_traceability_lot_codes": event.input_traceability_lot_codes,
         **event.kdes,
     }
     tlc_reference = available.get("tlc_source_reference") or available.get(
@@ -338,6 +414,16 @@ def merged_event_values(event: RegEngineEvent) -> dict[str, Any]:
 
 
 def dedupe_warnings(warnings: list[CTEValidationWarning]) -> list[CTEValidationWarning]:
+    """Drop repeats, and never let a field's advisory outrank its required gap.
+
+    The severity-aware second pass matters because the two tiers are
+    assembled independently -- per-CTE KDE tables, then industry/scenario
+    requirements -- so one field can be named by both. Keeping both entries
+    would let a consumer that reads the first warning for a field report
+    "recommended" for something the required tier already flagged, which is
+    the understatement #189 is about (app/static/app.js shows exactly one
+    warning per row in the shift log).
+    """
     seen: set[tuple[str, str]] = set()
     deduped: list[CTEValidationWarning] = []
     for warning in warnings:
@@ -346,7 +432,15 @@ def dedupe_warnings(warnings: list[CTEValidationWarning]) -> list[CTEValidationW
             continue
         seen.add(key)
         deduped.append(warning)
-    return deduped
+
+    required_fields = {
+        warning.field for warning in deduped if warning.severity == "required"
+    }
+    return [
+        warning
+        for warning in deduped
+        if warning.severity == "required" or warning.field not in required_fields
+    ]
 
 
 def _evaluate_check(records: list[StoredEventRecord], definition: AuditCheckDefinition) -> bool:

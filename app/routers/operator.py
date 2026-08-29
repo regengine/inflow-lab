@@ -42,11 +42,19 @@ async def delete_operator_tenant(
     tenant_dir = tenancy.tenant_dir(normalized_tenant)
     removed_data = tenant_dir.exists()
 
+    # pop_tenant_controller also opens a delete-in-progress window (#175):
+    # until finish_tenant_delete runs below -- even if shutdown or rmtree
+    # raises -- a concurrent request for this tenant id is refused instead
+    # of racing the rmtree below and getting zombied.
     tenant_controller = tenancy.pop_tenant_controller(normalized_tenant)
-    if tenant_controller is not None:
-        await tenant_controller.shutdown()
+    try:
+        if tenant_controller is not None:
+            await tenant_controller.shutdown()
 
-    shutil.rmtree(tenant_dir, ignore_errors=True)
+        shutil.rmtree(tenant_dir, ignore_errors=True)
+    finally:
+        tenancy.finish_tenant_delete(normalized_tenant)
+
     return TenantOperationResponse(
         status="deleted",
         tenant_id=normalized_tenant,

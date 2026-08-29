@@ -68,12 +68,42 @@ class RegEngineEvent(BaseModel):
     cte_type: CTEType
     traceability_lot_code: str
     product_description: str
-    quantity: float
+    # allow_inf_nan=False (#98): a non-finite quantity -- NaN, +/-Infinity, or
+    # an overflowing literal like 1e400 -- survives every downstream check
+    # (NaN compares False against `<= 0`) and then has no JSON encoding, so
+    # json.dumps emits a bare `NaN`/`Infinity` token into the tenant's durable
+    # JSONL and onto the signed wire. Neither is valid RFC 8259, so strict
+    # external parsers reject the whole file and jq silently coerces the value
+    # to null. Rejecting at the model is what stops any producer -- importer,
+    # engine, mock ingest body -- from reintroducing it.
+    #
+    # Deliberately NOT gt=0: quantity positivity is mirrored as a handler-side
+    # check in mock_service._field_constraint_errors, which exists to model
+    # RegEngine's live IngestEvent Field() constraints, and
+    # tests/test_mock_validation_parity.py constructs a RegEngineEvent with
+    # quantity=0 to prove the mock rejects the whole batch the way live does.
+    # A gt=0 here would make that parity fixture unconstructible.
+    quantity: float = Field(allow_inf_nan=False)
     unit_of_measure: str
     location_name: str
     location_gln: str | None = None
     timestamp: datetime
     kdes: dict[str, Any] = Field(default_factory=dict)
+    # Top-level transformation input-lot linkage, mirroring the location_gln
+    # precedent above. RegEngine's own IngestEvent
+    # (services/ingestion/app/webhook_models.py) declares
+    # input_traceability_lot_codes as a top-level field, and
+    # canonical_event.py's only writer of kdes["input_lot_codes"] gates
+    # entirely on that top-level field -- it never reads
+    # kdes["input_traceability_lot_codes"], which is the only place
+    # inflow-lab used to put it (issue #91). Populated in addition to, not
+    # instead of, the existing kdes["input_traceability_lot_codes"] copy:
+    # this repo's own lineage view (app/store.py), EPCIS export
+    # (app/epcis_export.py), and the mock ingest validator
+    # (app/mock_service.py) all still read the kdes copy, so removing it
+    # would break local behavior for a field that exists purely to reach
+    # RegEngine's live ingest, which the kdes copy never does.
+    input_traceability_lot_codes: list[str] | None = None
 
 
 class StoredEventRecord(BaseModel):
