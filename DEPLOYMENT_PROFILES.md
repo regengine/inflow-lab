@@ -10,6 +10,61 @@ This guide gives concrete run profiles for local development, shared design-part
 | Shared demo | `0.0.0.0` behind TLS/proxy | Basic Auth on | `data/tenants/{tenant_id}/` | `mock` | Design partners, multiple tenants, non-live workshops |
 | Live ingest trial | Prefer private host or VPN | Basic Auth on | Tenant-scoped | `mock`; switch request to `live` | Controlled RegEngine workspace validation |
 
+## Single-Process Requirement (applies to every profile)
+
+**inflow-lab must run as exactly one process: one web worker, one replica, one container.** This is not a performance recommendation — it is a correctness requirement, and the app now refuses to start when it can tell the requirement is being violated.
+
+### Why
+
+The simulation's run/stop control plane lives entirely in the memory of the process that serves the request:
+
+- `SimulationController.running` is a property over `self._task`; `self._task` and `self._stop_event` are ordinary instance attributes (`app/controller.py`).
+- `tenancy.controller` and `tenancy._tenant_controllers` are module-level singletons, built once per interpreter (`app/tenancy.py`).
+
+Nothing about a run is persisted or shared between processes. A second worker does not join the first one's simulation — it gets its own controller, with its own (empty) run state.
+
+### What breaks
+
+With more than one process behind a load balancer:
+
+- `POST /api/simulate/start` starts a run loop **in whichever worker served that request**.
+- `POST /api/simulate/stop` routed to any *other* worker finds no task in its own memory, signals its own unused stop event, and **returns 200**. The worker that actually holds the loop is never touched: it keeps stepping the engine and keeps delivering events — including live RegEngine traffic on the live-ingest profile.
+- `GET /api/simulate/status` and the tenant summaries report the `running` flag of whichever worker answered, so the UI shows "stopped" while the simulation is demonstrably still running.
+
+The operator is told the simulation stopped when it has not. On the live-ingest trial profile that means live traffic to a partner's RegEngine workspace that the Stop button cannot stop.
+
+### How it is enforced
+
+`app/worker_guard.py` runs in the startup lifespan of every worker and raises before the app serves anything. It refuses when the worker count it can observe is above 1:
+
+| Signal | Detected? | How |
+|---|---|---|
+| `WEB_CONCURRENCY` above 1 | Yes | Read from the environment. uvicorn and gunicorn both use it as the default worker count, and the container's `CMD` passes no `--workers` flag, so this is the variable that actually scales the shipped image. |
+| `uvicorn --workers N` / `gunicorn -w N` | Yes | Read from `sys.argv`. Readable even inside a uvicorn worker child, because uvicorn spawns workers through `multiprocessing`'s spawn context, which carries the parent's `sys.argv` across and restores it in the child. |
+| Railway replica count above 1 | **No** | Railway provides `RAILWAY_REPLICA_ID` and `RAILWAY_REPLICA_REGION` per replica but **no replica-count variable at all**, so a replica cannot tell whether it is 1 of 1 or 1 of 4. Railway also load-balances across replicas randomly, with no sticky sessions. Keeping the replica count at 1 is an operator responsibility; the app logs the requirement at startup when it detects it is on Railway, and can do nothing more. |
+| Separate containers behind a load balancer | **No** | Each is a healthy single-worker process; nothing inside one is aware of the others. |
+| `GUNICORN_CMD_ARGS` | **No** | gunicorn is not a dependency of this project, so a guard for it could not be exercised. Its `-w` on the actual command line *is* covered by the `sys.argv` row above. |
+| `uvicorn.run(..., workers=N)` from a custom entrypoint | **No** | The count is a function argument — it appears in neither `sys.argv` nor the environment. |
+
+The refusal looks like this:
+
+```
+RuntimeError: inflow-lab refuses to start with 4 worker processes (configured by the
+WEB_CONCURRENCY environment variable). Simulation run/stop state lives in per-process
+memory, so with more than one worker a Stop request can return 200 while a different
+worker keeps running the simulation and delivering events. Run a single process: set
+WEB_CONCURRENCY=1 (and drop any --workers flag above 1). To override deliberately, set
+REGENGINE_ALLOW_MULTIPLE_WORKERS=1. See DEPLOYMENT_PROFILES.md.
+```
+
+The shipped `Dockerfile` sets `WEB_CONCURRENCY=1` in `ENV`, so the safe value is stated in the image rather than inherited from a default. The `CMD` deliberately does **not** pass `--workers 1`: an explicit flag outranks `WEB_CONCURRENCY` in both servers, which would silently reduce an operator's `WEB_CONCURRENCY=4` back to one worker instead of failing loudly and telling them why.
+
+### Overriding it
+
+Set `REGENGINE_ALLOW_MULTIPLE_WORKERS=1` (accepted spellings: `1`, `true`, `yes`, `on`). Startup then proceeds and logs a warning instead of raising.
+
+Only do this if no one will use the Start/Stop controls — for example, a read-only deployment serving exports of an already-populated store. **Start/Stop, the status flag, and live delivery are all unreliable with the override on**, in the exact way described under "What breaks" above. There is no configuration that makes them reliable across processes; fixing that would require a shared run registry and a distributed lock, which is out of scope for a non-production simulator with an in-memory event store (see `REPO_PURPOSE.md`).
+
 ## Common Prerequisites
 
 ```bash
@@ -250,6 +305,13 @@ REGENGINE_DATA_DIR=/data
 Do not set `REGENGINE_BUILD_SHA` or `REGENGINE_BUILD_BRANCH` here. The shared demo is GitHub-connected, so Railway injects `RAILWAY_GIT_COMMIT_SHA`; those two variables outrank it (`app/build_info.py`) and would make `/api/healthz` report a hand-typed commit instead of the deployed one. They belong only to "Manual CLI deploy (fallback)" below.
 
 Attach a Railway volume at `/data` before using the service for partner demos. After a Railway domain is generated, update `REGENGINE_CORS_ORIGINS` to that exact HTTPS origin.
+
+**Keep this service at one replica, and do not set `WEB_CONCURRENCY` above 1.** See "Single-Process Requirement" above for why. Two specifics for Railway:
+
+- Replica count is set in the service's **Settings → Scale → Regions** field. Railway exposes no replica-count environment variable, so the app cannot detect a scale-up and cannot refuse it — this one is entirely on the operator. Railway distributes traffic across replicas randomly with no sticky sessions, so with two replicas a Stop request has roughly even odds of reaching the wrong one and returning a 200 that stops nothing.
+- A Railway service variable named `WEB_CONCURRENCY` overrides the `Dockerfile`'s `ENV`. Setting it above 1 makes every worker refuse to start, and the deploy fails its healthcheck rather than coming up half-controllable. That is deliberate.
+
+`railway.json` intentionally does not pin `deploy.multiRegionConfig`. The only replica knob config-as-code offers is `multiRegionConfig.<region>.numReplicas`, which requires hard-coding a region id and would override the workspace's preferred region for every deploy — a larger behavior change than this constraint warrants, on a config format Railway has since deprecated.
 
 ### Automated deploys (preferred)
 

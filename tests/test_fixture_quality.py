@@ -36,7 +36,7 @@ from app.demo_fixtures import (
     DemoFixture,
     get_demo_fixture,
 )
-from app.engine import LegitFlowEngine
+from app.engine import LegitFlowEngine, gs1_check_digit
 from app.mock_service import (
     MAX_EVENT_AGE_DAYS,
     MockRegEngineService,
@@ -351,11 +351,16 @@ def test_rebasing_preserves_relative_spacing_and_kde_dates(fixture_id) -> None:
 
 @pytest.mark.parametrize("fixture_id", _FIXTURE_IDS, ids=lambda f: f.value)
 def test_loaded_fixtures_pass_ingest_with_the_age_window_enforced(fixture_id) -> None:
-    """Acceptance criterion: ``enforce_event_age_window=True`` can be turned on
-    without rejecting fixture events. That flag has to stay off by default for
-    now only because dozens of *other* tests still use the fixed 2026-02-05
-    timestamp as their canonical valid event (#102's remaining half) -- the
-    fixtures themselves no longer stand in the way.
+    """Acceptance criterion: ``enforce_event_age_window=True`` does not reject
+    fixture events. This was the precondition for the flip, and #209 has since
+    taken it -- the flag now defaults to True, and the other blocker named here
+    (dozens of tests on a fixed 2026-02-05 timestamp, #102's remaining half) is
+    gone too, replaced by tests/support/timestamps.py.
+
+    The explicit ``enforce_event_age_window=True`` below is kept rather than
+    left to the default: this test's subject IS the age window, so it should
+    say so at the construction site and keep testing the same thing if the
+    default ever moves again.
     """
     now = datetime.now(UTC)
     fixture = get_demo_fixture(fixture_id, now=now)
@@ -414,3 +419,143 @@ def test_the_newest_fixture_event_lands_where_the_rebase_intends() -> None:
     )
 
     assert newest.date() == (now - timedelta(days=FIXTURE_RECENCY_DAYS)).date()
+
+
+# ---------------------------------------------------------------------------
+# #209 -- a "(00)" reference in the demo fixtures must be a real SSCC
+# ---------------------------------------------------------------------------
+#
+# AI (00) is GS1's Serial Shipping Container Code: 18 digits, the last of
+# which is a mod-10 check digit over the other 17. The shipped fixtures used
+# to put human-readable document numbers after it ("GS1-128 (00)BOL-DEMO-
+# LG-001"), which is precisely the class of malformed identifier this
+# simulator exists to help people notice -- so the demo data, of all data,
+# must not model it.
+
+_SSCC_REFERENCE_PREFIX = "GS1-128 (00)"
+
+
+def _sscc_references(fixture: DemoFixture) -> list[tuple[str, str | None]]:
+    """Every ``(00)`` reference in *fixture*, with its reference_document_number."""
+    references = []
+    for fixture_event in fixture.events:
+        kdes = fixture_event.event.kdes
+        reference_document = kdes.get("reference_document", "")
+        if isinstance(reference_document, str) and reference_document.startswith(
+            _SSCC_REFERENCE_PREFIX
+        ):
+            references.append(
+                (
+                    reference_document[len(_SSCC_REFERENCE_PREFIX) :],
+                    kdes.get("reference_document_number"),
+                )
+            )
+    return references
+
+
+def _assert_is_a_valid_sscc(candidate: str) -> None:
+    assert len(candidate) == 18, f"an SSCC is 18 digits, {candidate!r} has {len(candidate)}"
+    assert candidate.isdigit(), f"an SSCC is all digits, got {candidate!r}"
+    assert int(candidate[-1]) == gs1_check_digit(candidate[:-1]), (
+        f"{candidate!r} fails the GS1 mod-10 check digit"
+    )
+
+
+@pytest.mark.parametrize("fixture_id", _FIXTURE_IDS, ids=lambda f: f.value)
+def test_fixture_sscc_references_are_18_digits_with_a_valid_check_digit(fixture_id) -> None:
+    references = _sscc_references(DEMO_FIXTURES[fixture_id])
+
+    assert references, "no (00) references in this fixture -- the test would pass vacuously"
+    for sscc, _number in references:
+        _assert_is_a_valid_sscc(sscc)
+
+
+@pytest.mark.parametrize("fixture_id", _FIXTURE_IDS, ids=lambda f: f.value)
+def test_fixture_reference_document_number_is_the_same_sscc(fixture_id) -> None:
+    """The document reference and the document *number* KDE must agree.
+
+    A shipment whose reference_document says one identifier and whose
+    reference_document_number says another is unlinkable downstream, which
+    defeats the point of carrying both.
+    """
+    for sscc, number in _sscc_references(DEMO_FIXTURES[fixture_id]):
+        assert number == sscc
+
+
+@pytest.mark.parametrize("fixture_id", _FIXTURE_IDS, ids=lambda f: f.value)
+def test_rebasing_leaves_fixture_sscc_references_intact(fixture_id) -> None:
+    """#199's rebase moves dates, never identifiers.
+
+    ``_BARE_DATE`` is anchored at both ends precisely so an all-digit
+    reference is never mistaken for a date and rewritten; an 18-digit SSCC
+    is the identifier most likely to trip such a check, so pin it.
+    """
+    original = _sscc_references(DEMO_FIXTURES[fixture_id])
+    rebased = _sscc_references(get_demo_fixture(fixture_id))
+
+    assert rebased == original
+    for sscc, _number in rebased:
+        _assert_is_a_valid_sscc(sscc)
+
+
+def test_every_fixture_sscc_is_shared_by_exactly_one_shipping_receiving_pair() -> None:
+    """Each bill of lading names one shipment, from both ends.
+
+    Guards the fix that replaced the human-readable references: swapping in
+    per-event identifiers would still satisfy the check-digit tests above
+    while quietly severing the ship/receive link the fixtures exist to
+    demonstrate.
+    """
+    for fixture_id in _FIXTURE_IDS:
+        events_by_sscc: dict[str, list[str]] = {}
+        for fixture_event in DEMO_FIXTURES[fixture_id].events:
+            reference_document = fixture_event.event.kdes.get("reference_document", "")
+            if isinstance(reference_document, str) and reference_document.startswith(
+                _SSCC_REFERENCE_PREFIX
+            ):
+                sscc = reference_document[len(_SSCC_REFERENCE_PREFIX) :]
+                events_by_sscc.setdefault(sscc, []).append(fixture_event.event.cte_type.value)
+
+        assert events_by_sscc, f"{fixture_id.value} carries no (00) references"
+        for sscc, cte_types in events_by_sscc.items():
+            assert sorted(cte_types) == ["receiving", "shipping"], (
+                f"{sscc} in {fixture_id.value} is not one shipping/receiving pair: {cte_types}"
+            )
+
+
+def test_fixture_ssccs_are_unique_across_the_whole_demo_set() -> None:
+    """Two different shipments must never share an SSCC -- that is the
+    serial part of Serial Shipping Container Code."""
+    all_ssccs = [
+        sscc
+        for fixture_id in _FIXTURE_IDS
+        for sscc, _number in _sscc_references(DEMO_FIXTURES[fixture_id])
+    ]
+    distinct_pairs = {sscc for sscc in all_ssccs}
+
+    assert len(all_ssccs) == 2 * len(distinct_pairs), (
+        "each SSCC should appear exactly twice: once shipping, once receiving"
+    )
+
+
+def test_engine_generated_sscc_references_satisfy_the_same_rule() -> None:
+    """Fixtures and generated runs must agree on what an SSCC is.
+
+    The fixtures build theirs with ``app.engine.make_sscc`` -- the same
+    helper ``LegitFlowEngine._make_sscc`` uses -- so a change to those
+    rules that broke one would break the other, and this asserts the
+    generated half against the identical check.
+    """
+    engine = LegitFlowEngine(seed=_LIVE_SEED, scenario=ScenarioId.SEAFOOD_FIRST_RECEIVER)
+    generated = []
+    for _ in range(_LIVE_EVENT_COUNT):
+        event, _parents = engine.next_event()
+        reference_document = event.kdes.get("reference_document", "")
+        if isinstance(reference_document, str) and reference_document.startswith(
+            _SSCC_REFERENCE_PREFIX
+        ):
+            generated.append(reference_document[len(_SSCC_REFERENCE_PREFIX) :])
+
+    assert generated, "the seafood scenario emitted no GS1-128 (00) references"
+    for sscc in generated:
+        _assert_is_a_valid_sscc(sscc)

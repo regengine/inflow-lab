@@ -3,7 +3,7 @@ from __future__ import annotations
 import json
 
 import asyncio
-from datetime import UTC, datetime, timedelta
+from datetime import timedelta
 from typing import Any
 
 import pytest
@@ -13,6 +13,11 @@ from app.main import app, controller
 from app.routers import mock_regengine as mock_regengine_router
 from app.schemas.domain import CTEType, DestinationMode, RegEngineEvent, StoredEventRecord
 from app.schemas.simulation import SimulationConfig
+from tests.support.timestamps import (
+    CANONICAL_EVENT_DATE,
+    CANONICAL_EVENT_TIME,
+    CANONICAL_EVENT_TIMESTAMP,
+)
 
 
 # Regression tests for #143 (reject unknown/misplaced request body fields),
@@ -23,7 +28,10 @@ from app.schemas.simulation import SimulationConfig
 
 client = TestClient(app)
 
-_BASE_TIME = datetime(2026, 3, 1, 8, 0, tzinfo=UTC)
+# The suite's canonical valid-event time, relative to now rather than a
+# fixed literal: the mock enforces RegEngine's 90-day replay window, so a
+# hardcoded date here would silently age these records out of it (#209).
+_BASE_TIME = CANONICAL_EVENT_TIME
 
 
 def setup_function() -> None:
@@ -90,7 +98,7 @@ def _make_stored_record(
                         "quantity": 100,
                         "unit_of_measure": "cases",
                         "location_name": "Valley Fresh Farms",
-                        "timestamp": "2026-03-01T08:00:00Z",
+                        "timestamp": CANONICAL_EVENT_TIMESTAMP,
                         "kdes": {},
                     }
                 ],
@@ -161,8 +169,8 @@ def test_ingest_with_well_formed_body_still_succeeds() -> None:
                     "quantity": 100,
                     "unit_of_measure": "cases",
                     "location_name": "Valley Fresh Farms",
-                    "timestamp": "2026-03-01T08:00:00Z",
-                    "kdes": {"harvest_date": "2026-03-01", "reference_document": "Harvest Log HL-ROBUST-001"},
+                    "timestamp": CANONICAL_EVENT_TIMESTAMP,
+                    "kdes": {"harvest_date": CANONICAL_EVENT_DATE, "reference_document": "Harvest Log HL-ROBUST-001"},
                 }
             ],
         },
@@ -183,7 +191,7 @@ def test_ingest_with_well_formed_body_still_succeeds() -> None:
 def test_retry_with_explicit_empty_record_ids_retries_nothing() -> None:
     failed = _make_stored_record(
         "TLC-RETRY-EMPTY-001",
-        kdes={"harvest_date": "2026-03-01", "reference_document": "Harvest Log HL-EMPTY-001"},
+        kdes={"harvest_date": CANONICAL_EVENT_DATE, "reference_document": "Harvest Log HL-EMPTY-001"},
         delivery_status="failed",
         error="temporary outage",
     )
@@ -213,14 +221,14 @@ def test_retry_with_omitted_record_ids_retries_all_failed_records() -> None:
     first = _make_stored_record(
         "TLC-RETRY-ALL-001",
         minutes=0,
-        kdes={"harvest_date": "2026-03-01", "reference_document": "Harvest Log HL-ALL-001"},
+        kdes={"harvest_date": CANONICAL_EVENT_DATE, "reference_document": "Harvest Log HL-ALL-001"},
         delivery_status="failed",
         error="temporary outage",
     )
     second = _make_stored_record(
         "TLC-RETRY-ALL-002",
         minutes=1,
-        kdes={"harvest_date": "2026-03-01", "reference_document": "Harvest Log HL-ALL-002"},
+        kdes={"harvest_date": CANONICAL_EVENT_DATE, "reference_document": "Harvest Log HL-ALL-002"},
         delivery_status="failed",
         error="temporary outage",
     )
@@ -245,14 +253,14 @@ def test_retry_with_nonempty_record_ids_still_filters_to_that_subset() -> None:
     target = _make_stored_record(
         "TLC-RETRY-FILTER-TARGET",
         minutes=0,
-        kdes={"harvest_date": "2026-03-01", "reference_document": "Harvest Log HL-FILTER-001"},
+        kdes={"harvest_date": CANONICAL_EVENT_DATE, "reference_document": "Harvest Log HL-FILTER-001"},
         delivery_status="failed",
         error="temporary outage",
     )
     other = _make_stored_record(
         "TLC-RETRY-FILTER-OTHER",
         minutes=1,
-        kdes={"harvest_date": "2026-03-01", "reference_document": "Harvest Log HL-FILTER-002"},
+        kdes={"harvest_date": CANONICAL_EVENT_DATE, "reference_document": "Harvest Log HL-FILTER-002"},
         delivery_status="failed",
         error="temporary outage",
     )
@@ -474,7 +482,7 @@ def _ingest_event_body(**overrides) -> dict:
         "quantity": 100,
         "unit_of_measure": "cases",
         "location_name": "Valley Fresh Farms",
-        "timestamp": "2026-02-05T08:30:00Z",
+        "timestamp": CANONICAL_EVENT_TIMESTAMP,
         "kdes": {},
     }
     event.update(overrides)
@@ -582,7 +590,7 @@ def _seed_export_records(count: int) -> None:
                 f"TLC-EXPORT-{index:04d}",
                 minutes=index,
                 kdes={
-                    "harvest_date": "2026-03-01",
+                    "harvest_date": CANONICAL_EVENT_DATE,
                     "reference_document": f"Harvest Log HL-EXPORT-{index:04d}",
                 },
             )

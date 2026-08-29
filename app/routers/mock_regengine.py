@@ -20,7 +20,14 @@ from ..fda_export import (
     list_fda_export_preset_summaries,
     render_fda_request_csv,
 )
-from ..mock_service import MockRegEngineHTTPError, verify_webhook_signature
+from ..mock_service import (
+    MAX_BATCH_EVENTS,
+    MAX_INGEST_BODY_BYTES,
+    MockRegEngineHTTPError,
+    parse_signature_digest,
+    verify_webhook_signature,
+    webhook_signing_secret,
+)
 from ..schemas.domain import FDAExportPreset
 from ..schemas.exports import FDAExportPresetListResponse, FDAExportPresetSummary
 from ..schemas.ingestion import IngestPayload, MockIngestResponse
@@ -36,6 +43,12 @@ router = APIRouter(prefix="/api/mock/regengine", tags=["Mock RegEngine"])
 # unbounded by anything else in the system. A broad date range, or a lot
 # code with a wide trace graph, otherwise renders an arbitrarily large CSV
 # or JSON-LD document in one response.
+#
+# That same "reads the whole log from disk" property is why both endpoints
+# below take their records through the controller's ``_store_*`` helpers
+# rather than calling ``active_controller.store`` directly: it is real
+# blocking file I/O and belongs on a worker thread, not on the event loop
+# (#136's read half). See the offload block in app/controller.py.
 EXPORT_MAX_RECORDS = 5000
 
 
@@ -124,14 +137,36 @@ async def mock_regengine_ingest(
     # enumerating the payload shape where they should only ever have seen a
     # flat 401.
     #
-    # Reading the bytes is unavoidable -- HMAC is computed over them -- but
-    # everything downstream of the bytes now happens only after the
-    # signature checks out. Verifying against the real wire bytes rather
-    # than a round-tripped re-serialization of a parsed model is itself the
-    # point of the check; see verify_webhook_signature's docstring (#113).
-    raw_body = await request.body()
-
+    # Holding the bytes is unavoidable for the COMPARISON -- the HMAC is
+    # computed over them -- but three of the four ways a signature is
+    # rejected never look at the body at all: no header, a scheme that is
+    # not sha256, and a digest that is not hex. Those are decided first, so
+    # a caller who never signed is turned away without the body ever being
+    # accumulated (#209). Only a request carrying a digest that could
+    # plausibly verify gets to spend the server's memory.
+    #
+    # Verifying against the real wire bytes rather than a round-tripped
+    # re-serialization of a parsed model is itself the point of the check;
+    # see verify_webhook_signature's docstring (#113).
     try:
+        if webhook_signing_secret():
+            try:
+                parse_signature_digest(x_webhook_signature)
+            except MockRegEngineHTTPError:
+                # Decided without the body -- but the client is midway
+                # through sending one, and answering while it is still
+                # writing makes the server close the connection under it:
+                # the caller sees a connection reset instead of the 401
+                # that names what was wrong with their header. So the body
+                # is drained and discarded rather than skipped. That keeps
+                # the diagnostic -- the whole point of this simulator is
+                # that an integrator can read why their request failed --
+                # at chunk-sized memory instead of the whole payload.
+                await _discard_body(request)
+                raise
+
+        raw_body = await _read_bounded_body(request)
+
         verify_webhook_signature(raw_body, x_webhook_signature)
     except MockRegEngineHTTPError as exc:
         raise HTTPException(status_code=exc.status_code, detail=exc.detail) from exc
@@ -169,6 +204,50 @@ async def mock_regengine_ingest(
         )
     except MockRegEngineHTTPError as exc:
         raise HTTPException(status_code=exc.status_code, detail=exc.detail) from exc
+
+
+async def _read_bounded_body(request: Request) -> bytes:
+    """The raw request body, refused above ``MAX_INGEST_BODY_BYTES``.
+
+    Unconditional, unlike the signature pre-checks above: those only run when
+    a signing secret is configured, and an unsigned deployment is the default.
+    Without a ceiling this route read an arbitrarily large body into memory
+    for any unauthenticated caller.
+
+    Checked against ``Content-Length`` first so an oversized body is refused
+    without being read at all. The post-read check covers callers that send no
+    length (chunked transfer encoding), where the bytes have to arrive before
+    they can be counted.
+    """
+    declared = request.headers.get("content-length")
+    if declared is not None and declared.isdigit() and int(declared) > MAX_INGEST_BODY_BYTES:
+        raise _body_too_large(int(declared))
+    raw_body = await request.body()
+    if len(raw_body) > MAX_INGEST_BODY_BYTES:
+        raise _body_too_large(len(raw_body))
+    return raw_body
+
+
+def _body_too_large(size: int) -> MockRegEngineHTTPError:
+    return MockRegEngineHTTPError(
+        413,
+        f"Request body is {size} bytes, above the {MAX_INGEST_BODY_BYTES} byte "
+        f"ingest ceiling. Batches are capped at {MAX_BATCH_EVENTS} events; "
+        "split the batch and retry.",
+    )
+
+
+async def _discard_body(request: Request) -> None:
+    """Consume and throw away a request body already decided against.
+
+    Streams the chunks and keeps none of them, so an unauthenticated
+    caller's payload costs one chunk of memory rather than the whole body
+    (twice -- Starlette's own body() holds the chunk list and the joined
+    bytes at once). Draining rather than ignoring is what lets the client
+    finish its upload and actually read the 401.
+    """
+    async for _chunk in request.stream():
+        pass
 
 
 def _parse_ingest_payload(raw_body: bytes) -> IngestPayload:
@@ -237,14 +316,14 @@ async def mock_fda_request_export(
         raise HTTPException(status_code=400, detail="traceability_lot_code is required for this export preset")
 
     if traceability_lot_code:
-        records = active_controller.store.lineage(traceability_lot_code)
+        records = await active_controller._store_lineage(traceability_lot_code)
         if not records:
             raise HTTPException(status_code=404, detail="No records found for that lot code")
         records = _filter_records_between(records, start_date=start_filter, end_date=end_filter)
     else:
-        records = active_controller.store.all_between(
-            start_date=start_filter.isoformat() if start_filter else None,
-            end_date=end_filter.isoformat() if end_filter else None,
+        records = await active_controller._store_all_between(
+            start_filter.isoformat() if start_filter else None,
+            end_filter.isoformat() if end_filter else None,
         )
     records = apply_fda_export_preset(records, preset)
     _enforce_export_record_cap(records, scoped_by_lot_code=bool(traceability_lot_code))
@@ -272,14 +351,14 @@ async def mock_epcis_export(
 ) -> JSONResponse:
     start_filter, end_filter = _parse_export_date_filters(start_date=start_date, end_date=end_date)
     if traceability_lot_code:
-        records = active_controller.store.lineage(traceability_lot_code)
+        records = await active_controller._store_lineage(traceability_lot_code)
         if not records:
             raise HTTPException(status_code=404, detail="No records found for that lot code")
         records = _filter_records_between(records, start_date=start_filter, end_date=end_filter)
     else:
-        records = active_controller.store.all_between(
-            start_date=start_filter.isoformat() if start_filter else None,
-            end_date=end_filter.isoformat() if end_filter else None,
+        records = await active_controller._store_all_between(
+            start_filter.isoformat() if start_filter else None,
+            end_filter.isoformat() if end_filter else None,
         )
 
     _enforce_export_record_cap(records, scoped_by_lot_code=bool(traceability_lot_code))

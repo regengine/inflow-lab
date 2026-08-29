@@ -5,8 +5,42 @@ from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from typing import Any
 
+from .engine import GS1_COMPANY_PREFIX, make_sscc
 from .schemas.domain import CTEType, DemoFixtureId, RegEngineEvent
 from .scenarios import ScenarioId
+
+
+def _demo_sscc(serial: int) -> str:
+    """An 18-digit SSCC for one demo shipment's bill of lading (#209).
+
+    The shipping/receiving KDEs below advertise their reference as
+    ``GS1-128 (00)...``. AI (00) *is* the SSCC application identifier, so
+    whatever follows it has to be a real SSCC -- 18 digits closed by a
+    GS1 mod-10 check digit -- and these used to carry human-readable
+    document numbers instead. Cosmetic in a simulator, and exactly the
+    class of malformed identifier this simulator exists to help people
+    notice, which is why the shipped demo data should not be the thing
+    modelling it.
+
+    Built with the engine's own construction (``app.engine.make_sscc``,
+    the same helper ``LegitFlowEngine._make_sscc`` uses for generated GS1
+    shipments) so fixtures and generated runs agree on the rules. The 9
+    digits of serial reference are fixed rather than date-derived like
+    the engine's, because the golden export tests render these fixtures
+    byte-for-byte and must stay reproducible.
+    """
+    return make_sscc(f"0{GS1_COMPANY_PREFIX}{serial:09d}")
+
+
+# One SSCC per bill of lading. A shipping event and the receiving event
+# that answers it deliberately share one, exactly as the human-readable
+# references they replace did -- that shared reference is what ties the
+# two ends of a shipment together.
+_SSCC_LEAFY_GREENS_BOL = _demo_sscc(1)
+_SSCC_FRESH_CUT_INBOUND_BOL_A = _demo_sscc(2)
+_SSCC_FRESH_CUT_INBOUND_BOL_B = _demo_sscc(3)
+_SSCC_FRESH_CUT_OUTBOUND_BOL = _demo_sscc(4)
+_SSCC_RETAIL_BOL = _demo_sscc(5)
 
 
 @dataclass(frozen=True, slots=True)
@@ -158,9 +192,9 @@ DEMO_FIXTURES: dict[DemoFixtureId, DemoFixture] = {
                         "ship_from_location": "FreshPack Central",
                         "ship_to_location": "Distribution Center #4",
                         "carrier": "ColdRoute Freight",
-                        "reference_document": "GS1-128 (00)BOL-DEMO-LG-001",
+                        "reference_document": f"GS1-128 (00){_SSCC_LEAFY_GREENS_BOL}",
                         "reference_document_type": "Bill of Lading",
-                        "reference_document_number": "BOL-DEMO-LG-001",
+                        "reference_document_number": _SSCC_LEAFY_GREENS_BOL,
                         "tlc_source_reference": "SRC-DEMO-LG-PACK-001",
                         "traceability_lot_code_source_reference": "SRC-DEMO-LG-PACK-001",
                     },
@@ -180,9 +214,9 @@ DEMO_FIXTURES: dict[DemoFixtureId, DemoFixture] = {
                         "receiving_location": "Distribution Center #4",
                         "ship_from_location": "FreshPack Central",
                         "immediate_previous_source": "FreshPack Central",
-                        "reference_document": "GS1-128 (00)BOL-DEMO-LG-001",
+                        "reference_document": f"GS1-128 (00){_SSCC_LEAFY_GREENS_BOL}",
                         "reference_document_type": "Bill of Lading",
-                        "reference_document_number": "BOL-DEMO-LG-001",
+                        "reference_document_number": _SSCC_LEAFY_GREENS_BOL,
                         "tlc_source_reference": "SRC-DEMO-LG-PACK-001",
                         "traceability_lot_code_source_reference": "SRC-DEMO-LG-PACK-001",
                     },
@@ -366,9 +400,9 @@ DEMO_FIXTURES: dict[DemoFixtureId, DemoFixture] = {
                         "ship_from_location": "Processor Intake Packout",
                         "ship_to_location": "ReadyFresh Processing Plant",
                         "carrier": "PrepLine Logistics",
-                        "reference_document": "GS1-128 (00)BOL-DEMO-FC-001",
+                        "reference_document": f"GS1-128 (00){_SSCC_FRESH_CUT_INBOUND_BOL_A}",
                         "reference_document_type": "Bill of Lading",
-                        "reference_document_number": "BOL-DEMO-FC-001",
+                        "reference_document_number": _SSCC_FRESH_CUT_INBOUND_BOL_A,
                         "tlc_source_reference": "SRC-DEMO-FC-PACK-001",
                         "traceability_lot_code_source_reference": "SRC-DEMO-FC-PACK-001",
                     },
@@ -388,9 +422,9 @@ DEMO_FIXTURES: dict[DemoFixtureId, DemoFixture] = {
                         "ship_from_location": "Processor Intake Packout",
                         "ship_to_location": "ReadyFresh Processing Plant",
                         "carrier": "PrepLine Logistics",
-                        "reference_document": "GS1-128 (00)BOL-DEMO-FC-002",
+                        "reference_document": f"GS1-128 (00){_SSCC_FRESH_CUT_INBOUND_BOL_B}",
                         "reference_document_type": "Bill of Lading",
-                        "reference_document_number": "BOL-DEMO-FC-002",
+                        "reference_document_number": _SSCC_FRESH_CUT_INBOUND_BOL_B,
                         "tlc_source_reference": "SRC-DEMO-FC-PACK-002",
                         "traceability_lot_code_source_reference": "SRC-DEMO-FC-PACK-002",
                     },
@@ -410,9 +444,9 @@ DEMO_FIXTURES: dict[DemoFixtureId, DemoFixture] = {
                         "receiving_location": "ReadyFresh Processing Plant",
                         "ship_from_location": "Processor Intake Packout",
                         "immediate_previous_source": "Processor Intake Packout",
-                        "reference_document": "GS1-128 (00)BOL-DEMO-FC-001",
+                        "reference_document": f"GS1-128 (00){_SSCC_FRESH_CUT_INBOUND_BOL_A}",
                         "reference_document_type": "Bill of Lading",
-                        "reference_document_number": "BOL-DEMO-FC-001",
+                        "reference_document_number": _SSCC_FRESH_CUT_INBOUND_BOL_A,
                         "tlc_source_reference": "SRC-DEMO-FC-PACK-001",
                         "traceability_lot_code_source_reference": "SRC-DEMO-FC-PACK-001",
                     },
@@ -432,9 +466,9 @@ DEMO_FIXTURES: dict[DemoFixtureId, DemoFixture] = {
                         "receiving_location": "ReadyFresh Processing Plant",
                         "ship_from_location": "Processor Intake Packout",
                         "immediate_previous_source": "Processor Intake Packout",
-                        "reference_document": "GS1-128 (00)BOL-DEMO-FC-002",
+                        "reference_document": f"GS1-128 (00){_SSCC_FRESH_CUT_INBOUND_BOL_B}",
                         "reference_document_type": "Bill of Lading",
-                        "reference_document_number": "BOL-DEMO-FC-002",
+                        "reference_document_number": _SSCC_FRESH_CUT_INBOUND_BOL_B,
                         "tlc_source_reference": "SRC-DEMO-FC-PACK-002",
                         "traceability_lot_code_source_reference": "SRC-DEMO-FC-PACK-002",
                     },
@@ -483,9 +517,9 @@ DEMO_FIXTURES: dict[DemoFixtureId, DemoFixture] = {
                         "ship_from_location": "ReadyFresh Processing Plant",
                         "ship_to_location": "Foodservice DC #12",
                         "carrier": "ColdRoute Freight",
-                        "reference_document": "GS1-128 (00)BOL-DEMO-FC-OUT-001",
+                        "reference_document": f"GS1-128 (00){_SSCC_FRESH_CUT_OUTBOUND_BOL}",
                         "reference_document_type": "Bill of Lading",
-                        "reference_document_number": "BOL-DEMO-FC-OUT-001",
+                        "reference_document_number": _SSCC_FRESH_CUT_OUTBOUND_BOL,
                         "tlc_source_reference": "SRC-DEMO-FC-OUT-001",
                         "traceability_lot_code_source_reference": "SRC-DEMO-FC-OUT-001",
                     },
@@ -505,9 +539,9 @@ DEMO_FIXTURES: dict[DemoFixtureId, DemoFixture] = {
                         "receiving_location": "Foodservice DC #12",
                         "ship_from_location": "ReadyFresh Processing Plant",
                         "immediate_previous_source": "ReadyFresh Processing Plant",
-                        "reference_document": "GS1-128 (00)BOL-DEMO-FC-OUT-001",
+                        "reference_document": f"GS1-128 (00){_SSCC_FRESH_CUT_OUTBOUND_BOL}",
                         "reference_document_type": "Bill of Lading",
-                        "reference_document_number": "BOL-DEMO-FC-OUT-001",
+                        "reference_document_number": _SSCC_FRESH_CUT_OUTBOUND_BOL,
                         "tlc_source_reference": "SRC-DEMO-FC-OUT-001",
                         "traceability_lot_code_source_reference": "SRC-DEMO-FC-OUT-001",
                     },
@@ -613,9 +647,9 @@ DEMO_FIXTURES: dict[DemoFixtureId, DemoFixture] = {
                         "ship_from_location": "Retail Ready Packout",
                         "ship_to_location": "Retail DC West",
                         "carrier": "StoreLane Logistics",
-                        "reference_document": "GS1-128 (00)BOL-DEMO-RT-001",
+                        "reference_document": f"GS1-128 (00){_SSCC_RETAIL_BOL}",
                         "reference_document_type": "Bill of Lading",
-                        "reference_document_number": "BOL-DEMO-RT-001",
+                        "reference_document_number": _SSCC_RETAIL_BOL,
                         "tlc_source_reference": "SRC-DEMO-RT-PACK-001",
                         "traceability_lot_code_source_reference": "SRC-DEMO-RT-PACK-001",
                     },
@@ -635,9 +669,9 @@ DEMO_FIXTURES: dict[DemoFixtureId, DemoFixture] = {
                         "receiving_location": "Retail DC West",
                         "ship_from_location": "Retail Ready Packout",
                         "immediate_previous_source": "Retail Ready Packout",
-                        "reference_document": "GS1-128 (00)BOL-DEMO-RT-001",
+                        "reference_document": f"GS1-128 (00){_SSCC_RETAIL_BOL}",
                         "reference_document_type": "Bill of Lading",
-                        "reference_document_number": "BOL-DEMO-RT-001",
+                        "reference_document_number": _SSCC_RETAIL_BOL,
                         "tlc_source_reference": "SRC-DEMO-RT-PACK-001",
                         "traceability_lot_code_source_reference": "SRC-DEMO-RT-PACK-001",
                     },

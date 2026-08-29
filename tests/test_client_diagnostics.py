@@ -15,14 +15,24 @@ Covers two independent things:
      fixtures/tmp files -- this repo has no real network path to
      RegEngine's source, which is the point: it must fail loudly, not
      silently pass, when unconfigured).
+
+     Every freshness assertion here is driven by an injected clock (#211).
+     This file used to assert the guard's *wall-clock* verdict, which set
+     the whole suite to start failing on 2026-10-28 -- the day the pin as
+     written crosses its 90-day window -- with no code change involved and
+     nothing to fix but the date. The guard's real-calendar teeth live in
+     `app.contract._main()` (`uv run python -m app.contract`, exit code 1),
+     whose stale-pin exit code is pinned below, also through an injected
+     clock.
 """
 
 from __future__ import annotations
 
 import asyncio
 import json
-from datetime import UTC, datetime, timedelta
-from typing import Any
+import warnings
+from datetime import UTC, date, datetime, timedelta
+from typing import Any, Callable
 
 import httpx
 import pytest
@@ -37,6 +47,7 @@ from app.contract import (
     contract_pin_age_days,
     contract_staleness_window_days,
 )
+from app.contract import _main as contract_main
 from app.cte_rules import REQUIRED_KDES
 from app.regengine_client import (
     _MAX_ERROR_BODY_CHARS,
@@ -184,6 +195,10 @@ class FailingAsyncClient:
         *,
         headers: dict[str, str],
         content: bytes | None = None,
+        # extensions: the live client attaches {"sni_hostname": ...} when it
+        # pins the validated address for the dial (#207). Accepted and
+        # ignored here so this fake keeps working on either path.
+        extensions: dict[str, Any] | None = None,
     ) -> Any:
         assert FailingAsyncClient.response is not None
         return FailingAsyncClient.response
@@ -349,7 +364,15 @@ class ConnectionProbeAsyncClient:
         return None
 
     async def get(
-        self, url: str, *, headers: dict[str, str] | None = None, params: Any = None
+        self,
+        url: str,
+        *,
+        headers: dict[str, str] | None = None,
+        params: Any = None,
+        # extensions: the live client attaches {"sni_hostname": ...} when it
+        # pins the validated address for the dial (#207). Accepted and
+        # ignored here so this fake keeps working on either path.
+        extensions: dict[str, Any] | None = None,
     ) -> Any:
         if url.endswith("/health"):
             return FailingResponse(200, json_body={}, has_json_body=True)
@@ -380,13 +403,128 @@ def test_check_connection_behavior_is_unaffected_by_138(monkeypatch: Any) -> Non
 # ---------------------------------------------------------------------------
 
 
-def test_contract_pin_is_currently_fresh() -> None:
-    """Documents today's state: the pin was last confirmed
-    CONTRACT_LAST_CONFIRMED and the window hasn't elapsed, so this must not
-    raise yet. Once DEFAULT_CONTRACT_STALENESS_WINDOW_DAYS actually elapses
-    without CONTRACT_LAST_CONFIRMED moving forward, this test starts
-    failing -- that is #140's entire point, not a bug in this test."""
-    assert_contract_pin_is_fresh()
+def _clock_at(day: date) -> Callable[[], date]:
+    """An injected clock frozen at *day* -- #120's pattern from
+    app/mock_service.py (``clock: Callable[[], datetime]``), narrowed to
+    the calendar date this guard actually compares."""
+    return lambda: day
+
+
+def test_contract_pin_is_fresh_everywhere_inside_its_window() -> None:
+    """The guard must stay quiet for the pin's whole window.
+
+    This replaces a test that called ``assert_contract_pin_is_fresh()``
+    with no argument at all, i.e. against the real wall clock (#211). That
+    made the entire suite fail on a fixed calendar date -- 2026-10-28 for
+    the pin as written -- with no code change involved and nothing to
+    "fix" but the date, which is how a check turns into noise people learn
+    to skip past. The verdict here is a function of CONTRACT_LAST_CONFIRMED
+    and the window only, so it reads the same on any day the suite runs.
+
+    The wall-clock verdict is still enforced, deliberately and separately,
+    by ``uv run python -m app.contract`` -- see
+    ``test_contract_cli_exits_nonzero_for_a_genuinely_stale_pin`` below.
+    """
+    window_days = contract_staleness_window_days()
+    for offset in (0, 1, window_days // 2, window_days - 1, window_days):
+        day = CONTRACT_LAST_CONFIRMED + timedelta(days=offset)
+        assert_contract_pin_is_fresh(clock=_clock_at(day))
+        assert contract_pin_age_days(clock=_clock_at(day)) == offset
+
+
+def test_contract_pin_guard_fires_for_a_genuinely_stale_pin() -> None:
+    """The other half: the guard still has teeth.
+
+    Defusing the calendar bomb must not mean the guard stopped firing --
+    one day past the window it raises, and says which pin and how old.
+    """
+    window_days = contract_staleness_window_days()
+    stale_day = CONTRACT_LAST_CONFIRMED + timedelta(days=window_days + 1)
+
+    with pytest.raises(ContractPinStaleError) as exc_info:
+        assert_contract_pin_is_fresh(clock=_clock_at(stale_day))
+
+    assert CONTRACT_LAST_CONFIRMED.isoformat() in str(exc_info.value)
+    assert f"{window_days + 1} days" in str(exc_info.value)
+
+
+def test_contract_pin_verdict_ignores_the_wall_clock(monkeypatch: Any) -> None:
+    """Simulate a date past the old bomb date; the verdict must not move.
+
+    ``app.contract._contract_clock`` is the module-level default the guard
+    reads when a caller passes no clock. Substituting it here simulates
+    running this suite on 2026-12-15 -- well past 2026-10-28, the date the
+    previous version of this file was scheduled to start failing on -- and
+    both verdicts below still depend only on the date each call is given.
+    """
+    monkeypatch.setattr("app.contract._contract_clock", _clock_at(date(2026, 12, 15)))
+    window_days = contract_staleness_window_days()
+
+    assert_contract_pin_is_fresh(clock=_clock_at(CONTRACT_LAST_CONFIRMED + timedelta(days=window_days)))
+    with pytest.raises(ContractPinStaleError):
+        assert_contract_pin_is_fresh(
+            clock=_clock_at(CONTRACT_LAST_CONFIRMED + timedelta(days=window_days + 1))
+        )
+
+
+def test_contract_cli_exits_nonzero_for_a_genuinely_stale_pin(
+    monkeypatch: Any, capsys: Any
+) -> None:
+    """Where the dated nag actually bites: ``uv run python -m app.contract``.
+
+    Exit code 1 is #140's "the pin is stale" signal, distinct from 3
+    ("could not verify against upstream at all", which is what this
+    environment always reports for the remote half). Driven through the
+    injected clock so it is pinned on any calendar date -- and so the
+    guard's real-world teeth are demonstrably still there after #211 moved
+    them off the pytest verdict.
+    """
+    window_days = contract_staleness_window_days()
+    monkeypatch.setattr(
+        "app.contract._contract_clock",
+        _clock_at(CONTRACT_LAST_CONFIRMED + timedelta(days=window_days + 1)),
+    )
+    monkeypatch.delenv("REGENGINE_CONTRACT_ARTIFACT_PATH", raising=False)
+    monkeypatch.delenv("REGENGINE_CONTRACT_ARTIFACT_URL", raising=False)
+
+    assert contract_main() == 1
+    assert "STALE" in capsys.readouterr().err
+
+    # Fresh pin, same unconfigured environment: the stale signal is gone
+    # and only the unverifiable-remote-half signal (3) remains, so the 1
+    # above is really about the pin's age and nothing else.
+    monkeypatch.setattr(
+        "app.contract._contract_clock",
+        _clock_at(CONTRACT_LAST_CONFIRMED + timedelta(days=window_days)),
+    )
+    assert contract_main() == 3
+
+
+def test_contract_pin_freshness_against_the_real_calendar() -> None:
+    """The dated nag itself, kept visible without arming a time bomb.
+
+    Reports the pin's real age in every run: past the window this raises a
+    warning that shows up in pytest's warnings summary (deliberately not
+    captured by a ``recwarn``/``pytest.warns`` fixture, which would swallow
+    it), rather than failing an unrelated author's PR on a date nobody
+    chose. The only
+    assertion is one that can never be satisfied by the calendar moving --
+    a negative age means CONTRACT_LAST_CONFIRMED was set in the future,
+    which is a genuine mistake in the pin, not the passage of time.
+    """
+    age_days = contract_pin_age_days()
+    window_days = contract_staleness_window_days()
+    if age_days > window_days:
+        warnings.warn(
+            "The RegEngine KDE contract pin has not been reconfirmed in "
+            f"{age_days} days (limit {window_days}, last confirmed "
+            f"{CONTRACT_LAST_CONFIRMED.isoformat()}). Re-check it against "
+            "RegEngine and move CONTRACT_LAST_CONFIRMED in app/contract.py "
+            "forward; `uv run python -m app.contract` fails while this is "
+            "outstanding.",
+            stacklevel=1,
+        )
+    assert age_days >= 0, "CONTRACT_LAST_CONFIRMED is dated in the future"
 
 
 def test_contract_pin_age_days_computes_from_an_explicit_today() -> None:

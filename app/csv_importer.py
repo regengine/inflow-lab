@@ -300,19 +300,20 @@ def _replay_window_warnings(
     records is the natural thing to do -- so the import that fails this way
     is the one a design partner is most likely to try.
 
-    The mock's own age check exists (mock_service.MAX_EVENT_AGE_DAYS) but
-    ships off by default, because switching it on would reject this repo's
-    own bundled demo fixtures; see MockRegEngineService.__init__ and issue
-    #199. That default is exactly why this warning matters: in mock mode
-    every stale row is accepted with a hash and a chain link, and without
-    this the simulator gives no hint that an age limit even exists until
-    the same batch is wholesale-rejected against live.
+    This fires at parse time, before any delivery is attempted, which is
+    the whole point: the operator learns the rows are outside live's window
+    while they are still deciding what to import, not from a pile of
+    per-event rejections afterwards. Since #209 the mock enforces the same
+    floor on delivery, so the warning is advance notice of a refusal the
+    simulator itself will now issue -- not, as it was under the old default,
+    the only thing standing between a green mock result and a wholesale
+    rejection against live.
 
     A warning rather than an error, deliberately: importing historical data
-    into the simulator is legitimate and useful, and refusing it here would
-    break a workflow live's limit does not actually forbid (mock delivery,
-    export rehearsal, lineage inspection). Required severity, because unlike
-    a missing recommended KDE this is a row live WILL reject.
+    into the simulator is legitimate and useful (export rehearsal, lineage
+    inspection, audit scoring all work on rows live would refuse to ingest),
+    so the rows are still parsed and still stored. Required severity,
+    because unlike a missing recommended KDE this is a row live WILL reject.
     """
     timestamp = _ensure_timezone(event.timestamp)
     cutoff = now - timedelta(days=MAX_EVENT_AGE_DAYS)
@@ -326,7 +327,8 @@ def _replay_window_warnings(
                 f"timestamp is {(now - timestamp).days} days old, past RegEngine's "
                 f"{MAX_EVENT_AGE_DAYS}-day replay window (WEBHOOK_MAX_EVENT_AGE_DAYS) — live "
                 "ingest rejects this row with 'replay window exceeded'. The built-in mock "
-                "accepts it, so this warning is the only signal you get before delivery."
+                "now rejects it the same way, so the row imports and is stored but will "
+                "not deliver."
             ),
             severity="required",
         )

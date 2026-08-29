@@ -69,6 +69,28 @@ STALE_COMMIT_MESSAGE = (
 )
 
 
+def _consume_finished_task_exception(task: asyncio.Task[Any]) -> None:
+    """Retrieve a finished task's exception so asyncio never has to log it.
+
+    An exception on a Task nobody ever calls ``.exception()`` on is
+    reported by asyncio itself, from ``Task.__del__``, as "Task exception
+    was never retrieved" -- at garbage-collection time, detached from the
+    request that caused it and outside this app's own logger (#211).
+    Retrieving it here both silences that and puts the traceback in the
+    "inflow_lab" stream with the run it belongs to.
+
+    Caller must have established ``task.done()``; ``exception()`` would
+    otherwise raise InvalidStateError. A cancelled task has no exception
+    to retrieve -- ``exception()`` re-raises the CancelledError instead --
+    so it is skipped.
+    """
+    if task.cancelled():
+        return
+    error = task.exception()
+    if error is not None:
+        logger.error("simulation run loop ended with an unretrieved error", exc_info=error)
+
+
 def _with_stale_commit_note(error_message: str | None) -> str:
     """Append the dropped-commit note to whatever the delivery itself reported."""
     if not error_message:
@@ -240,15 +262,36 @@ class SimulationController:
         # a live run loop that nothing could ever reach again.
         async with self._lifecycle_lock:
             task = self._task
-            if task is None or task.done():
+            if task is None:
                 return
-            # Captured under the same lock as `task`, from the same read of
-            # self._task's generation -- start() always assigns
-            # self._stop_event and self._task together (see above), so this
-            # is guaranteed to be the event *this* task is actually waiting
-            # on, never a later start()'s fresh replacement.
-            stop_event = self._stop_event
-            stop_event.set()
+            if task.done():
+                # #211: this used to be folded into the `task is None`
+                # early return, which meant a loop that had already ended
+                # on its own -- crashed, above all -- left self._task
+                # installed forever, with no revision bump to tell the
+                # console the run was over. Clear it here instead. Both
+                # calls below are synchronous and cannot block: the task
+                # is done(), so exception() returns immediately, and this
+                # is still the same _lifecycle_lock hold that read it, so
+                # no start() can slip in between the read and the clear.
+                self._task = None
+                _consume_finished_task_exception(task)
+                already_finished = True
+            else:
+                already_finished = False
+                # Captured under the same lock as `task`, from the same read
+                # of self._task's generation -- start() always assigns
+                # self._stop_event and self._task together (see above), so
+                # this is guaranteed to be the event *this* task is actually
+                # waiting on, never a later start()'s fresh replacement.
+                stop_event = self._stop_event
+                stop_event.set()
+        if already_finished:
+            # Nothing to await -- the task is done and its reference is
+            # already cleared. Publish outside the lock, exactly as the
+            # normal path below does, so the console learns the run ended.
+            await self._publish_update()
+            return
         # await the task OUTSIDE the lock. _run_loop calls self.step(),
         # which itself does `async with self._lock` -- holding the lock
         # here while awaiting the loop's own task would deadlock stop()
@@ -256,7 +299,18 @@ class SimulationController:
         # start its next one): step() would block forever on a lock stop()
         # is holding, while stop() blocks forever on a task that can now
         # never finish stepping.
-        await task
+        try:
+            await task
+        except Exception:
+            # _run_loop swallows and logs its own step failures (#211), so
+            # reaching here means the task died some other way -- e.g. an
+            # error inside its own finally. Either way the task is over,
+            # and stop()'s remaining job (clear the reference, publish)
+            # must still happen rather than the caller of POST
+            # /api/simulate/stop getting a 500 and a controller still
+            # holding a dead task. CancelledError is a BaseException and
+            # deliberately keeps propagating.
+            logger.exception("simulation run loop task ended with an unhandled error")
         async with self._lifecycle_lock:
             # The other half of #156's fix. While the lock was open across
             # the `await task` above, a concurrent start() could have
@@ -618,7 +672,18 @@ class SimulationController:
             config = request.config or self.config
             config = config.model_copy(update={"scenario": scenario_id}, deep=True)
             config = self._sanitize_saved_config(config)
-            records = self.store.all_between()
+            # Offloaded (#136's read half), and deliberately still INSIDE
+            # self._lock. all_between() re-reads the whole persisted log,
+            # and the snapshot written below has to be of the store as it
+            # was at one instant: hoisting the read out of the lock would
+            # let a reset()/load_scenario_save() land between the read and
+            # save_snapshot(), writing a "save" of history the operator had
+            # already cleared. Holding the data-plane lock across a local
+            # disk read on a worker thread is the same trade
+            # _commit_delivered_records already documents and is NOT what
+            # #208 forbids -- that is about the 30s network POSTs, which
+            # still happen with this lock released.
+            records = await self._store_all_between()
             snapshot = self.scenario_saves.save_snapshot(
                 scenario=scenario_id,
                 config=config,
@@ -689,17 +754,40 @@ class SimulationController:
             delivery = request.delivery or base_config.delivery
             # record_ids distinguishes "omitted" (None -- no filter, retry
             # every failed record up to limit) from "present but empty"
-            # ([] -- retry nothing). EventStore.failed_delivery_records()
-            # cannot make that distinction itself: it builds its filter as
-            # set(record_ids or []), which treats [] exactly like None and
-            # so retries everything for an explicitly empty list (#144).
-            # Short-circuiting the empty-list case here, before the store
-            # is ever consulted, fixes the caller-visible behavior without
-            # touching that store method's filtering logic.
+            # ([] -- retry nothing) (#144). Short-circuited here, before
+            # the store is ever consulted, so the empty case answers
+            # without a read at all.
+            #
+            # EventStore.failed_delivery_records() makes the same
+            # distinction as of #211 -- it used to build its filter as
+            # set(record_ids or []), which treated [] exactly like None,
+            # so this short-circuit was the only thing standing between an
+            # explicitly empty list and "retry everything". Both layers
+            # now agree; this one stays because it is the caller-visible
+            # contract #144's tests pin, and because it saves the read.
             if request.record_ids is not None and len(request.record_ids) == 0:
                 candidates: list[StoredEventRecord] = []
             else:
-                candidates = self.store.failed_delivery_records(request.record_ids, limit=request.limit)
+                # Offloaded (#136's read half): failed_delivery_records()
+                # goes through _all_records(), i.e. a full re-read and
+                # re-parse of the persisted log, not a cache lookup.
+                #
+                # Deliberately still INSIDE self._lock, and this one is
+                # load-bearing rather than merely convenient: the candidate
+                # selection and the `store_epoch` snapshot below must come
+                # from one uninterrupted hold. If they did not, a reset()
+                # could land between them -- the candidates would name
+                # records that no longer exist while the epoch matched the
+                # cleared store, so _commit_retried_records would see no
+                # staleness and let update_many() rewrite the freshly
+                # emptied log from records it had just discarded. That is
+                # exactly the sharper stale case #208 calls out. Hoisting
+                # this read out of the lock to avoid an await under it
+                # would trade a bounded local-disk await for a correctness
+                # bug.
+                candidates = await self._store_failed_delivery_records(
+                    request.record_ids, request.limit
+                )
             # Truthiness (`if request.record_ids`) would misreport this the
             # same way: an explicitly empty list is falsy just like None, so
             # `requested` must key off "was the field provided at all" too.
@@ -937,11 +1025,18 @@ class SimulationController:
     #
     # EventStore guards its state with a threading.RLock (see the comment
     # on that lock in app/store.py) and does plain synchronous
-    # open()/write()/replace() calls. Called directly from one of the
-    # `async def` methods above, that I/O would run on the single event
-    # loop thread and block every other request in this process -- other
-    # tenants' SSE streams, health checks, unrelated API calls -- for as
-    # long as a big CSV import, delivery retry, or replay takes.
+    # open()/read()/write()/replace() calls. Called directly from one of
+    # the `async def` methods above, that I/O would run on the single
+    # event loop thread and block every other request in this process --
+    # other tenants' SSE streams, health checks, unrelated API calls --
+    # for as long as a big CSV import, delivery retry, replay, status
+    # poll or export takes.
+    #
+    # Reads count for this exactly as much as writes do, which is the
+    # half #136 originally missed: EventStore._all_records() re-reads and
+    # re-parses the whole persisted log, so all_between()/stats()/
+    # failed_delivery_records()/lineage() are full-file reads wearing an
+    # accessor's clothes, not cache lookups.
     #
     # The methods below are the only place offloading happens. Each one
     # runs exactly one EventStore call, start to finish, on a worker
@@ -968,14 +1063,17 @@ class SimulationController:
     #     instead of the event loop's own thread;
     #   - the reentrant re-acquisitions inside the store (configure ->
     #     _load_from_disk -> read_persisted_records; update_many ->
+    #     _all_records -> read_persisted_records; and on the read side
+    #     all_between/stats/failed_delivery_records/lineage ->
     #     _all_records -> read_persisted_records) stay on that same single
     #     worker thread from start to finish, so RLock's "reentrant only
     #     for the thread that already holds it" guarantee is never asked
     #     to span two different threads, which is the one thing that would
     #     actually break it.
     # Do not turn EventStore's add_many/update_many/replace_all/configure/
-    # read_persisted_records into `async def` methods that hold its lock
-    # across an `await` -- that would let the event loop thread block
+    # read_persisted_records/all_between/stats/failed_delivery_records/
+    # lineage into `async def` methods that hold its lock across an
+    # `await` -- that would let the event loop thread block
     # waiting on a worker thread for the lock while that worker is itself
     # waiting on the event loop to resume it: a deadlock. Keep EventStore
     # synchronous and do the `asyncio.to_thread` here, at the call site.
@@ -1005,6 +1103,48 @@ class SimulationController:
         self, persist_path: str | None = None
     ) -> list[StoredEventRecord]:
         return await asyncio.to_thread(self.store.read_persisted_records, persist_path)
+
+    # -- The read half of the same offload (#136, finding from #210) -------
+    #
+    # #136 landed the write half and left these four on the event loop.
+    # They are not incidental accessors: every one of them goes through
+    # EventStore._all_records(), which calls read_persisted_records() and
+    # therefore re-reads and re-parses the ENTIRE persisted JSONL log on
+    # every call -- the same open()/read()/pydantic-validate work the
+    # replay path was already offloading. On a 5k-record store that is a
+    # quarter of a second of the loop thread, and status() (via
+    # /api/simulate/status and every /api/stream snapshot) is the most
+    # frequently called path in the app.
+    #
+    # `recent()` is deliberately NOT wrapped: it returns a slice of the
+    # in-memory deque and touches no file at all, so putting it on a
+    # worker thread would buy nothing and cost a thread hop on the
+    # hottest read in the app. Add a wrapper here only for a store method
+    # that actually reaches disk.
+    #
+    # These also close the second half of #210's finding. Before this,
+    # writes ran on worker threads while these reads ran on the loop
+    # thread, and both take EventStore's threading.RLock -- so the event
+    # loop thread could block in a *native, uninterruptible* lock acquire
+    # waiting for a worker thread to finish a large write. That stall
+    # cannot happen while everything runs on one thread, so the write-only
+    # offload is what introduced it; putting the reads on worker threads
+    # too is what removes it.
+    async def _store_all_between(
+        self, start_date: str | None = None, end_date: str | None = None
+    ) -> list[StoredEventRecord]:
+        return await asyncio.to_thread(self.store.all_between, start_date, end_date)
+
+    async def _store_failed_delivery_records(
+        self, record_ids: list[str] | None = None, limit: int = 50
+    ) -> list[StoredEventRecord]:
+        return await asyncio.to_thread(self.store.failed_delivery_records, record_ids, limit)
+
+    async def _store_stats(self) -> dict[str, Any]:
+        return await asyncio.to_thread(self.store.stats)
+
+    async def _store_lineage(self, traceability_lot_code: str) -> list[StoredEventRecord]:
+        return await asyncio.to_thread(self.store.lineage, traceability_lot_code)
 
     async def _store_configure(self, persist_path: str) -> None:
         # A configure() that lands on a *different* file replaces the whole
@@ -1079,7 +1219,9 @@ class SimulationController:
             # overstate what this retry actually accomplished (#95's
             # second bug).
             masked_response = mask_secret_in_payload(response, api_key)
-            if _is_idempotency_replay(response, payload):
+            if _is_idempotency_replay(
+                response, payload, reused_key=idempotency_key is not None
+            ):
                 return DeliveryOutcome(
                     response=masked_response,
                     delivery_status="failed",
@@ -1222,15 +1364,52 @@ class SimulationController:
         # start() call that has nothing to do with it. Capturing the one
         # event this loop was created with, once, makes it deaf to any
         # later generation's event by construction.
-        while not stop_event.is_set():
-            await self.step(self.config.batch_size)
-            if self.config.interval_seconds <= 0:
-                await asyncio.sleep(0)
-            else:
-                try:
-                    await asyncio.wait_for(stop_event.wait(), timeout=self.config.interval_seconds)
-                except asyncio.TimeoutError:
-                    continue
+        #
+        # The whole body is wrapped (#211): before this, the loop had no
+        # handler at all, so anything step() raised -- a retired store
+        # (#175), a full disk, a bug in a delivery path -- killed the run
+        # in total silence. `running` went False because the task was
+        # done, but self._task stayed installed and already-done, so
+        # stop() early-returned without clearing it and without
+        # publishing; no revision bump reached /api/stream, so every
+        # connected console went on rendering a run that no longer
+        # existed; and the traceback surfaced only as asyncio's "Task
+        # exception was never retrieved" at garbage-collection time, in
+        # no operator's log context.
+        try:
+            while not stop_event.is_set():
+                await self.step(self.config.batch_size)
+                if self.config.interval_seconds <= 0:
+                    await asyncio.sleep(0)
+                else:
+                    try:
+                        await asyncio.wait_for(stop_event.wait(), timeout=self.config.interval_seconds)
+                    except asyncio.TimeoutError:
+                        continue
+        except Exception:
+            # Exception, not BaseException: a cancelled task
+            # (asyncio.CancelledError) is a deliberate teardown, not a
+            # failure, and must keep propagating so the task ends up
+            # cancelled rather than silently "completed".
+            #
+            # Logged through the same name-keyed "inflow_lab" logger that
+            # delivery failures already use (#182), so a run that dies
+            # lands in the stream operators are already watching.
+            logger.exception("simulation run loop stopped: unhandled error during step")
+        finally:
+            # Published on EVERY exit -- crash or clean stop. This is the
+            # bump that tells /api/stream (and therefore the console) that
+            # the run's state changed; without it, a crashed loop leaves
+            # every connected client believing the run is still live until
+            # something unrelated happens to bump the revision.
+            #
+            # Takes only self._change_condition, never self._lock or
+            # self._lifecycle_lock: step() has already released the data-
+            # plane lock by the time this runs (its `async with` unwinds
+            # as the exception propagates), so this cannot deadlock
+            # against the step it just left, nor against a concurrent
+            # stop(), which takes only _lifecycle_lock.
+            await self._publish_update()
 
     async def _publish_update(self) -> None:
         async with self._change_condition:
@@ -1245,21 +1424,50 @@ class SimulationController:
             )
             return self._revision
 
-    def snapshot(self, event_limit: int = 100) -> dict[str, Any]:
+    async def snapshot(self, event_limit: int = 100) -> dict[str, Any]:
+        """The /api/stream payload: revision + status + the recent events.
+
+        ``async def`` because ``status()`` is (see below). ``recent()``
+        stays a direct synchronous call on purpose: it is a slice of the
+        in-memory deque and reads no file, so it is not the stall #136 is
+        about and does not belong on a worker thread.
+        """
         return {
             "revision": self._revision,
-            "status": self.status(),
+            "status": await self.status(),
             "events": [record.model_dump(mode="json") for record in self.store.recent(limit=event_limit)],
         }
 
-    def status(self) -> dict[str, Any]:
-        records = self.store.all_between()
+    async def status(self) -> dict[str, Any]:
+        """The /api/simulate/status payload.
+
+        ``async def`` since #136's read half: both store calls below go
+        through ``EventStore._all_records()``, which re-reads and
+        re-parses the entire persisted JSONL log -- so this method used to
+        do two full-file reads on the event loop thread, on the most
+        frequently polled endpoint in the app (the console polls it, and
+        every /api/stream revision bump renders it through ``snapshot()``).
+
+        Takes no controller lock, so neither await here is under
+        ``self._lock``, and none of it can block a delivery. The two reads
+        still see the store at two separate instants, as the two separate
+        synchronous calls they replace already did -- a write landing
+        between them could make the audit summary and the record counts
+        disagree by a record. That window widens from "between two RLock
+        releases" to "across an await", which is acceptable precisely
+        because this is an unlocked read-only snapshot that never promised
+        a single consistent instant; the next poll corrects it. Anything
+        that needs the store at one instant takes ``self._lock`` and reads
+        inside it, the way ``save_scenario`` does.
+        """
+        records = await self._store_all_between()
+        stats = await self._store_stats()
         scenario = get_scenario(self.config.scenario)
         return {
             "running": self.running,
             "config": self._sanitize_public_config(self.config).model_dump(mode="json"),
             "stats": {
-                **self.store.stats(),
+                **stats,
                 "audit": summarize_scenario_audit(records, scenario),
                 "engine": self.engine.snapshot(),
             },
@@ -1272,6 +1480,7 @@ class SimulationController:
             mode=delivery.mode,
             endpoint=endpoint,
             endpoint_host=urlparse(endpoint).netloc,
+            default_endpoint=DEFAULT_LIVE_INGEST_ENDPOINT,
             api_key_configured=bool(delivery.api_key),
             tenant_configured=bool(delivery.tenant_id),
             hmac_configured=bool(os.getenv(WEBHOOK_HMAC_SECRET_ENV, "").strip()),
@@ -1562,7 +1771,9 @@ def _stored_idempotency_key(record: StoredEventRecord) -> str | None:
     return None
 
 
-def _is_idempotency_replay(response: dict[str, Any], payload: IngestPayload) -> bool:
+def _is_idempotency_replay(
+    response: dict[str, Any], payload: IngestPayload, *, reused_key: bool
+) -> bool:
     """True when *response* answers a differently-sized request than *payload* (#95).
 
     A genuinely fresh RegEngine response -- mock or live -- carries
@@ -1576,8 +1787,25 @@ def _is_idempotency_replay(response: dict[str, Any], payload: IngestPayload) -> 
     resending fewer events than the original batch that owned the key).
     The subset case is exactly what a mismatched event count catches:
     nothing about a legitimate, matching replay ever trips it.
+
+    Two narrowings, both required to avoid condemning honest deliveries:
+
+    ``reused_key`` -- a request that minted a fresh key cannot have replayed
+    anything, because nothing has ever been cached under it. Every step(),
+    import and replay is in that position, so an unnarrowed check judged them
+    all against a receiver contract they had no reason to satisfy.
+
+    A missing or empty ``events`` list -- a receiver that answers with a
+    summary body ("accepted": n) rather than per-event verdicts is answering
+    a shape no cache could have produced for a subset. Reading that as a
+    replay marked every event of a successful delivery ``failed``.
     """
-    return len(response.get("events", [])) != len(payload.events)
+    if not reused_key:
+        return False
+    events = response.get("events")
+    if not isinstance(events, list) or not events:
+        return False
+    return len(events) != len(payload.events)
 
 
 def _aggregate_outcomes(outcomes: list[DeliveryOutcome]) -> DeliveryOutcome:

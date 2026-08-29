@@ -29,7 +29,7 @@ Local mode (default):
 
 Deployed mode (never provisions, never touches Redis, small batch):
 
-    export REGENGINE_LIVE_ENDPOINT=https://www.regengine.co/api/v1/webhooks/ingest
+    export REGENGINE_LIVE_ENDPOINT={live_ingest_endpoint}
     export REGENGINE_LIVE_API_KEY=...
     export REGENGINE_LIVE_TENANT_ID=...
     uv run python scripts/customer_journey.py --confirm-live
@@ -57,11 +57,22 @@ import httpx
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from app.engine import LegitFlowEngine  # noqa: E402
-from app.regengine_client import LiveRegEngineClient, LiveRegEngineDeliveryError  # noqa: E402
+from app.regengine_client import (  # noqa: E402
+    DEFAULT_LIVE_INGEST_ENDPOINT,
+    LiveRegEngineClient,
+    LiveRegEngineDeliveryError,
+)
 from app.schemas.ingestion import IngestPayload  # noqa: E402
 from app.schemas.simulation import DeliveryConfig, SimulationConfig  # noqa: E402
 from app.scenarios import ScenarioId  # noqa: E402
 
+
+# #155: the deployed-mode example above is rendered from the one live
+# ingest URL the repo keeps, rather than repeating the literal here, so
+# `--help` cannot drift from what the live client actually posts to.
+# str.replace rather than str.format: the docstring is free-form prose and
+# a brace someone adds to it later must not become a KeyError at import.
+_USAGE = (__doc__ or "").replace("{live_ingest_endpoint}", DEFAULT_LIVE_INGEST_ENDPOINT)
 
 DEFAULT_BASE_URL = "http://localhost:8000"
 DEFAULT_REDIS_URL = "redis://localhost:6379/0"
@@ -609,7 +620,7 @@ async def run_journey(
 
 
 def main() -> int:
-    parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    parser = argparse.ArgumentParser(description=_USAGE, formatter_class=argparse.RawDescriptionHelpFormatter)
     mode = parser.add_mutually_exclusive_group(required=True)
     mode.add_argument("--local", action="store_true", help="Run against a local RegEngine stack; provisions tenant + key + billing.")
     mode.add_argument("--confirm-live", action="store_true", help="Run against a deployed RegEngine with pre-provisioned credentials. Small batch, no provisioning, no Redis.")

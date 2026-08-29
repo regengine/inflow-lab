@@ -42,7 +42,13 @@ async def get_lineage(
     ),
     active_controller: SimulationController = Depends(get_active_controller),
 ) -> LineageResponse:
-    records = active_controller.store.lineage(traceability_lot_code)
+    # Offloaded to a worker thread (#136's read half): store.lineage()
+    # goes through _all_records(), i.e. a full re-read and re-parse of
+    # the persisted JSONL log, then a BFS over it -- not a lookup in the
+    # in-memory ring. Routed through the controller's _store_* helpers so
+    # every offload in the app stays in the one place that documents why
+    # it is safe against EventStore's RLock (see app/controller.py).
+    records = await active_controller._store_lineage(traceability_lot_code)
     if not records:
         raise HTTPException(status_code=404, detail="No records found for that lot code")
 
