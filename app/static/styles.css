@@ -384,7 +384,9 @@ input::placeholder {
   border-color: var(--border-strong);
 }
 
-.button:disabled {
+.button:disabled,
+/* #194: an <a> cannot be :disabled, and the export controls are anchors. */
+.button[aria-disabled='true'] {
   cursor: not-allowed;
   filter: grayscale(0.4);
   opacity: 0.55;
@@ -802,8 +804,47 @@ th {
   color: var(--warning);
 }
 
+/* #189: a required-tier KDE gap and an advisory nudge used to render
+   identically. The backend distinguishes them now, so the console does
+   too -- required reads at danger weight, recommended stays a nudge. */
+.status-warning[data-severity='required'],
+.lineage-warning[data-severity='required'] {
+  color: var(--danger);
+  font-weight: 600;
+}
+
 tbody tr.has-audit-warning {
   background: rgba(255, 251, 235, 0.58);
+}
+
+/* #193: a row nothing has audited must not read as a row that passed. */
+.status-muted {
+  display: block;
+  margin-top: 6px;
+  color: var(--muted);
+}
+
+tbody tr.audit-not-evaluated {
+  background: rgba(241, 245, 249, 0.6);
+}
+
+.lineage-card.audit-not-evaluated {
+  border-style: dashed;
+}
+
+.scenario-alert.is-pending {
+  border-color: rgba(100, 116, 139, 0.3);
+  background: rgba(241, 245, 249, 0.72);
+}
+
+/* #189: the required tier reads hotter than the recommended nudge. */
+tbody tr.has-audit-warning[data-warning-severity='required'] {
+  background: rgba(254, 242, 242, 0.72);
+}
+
+.import-results li[data-severity='required'] {
+  color: var(--danger);
+  font-weight: 600;
 }
 
 .link-button {
@@ -1059,6 +1100,11 @@ tbody tr.has-audit-warning {
 .lineage-card.has-audit-warning {
   border-color: rgba(180, 83, 9, 0.24);
   background: linear-gradient(180deg, #fffdf8 0%, #fff8ea 100%);
+}
+
+.lineage-card.has-audit-warning[data-warning-severity='required'] {
+  border-color: rgba(185, 28, 28, 0.32);
+  background: linear-gradient(180deg, #fffbfb 0%, #fef2f2 100%);
 }
 
 .import-block {

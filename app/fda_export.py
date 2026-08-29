@@ -11,7 +11,17 @@ from .schemas.domain import CTEType, FDAExportPreset, RegEngineEvent, StoredEven
 
 FDA_EXPORT_COLUMNS = [
     "Traceability Lot Code",
-    "Traceability Lot Code Description",
+    # Was "Traceability Lot Code Description" holding event.cte_type.value
+    # (e.g. "receiving") -- a mislabel, not just a bad value: no KDE named
+    # "Traceability Lot Code Description" exists anywhere in FSMA 204 (21
+    # CFR 1.1325-1.1350 lists a per-CTE "Product Description" KDE, already
+    # its own column below, and nothing else description-shaped tied to the
+    # lot code itself). The CTE type is legitimate, useful content for a
+    # single CSV that flattens every CTE type into one row shape -- it just
+    # needed an honestly-named column, so this now matches RegEngine's own
+    # canonical spreadsheet (fsma_spreadsheet.py), which has no lot-code
+    # description column and puts the CTE under "Event Type (CTE)" (#94).
+    "Event Type (CTE)",
     "Product Description",
     "Quantity",
     "Unit of Measure",
@@ -103,6 +113,35 @@ def apply_fda_export_preset(
     return sorted(filtered, key=lambda record: record.event.timestamp)
 
 
+_FORMULA_LEADERS = ("=", "+", "-", "@", "\t", "\r")
+
+
+def _sanitize_cell(value: object) -> object:
+    """Neutralise spreadsheet formula injection in an exported cell.
+
+    Excel, LibreOffice and Sheets evaluate a cell whose text begins with
+    ``=``, ``+``, ``-``, ``@``, a tab or a carriage return. Lot codes,
+    product and location descriptions all reach this export from CSV import
+    or the API, so an operator-supplied ``=cmd|'/c calc'!A1`` would execute
+    when a reviewer opens the regulatory export.
+
+    Prefixing an apostrophe is the standard mitigation: spreadsheets treat
+    the rest as literal text and do not display the apostrophe. It does
+    change the byte a non-spreadsheet parser sees, which is the accepted
+    trade for a file whose whole purpose is to be opened in a spreadsheet.
+
+    Numbers are left alone -- they are not str, so they cannot carry a
+    leading formula character.
+    """
+    if isinstance(value, str) and value.startswith(_FORMULA_LEADERS):
+        return "'" + value
+    return value
+
+
+def _sanitize_row(row: dict[str, object]) -> dict[str, object]:
+    return {key: _sanitize_cell(value) for key, value in row.items()}
+
+
 def render_fda_request_csv(
     records: Iterable[StoredEventRecord],
     location_gln: Callable[[str], str],
@@ -115,21 +154,29 @@ def render_fda_request_csv(
         # Normalize before splitting -- see normalize_to_utc below (issue #157).
         normalized_timestamp = normalize_to_utc(event.timestamp)
         writer.writerow(
-            {
+            _sanitize_row({
                 "Traceability Lot Code": event.traceability_lot_code,
-                "Traceability Lot Code Description": event.cte_type.value,
+                "Event Type (CTE)": event.cte_type.value,
                 "Product Description": event.product_description,
                 "Quantity": event.quantity,
                 "Unit of Measure": event.unit_of_measure,
                 "Location Description": event.location_name,
-                "Location Identifier (GLN)": location_gln(event.location_name),
+                # Registry lookup first, then the event's own GLN (#162).
+                # csv_importer threads a GLN column into
+                # RegEngineEvent.location_gln, but this column only ever
+                # consulted the engine's static name->GLN registry -- which an
+                # imported location is not in -- so an operator who supplied a
+                # GLN got an empty cell in the regulatory export.
+                "Location Identifier (GLN)": (
+                    location_gln(event.location_name) or event.location_gln or ""
+                ),
                 "Ship-To / Previous Source Location Description": _linked_location_description(event),
                 "TLC Source Reference": _tlc_source_reference(event),
                 "Date": normalized_timestamp.date().isoformat(),
                 "Time": normalized_timestamp.time().isoformat(timespec="seconds"),
                 "Reference Document Type": event.kdes.get("reference_document_type", ""),
                 "Reference Document Number": event.kdes.get("reference_document_number", ""),
-            }
+            })
         )
     return output.getvalue()
 

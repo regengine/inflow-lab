@@ -101,8 +101,12 @@ def _render_event(
     event["eventTimeZoneOffset"] = _timezone_offset(record.event.timestamp)
     event["bizStep"] = _BIZ_STEPS[record.event.cte_type]
     event["disposition"] = _DISPOSITIONS[record.event.cte_type]
-    event["readPoint"] = _location_reference(record.event.location_name, location_gln)
-    event["bizLocation"] = _location_reference(record.event.location_name, location_gln)
+    event["readPoint"] = _location_reference(
+        record.event.location_name, location_gln, record.event.location_gln
+    )
+    event["bizLocation"] = _location_reference(
+        record.event.location_name, location_gln, record.event.location_gln
+    )
 
     # readPoint/bizLocation only ever describe *this* event's own location.
     # CBV's mechanism for "who this lot moved from/to" in a handoff is
@@ -146,7 +150,9 @@ def _render_object_event(
                 product_description=event.product_description,
             )
         ],
-        "regengine:location": _location_reference(event.location_name, location_gln),
+        "regengine:location": _location_reference(
+            event.location_name, location_gln, event.location_gln
+        ),
     }
 
 
@@ -176,7 +182,9 @@ def _render_transformation_event(
                 product_description=event.product_description,
             )
         ],
-        "regengine:location": _location_reference(event.location_name, location_gln),
+        "regengine:location": _location_reference(
+            event.location_name, location_gln, event.location_gln
+        ),
     }
 
 
@@ -269,11 +277,20 @@ def _input_lot_codes(record: StoredEventRecord) -> list[str]:
     if isinstance(source_lot_code, str) and source_lot_code not in lot_codes:
         lot_codes.append(source_lot_code)
 
+    # The kdes copy first, then the top-level field. Reading only the kdes
+    # copy meant an event that carried the value where the contract says to
+    # carry it -- top-level -- rendered an empty inputQuantityList, losing the
+    # input-to-output lineage link that is the entire point of a
+    # transformation CTE.
     input_lot_codes = record.event.kdes.get("input_traceability_lot_codes", [])
     if isinstance(input_lot_codes, list):
         for lot_code in input_lot_codes:
             if isinstance(lot_code, str) and lot_code not in lot_codes:
                 lot_codes.append(lot_code)
+
+    for lot_code in record.event.input_traceability_lot_codes or []:
+        if isinstance(lot_code, str) and lot_code not in lot_codes:
+            lot_codes.append(lot_code)
 
     return lot_codes
 
@@ -320,8 +337,16 @@ def _lot_identifier(lot_code: str) -> str:
     return f"urn:regengine:lot:{quote(lot_code, safe='')}"
 
 
-def _location_reference(location_name: str, location_gln: Callable[[str], str]) -> dict[str, str]:
-    gln = location_gln(location_name)
+def _location_reference(
+    location_name: str,
+    location_gln: Callable[[str], str],
+    event_gln: str | None = None,
+) -> dict[str, str]:
+    # Registry lookup first, then the event's own GLN (#162). csv_importer
+    # threads a GLN column into RegEngineEvent.location_gln, but this only ever
+    # consulted the engine's static name->GLN registry -- which an imported
+    # location is not in -- so a supplied GLN never reached the EPCIS document.
+    gln = location_gln(location_name) or event_gln or ""
     reference = {
         "id": _location_id(location_name),
         "regengine:locationName": location_name,

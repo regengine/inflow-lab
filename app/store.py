@@ -6,7 +6,7 @@ import os
 from collections import Counter, deque
 from pathlib import Path
 from threading import RLock
-from typing import Any, Iterable
+from typing import Any, Iterable, NamedTuple
 
 from .fda_export import normalize_to_utc
 from .schemas.domain import LineageEdge, LineageNode, StoredEventRecord
@@ -51,8 +51,26 @@ def _serialize_record(record: StoredEventRecord) -> str:
     ``replace_all``). Routing them all through the same function is what
     keeps the ``_scrub_secrets`` pass from drifting out of sync between an
     append and a rewrite of the same record.
+
+    ``allow_nan=False`` (#98) is the last line of defence for the file
+    format. Python's default ``allow_nan=True`` emits bare ``NaN`` /
+    ``Infinity`` tokens, which are *not* RFC 8259: a strict reader
+    (browser ``JSON.parse``, Go ``encoding/json``, Rust serde) rejects the
+    whole line and ``jq`` quietly coerces the value to ``null``. The
+    ``quantity`` field is now guarded at the model (``allow_inf_nan=False``),
+    so a validated record cannot reach here carrying NaN; this keeps the
+    guarantee at the file boundary itself, where it belongs, for any producer
+    that bypasses model validation. It matters specifically for *typed*
+    ``float`` fields: ``model_dump(mode="json")`` passes a non-finite typed
+    float through unchanged, while a non-finite value under an ``Any``-typed
+    field such as ``kdes`` is already coerced to ``None`` by pydantic. Both
+    write paths are safe against the resulting ``ValueError``:
+    ``_write_records`` builds a ``.tmp`` and only ``replace``s it on success,
+    and ``_append_locked`` flushes and commits one record at a time, so a
+    mid-batch failure behaves exactly like the mid-batch ``OSError`` those
+    paths already document.
     """
-    return json.dumps(_scrub_secrets(record.model_dump(mode="json")))
+    return json.dumps(_scrub_secrets(record.model_dump(mode="json")), allow_nan=False)
 
 
 def mask_secret_in_string(message: str | None, secret: str | None) -> str | None:
@@ -78,12 +96,67 @@ def mask_secret_in_payload(value: Any, secret: str | None = None) -> Any:
     return value
 
 
+class CorruptRecordLine(NamedTuple):
+    """One JSONL line ``read_persisted_records`` could not parse and skipped.
+
+    Populated on ``EventStore.last_read_corrupt_lines`` after every
+    ``read_persisted_records()`` call (#93) so a caller holding the store
+    can tell a read that quietly dropped bad lines apart from one that
+    returned the tenant's complete history -- see
+    ``EventStore.last_read_was_complete``. Never carries the line's own
+    content: it failed to parse *as* a record, so it could still hold a
+    secret-named KDE the model never got a chance to scrub.
+    """
+
+    path: str
+    line_number: int
+    error: str
+
+
 class EventStore:
     def __init__(self, persist_path: str = "data/events.jsonl", max_records: int = 5000) -> None:
         self.persist_path = Path(persist_path)
         self.max_records = max_records
         self._records: deque[StoredEventRecord] = deque(maxlen=max_records)
         self._counter = 0
+        # Freshly overwritten by every read_persisted_records() call (#93);
+        # see that method and last_read_was_complete for why this exists.
+        # Initialized empty here so the attribute always exists even before
+        # the _load_from_disk() call a few lines down performs the first
+        # real read.
+        self.last_read_corrupt_lines: list[CorruptRecordLine] = []
+        # threading.RLock, not asyncio.Lock (#136). Two different kinds of
+        # caller take it: EventStore.__init__/_load_from_disk and
+        # MockRegEngineService.__init__ (mock_service.py, via
+        # read_persisted_records) call in from plain synchronous code with
+        # no event loop running at all, while app.controller offloads the
+        # write paths (add_many/update_many/replace_all/configure) and the
+        # replay read (read_persisted_records) onto worker threads via
+        # asyncio.to_thread so a large write or replay can't stall the
+        # single event loop (see the locking comment in
+        # SimulationController, app/controller.py).
+        #
+        # That split only works because every public method on this class
+        # is a plain `def`, never `async def`: each one acquires and fully
+        # releases this lock within its own synchronous call frame, with no
+        # `await` anywhere inside the locked section for it to suspend on.
+        # asyncio.to_thread runs one such call start-to-finish on a single
+        # worker thread, which preserves both guarantees this lock has to
+        # provide:
+        #   - cross-call mutual exclusion, because RLock serializes *any*
+        #     threads that ask for it, not just the event loop's own thread;
+        #   - same-call reentrancy (configure -> _load_from_disk ->
+        #     read_persisted_records; update_many -> _all_records ->
+        #     read_persisted_records), because RLock is only reentrant for
+        #     the thread that already holds it, and that nested chain never
+        #     leaves the one worker thread running it.
+        # Do NOT turn one of these methods into `async def` while it still
+        # holds this lock across an `await` -- that would let the event
+        # loop thread block waiting on a worker thread for the lock while
+        # that worker is itself waiting on the event loop to resume it: a
+        # deadlock. If a method here ever needs to suspend mid-critical-
+        # section, that is a sign it no longer belongs behind this lock as
+        # written, not a reason to relax the "no await while held" rule.
         self._lock = RLock()
         self._load_from_disk()
 
@@ -122,27 +195,109 @@ class EventStore:
         self._counter = counter
 
     def read_persisted_records(self, persist_path: str | None = None) -> list[StoredEventRecord]:
+        """Read the full persisted log from disk, synchronously.
+
+        Stays a plain synchronous method deliberately (#136): it is called
+        from EventStore.__init__/_load_from_disk and from
+        MockRegEngineService.__init__ (mock_service.py), both of which run
+        before/without any event loop, so an ``async def`` here would break
+        construction. Async callers with a loop running (app.controller's
+        ``replay``) instead offload a whole call to a worker thread via
+        ``asyncio.to_thread`` -- see the lock comment in ``__init__`` above
+        for why that is safe.
+
+        A line that fails to parse -- a future StoredEventRecord/CTEType
+        schema change, a write torn by a crash mid-append, a hand-edited
+        file -- is skipped and logged rather than aborting the whole read
+        (#93): one bad line must not make a tenant's entire history
+        unreadable, and since __init__/_load_from_disk calls this too, it
+        must not stop the app from starting on a corrupt store either.
+
+        The return type deliberately stays a plain list so callers that
+        already unpack it directly keep working unchanged (mock_service.py's
+        ``_resume_chain_hash`` does ``sorted(store.read_persisted_records(),
+        ...)``; controller.py's ``_store_read_persisted_records`` awaits this
+        through ``asyncio.to_thread`` and hands the list straight to its own
+        caller). A skipped line is instead recorded on
+        ``self.last_read_corrupt_lines`` -- see ``last_read_was_complete``
+        for how a caller tells a read that dropped lines apart from one that
+        returned the complete history.
+        """
         path = Path(persist_path) if persist_path else self.persist_path
         records: list[StoredEventRecord] = []
+        corrupt_lines: list[CorruptRecordLine] = []
 
         with self._lock:
             if path.exists():
-                with path.open("r", encoding="utf-8") as handle:
+                # Opened in BINARY mode, deliberately (#93). A text-mode
+                # handle decodes as it iterates, so a run of invalid UTF-8
+                # bytes anywhere in the file raises UnicodeDecodeError out
+                # of the `for` statement itself -- outside the try below,
+                # and therefore past every skip-and-log guard here. That is
+                # the same whole-read abort this method exists to prevent,
+                # just triggered by byte corruption instead of a syntax
+                # error: torn writes, a truncated volume restore, or a file
+                # written by something that was not this app.
+                #
+                # Reading bytes and letting model_validate_json do the
+                # decoding moves that failure inside the try, where it
+                # arrives as a pydantic ValidationError (a ValueError) and
+                # is skipped and logged exactly like any other unparseable
+                # line. Iterating a binary handle still splits on b"\n",
+                # which is precisely what _serialize_record writes, so
+                # line numbering is unchanged.
+                with path.open("rb") as handle:
                     for line_number, line in enumerate(handle, start=1):
                         if not line.strip():
                             continue
                         try:
                             records.append(StoredEventRecord.model_validate_json(line))
                         except ValueError as exc:
-                            raise ValueError(
-                                f"Could not load stored event record from {path}:{line_number}"
-                            ) from exc
+                            # Skip and log rather than abort (#93). The raw
+                            # line itself is never logged: it failed to
+                            # parse *as* a record, so it could still carry a
+                            # secret-named KDE the model never got a chance
+                            # to scrub.
+                            logger.error(
+                                "skipping unreadable event record at %s:%d (%s)",
+                                path,
+                                line_number,
+                                exc,
+                            )
+                            corrupt_lines.append(
+                                CorruptRecordLine(path=str(path), line_number=line_number, error=str(exc))
+                            )
+            # Overwritten every call, including empty, so this always
+            # reflects *this* read rather than stale state left by a
+            # previous one -- see last_read_was_complete.
+            self.last_read_corrupt_lines = corrupt_lines
         return records
+
+    @property
+    def last_read_was_complete(self) -> bool:
+        """False if the most recent ``read_persisted_records()`` skipped a line.
+
+        A short or empty read result can mean two very different things:
+        "this genuinely is the tenant's whole history" or "some of it was
+        unreadable and got skipped" (#93). Callers that need to tell those
+        apart -- rather than inferring completeness from record count alone
+        -- should check this immediately after the read. It reflects the
+        single most recent ``read_persisted_records()`` call on this store,
+        including nested/reentrant ones made while already holding this
+        store's lock (``_load_from_disk``, and ``update_many`` via
+        ``_all_records``).
+        """
+        return not self.last_read_corrupt_lines
 
     def reset(self) -> None:
         with self._lock:
             self._records.clear()
             self._counter = 0
+            # The file backing last_read_corrupt_lines is about to be
+            # deleted; carrying its stale diagnostics forward would make a
+            # freshly reset (empty, healthy) store still report a past
+            # corruption that reset() just removed.
+            self.last_read_corrupt_lines = []
             if self.persist_path.exists():
                 self.persist_path.unlink()
             self.persist_path.parent.mkdir(parents=True, exist_ok=True)
@@ -329,7 +484,41 @@ class EventStore:
                     self._counter = next_sequence_no
                     self._records.appendleft(record)
                     stored.append(record)
+                if stored:
+                    self._fsync_appended(handle)
         return stored
+
+    def _fsync_appended(self, handle: Any) -> None:
+        """Force this batch's appended bytes to stable storage (#93).
+
+        ``flush()`` in the loop above only pushes the bytes out of Python's
+        buffer into the OS page cache. That is enough to make a write error
+        surface synchronously and enough to survive the process dying, but
+        not enough to survive the machine losing power -- so an
+        acknowledged append could still be missing after a hard restart.
+        ``update_many``/``replace_all`` get their durability from the tmp +
+        ``os.replace`` swap in ``_write_records``; the append path had no
+        equivalent, which is the durability half of #93.
+
+        A tmp + rename would give the same guarantee here only by
+        rewriting the entire log on every append -- turning an O(1) append
+        into O(total records), on the hot path every step() takes. #93
+        names ``fsync`` as the alternative for exactly this reason.
+
+        One fsync per *batch*, not per record: the per-record ``flush()``
+        already supplies the error detection and the write-then-commit
+        ordering the loop depends on, and an fsync per record would make a
+        multi-thousand-row CSV import pay a disk round-trip per row.
+
+        Skipped for anything that is not a regular file: the persist path
+        can legitimately point at a character device (the durability tests
+        use /dev/full to force ENOSPC), which has no durable state to
+        flush. Same constraint ``_truncate_torn_tail`` and
+        ``_resync_counter_from_disk`` already carry, for the same reason.
+        """
+        if not self.persist_path.is_file():
+            return
+        os.fsync(handle.fileno())
 
     def update_many(self, records: Iterable[StoredEventRecord]) -> list[StoredEventRecord]:
         self._refuse_if_retired()
@@ -377,13 +566,28 @@ class EventStore:
         record_ids: list[str] | None = None,
         limit: int = 50,
     ) -> list[StoredEventRecord]:
-        record_id_filter = set(record_ids or [])
+        """Failed records, optionally narrowed to *record_ids*.
+
+        ``record_ids=None`` means "no filter -- every failed record".
+        ``record_ids=[]`` means "this explicitly empty set" and therefore
+        matches nothing. That distinction is #144's, and until #211 it
+        lived only in SimulationController.retry_failed_delivery, which
+        short-circuits the empty list before ever calling this method:
+        this method itself built its filter as ``set(record_ids or [])``
+        and then treated an empty filter as "match everything", so a
+        direct caller passing ``[]`` got every failed record retried --
+        exactly the behaviour #144 is about, one layer down. The
+        controller keeps its short-circuit (it is pinned by tests, and it
+        answers without touching the store at all); this makes the store
+        agree rather than depending on being called from there.
+        """
+        record_id_filter = None if record_ids is None else set(record_ids)
         records = self._all_records()
         failed_records = [
             record
             for record in records
             if record.delivery_status == "failed"
-            and (not record_id_filter or record.record_id in record_id_filter)
+            and (record_id_filter is None or record.record_id in record_id_filter)
         ]
         return failed_records[:limit]
 
@@ -428,6 +632,16 @@ class EventStore:
                 "last_error": latest_failure.error if latest_failure else None,
             },
             "persist_path": str(self.persist_path),
+            # #93: lets a caller of the already-wired /api/simulate/status
+            # and /api/health (both flow stats() into their response) tell
+            # a read that skipped unreadable lines apart from one that
+            # returned the tenant's complete history -- without changing
+            # the shape of anything that already unpacks stats()'s return
+            # value (it stays a plain dict; this only adds a key).
+            "store_integrity": {
+                "complete": self.last_read_was_complete,
+                "corrupt_lines_skipped": len(self.last_read_corrupt_lines),
+            },
         }
 
     def lineage(self, traceability_lot_code: str) -> list[StoredEventRecord]:

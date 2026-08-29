@@ -2,7 +2,9 @@ from __future__ import annotations
 
 import os
 import sys
+from collections.abc import Mapping
 from dataclasses import dataclass, field
+from functools import partial
 from pathlib import Path
 from typing import Any
 from urllib.parse import urlparse
@@ -13,12 +15,41 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
-from app.build_info import APP_VERSION
+# Must follow the sys.path insert above: this script is run directly
+# (`python scripts/remote_smoke.py`), so the repo root is not on sys.path
+# until that line puts it there. Deliberate, not an ordering slip (#137).
+from app.build_info import APP_VERSION  # noqa: E402
+from scripts import _smoke_common  # noqa: E402
+from scripts._smoke_common import origin_from_url, secret_values  # noqa: E402
 
 
 DEFAULT_TENANT = "remote-smoke"
 DEFAULT_UNTRUSTED_ORIGIN = "https://untrusted.example"
 FRESH_CUT_OUTPUT_LOT = "TLC-DEMO-FC-OUT-001"
+
+# #124: the remote-smoke workflows take `base_url` as a free-text
+# workflow_dispatch input and hand it to this script in the same env block
+# that carries the live shared-demo REGENGINE_REMOTE_USERNAME/PASSWORD.
+# Without a host restriction, anyone who can dispatch the workflow could
+# point it at a server they control and collect those credentials from the
+# Basic Auth header of the first authenticated request -- no PR, no review.
+# So the destination host is allowlisted here, in code, and checked before
+# a config carrying the secrets is ever constructed.
+DEFAULT_ALLOWED_HOSTS = ("regengine-inflow-lab-gh-production.up.railway.app",)
+
+# Loopback is always permitted: `browser_smoke.py` spawns its own uvicorn on
+# 127.0.0.1 for local runs, and a developer pointing either script at their
+# own instance is not an exfiltration path.
+LOOPBACK_HOSTS = frozenset({"127.0.0.1", "::1", "localhost"})
+
+# Escape hatch for a legitimately different deployment (a fork, a staging
+# host). Deliberately an environment variable and NOT a workflow input:
+# a dispatcher can only set the inputs a workflow declares, so this cannot
+# be reached from the dispatch form that motivates the allowlist -- setting
+# it requires editing a workflow, which takes a reviewed commit. Replaces
+# the defaults rather than extending them, so the permitted set is always
+# exactly what the operator wrote.
+ALLOWED_HOSTS_ENV_VAR = "REGENGINE_REMOTE_ALLOWED_HOSTS"
 
 
 class RemoteSmokeFailure(AssertionError):
@@ -89,6 +120,8 @@ def config_from_env(environ: dict[str, str] | None = None) -> RemoteSmokeConfig:
         )
 
     base_url = normalize_base_url(environ["REGENGINE_REMOTE_BASE_URL"])
+    # Before the config -- and therefore the username/password -- exists.
+    assert_base_url_allowed(base_url, environ)
     return RemoteSmokeConfig(
         base_url=base_url,
         username=environ["REGENGINE_REMOTE_USERNAME"],
@@ -270,17 +303,9 @@ def request_json(
         json=json,
         params=params,
     )
-    assert_status(config, response, 200, path)
-    try:
-        payload = response.json()
-    except ValueError as exc:
-        raise RemoteSmokeFailure(
-            f"{path}: expected JSON response, got "
-            f"{config.redact(response.text[:300])!r}"
-        ) from exc
-    if not isinstance(payload, dict):
-        raise RemoteSmokeFailure(f"{path}: expected JSON object response")
-    return payload
+    return _smoke_common.response_json(
+        RemoteSmokeFailure, response, path, redact=config.redact
+    )
 
 
 def request(
@@ -321,18 +346,23 @@ def health_response_header(
     )
 
 
+# The shared harness in _smoke_common takes the failure type as its first
+# argument so every script can keep its own exception class. These bind
+# this script's class once instead of at each of the call sites below.
+assert_equal = partial(_smoke_common.assert_equal, RemoteSmokeFailure)
+assert_in = partial(_smoke_common.assert_in, RemoteSmokeFailure)
+assert_build_sha = partial(_smoke_common.assert_build_sha, RemoteSmokeFailure)
+
+
 def assert_status(
     config: RemoteSmokeConfig,
     response: httpx.Response,
     expected_status: int,
     label: str,
 ) -> None:
-    if response.status_code != expected_status:
-        body = config.redact(response.text[:500])
-        raise RemoteSmokeFailure(
-            f"{label}: expected HTTP {expected_status}, got "
-            f"{response.status_code}: {body}"
-        )
+    _smoke_common.assert_status(
+        RemoteSmokeFailure, response, expected_status, label, redact=config.redact
+    )
 
 
 def assert_header(
@@ -342,57 +372,72 @@ def assert_header(
     expected_value: str,
     label: str,
 ) -> None:
-    actual = response.headers.get(header_name)
-    if actual != expected_value:
-        raise RemoteSmokeFailure(
-            f"{label}: expected {header_name}={expected_value!r}, got "
-            f"{config.redact(str(actual))!r}"
-        )
-
-
-def assert_equal(actual: Any, expected: Any, label: str) -> None:
-    if actual != expected:
-        raise RemoteSmokeFailure(f"{label}: expected {expected!r}, got {actual!r}")
-
-
-def assert_in(member: Any, container: Any, label: str) -> None:
-    if member not in container:
-        raise RemoteSmokeFailure(f"{label}: expected {member!r} to be present")
+    _smoke_common.assert_header(
+        RemoteSmokeFailure,
+        response,
+        header_name,
+        expected_value,
+        label,
+        redact=config.redact,
+    )
 
 
 def assert_build_info(config: RemoteSmokeConfig, build: Any) -> dict[str, Any]:
-    if not isinstance(build, dict):
-        raise RemoteSmokeFailure("healthz build: expected build metadata object")
-    assert_equal(build.get("version"), APP_VERSION, "healthz build version")
-    for field in ("commit_sha", "commit_sha_short", "branch", "deployment_id"):
-        value = build.get(field)
-        if value is not None and not isinstance(value, str):
-            raise RemoteSmokeFailure(f"healthz build {field}: expected string or null")
-    return build
-
-
-def assert_build_sha(actual: Any, expected: str, label: str) -> None:
-    if not isinstance(actual, str) or not actual:
-        raise RemoteSmokeFailure(f"{label}: expected deployed commit {expected[:12]}, got none")
-    if not _sha_prefix_match(actual, expected):
-        raise RemoteSmokeFailure(
-            f"{label}: expected deployed commit {expected[:12]}, got {actual[:12]}"
-        )
-
-
-def _sha_prefix_match(actual: str, expected: str) -> bool:
-    actual = actual.strip().lower()
-    expected = expected.strip().lower()
-    return actual.startswith(expected) or expected.startswith(actual)
+    return _smoke_common.assert_build_info(RemoteSmokeFailure, build, APP_VERSION)
 
 
 def normalize_base_url(value: str) -> str:
-    base_url = value.strip().rstrip("/")
-    parsed = urlparse(base_url)
-    if parsed.scheme not in {"http", "https"} or not parsed.netloc:
-        raise RemoteSmokeFailure(
+    return _smoke_common.normalize_base_url(
+        RemoteSmokeFailure,
+        value,
+        message=(
             "REGENGINE_REMOTE_BASE_URL must be an HTTP(S) URL such as "
             "https://demo.example.com"
+        ),
+    )
+
+
+def allowed_smoke_hosts(environ: Mapping[str, str] | None = None) -> tuple[str, ...]:
+    """The hosts a smoke script may send real credentials to (#124)."""
+    env = os.environ if environ is None else environ
+    configured = (env.get(ALLOWED_HOSTS_ENV_VAR) or "").replace(",", " ").split()
+    if configured:
+        return tuple(host.lower() for host in configured)
+    return DEFAULT_ALLOWED_HOSTS
+
+
+def assert_base_url_allowed(
+    base_url: str,
+    environ: Mapping[str, str] | None = None,
+) -> str:
+    """Fail closed unless ``base_url`` names an allowlisted host (#124).
+
+    Compares ``parsed.hostname`` rather than ``parsed.netloc``: hostname is
+    lowercased and strips both the port and any ``user:pass@`` userinfo
+    prefix, so it is the host the client will actually dial. Matching on the
+    raw netloc would let ``https://allowed.host@attacker.example/`` read as
+    allowlisted while every request went to ``attacker.example``.
+
+    Plaintext HTTP is refused for non-loopback hosts as well. Basic Auth puts
+    the shared-demo password in a base64 header on the wire, so an ``http://``
+    downgrade to even an allowlisted host hands it to anyone on the path.
+    """
+    parsed = urlparse(base_url)
+    host = (parsed.hostname or "").lower()
+    if host in LOOPBACK_HOSTS:
+        return base_url
+
+    allowed = allowed_smoke_hosts(environ)
+    if host not in allowed:
+        raise RemoteSmokeFailure(
+            f"Refusing to send credentials to {host or base_url!r}: not an "
+            f"allowlisted remote-smoke host. Allowed: {', '.join(allowed)}. "
+            f"Set {ALLOWED_HOSTS_ENV_VAR} to target a different deployment."
+        )
+    if parsed.scheme != "https":
+        raise RemoteSmokeFailure(
+            f"Refusing to send credentials to {base_url!r} over plaintext HTTP: "
+            "Basic Auth would be exposed on the wire. Use https://."
         )
     return base_url
 
@@ -402,27 +447,12 @@ def normalize_optional_origin(value: str | None) -> str | None:
         return None
     origin = value.strip().rstrip("/")
     parsed = urlparse(origin)
-    if parsed.scheme not in {"http", "https"} or not parsed.netloc:
+    if parsed.scheme not in _smoke_common.HTTP_SCHEMES or not parsed.netloc:
         raise RemoteSmokeFailure(
             "Remote smoke CORS origins must be HTTP(S) origins such as "
             "https://demo.example.com"
         )
     return f"{parsed.scheme}://{parsed.netloc}"
-
-
-def origin_from_url(value: str) -> str:
-    parsed = urlparse(value)
-    port = f":{parsed.port}" if parsed.port else ""
-    return f"{parsed.scheme}://{parsed.hostname}{port}"
-
-
-def secret_values(*extra_values: str | None) -> set[str]:
-    values = {value for value in extra_values if value}
-    for key, value in os.environ.items():
-        key_lower = key.lower()
-        if value and any(token in key_lower for token in ("password", "api_key", "apikey", "secret", "token")):
-            values.add(value)
-    return {value for value in values if len(value) >= 4}
 
 
 if __name__ == "__main__":

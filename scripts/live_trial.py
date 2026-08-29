@@ -4,10 +4,18 @@ import argparse
 import os
 import sys
 from dataclasses import dataclass, field
+from functools import partial
+from pathlib import Path
 from typing import Any
-from urllib.parse import urlparse
 
 import httpx
+
+REPO_ROOT = Path(__file__).resolve().parents[1]
+if str(REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPO_ROOT))
+
+from scripts import _smoke_common  # noqa: E402
+from scripts._smoke_common import secret_values  # noqa: E402
 
 
 DEFAULT_TIMEOUT_SECONDS = 30.0
@@ -179,7 +187,36 @@ def run_live_trial(
             )
         return summary
     finally:
-        stop_simulation(client, config)
+        # Both calls below run on every exit from the try block above --
+        # normal return, a LiveTrialFailure from a failed assertion, any
+        # other exception (e.g. a dropped connection mid-batch), or a
+        # KeyboardInterrupt -- because they live in this `finally`, not
+        # after a `return` on the happy path (#105).
+        try:
+            stop_simulation(client, config)
+            if confirm_live:
+                # Only --confirm-live can arm live delivery, so only that
+                # path needs to disarm it again. A dry run never leaves
+                # delivery on anything but mock, and run_mock_dry_run's own
+                # reset already proves that. Guarded on the flag rather than
+                # on whether this run actually reached run_one_live_batch:
+                # the tenant may already have been armed by an earlier run
+                # (that is the exact failure mode #105 reports), so
+                # --confirm-live always tries to disarm it, even if this
+                # run's own mock dry-run failed first.
+                revert_delivery_to_mock(client, config)
+        finally:
+            # #137: `owns_client` was computed and then never read, so a
+            # client this function created itself was never closed. Closing
+            # it here matches the owns_client/close pair in
+            # scripts/remote_smoke.py. Nested in its own `finally` so the
+            # close still happens if either cleanup call above raises --
+            # an aborted run is exactly when a leaked connection is likeliest
+            # and least welcome. Ordered after them because both still need
+            # the connection open. A caller-supplied client is left alone;
+            # closing someone else's client is theirs to do.
+            if owns_client:
+                client.close()
 
 
 def run_mock_dry_run(client: httpx.Client, config: LiveTrialConfig) -> dict[str, Any]:
@@ -260,6 +297,52 @@ def stop_simulation(client: httpx.Client, config: LiveTrialConfig) -> None:
         )
 
 
+def revert_delivery_to_mock(client: httpx.Client, config: LiveTrialConfig) -> None:
+    """Disarm live delivery for config.demo_tenant by resetting it to mock.
+
+    This is the safety-critical call #105 is about: skip it, or let it fail
+    silently, and the tenant controller keeps the customer's live endpoint,
+    API key and tenant id cached with delivery.mode == "live" for the
+    lifetime of the process -- so the next Start or Step click posts
+    simulated CTEs into a customer's production RegEngine.
+
+    Unlike stop_simulation() above, this must never swallow a failure: it
+    does not catch httpx.HTTPError (a dropped connection here is exactly as
+    dangerous as a bad status code), and it treats any non-200 response as
+    fatal rather than only status_code >= 500. A revert that failed silently
+    is indistinguishable from no revert at all, so this always raises
+    loudly instead -- carrying forward whatever trial failure was already in
+    flight, if any, so a single printed line captures both facts.
+    """
+    prior_failure = sys.exc_info()[1]
+    try:
+        request_json(
+            client,
+            config,
+            "POST",
+            "/api/simulate/reset",
+            json={
+                "delivery": {
+                    "mode": "mock",
+                    "endpoint": None,
+                    "api_key": None,
+                    "tenant_id": None,
+                }
+            },
+        )
+    except (LiveTrialFailure, httpx.HTTPError) as exc:
+        message = (
+            f"CRITICAL: failed to revert tenant {config.demo_tenant!r} delivery to mock "
+            f"after the trial ({config.base_url}). The tenant may still be armed for live "
+            "delivery -- verify GET /api/simulate/status by hand before anyone else uses "
+            f"this demo. Underlying error: {exc}"
+        )
+        if prior_failure is not None and prior_failure is not exc:
+            message += f" (the trial itself had already failed: {prior_failure})"
+        raise LiveTrialFailure(message) from exc
+    print(f"delivery reverted to mock for tenant {config.demo_tenant}")
+
+
 def request_json(
     client: httpx.Client,
     config: LiveTrialConfig,
@@ -270,16 +353,7 @@ def request_json(
     params: dict[str, str] | None = None,
 ) -> dict[str, Any]:
     response = request(client, config, method, path, json=json, params=params)
-    assert_status(config, response, 200, path)
-    try:
-        payload = response.json()
-    except ValueError as exc:
-        raise LiveTrialFailure(
-            f"{path}: expected JSON response, got {config.redact(response.text[:300])!r}"
-        ) from exc
-    if not isinstance(payload, dict):
-        raise LiveTrialFailure(f"{path}: expected JSON object response")
-    return payload
+    return _smoke_common.response_json(LiveTrialFailure, response, path, redact=config.redact)
 
 
 def request(
@@ -301,43 +375,21 @@ def request(
     )
 
 
+# _smoke_common's helpers take the failure type first so each script keeps
+# its own exception class; bind it once here rather than at every call site.
+assert_equal = partial(_smoke_common.assert_equal, LiveTrialFailure)
+normalize_base_url = partial(_smoke_common.normalize_base_url, LiveTrialFailure)
+
+
 def assert_status(
     config: LiveTrialConfig,
     response: httpx.Response,
     expected_status: int,
     label: str,
 ) -> None:
-    if response.status_code != expected_status:
-        raise LiveTrialFailure(
-            f"{label}: expected HTTP {expected_status}, got "
-            f"{response.status_code}: {config.redact(response.text[:500])}"
-        )
-
-
-def assert_equal(actual: Any, expected: Any, label: str) -> None:
-    if actual != expected:
-        raise LiveTrialFailure(f"{label}: expected {expected!r}, got {actual!r}")
-
-
-def normalize_base_url(value: str) -> str:
-    base_url = value.strip().rstrip("/")
-    parsed = urlparse(base_url)
-    if parsed.scheme not in {"http", "https"} or not parsed.netloc:
-        raise LiveTrialFailure(f"Expected an HTTP(S) URL, got {value!r}")
-    return base_url
-
-
-def secret_values(*extra_values: str | None) -> set[str]:
-    values = {value for value in extra_values if value}
-    for key, value in os.environ.items():
-        key_lower = key.lower()
-        credential_name = any(
-            token in key_lower
-            for token in ("password", "api_key", "apikey", "secret", "token")
-        )
-        if value and credential_name:
-            values.add(value)
-    return {value for value in values if len(value) >= 4}
+    _smoke_common.assert_status(
+        LiveTrialFailure, response, expected_status, label, redact=config.redact
+    )
 
 
 if __name__ == "__main__":

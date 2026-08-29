@@ -34,9 +34,10 @@ const state = {
   exportPresetDescriptions: {
     all_records: 'Full FDA-request export for the selected date range.',
   },
+  exportPresetRequiresLot: {},
+  eventRows: null,
+  streamRevision: null,
 };
-
-const DEFAULT_LIVE_INGEST_ENDPOINT = 'https://www.regengine.co/api/v1/webhooks/ingest';
 
 const ids = {
   source: document.getElementById('source'),
@@ -323,8 +324,53 @@ const welcomeEls = {
   skip: document.getElementById('welcomeSkipBtn'),
 };
 
+// #151: the overlay declares role="dialog" aria-modal="true" and covers the
+// viewport, but nothing enforced that -- Tab walked straight into the config
+// form hidden behind the backdrop. Marking the page inert takes the
+// background out of the tab order (and out of the accessibility tree) for
+// browsers that support it; the Tab handler below is the behaviour guarantee
+// for the ones that don't.
+function setPageInert(inert) {
+  const page = document.querySelector('main.page');
+  if (!page) {
+    return;
+  }
+  if (inert) {
+    page.inert = true;
+    page.setAttribute('aria-hidden', 'true');
+  } else {
+    page.inert = false;
+    page.removeAttribute('aria-hidden');
+  }
+}
+
+function welcomeFocusables() {
+  return [welcomeEls.tour, welcomeEls.sample, welcomeEls.skip].filter(
+    (button) => button && !button.disabled && !button.hidden,
+  );
+}
+
+// Keeps Tab/Shift+Tab inside the dialog's own buttons. Focus that is already
+// outside the dialog (a background control, or <body>) is pulled back to the
+// leading edge rather than allowed to continue through the page.
+function trapWelcomeFocus(event) {
+  const focusable = welcomeFocusables();
+  if (!focusable.length) {
+    return;
+  }
+  event.preventDefault();
+  const current = focusable.indexOf(document.activeElement);
+  if (current === -1) {
+    focusable[event.shiftKey ? focusable.length - 1 : 0].focus();
+    return;
+  }
+  const delta = event.shiftKey ? -1 : 1;
+  focusable[(current + delta + focusable.length) % focusable.length].focus();
+}
+
 function hideWelcome() {
   welcomeEls.overlay.hidden = true;
+  setPageInert(false);
   markOnboarded();
 }
 
@@ -333,6 +379,7 @@ function maybeShowWelcome() {
     return;
   }
   welcomeEls.overlay.hidden = false;
+  setPageInert(true);
   welcomeEls.tour.focus();
 }
 
@@ -364,8 +411,50 @@ function setStatus(message, tone = 'neutral', holdMs = 0) {
   state.statusHoldUntil = holdMs > 0 ? Date.now() + holdMs : 0;
 }
 
+// #148: deliveryMode/endpoint/apiKey/tenantId were only ever written by
+// applyConfigToForm(), which runs from "Load saved" and nowhere else. On a
+// plain page load, a reload, or in a second tab they fell back to their raw
+// HTML defaults -- Sandbox, blank endpoint, blank tenant -- even while the
+// server was delivering live. buildConfig() reads those same raw fields into
+// every Start / Clear shift / Retry / fixture load / CSV import, and the
+// server used to replace its whole delivery config with whatever arrived, so
+// one reload was enough to silently downgrade live delivery to the sandbox.
+//
+// Hydrating from the server's own status on every snapshot keeps the form
+// honest. The dirty flag is what stops a 1.5s snapshot tick from stomping an
+// edit in progress: any change to a delivery control sets it, and it clears
+// once that edit has actually been pushed to the server.
+let deliveryFormDirty = false;
+
+function markDeliveryFormDirty() {
+  deliveryFormDirty = true;
+}
+
+function deliveryFormPushed() {
+  deliveryFormDirty = false;
+}
+
+function hydrateDeliveryForm(status = state.status) {
+  const delivery = status?.config?.delivery;
+  if (!delivery || deliveryFormDirty) {
+    return;
+  }
+  if (delivery.mode) {
+    ids.deliveryMode.value = delivery.mode;
+  }
+  // Only write back what the server actually reported. api_key is never
+  // returned, and tenant_id is withheld in live mode, so blanking these from
+  // an absent value would be the very wipe this fixes.
+  if (delivery.endpoint) {
+    ids.endpoint.value = delivery.endpoint;
+  }
+  if (delivery.tenant_id) {
+    ids.tenantId.value = delivery.tenant_id;
+  }
+}
+
 function buildConfig() {
-  const endpoint = ids.endpoint.value.trim() || DEFAULT_LIVE_INGEST_ENDPOINT;
+  const endpoint = ids.endpoint.value.trim();
   const apiKey = ids.apiKey.value.trim();
   const tenantId = ids.tenantId.value.trim();
   const seedValue = ids.seed.value.trim();
@@ -376,7 +465,9 @@ function buildConfig() {
     interval_seconds: Number(ids.interval.value || 1.5),
     batch_size: Number(ids.batchSize.value || 3),
     seed: seedValue === '' ? null : Number(seedValue),
-    persist_path: 'data/events.jsonl',
+    // Deliberately omitted: the server derives the default log path from
+    // REGENGINE_DATA_DIR. Sending a literal here overrode that and put the
+    // default scope's events outside a mounted volume, losing them on restart.
     delivery: {
       mode: ids.deliveryMode.value,
       endpoint: endpoint || null,
@@ -387,14 +478,63 @@ function buildConfig() {
   };
 }
 
+// #196: `detail` is not always a string. FastAPI answers a body/query
+// validation failure with an ARRAY of error objects, and passing that to
+// new Error() stringifies it to "[object Object]" -- setStatus() then shows
+// the operator that literal text instead of which field is wrong and why.
+// A non-JSON error body (an HTML 5xx from a proxy in front of the app) lost
+// everything the same way. This turns both into something actionable.
+function describeApiError(payload, response, rawBody = '') {
+  const detail = payload?.detail;
+  if (typeof detail === 'string' && detail.trim()) {
+    return detail.trim();
+  }
+  if (Array.isArray(detail) && detail.length) {
+    const lines = detail
+      .map((item) => {
+        // loc is ["body", "config", "batch_size"] -- the leading request
+        // part is noise; the rest names a field the operator can find.
+        const location = Array.isArray(item?.loc)
+          ? item.loc
+              .filter((part, index) => !(index === 0 && ['body', 'query', 'path', 'header', 'cookie'].includes(part)))
+              .join('.')
+          : '';
+        const message = typeof item?.msg === 'string' && item.msg ? item.msg : JSON.stringify(item);
+        return location ? `${location}: ${message}` : message;
+      })
+      .filter(Boolean);
+    if (lines.length) {
+      return lines.join('; ');
+    }
+  }
+  if (detail && typeof detail === 'object') {
+    return JSON.stringify(detail);
+  }
+  const statusLine = `Request failed: ${response.status}${response.statusText ? ` ${response.statusText}` : ''}`;
+  const snippet = String(rawBody || '')
+    .replace(/<[^>]*>/g, ' ')
+    .replace(/\s+/g, ' ')
+    .trim()
+    .slice(0, 120);
+  return snippet ? `${statusLine} — ${snippet}` : statusLine;
+}
+
 async function api(path, options = {}) {
   const response = await fetch(path, {
     headers: { 'Content-Type': 'application/json' },
     ...options,
   });
   if (!response.ok) {
-    const payload = await response.json().catch(() => ({}));
-    throw new Error(payload.detail || `Request failed: ${response.status}`);
+    // Read as text first: the body can only be consumed once, and a
+    // non-JSON error body still has to reach describeApiError().
+    const rawBody = await response.text().catch(() => '');
+    let payload = {};
+    try {
+      payload = rawBody ? JSON.parse(rawBody) : {};
+    } catch (error) {
+      payload = {};
+    }
+    throw new Error(describeApiError(payload, response, rawBody));
   }
   const contentType = response.headers.get('content-type') || '';
   if (contentType.includes('application/json')) {
@@ -572,6 +712,12 @@ function renderExportPresetOptions(presets) {
   state.exportPresetDescriptions = Object.fromEntries(
     presets.map((preset) => [preset.id, preset.description]),
   );
+  // The backend has always shipped requires_lot_code on this payload; the
+  // console just never read it, so "Lot trace" was offered with an empty lot
+  // field and failed with a raw JSON 400 in a new tab (#194).
+  state.exportPresetRequiresLot = Object.fromEntries(
+    presets.map((preset) => [preset.id, Boolean(preset.requires_lot_code)]),
+  );
   ids.exportPreset.innerHTML = presets
     .map(
       (preset) => `
@@ -612,7 +758,76 @@ function updateExportLink() {
   ids.exportDownloadLink.href = `/api/mock/regengine/export/fda-request?${csvParams.toString()}`;
   ids.epcisDownloadLink.href = `/api/mock/regengine/export/epcis${epcisQuery ? `?${epcisQuery}` : ''}`;
   const presetDescription = state.exportPresetDescriptions[preset] || 'FDA-request CSV export.';
-  ids.exportPresetDescription.textContent = `${presetDescription} EPCIS uses the same lot and date filters.`;
+  // Only the CSV export takes a preset; EPCIS filters by lot/date alone.
+  const lotRequired = Boolean(state.exportPresetRequiresLot[preset]) && !lotCode;
+  setExportLinkEnabled(ids.exportDownloadLink, !lotRequired);
+  ids.exportPresetDescription.textContent = lotRequired
+    ? `${presetDescription} Enter a Traceability Lot Code to enable this export. EPCIS uses the same lot and date filters.`
+    : `${presetDescription} EPCIS uses the same lot and date filters.`;
+}
+
+// aria-disabled rather than a class: an <a> has no :disabled state, and the
+// anchor must stay focusable so activating it can explain *why* it is off.
+function setExportLinkEnabled(link, enabled) {
+  if (!link) {
+    return;
+  }
+  if (enabled) {
+    link.removeAttribute('aria-disabled');
+  } else {
+    link.setAttribute('aria-disabled', 'true');
+  }
+}
+
+function exportFilename(disposition, fallback) {
+  const match = /filename\*?=(?:UTF-8'')?"?([^";]+)"?/i.exec(String(disposition || ''));
+  return match ? decodeURIComponent(match[1].trim()) : fallback;
+}
+
+// Fetch the export instead of letting the anchor navigate. A plain anchor
+// bypasses api()/setStatus() entirely, so a 400 (preset needs a lot code) or
+// 404 (typo'd lot) rendered as raw JSON in a new tab while the console
+// itself reported nothing -- and the guide rail marked "Export evidence"
+// done regardless of the outcome (#194).
+async function downloadExport(link, fallbackFilename) {
+  if (link.getAttribute('aria-disabled') === 'true') {
+    setStatus(
+      'This export preset needs a Traceability Lot Code. Enter one in the export filters, then try again.',
+      'error',
+      6000,
+    );
+    ids.exportLot.focus();
+    return;
+  }
+  try {
+    const response = await fetch(link.href, { headers: { Accept: '*/*' } });
+    if (!response.ok) {
+      const rawBody = await response.text().catch(() => '');
+      let payload = {};
+      try {
+        payload = rawBody ? JSON.parse(rawBody) : {};
+      } catch (error) {
+        payload = {};
+      }
+      throw new Error(describeApiError(payload, response, rawBody));
+    }
+    const blob = await response.blob();
+    const filename = exportFilename(response.headers.get('content-disposition'), fallbackFilename);
+    const objectUrl = URL.createObjectURL(blob);
+    const anchor = document.createElement('a');
+    anchor.href = objectUrl;
+    anchor.download = filename;
+    document.body.appendChild(anchor);
+    anchor.click();
+    anchor.remove();
+    URL.revokeObjectURL(objectUrl);
+    // Only a confirmed 2xx counts as evidence produced.
+    journey.exported = true;
+    renderGuide();
+    setStatus(`Downloaded ${filename}.`, 'success', 3500);
+  } catch (error) {
+    setStatus(error.message, 'error', 6000);
+  }
 }
 
 function preferredTraceLot(lotCodes = []) {
@@ -688,18 +903,29 @@ function scenarioNarrative(summary) {
   return 'This flow should prove field-level origin, packout packaging changes, and downstream traceability through transformation and shipment.';
 }
 
-function pendingAuditModel(summary) {
+// The stand-in used when backendAudit() has nothing to report. `missing: 0`
+// is literally true -- nothing was evaluated, so nothing is missing -- but
+// it is NOT the same fact as "the backend scored this profile and found no
+// gaps". `pending: true` is what callers must branch on so a not-computed
+// audit can never be rendered as a passing one (#193).
+function pendingAuditModel(summary, status = state.status) {
+  const scoredScenario = status?.config?.scenario || null;
+  const mismatched = Boolean(scoredScenario && summary && scoredScenario !== summary.id);
   return {
     checks: [],
     score: 0,
     tone: 'watch',
-    label: 'Awaiting simulator audit',
+    pending: true,
+    mismatched,
+    label: mismatched ? 'Not scored for this profile' : 'Awaiting simulator audit',
     passed: 0,
     total: 0,
     missing: 0,
-    detail: summary
-      ? `${summary.label} needs a simulator status refresh before audit scoring can be shown.`
-      : 'Run the simulator to load backend audit scoring.',
+    detail: mismatched
+      ? `Showing ${summary.label}, but the backend last scored ${scenarioLabel(scoredScenario)}. Start the line on this profile to score it.`
+      : summary
+        ? `${summary.label} needs a simulator status refresh before audit scoring can be shown.`
+        : 'Run the simulator to load backend audit scoring.',
   };
 }
 
@@ -708,7 +934,7 @@ function renderReadinessBanner(summary, events, status = state.status) {
     ids.readinessBanner.innerHTML = '<p class="note">Readiness scoring will appear once scenario metadata loads.</p>';
     return;
   }
-  const readiness = backendAudit(status, summary) || pendingAuditModel(summary);
+  const readiness = backendAudit(status, summary) || pendingAuditModel(summary, status);
   ids.readinessBanner.innerHTML = `
     <div class="readiness-banner-shell" data-tone="${readiness.tone}">
       <div class="readiness-score">
@@ -729,15 +955,41 @@ function renderReadinessBanner(summary, events, status = state.status) {
   `;
 }
 
-function recordWarnings(record, summary, status = state.status) {
+// Returns both the warnings AND whether an audit ran at all (#193), with every
+// warning carrying its severity and the required ones sorted first (#189).
+//
+// #193: "nothing audited this row" and "the audit cleared this row" used to
+// collapse into one empty array, so a row nothing had evaluated rendered
+// exactly like a row the backend had cleared. `evaluated` keeps them apart.
+//
+// #189: a warning is {message, severity} rather than a bare string, because the
+// backend marks each one required or recommended instead of leaving the tiers
+// distinguishable only by a message prefix. Required sorts first -- a shift-log
+// row shows exactly one warning, so whichever lands at index 0 is the whole
+// story an operator gets for that event.
+function recordAudit(record, summary, status = state.status) {
   const audit = backendAudit(status, summary);
-  const warningPayload = audit?.warnings_by_record?.[record.record_id];
-  if (Array.isArray(warningPayload) && warningPayload.length) {
-    return warningPayload
-      .map((warning) => warning.message)
-      .filter((message) => typeof message === 'string' && message);
+  if (!audit) {
+    return { evaluated: false, warnings: [] };
   }
-  return [];
+  const warningPayload = audit.warnings_by_record?.[record.record_id];
+  if (!Array.isArray(warningPayload) || !warningPayload.length) {
+    return { evaluated: true, warnings: [] };
+  }
+  return {
+    evaluated: true,
+    warnings: warningPayload
+      .filter((warning) => typeof warning?.message === 'string' && warning.message)
+      .map((warning) => ({
+        message: warning.message,
+        severity: warning.severity === 'required' ? 'required' : 'recommended',
+      }))
+      .sort((left, right) => (left.severity === right.severity ? 0 : left.severity === 'required' ? -1 : 1)),
+  };
+}
+
+function warningSeverityTone(warnings) {
+  return warnings.some((warning) => warning.severity === 'required') ? 'required' : 'recommended';
 }
 
 function renderScenarioWorkbench(status = state.status, events = state.events) {
@@ -746,11 +998,26 @@ function renderScenarioWorkbench(status = state.status, events = state.events) {
     ids.scenarioWorkbench.innerHTML = '<p class="note">Scenario metadata will appear here once presets load.</p>';
     return;
   }
-  const readiness = backendAudit(status, summary) || pendingAuditModel(summary);
+  const readiness = backendAudit(status, summary) || pendingAuditModel(summary, status);
   const checks = readiness.checks;
   const sourceCte = sourceCteForScenario(summary);
   const eventCount = (events || []).length;
   const warningCount = readiness.missing;
+  // "No gaps out of N checks" and "no checks were run" are different facts.
+  // Only the first earns the reassuring copy; the readiness banner above
+  // already guards on readiness.total for the same reason.
+  const auditScored = !readiness.pending && readiness.total > 0;
+  const alertModifier = !auditScored ? ' is-pending' : warningCount ? ' has-warning' : '';
+  const alertHeadline = !auditScored
+    ? readiness.mismatched
+      ? `Not scored for ${summary.label}`
+      : 'Audit not evaluated yet'
+    : warningCount
+      ? `${warningCount} signal(s) still missing`
+      : 'Signals visible';
+  const alertDetail = auditScored
+    ? `${escapeHtml(summary.reference_format)} references, ${escapeHtml(sourceCte)} source flow`
+    : escapeHtml(readiness.detail);
   const transformCount = (events || []).filter((record) => record.event.cte_type === 'transformation').length;
   const cards = [
     ['Operation', operationTypeLabel(summary.operation_type)],
@@ -770,10 +1037,10 @@ function renderScenarioWorkbench(status = state.status, events = state.events) {
         <p>${escapeHtml(summary.description)}</p>
         <p class="note">${escapeHtml(scenarioNarrative(summary))}</p>
       </div>
-      <div class="scenario-alert${warningCount ? ' has-warning' : ''}">
+      <div class="scenario-alert${alertModifier}">
         <span>Audit readiness</span>
-        <strong>${warningCount ? `${warningCount} signal(s) still missing` : 'Signals visible'}</strong>
-        <small>${escapeHtml(summary.reference_format)} references, ${escapeHtml(sourceCte)} source flow</small>
+        <strong>${escapeHtml(alertHeadline)}</strong>
+        <small>${alertDetail}</small>
       </div>
     </div>
     <div class="scenario-signal-grid">
@@ -1063,48 +1330,137 @@ function formatKdeValue(value) {
   return value ?? '';
 }
 
+function eventRowClass(audit) {
+  if (audit.warnings.length) {
+    return 'has-audit-warning';
+  }
+  return audit.evaluated ? '' : 'audit-not-evaluated';
+}
+
+// #189 puts the row's severity tone in an attribute rather than the class list,
+// so the keyed-diff path (#195) has to set it on the node the way it sets the
+// class -- and clear it when a row stops warning. Rows now outlive a snapshot,
+// so a stale tone would otherwise cling to a reused node after its warning went
+// away, which the old innerHTML rebuild got for free.
+function applyEventRowAttributes(node, audit) {
+  node.setAttribute('class', eventRowClass(audit));
+  if (audit.warnings.length) {
+    node.setAttribute('data-warning-severity', warningSeverityTone(audit.warnings));
+  } else {
+    node.removeAttribute('data-warning-severity');
+  }
+}
+
+function eventRowCells(record, audit) {
+  const event = record.event;
+  // Required sorts first in recordAudit, so index 0 is the strongest warning --
+  // the only one this row has room to show (#189).
+  const topWarning = audit.warnings[0];
+  return `
+    <td>${record.sequence_no}</td>
+    <td><span class="pill">${escapeHtml(event.cte_type)}</span></td>
+    <td><button class="link-button" data-lot="${escapeHtml(event.traceability_lot_code)}">${escapeHtml(event.traceability_lot_code)}</button></td>
+    <td>${escapeHtml(event.product_description)}</td>
+    <td>${escapeHtml(event.location_name)}</td>
+    <td>${escapeHtml(new Date(event.timestamp).toLocaleString())}</td>
+    <td>${escapeHtml(record.destination_mode)}</td>
+    <td>
+      ${escapeHtml(record.delivery_attempts || 0)}
+      ${topWarning ? `<small class="status-warning" data-severity="${topWarning.severity}">${escapeHtml(topWarning.severity === 'required' ? `Required: ${topWarning.message}` : topWarning.message)}</small>` : ''}
+      ${audit.evaluated ? '' : '<small class="status-muted">Audit not evaluated</small>'}
+    </td>
+    <td>
+      <span class="status-pill" data-tone="${deliveryTone(record.delivery_status)}">${escapeHtml(record.delivery_status)}</span>
+      ${record.error ? `<small class="status-error">${escapeHtml(record.error)}</small>` : ''}
+    </td>
+  `;
+}
+
+// Everything about a row that can change between snapshots. A row whose
+// signature is unchanged is left alone entirely, which is what keeps focus
+// and text selection alive across a tick (#195).
+function eventRowSignature(record, audit) {
+  return JSON.stringify([
+    record.sequence_no,
+    record.delivery_status,
+    record.delivery_attempts || 0,
+    record.destination_mode,
+    record.error || '',
+    audit.evaluated,
+    // Both the one warning the row shows and the row-level tone -- #189 derives
+    // the tone from every warning, not just the first, so a required entry
+    // arriving behind the displayed one still has to repaint the row.
+    audit.warnings[0]?.message || '',
+    audit.warnings[0]?.severity || '',
+    audit.warnings.length ? warningSeverityTone(audit.warnings) : '',
+    record.event.cte_type,
+    record.event.traceability_lot_code,
+    record.event.product_description,
+    record.event.location_name,
+    record.event.timestamp,
+  ]);
+}
+
+// #195: this used to be one `ids.eventsBody.innerHTML = events.map(...)` per
+// snapshot -- about every 1.5s while the line runs. That destroys the row a
+// keyboard operator is on (focus reverts to <body>), clears any text
+// selection, and re-attaches one click listener per row every tick. Rows are
+// now keyed by record_id and patched: an unchanged row keeps its DOM node.
 function renderEvents(events) {
   const summary = activeScenarioSummary();
+  const body = ids.eventsBody;
   if (!events.length) {
-    ids.eventsBody.innerHTML = `
-      <tr>
-        <td colspan="9" class="empty-state">No events yet. Load a fixture or run a single batch.</td>
-      </tr>
-    `;
-    return;
-  }
-  ids.eventsBody.innerHTML = events
-    .map((record) => {
-      const event = record.event;
-      const warnings = recordWarnings(record, summary);
-      return `
-        <tr class="${warnings.length ? 'has-audit-warning' : ''}">
-          <td>${record.sequence_no}</td>
-          <td><span class="pill">${escapeHtml(event.cte_type)}</span></td>
-          <td><button class="link-button" data-lot="${escapeHtml(event.traceability_lot_code)}">${escapeHtml(event.traceability_lot_code)}</button></td>
-          <td>${escapeHtml(event.product_description)}</td>
-          <td>${escapeHtml(event.location_name)}</td>
-          <td>${escapeHtml(new Date(event.timestamp).toLocaleString())}</td>
-          <td>${escapeHtml(record.destination_mode)}</td>
-          <td>
-            ${escapeHtml(record.delivery_attempts || 0)}
-            ${warnings.length ? `<small class="status-warning">${escapeHtml(warnings[0])}</small>` : ''}
-          </td>
-          <td>
-            <span class="status-pill" data-tone="${deliveryTone(record.delivery_status)}">${escapeHtml(record.delivery_status)}</span>
-            ${record.error ? `<small class="status-error">${escapeHtml(record.error)}</small>` : ''}
-          </td>
+    if (!body.querySelector('.empty-state')) {
+      body.innerHTML = `
+        <tr>
+          <td colspan="9" class="empty-state">No events yet. Load a fixture or run a single batch.</td>
         </tr>
       `;
-    })
-    .join('');
+    }
+    state.eventRows = new Map();
+    return;
+  }
+  if (!state.eventRows || !state.eventRows.size) {
+    // Clears the empty-state placeholder before the first real row lands.
+    body.innerHTML = '';
+    state.eventRows = new Map();
+  }
+  const rows = state.eventRows;
+  const focusedLot = document.activeElement?.dataset?.lot;
 
-  ids.eventsBody.querySelectorAll('[data-lot]').forEach((button) => {
-    button.addEventListener('click', async () => {
-      ids.lotLookup.value = button.dataset.lot;
-      await lookupLineage();
-    });
+  const wanted = new Set(events.map((record) => record.record_id));
+  for (const [recordId, entry] of [...rows]) {
+    if (!wanted.has(recordId)) {
+      entry.node.remove();
+      rows.delete(recordId);
+    }
+  }
+
+  events.forEach((record, index) => {
+    const audit = recordAudit(record, summary);
+    const signature = eventRowSignature(record, audit);
+    let entry = rows.get(record.record_id);
+    if (!entry) {
+      entry = { node: document.createElement('tr'), signature: null };
+      rows.set(record.record_id, entry);
+    }
+    if (entry.signature !== signature) {
+      applyEventRowAttributes(entry.node, audit);
+      entry.node.innerHTML = eventRowCells(record, audit);
+      entry.signature = signature;
+    }
+    if (body.children[index] !== entry.node) {
+      body.insertBefore(entry.node, body.children[index] || null);
+    }
   });
+
+  // Only reachable when the focused row was one of the few that repainted.
+  if (focusedLot && document.activeElement?.dataset?.lot !== focusedLot) {
+    const restored = Array.from(body.querySelectorAll('[data-lot]')).find(
+      (button) => button.dataset.lot === focusedLot,
+    );
+    restored?.focus();
+  }
 }
 
 function renderLineage(payload, traceabilityLotCode) {
@@ -1188,13 +1544,13 @@ function renderLineage(payload, traceabilityLotCode) {
   const timelineMarkup = records
     .map((record) => {
       const event = record.event;
-      const warnings = recordWarnings(record, scenarioSummary);
+      const audit = recordAudit(record, scenarioSummary);
       const kdes = Object.entries(event.kdes || {})
         .slice(0, 6)
         .map(([key, value]) => `<li><strong>${escapeHtml(key)}:</strong> ${escapeHtml(formatKdeValue(value))}</li>`)
         .join('');
       return `
-        <article class="lineage-card${warnings.length ? ' has-audit-warning' : ''}">
+        <article class="lineage-card${audit.warnings.length ? ' has-audit-warning' : audit.evaluated ? '' : ' audit-not-evaluated'}"${audit.warnings.length ? ` data-warning-severity="${warningSeverityTone(audit.warnings)}"` : ''}>
           <header>
             <h3>${escapeHtml(cteLabel(event.cte_type))}</h3>
             <span>${formatDateTime(event.timestamp)}</span>
@@ -1202,7 +1558,8 @@ function renderLineage(payload, traceabilityLotCode) {
           <p><strong>Lot:</strong> ${escapeHtml(event.traceability_lot_code)}</p>
           <p><strong>Product:</strong> ${escapeHtml(event.product_description)}</p>
           <p><strong>Location:</strong> ${escapeHtml(event.location_name)}</p>
-          ${warnings.length ? `<p class="lineage-warning">${escapeHtml(warnings.join(' • '))}</p>` : ''}
+          ${audit.warnings.length ? `<p class="lineage-warning" data-severity="${warningSeverityTone(audit.warnings)}">${escapeHtml(audit.warnings.map((warning) => (warning.severity === 'required' ? `Required: ${warning.message}` : warning.message)).join(' • '))}</p>` : ''}
+          ${audit.evaluated ? '' : '<p class="status-muted">Audit not evaluated for this line profile.</p>'}
           <ul>${kdes}</ul>
         </article>
       `;
@@ -1247,7 +1604,11 @@ function renderImportResult(result) {
   const warningList = warnings
     .map((warning) => {
       const field = warning.field ? ` ${escapeHtml(warning.field)}:` : '';
-      return `<li>Row ${escapeHtml(warning.row)}${field} ${escapeHtml(warning.message)}</li>`;
+      // #189: an FDA-mandatory KDE and a nice-to-have used to read
+      // identically here. The backend distinguishes them now, so say which.
+      const severity = warning.severity === 'required' ? 'required' : 'recommended';
+      const prefix = severity === 'required' ? 'Required — ' : '';
+      return `<li data-severity="${severity}">Row ${escapeHtml(warning.row)}${field} ${escapeHtml(prefix)}${escapeHtml(warning.message)}</li>`;
     })
     .join('');
   ids.importResults.innerHTML = `
@@ -1265,6 +1626,7 @@ function renderSnapshot(status, events, health = state.health) {
   state.status = status;
   state.health = health;
   state.events = events;
+  hydrateDeliveryForm(status);
   updateShellStatus(status, events, health);
   renderGuide(status, events);
   renderReadinessBanner(activeScenarioSummary(), events, status);
@@ -1278,13 +1640,38 @@ function renderSnapshot(status, events, health = state.health) {
   }
 }
 
+// #195: refresh() is called from the 2s fallback poller, the Refresh button,
+// and the tail of every mutating action, so two can easily overlap. Without
+// a token the slower one repaints stale state over the newer one.
+let refreshSeq = 0;
+
 async function refresh() {
+  const requestId = ++refreshSeq;
   const [health, status, events] = await Promise.all([
     api('/api/health'),
     api('/api/simulate/status'),
     api('/api/events?limit=100'),
   ]);
+  if (requestId !== refreshSeq) {
+    return;
+  }
   renderSnapshot(status, events.events, health);
+}
+
+// The poller's entry point: skips the tick entirely while a poll is still in
+// flight, so a slow backend cannot make polls pile up.
+let pollInFlight = false;
+
+async function pollForFreshness() {
+  if (pollInFlight) {
+    return;
+  }
+  pollInFlight = true;
+  try {
+    await refresh();
+  } finally {
+    pollInFlight = false;
+  }
 }
 
 function stopFallbackPolling() {
@@ -1299,7 +1686,7 @@ function startFallbackPolling() {
     return;
   }
   state.fallbackTimer = setInterval(() => {
-    refresh().catch((error) => {
+    pollForFreshness().catch((error) => {
       setStatus(error.message, 'error', 5000);
     });
   }, 2000);
@@ -1308,6 +1695,17 @@ function startFallbackPolling() {
 function applyStreamSnapshot(payload) {
   if (!payload || !payload.status || !Array.isArray(payload.events)) {
     return;
+  }
+  // The stream stamps every snapshot with the controller's monotonic
+  // revision. After a reconnect the server replays from its current
+  // revision, so an in-flight older frame must not repaint over a newer
+  // one (#195).
+  const revision = Number(payload.revision);
+  if (Number.isFinite(revision)) {
+    if (state.streamRevision !== null && revision < state.streamRevision) {
+      return;
+    }
+    state.streamRevision = revision;
   }
   renderSnapshot(payload.status, payload.events);
 }
@@ -1397,8 +1795,24 @@ function renderConnectionStatus(integration) {
   }
 }
 
+// #155: the live ingest default is single-sourced from
+// DEFAULT_LIVE_INGEST_ENDPOINT in app/regengine_client.py and published as
+// `default_endpoint` here. The console used to keep its own copy of that
+// literal and substitute it into every buildConfig(), so the server's
+// default was unreachable from the UI and changing the Python constant
+// alone would have left live traffic going to the stale URL. Now the hint
+// comes from the server and buildConfig() sends null for a blank field, so
+// the server applies the same default it just reported.
+function applyDefaultEndpointPlaceholder(integration) {
+  const fallback = integration?.default_endpoint;
+  if (ids.endpoint && fallback) {
+    ids.endpoint.setAttribute('placeholder', fallback);
+  }
+}
+
 async function loadIntegrationStatus() {
   const integration = await api('/api/integration/status');
+  applyDefaultEndpointPlaceholder(integration);
   renderConnectionStatus(integration);
 }
 
@@ -1425,6 +1839,7 @@ async function saveIntegrationSettings() {
       body: JSON.stringify(request),
     });
     renderConnectionStatus(integration);
+    deliveryFormPushed();
     setStatus('Saved RegEngine connection settings.', 'success', 2500);
     await refresh();
   } catch (error) {
@@ -1479,6 +1894,7 @@ async function startLoop() {
       method: 'POST',
       body: JSON.stringify({ config: buildConfig() }),
     });
+    deliveryFormPushed();
     setStatus('Started production line.', 'success', 2500);
     await refresh();
   } catch (error) {
@@ -1527,6 +1943,7 @@ async function retryFailedDeliveries() {
       method: 'POST',
       body: JSON.stringify({ delivery: config.delivery, source: config.source }),
     });
+    deliveryFormPushed();
     if (result.status === 'empty') {
       setStatus('No failed deliveries are waiting to retry.', 'success', 2500);
     } else if (result.status === 'skipped') {
@@ -1593,6 +2010,7 @@ async function loadSelectedDemoFixture() {
         delivery: config.delivery,
       }),
     });
+    deliveryFormPushed();
     const fixtureScenario = state.scenarioCatalog[result.scenario];
     renderScenarioOptions(
       state.allScenarios.length ? state.allScenarios : Object.values(state.scenarioCatalog),
@@ -1655,6 +2073,7 @@ async function importCsv() {
         delivery: config.delivery,
       }),
     });
+    deliveryFormPushed();
     renderImportResult(result);
     if (result.status === 'delivery_failed') {
       setStatus(`Imported ${result.accepted} row(s), but delivery failed: ${result.error || 'delivery error'}`, 'error', 7000);
@@ -1678,6 +2097,13 @@ async function resetState() {
       body: JSON.stringify(buildConfig()),
     });
     ids.lineageResults.innerHTML = '';
+    // The records those filters name are gone, so leaving them in place
+    // points both export links (and the trace box) at a lot code that no
+    // longer exists -- an export that silently returns nothing (#150).
+    ids.lotLookup.value = '';
+    ids.exportLot.value = '';
+    updateExportLink();
+    deliveryFormPushed();
     setStatus('Cleared line state and shift log.', 'success', 2500);
     await refresh();
   } catch (error) {
@@ -1685,19 +2111,35 @@ async function resetState() {
   }
 }
 
+// #149: four independent surfaces call lookupLineage() -- the events-table
+// lot buttons, the lineage-flow node/edge links, the record spotlight, and
+// the trace box itself -- none of them guarded. Two lots clicked in quick
+// succession therefore leave two fetches in flight, and whichever resolved
+// last used to win the panel regardless of click order, so the trace on
+// screen could belong to a different lot than the one the input names.
+// A monotonic token makes any superseded response a no-op.
+let lineageRequestSeq = 0;
+
 async function lookupLineage() {
   const lotCode = ids.lotLookup.value.trim();
   if (!lotCode) {
     setStatus('Enter a lot code first.', 'error', 5000);
     return;
   }
+  const requestId = ++lineageRequestSeq;
   try {
     const payload = await api(`/api/lineage/${encodeURIComponent(lotCode)}`);
+    if (requestId !== lineageRequestSeq) {
+      return;
+    }
     renderLineage(payload, lotCode);
     journey.traced = true;
     renderGuide();
     setStatus(`Loaded lineage for ${lotCode}.`, 'success', 2500);
   } catch (error) {
+    if (requestId !== lineageRequestSeq) {
+      return;
+    }
     ids.lineageResults.innerHTML = `<p class="note">${escapeHtml(error.message)}</p>`;
     setStatus(error.message, 'error', 5000);
   }
@@ -1754,14 +2196,26 @@ ids.lotLookup.addEventListener('keydown', (event) => {
   }
 });
 
+// One delegated listener for the whole shift log (#195). The rows are
+// patched rather than rebuilt now, but binding here also means a rebuilt row
+// can never arrive without its handler, and nothing is re-bound per tick.
+ids.eventsBody.addEventListener('click', async (event) => {
+  const button = event.target?.closest?.('[data-lot]');
+  if (!button) {
+    return;
+  }
+  ids.lotLookup.value = button.dataset.lot;
+  await lookupLineage();
+});
+
 document.getElementById('nextActionGo')?.addEventListener('click', goToNextAction);
-for (const link of [ids.exportDownloadLink, ids.epcisDownloadLink]) {
-  link?.addEventListener('click', () => {
-    if (!state.events.length) {
-      return;
-    }
-    journey.exported = true;
-    renderGuide();
+for (const [link, fallbackFilename] of [
+  [ids.exportDownloadLink, 'fda-request-export.csv'],
+  [ids.epcisDownloadLink, 'epcis-events.json'],
+]) {
+  link?.addEventListener('click', (event) => {
+    event.preventDefault();
+    runWithBusy(link, () => downloadExport(link, fallbackFilename));
   });
 }
 document.querySelectorAll('#guideRail [data-guide-target]').forEach((step) => {
@@ -1789,6 +2243,10 @@ welcomeEls.sample.addEventListener('click', () => {
 });
 welcomeEls.skip.addEventListener('click', hideWelcome);
 document.addEventListener('keydown', (event) => {
+  if (event.key === 'Tab' && !welcomeEls.overlay.hidden) {
+    trapWelcomeFocus(event);
+    return;
+  }
   if (event.key !== 'Escape') {
     return;
   }
@@ -1805,6 +2263,12 @@ ids.exportLot.addEventListener('input', updateExportLink);
 ids.exportStartDate.addEventListener('change', updateExportLink);
 ids.exportEndDate.addEventListener('change', updateExportLink);
 ids.deliveryMode.addEventListener('change', () => updateShellStatus());
+// Any edit to a delivery control wins over server hydration until it has been
+// submitted -- a snapshot tick must never overwrite what the operator typed.
+for (const control of [ids.deliveryMode, ids.endpoint, ids.apiKey, ids.tenantId]) {
+  control?.addEventListener('input', markDeliveryFormDirty);
+  control?.addEventListener('change', markDeliveryFormDirty);
+}
 ids.operationType.addEventListener('change', () => {
   renderScenarioOptions(state.allScenarios, ids.scenario.value, ids.operationType.value);
 });

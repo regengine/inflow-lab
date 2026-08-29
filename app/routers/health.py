@@ -8,6 +8,12 @@ from typing import Any
 from fastapi import APIRouter, Depends
 from fastapi.responses import JSONResponse
 
+from ..schemas.health import (
+    HealthResponse,
+    HealthUnavailableResponse,
+    HealthzResponse,
+    HealthzUnavailableResponse,
+)
 from ..auth import TenantContext
 from ..build_info import current_build_info
 from ..contract import INFLOW_CONTRACT_VERSION
@@ -101,7 +107,11 @@ def _write_probe_target(store: EventStore) -> tuple[Path, str]:
     return persist_path.parent / ".healthz-write-probe", "w"
 
 
-@router.get("/health", response_model=None)
+@router.get(
+    "/health",
+    response_model=HealthResponse,
+    responses={503: {"model": HealthUnavailableResponse}},
+)
 async def health(
     context: TenantContext = Depends(get_tenant_context),
     active_controller: SimulationController = Depends(get_active_controller),
@@ -139,11 +149,15 @@ async def health(
             "username": context.username,
             "uses_default_storage": context.uses_default_storage,
         },
-        "status": active_controller.status(),
+        "status": await active_controller.status(),
     }
 
 
-@router.get("/healthz", response_model=None)
+@router.get(
+    "/healthz",
+    response_model=HealthzResponse,
+    responses={503: {"model": HealthzUnavailableResponse}},
+)
 async def healthz(
     active_controller: SimulationController = Depends(get_active_controller),
 ) -> dict[str, Any] | JSONResponse:

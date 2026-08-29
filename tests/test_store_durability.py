@@ -359,3 +359,54 @@ def test_update_many_does_not_publish_a_rewrite_that_failed_to_persist(tmp_path,
     on_disk = [json.loads(line) for line in
                (tmp_path / "events.jsonl").read_text(encoding="utf-8").splitlines() if line.strip()]
     assert [r["event"]["traceability_lot_code"] for r in on_disk] == ["LOT-ORIGINAL"]
+
+
+# ---------------------------------------------------------------------------
+# #98 — every persisted line must be strict RFC 8259 JSON.
+# ---------------------------------------------------------------------------
+
+
+def _reject_json_constants(token: str) -> float:
+    """A ``parse_constant`` hook that makes ``json.loads`` strict.
+
+    Python's ``json`` is deliberately lenient: it accepts the bare ``NaN``,
+    ``Infinity`` and ``-Infinity`` tokens that ``json.dumps`` emits by
+    default, which is exactly why a NaN quantity used to round-trip fine
+    inside inflow-lab while breaking every strict external consumer
+    (browser ``JSON.parse``, Go ``encoding/json``, Rust serde) and being
+    silently coerced to ``null`` by ``jq``. Raising here gives us the
+    strict-parser behavior those consumers have.
+    """
+    raise ValueError(f"non-RFC-8259 JSON token: {token}")
+
+
+def test_persisted_lines_parse_under_a_strict_json_parser(tmp_path):
+    persist_path = tmp_path / "events.jsonl"
+    store = EventStore(persist_path=str(persist_path))
+    store.add_many([make_record("TLC-STRICT-000001", kdes={"harvest_date": "2026-02-05"})])
+
+    for line in persist_path.read_text(encoding="utf-8").splitlines():
+        # Raises if the line carries NaN/Infinity; passes on real JSON.
+        json.loads(line, parse_constant=_reject_json_constants)
+
+
+def test_serialize_record_refuses_to_emit_a_non_finite_quantity():
+    """``allow_nan=False`` is the write path's own format guarantee.
+
+    ``quantity`` is now guarded at the model (``allow_inf_nan=False``), so a
+    validated record can no longer carry NaN. This pins the layer *below*
+    that: a record built without validation -- ``model_construct``, which is
+    what any future producer bypassing the model looks like -- must make the
+    serializer raise rather than silently write a bare ``NaN`` token. Note
+    ``quantity`` is a typed ``float``, so ``model_dump(mode="json")`` passes
+    NaN through unchanged; only fields typed ``Any`` (like ``kdes``) get
+    coerced to ``None`` by pydantic, which is why the typed field is the one
+    that needs this guard.
+    """
+    record = make_record("TLC-NONFINITE-000002")
+    record.event = RegEngineEvent.model_construct(
+        **(record.event.model_dump() | {"quantity": float("nan")})
+    )
+
+    with pytest.raises(ValueError):
+        store_module._serialize_record(record)

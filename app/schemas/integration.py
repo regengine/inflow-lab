@@ -12,6 +12,11 @@ class IntegrationStatusResponse(BaseModel):
     mode: DestinationMode
     endpoint: str
     endpoint_host: str
+    # The live ingest URL applied when no endpoint is configured, published
+    # so the console can show it and defer to it instead of keeping its own
+    # copy of the literal (#155). Distinct from `endpoint` above, which is
+    # the *effective* target and equals this only while nothing overrides it.
+    default_endpoint: str
     api_key_configured: bool
     tenant_configured: bool
     hmac_configured: bool
