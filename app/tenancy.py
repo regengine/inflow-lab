@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import logging
 import os
 from pathlib import Path
@@ -41,8 +42,25 @@ _tenant_lock = RLock()
 
 
 async def shutdown_tenant_controllers() -> None:
-    for tenant_controller in set(_tenant_controllers.values()):
-        await tenant_controller.shutdown()
+    """Shut every tenant's controller down at once, not one after another.
+
+    Serially awaiting each `shutdown()` meant container shutdown paid the sum
+    of every tenant's stop latency. Each `shutdown()` is now individually
+    bounded (see `SimulationController.shutdown`), and running them
+    concurrently keeps the total near the slowest one rather than their sum.
+    `return_exceptions` so one wedged tenant cannot stop the others being
+    cleaned up.
+    """
+    controllers = set(_tenant_controllers.values())
+    if not controllers:
+        return
+    outcomes = await asyncio.gather(
+        *(tenant_controller.shutdown() for tenant_controller in controllers),
+        return_exceptions=True,
+    )
+    for outcome in outcomes:
+        if isinstance(outcome, BaseException):
+            logger.warning("Tenant controller shutdown failed: %s", outcome)
 
 
 def active_controller_for_context(context: TenantContext) -> SimulationController:

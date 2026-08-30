@@ -10,6 +10,7 @@ from collections.abc import Iterator
 from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Any
 
 import httpx
 
@@ -121,7 +122,7 @@ def _run_dashboard_smoke(base_url: str, config: BrowserSmokeConfig) -> None:
     failed = False
     try:
         with sync_playwright() as playwright:
-            launch_options: dict[str, object] = {"headless": config.headless}
+            launch_options: dict[str, Any] = {"headless": config.headless}
             if config.executable_path:
                 launch_options["executable_path"] = config.executable_path
             browser = playwright.chromium.launch(**launch_options)
@@ -267,8 +268,8 @@ def _run_dashboard_smoke(base_url: str, config: BrowserSmokeConfig) -> None:
             raise RuntimeError(f"Browser console errors: {console_errors}")
 
 
-def _browser_context_options(config: BrowserSmokeConfig) -> dict[str, object]:
-    options: dict[str, object] = {}
+def _browser_context_options(config: BrowserSmokeConfig) -> dict[str, Any]:
+    options: dict[str, Any] = {}
     if config.username and config.password:
         options["http_credentials"] = {
             "username": config.username,

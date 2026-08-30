@@ -5,6 +5,7 @@ import logging
 import os
 import uuid
 from collections import defaultdict, deque
+from contextlib import suppress
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from typing import Any, Literal
@@ -24,7 +25,7 @@ from .regengine_client import (
 )
 from .scenario_saves import ScenarioSaveStore
 from .scenarios import ScenarioId, get_scenario
-from .schemas.domain import DemoFixtureId, DestinationMode, StoredEventRecord
+from .schemas.domain import DemoFixtureId, DestinationMode, RegEngineEvent, StoredEventRecord
 from .schemas.ingestion import (
     CSVImportRequest,
     CSVImportResponse,
@@ -53,6 +54,33 @@ from .schemas.simulation import (
 from .store import EventStore, mask_secret_in_payload, mask_secret_in_string
 
 logger = logging.getLogger(__name__)
+
+DEFAULT_SHUTDOWN_TIMEOUT_SECONDS = 10.0
+
+_REPLAY_STATUS: dict[str, Literal["posted", "rebuilt", "failed"]] = {
+    "posted": "posted",
+    "failed": "failed",
+    "generated": "rebuilt",
+}
+
+# What a caller is told when its delivery landed but the store moved underneath
+# it. The events did reach the endpoint; what was abandoned is the local record
+# of them, because writing it would have resurrected a store the operator just
+# cleared.
+STALE_COMMIT_NOTE = (
+    "Delivery completed, but the store was reset or reconfigured while it was in "
+    "flight, so these records were not committed locally."
+)
+
+
+def _shutdown_timeout_seconds() -> float:
+    try:
+        value = float(
+            os.getenv("REGENGINE_SHUTDOWN_TIMEOUT_SECONDS", str(DEFAULT_SHUTDOWN_TIMEOUT_SECONDS))
+        )
+    except ValueError:
+        return DEFAULT_SHUTDOWN_TIMEOUT_SECONDS
+    return value if value > 0 else DEFAULT_SHUTDOWN_TIMEOUT_SECONDS
 
 
 @dataclass(slots=True)
@@ -91,6 +119,13 @@ class SimulationController:
         self._task: asyncio.Task[None] | None = None
         self._stop_event = asyncio.Event()
         self._lock = asyncio.Lock()
+        # Bumped whenever the store is cleared or repointed. Delivery now runs
+        # outside `_lock` (#208), so between snapshotting what to send and
+        # committing the outcome, a `reset()` or a fixture load can land. The
+        # epoch is how the commit phase notices: if it changed, the batch in
+        # flight describes a store that no longer exists and is dropped rather
+        # than written over the new one.
+        self._store_epoch = 0
         self._revision = 0
         self._change_condition = asyncio.Condition()
 
@@ -108,6 +143,7 @@ class SimulationController:
             previous_config = self.config
             self.config = config
             self.store.configure(config.persist_path)
+            self._store_epoch += 1
             if not self.running and (
                 config.seed != previous_config.seed
                 or config.scenario != previous_config.scenario
@@ -131,7 +167,28 @@ class SimulationController:
         await self._publish_update()
 
     async def shutdown(self) -> None:
-        await self.stop()
+        """Stop the run loop, giving up rather than hanging on a wedged one.
+
+        Container shutdown used to inherit whatever the run loop was waiting
+        on. Delivery no longer holds `_lock`, so a stop signal lands promptly,
+        but a single in-flight POST can still take the full live timeout (30s
+        by default), and the platform's shutdown grace period is shorter than
+        that. Cancel instead of waiting past the cap.
+        """
+        try:
+            await asyncio.wait_for(self.stop(), timeout=_shutdown_timeout_seconds())
+        except TimeoutError:
+            logger.warning(
+                "Controller shutdown timed out after %ss; cancelling the run loop: tenant=%s",
+                _shutdown_timeout_seconds(),
+                self.tenant_id,
+            )
+            task = self._task
+            if task is not None and not task.done():
+                task.cancel()
+                with suppress(asyncio.CancelledError, Exception):
+                    await task
+            self._task = None
 
     async def reset(self, config: SimulationConfig | None = None) -> None:
         await self.stop()
@@ -142,12 +199,18 @@ class SimulationController:
             self.engine.reset(self.config.seed, scenario=self.config.scenario, scale=self.config.scale)
             self.store.reset()
             self.mock_service.reset()
+            self._store_epoch += 1
         await self._publish_update()
 
     async def step(self, batch_size: int | None = None, config: SimulationConfig | None = None) -> StepResponse:
+        # Phase 1 -- snapshot under the lock. The engine advances here because
+        # its state is shared; everything the delivery needs is copied out so
+        # phase 2 does not read `self` at all.
         async with self._lock:
             _validate_live_delivery(self.config.delivery)
-            size = batch_size or self.config.batch_size
+            step_config = self.config
+            epoch = self._store_epoch
+            size = batch_size or step_config.batch_size
             events = []
             lineages = []
             for _ in range(size):
@@ -155,32 +218,32 @@ class SimulationController:
                 events.append(event)
                 lineages.append(parent_lot_codes)
 
-            payload = IngestPayload(source=self.config.source, events=events)
-            outcome = await self._deliver_payload(
-                payload,
-                self.config,
-                idempotency_key=uuid.uuid4().hex,
-            )
+        # Phase 2 -- deliver with the lock released.
+        payload = IngestPayload(source=step_config.source, events=events)
+        outcome = await self._deliver_payload(
+            payload,
+            step_config,
+            idempotency_key=uuid.uuid4().hex,
+        )
 
-            stored_records: list[StoredEventRecord] = []
-            response_events = (outcome.response or {}).get("events", []) if outcome.response else []
-            paired_responses = _pair_event_responses(events, response_events)
-            for index, event in enumerate(events):
-                event_response = paired_responses[index]
-                stored_records.append(
-                    StoredEventRecord(
-                        payload_source=self.config.source,
-                        event=event,
-                        parent_lot_codes=lineages[index],
-                        destination_mode=self.config.delivery.mode,
-                        delivery_attempts=outcome.delivery_attempts,
-                        last_delivery_attempt_at=outcome.attempted_at,
-                        delivery_response=event_response,
-                        delivery_metadata=outcome.metadata,
-                        **_event_delivery_fields(outcome, event_response),
-                    )
+        # Phase 3 -- commit under the lock, unless the store moved.
+        async with self._lock:
+            committed = epoch == self._store_epoch
+            stored_records = _build_stored_records(
+                events=events,
+                lineages=lineages,
+                source=step_config.source,
+                delivery_mode=step_config.delivery.mode,
+                outcome=outcome,
+            )
+            if committed:
+                self.store.add_many(stored_records)
+            else:
+                logger.warning(
+                    "Dropped a step commit: the store changed during delivery: tenant=%s events=%d",
+                    self.tenant_id,
+                    len(events),
                 )
-            self.store.add_many(stored_records)
 
             result = StepResponse(
                 generated=len(events),
@@ -190,16 +253,17 @@ class SimulationController:
                 failed=outcome.failed,
                 lot_codes=[event.traceability_lot_code for event in events],
                 delivery_status=outcome.delivery_status,
-                delivery_mode=self.config.delivery.mode,
+                delivery_mode=step_config.delivery.mode,
                 delivery_attempts=outcome.delivery_attempts,
                 response=outcome.response,
-                error=outcome.error_message,
+                error=_with_stale_note(outcome.error_message, committed),
             )
         await self._publish_update()
         return result
 
     async def replay(self, request: ReplayRequest | None = None) -> ReplayResponse:
         request = request or ReplayRequest()
+        # Phase 1 -- snapshot under the lock.
         async with self._lock:
             persist_path = request.persist_path or self.config.persist_path
             source = request.source or self.config.source
@@ -215,44 +279,44 @@ class SimulationController:
             records = self.store.read_persisted_records(persist_path)
             events = [record.event for record in records]
 
-            if not events:
-                result = ReplayResponse(
-                    status="empty",
-                    read=0,
-                    replayed=0,
-                    posted=0,
-                    failed=0,
-                    source=source,
-                    persist_path=persist_path,
-                    delivery_mode=delivery.mode,
-                    delivery_attempts=0,
-                )
-            else:
-                payload = IngestPayload(source=source, events=events)
-                outcome = await self._deliver_payload(payload, replay_config)
-                _REPLAY_STATUS: dict[str, Literal["posted", "rebuilt", "failed"]] = {
-                    "posted": "posted",
-                    "failed": "failed",
-                    "generated": "rebuilt",
-                }
-                replay_status = _REPLAY_STATUS[outcome.delivery_status]
-                result = ReplayResponse(
-                    status=replay_status,
-                    read=len(records),
-                    replayed=len(events),
-                    posted=outcome.posted,
-                    failed=outcome.failed,
-                    source=source,
-                    persist_path=persist_path,
-                    delivery_mode=delivery.mode,
-                    delivery_attempts=outcome.delivery_attempts,
-                    response=outcome.response,
-                    error=outcome.error_message,
-                )
+        if not events:
+            result = ReplayResponse(
+                status="empty",
+                read=0,
+                replayed=0,
+                posted=0,
+                failed=0,
+                source=source,
+                persist_path=persist_path,
+                delivery_mode=delivery.mode,
+                delivery_attempts=0,
+            )
+        else:
+            # Phase 2 -- deliver with the lock released. Replay re-posts what is
+            # already on disk and writes nothing back, so there is no phase 3
+            # and no epoch check: a concurrent `reset()` cannot make this commit
+            # wrong, because there is no commit.
+            payload = IngestPayload(source=source, events=events)
+            outcome = await self._deliver_payload(payload, replay_config)
+            replay_status = _REPLAY_STATUS[outcome.delivery_status]
+            result = ReplayResponse(
+                status=replay_status,
+                read=len(records),
+                replayed=len(events),
+                posted=outcome.posted,
+                failed=outcome.failed,
+                source=source,
+                persist_path=persist_path,
+                delivery_mode=delivery.mode,
+                delivery_attempts=outcome.delivery_attempts,
+                response=outcome.response,
+                error=outcome.error_message,
+            )
         await self._publish_update()
         return result
 
     async def import_csv(self, request: CSVImportRequest) -> CSVImportResponse:
+        # Phase 1 -- snapshot under the lock.
         async with self._lock:
             source = request.source or self.config.source
             delivery = request.delivery or self.config.delivery
@@ -264,35 +328,40 @@ class SimulationController:
                 },
                 deep=True,
             )
+            epoch = self._store_epoch
             parsed = parse_csv_import(
                 request.import_type,
                 request.csv_text,
                 default_timestamp=datetime.now(UTC),
             )
 
-            outcome = DeliveryOutcome()
+        # Phase 2 -- deliver with the lock released.
+        outcome = DeliveryOutcome()
+        if parsed.events:
+            payload = IngestPayload(source=source, events=parsed.events)
+            outcome = await self._deliver_payload(payload, import_config)
+
+        # Phase 3 -- commit under the lock, unless the store moved.
+        async with self._lock:
+            committed = epoch == self._store_epoch
             stored_records: list[StoredEventRecord] = []
             if parsed.events:
-                payload = IngestPayload(source=source, events=parsed.events)
-                outcome = await self._deliver_payload(payload, import_config)
-                response_events = (outcome.response or {}).get("events", []) if outcome.response else []
-                paired_responses = _pair_event_responses(parsed.events, response_events)
-                for index, event in enumerate(parsed.events):
-                    event_response = paired_responses[index]
-                    stored_records.append(
-                        StoredEventRecord(
-                            payload_source=source,
-                            event=event,
-                            parent_lot_codes=parsed.parent_lot_codes[index],
-                            destination_mode=delivery.mode,
-                            delivery_attempts=outcome.delivery_attempts,
-                            last_delivery_attempt_at=outcome.attempted_at,
-                            delivery_response=event_response,
-                            delivery_metadata=outcome.metadata,
-                            **_event_delivery_fields(outcome, event_response),
-                        )
+                stored_records = _build_stored_records(
+                    events=parsed.events,
+                    lineages=parsed.parent_lot_codes,
+                    source=source,
+                    delivery_mode=delivery.mode,
+                    outcome=outcome,
+                )
+                if committed:
+                    self.store.add_many(stored_records)
+                else:
+                    logger.warning(
+                        "Dropped a CSV import commit: the store changed during delivery: "
+                        "tenant=%s events=%d",
+                        self.tenant_id,
+                        len(parsed.events),
                     )
-                self.store.add_many(stored_records)
 
             rejected = parsed.total - len(parsed.events)
             status: Literal["accepted", "partial", "rejected", "delivery_failed"]
@@ -311,7 +380,9 @@ class SimulationController:
                 total=parsed.total,
                 accepted=len(parsed.events),
                 rejected=rejected,
-                stored=len(stored_records),
+                # `stored` is what reached the store, so a dropped commit
+                # reports 0 rather than the size of the batch it threw away.
+                stored=len(stored_records) if committed else 0,
                 posted=outcome.posted,
                 failed=outcome.failed,
                 source=source,
@@ -321,7 +392,7 @@ class SimulationController:
                 errors=parsed.errors,
                 warnings=parsed.warnings,
                 response=outcome.response,
-                error=outcome.error_message,
+                error=_with_stale_note(outcome.error_message, committed),
             )
         await self._publish_update()
         return result
@@ -335,6 +406,9 @@ class SimulationController:
         fixture = get_demo_fixture(fixture_id)
         await self.stop()
 
+        # Phase 1 -- reconfigure and snapshot under the lock. The epoch is read
+        # *after* this path's own reset, so the fixture load does not treat its
+        # own clearing of the store as somebody else's.
         async with self._lock:
             source = request.source or self.config.source
             delivery = request.delivery or self.config.delivery
@@ -352,35 +426,52 @@ class SimulationController:
             if request.reset:
                 self.store.reset()
                 self.mock_service.reset()
-
+            self._store_epoch += 1
+            epoch = self._store_epoch
+            fixture_config = self.config
             events = [fixture_event.event for fixture_event in fixture.events]
-            payload = IngestPayload(source=source, events=events)
-            outcome = await self._deliver_payload(payload, self.config)
-            response_events = (outcome.response or {}).get("events", []) if outcome.response else []
-            paired_responses = _pair_event_responses(events, response_events)
-            stored_records = []
-            for index, fixture_event in enumerate(fixture.events):
-                event_response = paired_responses[index]
-                stored_records.append(
-                    StoredEventRecord(
-                        payload_source=source,
-                        event=fixture_event.event,
-                        parent_lot_codes=list(fixture_event.parent_lot_codes),
-                        destination_mode=delivery.mode,
-                        delivery_attempts=outcome.delivery_attempts,
-                        last_delivery_attempt_at=outcome.attempted_at,
-                        delivery_response=event_response,
-                        delivery_metadata=outcome.metadata,
-                        **_event_delivery_fields(outcome, event_response),
-                    )
+
+        # Phase 2 -- deliver with the lock released.
+        payload = IngestPayload(source=source, events=events)
+        outcome = await self._deliver_payload(payload, fixture_config)
+
+        # Phase 3 -- commit under the lock, unless the store moved.
+        async with self._lock:
+            committed = epoch == self._store_epoch
+            stored_records = _build_stored_records(
+                events=events,
+                lineages=[list(fixture_event.parent_lot_codes) for fixture_event in fixture.events],
+                source=source,
+                delivery_mode=delivery.mode,
+                outcome=outcome,
+            )
+            if committed:
+                self.store.add_many(stored_records)
+            else:
+                logger.warning(
+                    "Dropped a fixture-load commit: the store changed during delivery: "
+                    "tenant=%s fixture=%s events=%d",
+                    self.tenant_id,
+                    fixture.id.value,
+                    len(events),
                 )
-            self.store.add_many(stored_records)
+
+            fixture_status: Literal["loaded", "delivery_failed"]
+            if outcome.delivery_status == "failed":
+                fixture_status = "delivery_failed"
+            elif not committed:
+                # A load that stored nothing must not answer `loaded`; #217
+                # records exactly this shape as a defect in the other tree.
+                fixture_status = "delivery_failed"
+            else:
+                fixture_status = "loaded"
+
             result = DemoFixtureLoadResponse(
-                status="delivery_failed" if outcome.delivery_status == "failed" else "loaded",
+                status=fixture_status,
                 fixture_id=fixture.id,
                 scenario=fixture.scenario,
                 loaded=len(events),
-                stored=len(stored_records),
+                stored=len(stored_records) if committed else 0,
                 posted=outcome.posted,
                 failed=outcome.failed,
                 source=source,
@@ -388,7 +479,7 @@ class SimulationController:
                 delivery_attempts=outcome.delivery_attempts,
                 lot_codes=fixture.lot_codes,
                 response=outcome.response,
-                error=outcome.error_message,
+                error=_with_stale_note(outcome.error_message, committed),
             )
         await self._publish_update()
         return result
@@ -461,6 +552,10 @@ class SimulationController:
         request: DeliveryRetryRequest | None = None,
     ) -> DeliveryRetryResponse:
         request = request or DeliveryRetryRequest()
+        # Set in phase 1 for the three cases that deliver nothing; otherwise
+        # left None so phase 2 knows there is a batch to send.
+        result: DeliveryRetryResponse | None = None
+        # Phase 1 -- snapshot under the lock.
         async with self._lock:
             delivery = request.delivery or self.config.delivery
             candidates = self.store.failed_delivery_records(request.record_ids, limit=request.limit)
@@ -494,10 +589,8 @@ class SimulationController:
                 )
             else:
                 _validate_live_delivery(delivery)
-                posted = 0
-                failed = 0
-                updated_records: list[StoredEventRecord] = []
-                responses: list[dict[str, Any]] = []
+                retry_config_base = self.config
+                epoch = self._store_epoch
                 grouped_records: dict[tuple[str, str | None], list[StoredEventRecord]] = {}
                 for record in candidates:
                     source = request.source or record.payload_source
@@ -508,61 +601,82 @@ class SimulationController:
                     )
                     grouped_records.setdefault((source, idempotency_key), []).append(record)
 
-                for (source, idempotency_key), records in grouped_records.items():
-                    retry_config = self.config.model_copy(
-                        update={
-                            "source": source,
-                            "delivery": delivery,
-                        },
-                        deep=True,
-                    )
-                    payload = IngestPayload(source=source, events=[record.event for record in records])
-                    outcome = await self._deliver_payload(
-                        payload,
-                        retry_config,
-                        idempotency_key=idempotency_key,
-                    )
-                    response_events = (outcome.response or {}).get("events", []) if outcome.response else []
-                    responses.append(
-                        {
-                            "source": source,
-                            "delivery_status": outcome.delivery_status,
-                            "posted": outcome.posted,
-                            "failed": outcome.failed,
-                            "response": outcome.response,
-                            "error": outcome.error_message,
-                        }
-                    )
+        # Phase 2 -- deliver every group with the lock released. `result` is
+        # already set for the three cases that never deliver.
+        if result is None:
+            posted = 0
+            failed = 0
+            updated_records: list[StoredEventRecord] = []
+            responses: list[dict[str, Any]] = []
+            for (source, idempotency_key), records in grouped_records.items():
+                retry_config = retry_config_base.model_copy(
+                    update={
+                        "source": source,
+                        "delivery": delivery,
+                    },
+                    deep=True,
+                )
+                payload = IngestPayload(source=source, events=[record.event for record in records])
+                outcome = await self._deliver_payload(
+                    payload,
+                    retry_config,
+                    idempotency_key=idempotency_key,
+                )
+                response_events = (outcome.response or {}).get("events", []) if outcome.response else []
+                responses.append(
+                    {
+                        "source": source,
+                        "delivery_status": outcome.delivery_status,
+                        "posted": outcome.posted,
+                        "failed": outcome.failed,
+                        "response": outcome.response,
+                        "error": outcome.error_message,
+                    }
+                )
 
-                    paired_responses = _pair_event_responses(
-                        [record.event for record in records], response_events
-                    )
-                    for index, record in enumerate(records):
-                        event_response = paired_responses[index]
-                        next_attempts = record.delivery_attempts + outcome.delivery_attempts
-                        fields = _event_delivery_fields(outcome, event_response)
-                        if fields["delivery_status"] == "posted":
-                            fields["error"] = None
-                        else:
-                            fields["last_delivery_success_at"] = record.last_delivery_success_at
-                        updated_records.append(
-                            record.model_copy(
-                                update={
-                                    "destination_mode": delivery.mode,
-                                    "delivery_attempts": next_attempts,
-                                    "last_delivery_attempt_at": outcome.attempted_at
-                                    or record.last_delivery_attempt_at,
-                                    "delivery_response": event_response,
-                                    "delivery_metadata": outcome.metadata,
-                                    **fields,
-                                },
-                                deep=True,
-                            )
+                paired_responses = _pair_event_responses(
+                    [record.event for record in records], response_events
+                )
+                for index, record in enumerate(records):
+                    event_response = paired_responses[index]
+                    next_attempts = record.delivery_attempts + outcome.delivery_attempts
+                    fields = _event_delivery_fields(outcome, event_response)
+                    if fields["delivery_status"] == "posted":
+                        fields["error"] = None
+                    else:
+                        fields["last_delivery_success_at"] = record.last_delivery_success_at
+                    updated_records.append(
+                        record.model_copy(
+                            update={
+                                "destination_mode": delivery.mode,
+                                "delivery_attempts": next_attempts,
+                                "last_delivery_attempt_at": outcome.attempted_at
+                                or record.last_delivery_attempt_at,
+                                "delivery_response": event_response,
+                                "delivery_metadata": outcome.metadata,
+                                **fields,
+                            },
+                            deep=True,
                         )
-                    posted += outcome.posted
-                    failed += outcome.failed
+                    )
+                posted += outcome.posted
+                failed += outcome.failed
 
-                self.store.update_many(updated_records)
+            # Phase 3 -- commit under the lock, unless the store moved. This one
+            # matters most: `update_many` rewrites the whole log, so applying it
+            # after a `reset()` would resurrect every record the operator just
+            # deleted.
+            async with self._lock:
+                committed = epoch == self._store_epoch
+                if committed:
+                    self.store.update_many(updated_records)
+                else:
+                    logger.warning(
+                        "Dropped a delivery-retry commit: the store changed during delivery: "
+                        "tenant=%s records=%d",
+                        self.tenant_id,
+                        len(updated_records),
+                    )
                 retry_status: Literal["empty", "posted", "partial", "failed", "skipped"]
                 if posted and failed:
                     retry_status = "partial"
@@ -581,7 +695,10 @@ class SimulationController:
                     delivery_mode=delivery.mode,
                     record_ids=[record.record_id for record in candidates],
                     responses=responses,
-                    error=next((item["error"] for item in responses if item.get("error")), None),
+                    error=_with_stale_note(
+                        next((item["error"] for item in responses if item.get("error")), None),
+                        committed,
+                    ),
                 )
         await self._publish_update()
         return result
@@ -830,6 +947,50 @@ class SimulationController:
             persist_path=snapshot.config.persist_path,
             delivery_mode=snapshot.config.delivery.mode,
         )
+
+
+def _with_stale_note(error_message: str | None, committed: bool) -> str | None:
+    """Fold the dropped-commit note into a response's `error` field.
+
+    A caller has to be able to tell "your events were delivered and stored"
+    from "your events were delivered and then thrown away", and the machine-
+    readable status alone cannot say it -- the delivery genuinely succeeded.
+    """
+    if committed:
+        return error_message
+    if error_message:
+        return f"{error_message} {STALE_COMMIT_NOTE}"
+    return STALE_COMMIT_NOTE
+
+
+def _build_stored_records(
+    events: list[RegEngineEvent],
+    lineages: list[list[str]],
+    source: str,
+    delivery_mode: DestinationMode,
+    outcome: DeliveryOutcome,
+) -> list[StoredEventRecord]:
+    """Turn a delivered batch into the records that describe it.
+
+    Shared by `step`, `import_csv` and `load_demo_fixture`, which built this
+    identically three times over.
+    """
+    response_events = (outcome.response or {}).get("events", []) if outcome.response else []
+    paired_responses = _pair_event_responses(events, response_events)
+    return [
+        StoredEventRecord(
+            payload_source=source,
+            event=event,
+            parent_lot_codes=lineages[index],
+            destination_mode=delivery_mode,
+            delivery_attempts=outcome.delivery_attempts,
+            last_delivery_attempt_at=outcome.attempted_at,
+            delivery_response=paired_responses[index],
+            delivery_metadata=outcome.metadata,
+            **_event_delivery_fields(outcome, paired_responses[index]),
+        )
+        for index, event in enumerate(events)
+    ]
 
 
 def _pair_event_responses(

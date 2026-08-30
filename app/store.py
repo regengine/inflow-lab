@@ -192,13 +192,21 @@ class EventStore:
         record_ids: list[str] | None = None,
         limit: int = 50,
     ) -> list[StoredEventRecord]:
-        record_id_filter = set(record_ids or [])
+        # `None` means "no filter, retry everything"; an explicit empty list
+        # means "these zero records", which is nothing. `set(record_ids or [])`
+        # collapsed the two, so a direct caller passing [] got every failed
+        # record back. The caller-visible half of this was fixed in the
+        # controller (#144); this is the same bug one layer down, which #211
+        # notes was left behind.
+        record_id_filter = None if record_ids is None else set(record_ids)
+        if record_id_filter is not None and not record_id_filter:
+            return []
         records = self._all_records()
         failed_records = [
             record
             for record in records
             if record.delivery_status == "failed"
-            and (not record_id_filter or record.record_id in record_id_filter)
+            and (record_id_filter is None or record.record_id in record_id_filter)
         ]
         return failed_records[:limit]
 
