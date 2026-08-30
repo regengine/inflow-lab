@@ -59,6 +59,7 @@ class ScenarioSaveStore:
         config: SimulationConfig,
         records: Iterable[StoredEventRecord],
     ) -> ScenarioSaveSnapshot:
+        """Blocking: callers on the event loop must go through asyncio.to_thread."""
         return self.save(
             ScenarioSaveSnapshot(
                 scenario=scenario,
