@@ -156,13 +156,21 @@ class SimulationController:
         await self._publish_update()
 
     async def stop(self) -> None:
-        if not self.running:
-            return
-        self._stop_event.set()
         task = self._task
         if task is None:
             return
-        await task
+        self._stop_event.set()
+        if not task.done():
+            await task
+        elif not task.cancelled():
+            # A run loop that ended on its own leaves a finished task
+            # installed. Gating on `self.running` here -- which a done task
+            # makes False -- meant `stop()` returned without clearing it or
+            # bumping the revision. (`start()` does replace such a task, so
+            # this never blocked a restart; what it lost was the state change
+            # subscribers needed to see.) Retrieve any exception so asyncio
+            # does not log it as never retrieved.
+            task.exception()
         self._task = None
         await self._publish_update()
 
@@ -832,15 +840,39 @@ class SimulationController:
         )
 
     async def _run_loop(self) -> None:
-        while not self._stop_event.is_set():
-            await self.step(self.config.batch_size)
-            if self.config.interval_seconds <= 0:
-                await asyncio.sleep(0)
-            else:
-                try:
-                    await asyncio.wait_for(self._stop_event.wait(), timeout=self.config.interval_seconds)
-                except TimeoutError:
-                    continue
+        """Drive the simulation until stopped.
+
+        A crash in here used to be invisible. The task ended, `running` went
+        False because `task.done()` was already true, and `stop()` therefore
+        early-returned without clearing `self._task` or bumping the revision
+        -- so the SSE stream never told the console the run had died, and
+        asyncio logged a "never retrieved" exception at GC time instead.
+        """
+        try:
+            while not self._stop_event.is_set():
+                await self.step(self.config.batch_size)
+                if self.config.interval_seconds <= 0:
+                    await asyncio.sleep(0)
+                else:
+                    try:
+                        await asyncio.wait_for(self._stop_event.wait(), timeout=self.config.interval_seconds)
+                    except TimeoutError:
+                        continue
+        except asyncio.CancelledError:
+            # Shutdown cancels a wedged loop; that is not a run failure, and
+            # publishing here would await inside a cancellation.
+            raise
+        except Exception:
+            logger.exception(
+                "Simulation run loop stopped on an unhandled error: tenant=%s",
+                self.tenant_id,
+            )
+            # The run is over either way -- tell subscribers, so the console
+            # stops showing it as running. Deliberately not re-raised: the
+            # failure is already logged with its traceback and published, and
+            # re-raising would leave an unretrieved exception on a task that
+            # nothing is guaranteed to await.
+            await self._publish_update()
 
     async def _publish_update(self) -> None:
         async with self._change_condition:

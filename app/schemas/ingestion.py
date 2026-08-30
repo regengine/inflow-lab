@@ -91,11 +91,21 @@ class ReplayResponse(BaseModel):
     error: str | None = None
 
 
+# The importer parses the whole document into memory and turns every row into
+# a record, with no row cap of its own, so an unbounded `csv_text` is an
+# unbounded allocation. 2 MiB is roughly 13k rows at typical CTE row widths --
+# far more than any demo import -- and rejects as a 422 rather than dying in
+# the handler. Note this bounds what is *parsed*, not what is *received*:
+# the ASGI server still buffers the request body first, so a hard byte limit
+# belongs in front of the app.
+MAX_CSV_TEXT_CHARS = 2 * 1024 * 1024
+
+
 class CSVImportRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     import_type: CSVImportType
-    csv_text: str
+    csv_text: str = Field(max_length=MAX_CSV_TEXT_CHARS)
     source: str | None = None
     delivery: DeliveryConfig | None = None
 

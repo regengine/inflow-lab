@@ -76,10 +76,22 @@ class MockRegEngineService:
         idempotency_key: str | None = None,
         friction: tuple[str, ...] = (),
     ) -> MockIngestResponse:
-        for code in friction:
-            failure = FRICTION_RESPONSES.get(code)
-            if failure is not None:
-                raise MockRegEngineHTTPError(*failure)
+        # An unrecognised code used to be skipped in silence and the batch
+        # accepted with a 200 -- an operator rehearsing a failure mode that
+        # never fires, which is the exact class of silent no-op this simulator
+        # exists to surface. `MockFrictionCode` already pins the HTTP and
+        # config paths to the known set; this guards a direct caller.
+        # Validated up front so which code is reported does not depend on the
+        # order they were listed in.
+        unknown = sorted({code for code in friction if code not in FRICTION_RESPONSES})
+        if unknown:
+            raise MockRegEngineHTTPError(
+                422,
+                f"Unknown mock friction code(s): {', '.join(unknown)}. "
+                f"Known codes: {', '.join(sorted(FRICTION_RESPONSES))}.",
+            )
+        if friction:
+            raise MockRegEngineHTTPError(*FRICTION_RESPONSES[friction[0]])
 
         if len(payload.events) > MAX_BATCH_EVENTS:
             raise MockRegEngineHTTPError(

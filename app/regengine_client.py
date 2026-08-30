@@ -178,9 +178,17 @@ class LiveRegEngineClient:
         parsed = urlparse(endpoint)
         host = parsed.netloc
         if not api_key or not tenant_id:
+            # Name the field that is actually missing. Restating the rule
+            # ("both are required") left an operator who had set one of the two
+            # reading a message that described a condition they had already met.
+            missing = [
+                label
+                for label, value in (("an API key", api_key), ("a tenant id", tenant_id))
+                if not value
+            ]
             return ConnectionCheckResult(
                 verdict="not_configured",
-                detail="Both an API key and a tenant id are required before testing the connection.",
+                detail=f"Missing {' and '.join(missing)}. Both are required before testing the connection.",
                 endpoint_host=host,
             )
 
