@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 import os
 import uuid
 from collections import defaultdict, deque
@@ -52,6 +53,9 @@ from .scenarios import ScenarioId, get_scenario
 from .store import EventStore, mask_secret_in_payload, mask_secret_in_string
 
 
+logger = logging.getLogger(__name__)
+
+
 @dataclass(slots=True)
 class DeliveryOutcome:
     response: dict[str, Any] | None = None
@@ -73,7 +77,12 @@ class SimulationController:
         scenario_saves: ScenarioSaveStore,
         mock_service: MockRegEngineService,
         live_client: LiveRegEngineClient,
+        tenant_id: str | None = None,
     ) -> None:
+        # Only used to identify this controller in log lines. The default
+        # controller serves the shared store, so it is labelled as such rather
+        # than left blank.
+        self.tenant_id = tenant_id or "default"
         self.engine = engine
         self.store = store
         self.scenario_saves = scenario_saves
@@ -616,6 +625,7 @@ class SimulationController:
                 )
             return DeliveryOutcome()
         except MockRegEngineHTTPError as exc:
+            self._log_delivery_failure("mock", delivery_idempotency_key, payload, exc)
             return DeliveryOutcome(
                 delivery_status="failed",
                 failed=len(payload.events),
@@ -630,6 +640,7 @@ class SimulationController:
                 },
             )
         except LiveRegEngineDeliveryError as exc:
+            self._log_delivery_failure("live", delivery_idempotency_key, payload, exc)
             metadata = exc.metadata | {"attempted_event_count": len(payload.events)}
             if delivery_idempotency_key and "idempotency_key" not in metadata:
                 metadata["idempotency_key"] = delivery_idempotency_key
@@ -642,6 +653,9 @@ class SimulationController:
                 metadata=metadata,
             )
         except Exception as exc:  # pragma: no cover - exercised by live integration, not unit tests
+            self._log_delivery_failure(
+                config.delivery.mode.value, delivery_idempotency_key, payload, exc, unexpected=True
+            )
             metadata = {
                 "delivery_mode": config.delivery.mode.value,
                 "attempted_event_count": len(payload.events),
@@ -656,6 +670,35 @@ class SimulationController:
                 error_message=mask_secret_in_string(str(exc), api_key),
                 metadata=metadata,
             )
+
+    def _log_delivery_failure(
+        self,
+        delivery_mode: str,
+        idempotency_key: str | None,
+        payload: IngestPayload,
+        exc: Exception,
+        unexpected: bool = False,
+    ) -> None:
+        """Put a delivery failure in the log stream, not only in the response.
+
+        Before this, a failed delivery left no trace anywhere an operator
+        watching `docker logs` or Railway would see it -- the only record was
+        the value returned to whoever happened to be polling, or the `error`
+        field on the stored record. `idempotency_key` is the correlation id
+        because it already identifies the attempt end to end.
+
+        The message is masked with the same helper the response uses, so an api
+        key echoed back inside an error string does not reach the log unmasked.
+        """
+        logger.error(
+            "Delivery failed: tenant=%s mode=%s idempotency_key=%s events=%d error=%s",
+            self.tenant_id,
+            delivery_mode,
+            idempotency_key,
+            len(payload.events),
+            mask_secret_in_string(str(exc), self.config.delivery.api_key),
+            exc_info=unexpected,
+        )
 
     async def _run_loop(self) -> None:
         while not self._stop_event.is_set():

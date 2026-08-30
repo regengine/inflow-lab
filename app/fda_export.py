@@ -96,6 +96,20 @@ def apply_fda_export_preset(
     return sorted(filtered, key=lambda record: record.event.timestamp)
 
 
+# Excel, Google Sheets and LibreOffice all treat a cell beginning with one of
+# these as a formula to evaluate, so a value like `=cmd|'/c calc'!A1` arriving
+# through a product description or location name becomes live code the moment a
+# regulator opens the export. Neutralised with a leading apostrophe, which the
+# spreadsheet strips on display, per OWASP's CSV-injection guidance.
+_FORMULA_PREFIXES = ("=", "+", "-", "@", "\t", "\r")
+
+
+def _neutralize_formula(value: object) -> object:
+    if not isinstance(value, str) or not value.startswith(_FORMULA_PREFIXES):
+        return value
+    return "'" + value
+
+
 def render_fda_request_csv(
     records: Iterable[StoredEventRecord],
     location_gln: Callable[[str], str],
@@ -107,6 +121,8 @@ def render_fda_request_csv(
         event = record.event
         writer.writerow(
             {
+                key: _neutralize_formula(value)
+                for key, value in {
                 "Traceability Lot Code": event.traceability_lot_code,
                 "Traceability Lot Code Description": event.cte_type.value,
                 "Product Description": event.product_description,
@@ -118,6 +134,7 @@ def render_fda_request_csv(
                 "Time": event.timestamp.time().isoformat(timespec="seconds"),
                 "Reference Document Type": event.kdes.get("reference_document_type", ""),
                 "Reference Document Number": event.kdes.get("reference_document_number", ""),
+                }.items()
             }
         )
     return output.getvalue()

@@ -46,6 +46,11 @@ async def delete_operator_tenant(
     if tenant_controller is not None:
         await tenant_controller.shutdown()
 
+    # Safe as written -- `operator_tenant_id` applies a strict regex and a URL
+    # segment cannot contain a slash -- but a recursive delete should not rest
+    # on an upstream validator staying strict, and this also catches a
+    # symlinked tenant directory redirecting the delete somewhere else.
+    tenancy.assert_within_tenant_root(tenant_dir)
     shutil.rmtree(tenant_dir, ignore_errors=True)
     return TenantOperationResponse(
         status="deleted",

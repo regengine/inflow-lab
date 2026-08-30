@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import hmac
 import json
+import logging
 import os
 import uuid
 from dataclasses import dataclass
@@ -14,6 +15,9 @@ import httpx
 from .contract import INFLOW_CONTRACT_VERSION
 from .schemas.ingestion import IngestPayload
 from .schemas.simulation import SimulationConfig
+
+
+logger = logging.getLogger(__name__)
 
 
 DEFAULT_LIVE_INGEST_ENDPOINT = "https://www.regengine.co/api/v1/webhooks/ingest"
@@ -108,12 +112,31 @@ class LiveRegEngineClient:
             async with httpx.AsyncClient(timeout=_live_timeout_seconds()) as client:
                 response = await client.post(endpoint, headers=headers, content=body_bytes)
         except httpx.HTTPError as exc:
+            # The transport never reached RegEngine. Logged here as well as
+            # raised because the exception only ever reaches the one caller
+            # holding the request; nothing else recorded that live ingest was
+            # failing. Log the exception class rather than str(exc), which can
+            # contain the full URL.
+            logger.warning(
+                "Live ingest transport error: endpoint=%s idempotency_key=%s events=%d error=%s",
+                endpoint,
+                idempotency_key,
+                len(payload.events),
+                exc.__class__.__name__,
+            )
             raise LiveRegEngineDeliveryError(str(exc), metadata) from exc
 
         metadata = metadata | {"status_code": response.status_code}
         try:
             response.raise_for_status()
         except httpx.HTTPStatusError as exc:
+            logger.warning(
+                "Live ingest rejected: endpoint=%s idempotency_key=%s events=%d status=%s",
+                endpoint,
+                idempotency_key,
+                len(payload.events),
+                response.status_code,
+            )
             raise LiveRegEngineDeliveryError(str(exc), metadata) from exc
         return LiveIngestResult(response=response.json(), metadata=metadata)
 
@@ -151,6 +174,11 @@ class LiveRegEngineClient:
                 )
                 remote_contract = await _fetch_remote_contract_version(client, parsed)
         except httpx.HTTPError as exc:
+            logger.warning(
+                "Connection test could not reach RegEngine: host=%s error=%s",
+                host,
+                exc.__class__.__name__,
+            )
             return ConnectionCheckResult(
                 verdict="unreachable",
                 detail=f"Could not reach RegEngine at {host}: {exc.__class__.__name__}",
