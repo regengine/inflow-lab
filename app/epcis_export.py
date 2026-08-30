@@ -131,7 +131,10 @@ def _render_transformation_event(
         "type": "TransformationEvent",
         "transformationID": transformation_id,
         "inputQuantityList": [
-            _quantity_element(lot_code=lot_code)
+            _quantity_element(
+                lot_code=lot_code,
+                **_input_quantity_for(record, lot_code),
+            )
             for lot_code in _input_lot_codes(record)
         ],
         "outputQuantityList": [
@@ -180,6 +183,33 @@ def _quantity_element(
     if product_description:
         element["regengine:productDescription"] = product_description
     return element
+
+
+def _input_quantity_for(record: StoredEventRecord, lot_code: str) -> dict[str, Any]:
+    """The quantity consumed from one input lot, if the event recorded it.
+
+    Every input element used to render with no `quantity` at all, because the
+    quantity taken from each input lot was not captured anywhere upstream --
+    only an aggregate `yield_ratio`. The `input_quantities` KDE (21 CFR
+    1.1350(a)(6)) now carries it per lot, so the export can finally emit it.
+    Absent or malformed entries fall back to the previous shape rather than
+    guessing, and `validate_event_kdes` is what flags that as a gap.
+    """
+    entries = record.event.kdes.get("input_quantities")
+    if not isinstance(entries, list):
+        return {}
+    for entry in entries:
+        if not isinstance(entry, dict) or entry.get("lot_code") != lot_code:
+            continue
+        quantity = entry.get("quantity")
+        if not isinstance(quantity, (int, float)) or isinstance(quantity, bool):
+            return {}
+        unit_of_measure = entry.get("unit_of_measure")
+        return {
+            "quantity": quantity,
+            "unit_of_measure": unit_of_measure if isinstance(unit_of_measure, str) else None,
+        }
+    return {}
 
 
 def _input_lot_codes(record: StoredEventRecord) -> list[str]:

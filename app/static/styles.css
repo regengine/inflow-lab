@@ -800,6 +800,15 @@ th {
   color: var(--warning);
 }
 
+/* A missing required KDE is a rule violation, not a nicety -- give it the
+   danger colour so it does not read as the same class of note as a missing
+   recommended one. */
+.status-warning[data-severity='required'],
+.lineage-warning[data-severity='required'] {
+  color: var(--danger);
+  font-weight: 600;
+}
+
 tbody tr.has-audit-warning {
   background: rgba(255, 251, 235, 0.58);
 }

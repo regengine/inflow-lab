@@ -111,6 +111,18 @@ class IndustryAdapter:
             "location_name": processor.name,
             "input_traceability_lot_codes": [lot.lot_code for lot in inputs],
             "input_products": [lot.product_description for lot in inputs],
+            # 21 CFR 1.1350(a)(6) wants the quantity and unit of measure used
+            # *from each* input lot, so an aggregate (`yield_ratio` below, or a
+            # single total) does not satisfy it. Every input lot the engine
+            # consumes gets its own entry.
+            "input_quantities": [
+                {
+                    "lot_code": lot.lot_code,
+                    "quantity": lot.quantity,
+                    "unit_of_measure": lot.unit_of_measure,
+                }
+                for lot in inputs
+            ],
             "output_traceability_lot_codes": [lot.lot_code for lot in outputs],
             "reference_document": engine._reference_document(reference_type, reference_number),
             "reference_document_type": reference_type,

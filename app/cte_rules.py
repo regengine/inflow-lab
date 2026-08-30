@@ -7,10 +7,23 @@ from .scenarios import ScenarioPreset
 from .schemas.domain import CTEType, RegEngineEvent, StoredEventRecord
 
 
+# Warning tiers, in descending order of how much they should worry a viewer.
+# "required" means the record is missing something the rule actually demands;
+# "recommended" means it is missing something that makes the record more useful
+# but that no rule requires.
+SEVERITY_REQUIRED = "required"
+SEVERITY_RECOMMENDED = "recommended"
+
+
 @dataclass(frozen=True, slots=True)
 class CTEValidationWarning:
     field: str
     message: str
+    # Defaulted so every existing construction site keeps working; the tiers
+    # that matter set it explicitly.
+    severity: str = SEVERITY_RECOMMENDED
+    # The regulation the requirement comes from, when there is one to cite.
+    citation: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -110,6 +123,24 @@ REQUIRED_KDES: dict[CTEType, tuple[str, ...]] = {
     ),
 }
 
+# KDEs the FSMA 204 rule requires that RegEngine's *ingest-time* schema gate
+# (REQUIRED_KDES above, pinned verbatim to its REQUIRED_KDES_BY_CTE) does not
+# check. They are not a divergence from RegEngine: RegEngine enforces these
+# through its compliance rules engine instead, where "Transformation events must
+# list all input traceability lot codes" is seeded at `critical` severity citing
+# 21 CFR 1.1350(a)(4) (services/shared/rules/seeds.py). Filing them under
+# RECOMMENDED_KDES understated them as a soft nudge, which is what #189 is
+# about; promoting them into REQUIRED_KDES would instead break the ingest pin
+# and claim live ingest rejects what it accepts. Hence a third tier: reported at
+# required severity, kept out of the pinned table.
+FSMA_REQUIRED_KDES: dict[CTEType, tuple[tuple[str, str], ...]] = {
+    CTEType.TRANSFORMATION: (
+        ("input_traceability_lot_codes", "21 CFR 1.1350(a)(4)"),
+        ("input_products", "21 CFR 1.1350(a)(5)"),
+        ("input_quantities", "21 CFR 1.1350(a)(6)"),
+    ),
+}
+
 RECOMMENDED_KDES: dict[CTEType, tuple[str, ...]] = {
     CTEType.HARVESTING: ("field_name", "tlc_source_reference"),
     CTEType.COOLING: ("harvest_location", "tlc_source_reference"),
@@ -124,7 +155,7 @@ RECOMMENDED_KDES: dict[CTEType, tuple[str, ...]] = {
     ),
     CTEType.SHIPPING: ("carrier", "reference_document_type"),
     CTEType.RECEIVING: ("reference_document_type",),
-    CTEType.TRANSFORMATION: ("input_traceability_lot_codes", "input_products", "reference_document_type"),
+    CTEType.TRANSFORMATION: ("reference_document_type",),
 }
 
 INDUSTRY_EVENT_REQUIREMENTS: dict[str, tuple[EventRequirement, ...]] = {
@@ -236,6 +267,21 @@ def validate_event_kdes(event: RegEngineEvent) -> list[CTEValidationWarning]:
                 CTEValidationWarning(
                     field=field,
                     message=f"Missing expected {event.cte_type.value} KDE: {field}",
+                    severity=SEVERITY_REQUIRED,
+                )
+            )
+
+    for field, citation in FSMA_REQUIRED_KDES.get(event.cte_type, ()):
+        if not _has_value(available.get(field)):
+            warnings.append(
+                CTEValidationWarning(
+                    field=field,
+                    message=(
+                        f"Missing expected {event.cte_type.value} KDE: {field} "
+                        f"(required by {citation})"
+                    ),
+                    severity=SEVERITY_REQUIRED,
+                    citation=citation,
                 )
             )
 
@@ -255,6 +301,22 @@ def validate_event_kdes(event: RegEngineEvent) -> list[CTEValidationWarning]:
                 CTEValidationWarning(
                     field="input_traceability_lot_codes",
                     message="Transformation input_traceability_lot_codes should be a non-empty list of lot codes",
+                    severity=SEVERITY_REQUIRED,
+                    citation="21 CFR 1.1350(a)(4)",
+                )
+            )
+
+        input_quantities = available.get("input_quantities")
+        if _has_value(input_quantities) and not _is_input_quantity_list(input_quantities):
+            warnings.append(
+                CTEValidationWarning(
+                    field="input_quantities",
+                    message=(
+                        "Transformation input_quantities should be a list of "
+                        "{lot_code, quantity, unit_of_measure} entries, one per input lot"
+                    ),
+                    severity=SEVERITY_REQUIRED,
+                    citation="21 CFR 1.1350(a)(6)",
                 )
             )
 
@@ -387,3 +449,27 @@ def _is_nonempty_string_list(value: Any) -> bool:
     return isinstance(value, list) and bool(value) and all(
         isinstance(item, str) and item.strip() for item in value
     )
+
+
+def _is_input_quantity_list(value: Any) -> bool:
+    """One {lot_code, quantity, unit_of_measure} entry per input lot.
+
+    21 CFR 1.1350(a)(6) requires the quantity and unit of measure consumed
+    *from each input lot*, not an aggregate -- so a single total, or a yield
+    ratio, does not satisfy it.
+    """
+    if not isinstance(value, list) or not value:
+        return False
+    for entry in value:
+        if not isinstance(entry, dict):
+            return False
+        lot_code = entry.get("lot_code")
+        quantity = entry.get("quantity")
+        unit = entry.get("unit_of_measure")
+        if not isinstance(lot_code, str) or not lot_code.strip():
+            return False
+        if not isinstance(quantity, (int, float)) or isinstance(quantity, bool):
+            return False
+        if not isinstance(unit, str) or not unit.strip():
+            return False
+    return True

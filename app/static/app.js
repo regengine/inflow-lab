@@ -726,15 +726,24 @@ function renderReadinessBanner(summary, events, status = state.status) {
   `;
 }
 
+// Warnings arrive as {field, message, severity, citation}. The events table has
+// room for one, so required-tier warnings sort ahead of recommended ones: a
+// missing transformation input lot is a rule violation, a missing
+// reference_document_type is a nicety, and the collapsed cell should show the
+// former. Older payloads without a severity are treated as recommended.
 function recordWarnings(record, summary, status = state.status) {
   const audit = backendAudit(status, summary);
   const warningPayload = audit?.warnings_by_record?.[record.record_id];
-  if (Array.isArray(warningPayload) && warningPayload.length) {
-    return warningPayload
-      .map((warning) => warning.message)
-      .filter((message) => typeof message === 'string' && message);
+  if (!Array.isArray(warningPayload) || !warningPayload.length) {
+    return [];
   }
-  return [];
+  return warningPayload
+    .filter((warning) => typeof warning?.message === 'string' && warning.message)
+    .map((warning) => ({
+      message: warning.message,
+      severity: warning.severity === 'required' ? 'required' : 'recommended',
+    }))
+    .sort((a, b) => (a.severity === b.severity ? 0 : a.severity === 'required' ? -1 : 1));
 }
 
 function renderScenarioWorkbench(status = state.status, events = state.events) {
@@ -1085,7 +1094,7 @@ function renderEvents(events) {
           <td>${escapeHtml(record.destination_mode)}</td>
           <td>
             ${escapeHtml(record.delivery_attempts || 0)}
-            ${warnings.length ? `<small class="status-warning">${escapeHtml(warnings[0])}</small>` : ''}
+            ${warnings.length ? `<small class="status-warning" data-severity="${escapeHtml(warnings[0].severity)}">${escapeHtml(warnings[0].message)}</small>` : ''}
           </td>
           <td>
             <span class="status-pill" data-tone="${escapeHtml(deliveryTone(record.delivery_status))}">${escapeHtml(record.delivery_status)}</span>
@@ -1199,7 +1208,7 @@ function renderLineage(payload, traceabilityLotCode) {
           <p><strong>Lot:</strong> ${escapeHtml(event.traceability_lot_code)}</p>
           <p><strong>Product:</strong> ${escapeHtml(event.product_description)}</p>
           <p><strong>Location:</strong> ${escapeHtml(event.location_name)}</p>
-          ${warnings.length ? `<p class="lineage-warning">${escapeHtml(warnings.join(' • '))}</p>` : ''}
+          ${warnings.length ? `<p class="lineage-warning" data-severity="${escapeHtml(warnings[0].severity)}">${escapeHtml(warnings.map((warning) => warning.message).join(' • '))}</p>` : ''}
           <ul>${kdes}</ul>
         </article>
       `;
