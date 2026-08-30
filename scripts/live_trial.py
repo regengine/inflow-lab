@@ -3,12 +3,12 @@ from __future__ import annotations
 import argparse
 import os
 import sys
+from collections.abc import Mapping
 from dataclasses import dataclass, field
 from typing import Any
 from urllib.parse import urlparse
 
 import httpx
-
 
 DEFAULT_TIMEOUT_SECONDS = 30.0
 TRIAL_SCENARIO = "fresh_cut_processor"
@@ -108,7 +108,7 @@ def config_from_env(
     *,
     require_live: bool,
 ) -> LiveTrialConfig:
-    environ = environ or os.environ
+    resolved_environ: Mapping[str, str] = environ if environ is not None else os.environ
     required_names = [
         "REGENGINE_REMOTE_BASE_URL",
         "REGENGINE_REMOTE_USERNAME",
@@ -124,22 +124,22 @@ def config_from_env(
             ]
         )
 
-    missing = [name for name in required_names if not environ.get(name)]
+    missing = [name for name in required_names if not resolved_environ.get(name)]
     if missing:
         raise LiveTrialFailure(
             "Missing required environment variables: " + ", ".join(missing)
         )
 
     return LiveTrialConfig(
-        base_url=normalize_base_url(environ["REGENGINE_REMOTE_BASE_URL"]),
-        username=environ["REGENGINE_REMOTE_USERNAME"],
-        password=environ["REGENGINE_REMOTE_PASSWORD"],
-        demo_tenant=environ["REGENGINE_REMOTE_TENANT"],
-        live_endpoint=normalize_base_url(environ["REGENGINE_LIVE_ENDPOINT"])
-        if environ.get("REGENGINE_LIVE_ENDPOINT")
+        base_url=normalize_base_url(resolved_environ["REGENGINE_REMOTE_BASE_URL"]),
+        username=resolved_environ["REGENGINE_REMOTE_USERNAME"],
+        password=resolved_environ["REGENGINE_REMOTE_PASSWORD"],
+        demo_tenant=resolved_environ["REGENGINE_REMOTE_TENANT"],
+        live_endpoint=normalize_base_url(resolved_environ["REGENGINE_LIVE_ENDPOINT"])
+        if resolved_environ.get("REGENGINE_LIVE_ENDPOINT")
         else None,
-        live_api_key=environ.get("REGENGINE_LIVE_API_KEY"),
-        live_tenant_id=environ.get("REGENGINE_LIVE_TENANT_ID"),
+        live_api_key=resolved_environ.get("REGENGINE_LIVE_API_KEY"),
+        live_tenant_id=resolved_environ.get("REGENGINE_LIVE_TENANT_ID"),
     )
 
 
@@ -180,6 +180,11 @@ def run_live_trial(
         return summary
     finally:
         stop_simulation(client, config)
+        # Only close what we opened. A caller-supplied client stays the
+        # caller's to manage; the one built above was leaked, holding its
+        # connection pool open for the life of the process.
+        if owns_client:
+            client.close()
 
 
 def run_mock_dry_run(client: httpx.Client, config: LiveTrialConfig) -> dict[str, Any]:

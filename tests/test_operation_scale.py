@@ -11,7 +11,6 @@ from app.scenarios import SCENARIO_PRESETS, ScenarioId, get_scenario, scale_scen
 from app.schemas.domain import OperationScale
 from app.schemas.simulation import SimulationConfig
 
-
 client = TestClient(app)
 
 

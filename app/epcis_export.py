@@ -1,11 +1,11 @@
 from __future__ import annotations
 
+from collections.abc import Callable, Iterable
 from datetime import UTC, datetime
-from typing import Any, Callable, Iterable
+from typing import Any
 from urllib.parse import quote
 
 from .schemas.domain import CTEType, StoredEventRecord
-
 
 EPCIS_CONTEXT = "https://ref.gs1.org/standards/epcis/2.0.0/epcis-context.jsonld"
 REGENGINE_EPCIS_CONTEXT = {"regengine": "https://www.regengine.co/ns/epcis#"}

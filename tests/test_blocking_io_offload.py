@@ -36,7 +36,6 @@ from app.schemas.domain import CTEType, RegEngineEvent, StoredEventRecord
 from app.schemas.simulation import SimulationConfig
 from app.store import EventStore
 
-
 # How long a single blocking call is made to take, and how much of that the
 # loop is allowed to lose. A blocking call on the loop yields ~0 ticks; an
 # offloaded one yields hundreds.

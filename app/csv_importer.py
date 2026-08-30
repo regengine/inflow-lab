@@ -4,6 +4,7 @@ import csv
 import io
 import json
 import re
+from collections.abc import Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from typing import Any
@@ -13,7 +14,6 @@ from pydantic import ValidationError
 from .cte_rules import validate_event_kdes
 from .schemas.domain import CSVImportType, CTEType, RegEngineEvent
 from .schemas.ingestion import CSVImportError, CSVImportWarning
-
 
 EVENT_REQUIRED_FIELDS = (
     "cte_type",
@@ -159,6 +159,10 @@ def _parse_seed_lot(
     if errors:
         return None, [], errors, []
 
+    # `_parse_timestamp` returns None only after appending to `errors`, so the
+    # guard above already excludes it. Asserted rather than left implicit: the
+    # invariant is three call frames away from the attribute access.
+    assert timestamp is not None  # nosec B101
     kdes.setdefault("harvest_date", timestamp.date().isoformat())
     kdes.setdefault("farm_location", row["location_name"])
     if row.get("field_name"):
@@ -221,7 +225,7 @@ def _build_event(
     return event, parent_lot_codes, [], warnings
 
 
-def _header_errors(fieldnames: list[str] | None) -> list[CSVImportError]:
+def _header_errors(fieldnames: Sequence[str] | None) -> list[CSVImportError]:
     if not fieldnames:
         return [CSVImportError(row=1, field="header", message="CSV header row is required")]
 

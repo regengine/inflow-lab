@@ -3,12 +3,12 @@ from __future__ import annotations
 import json
 import logging
 from collections import Counter, deque
+from collections.abc import Iterable
 from pathlib import Path
 from threading import RLock
-from typing import Any, Iterable
+from typing import Any
 
 from .schemas.domain import LineageEdge, LineageNode, StoredEventRecord
-
 
 # Sentinel that replaces secrets in scrubbed output. Not a credential.
 MASKED_SECRET = "***MASKED***"  # nosec B105
@@ -175,7 +175,7 @@ class EventStore:
         return [record for record in updated_records if record.record_id in replacements]
 
     def replace_all(self, records: Iterable[StoredEventRecord]) -> list[StoredEventRecord]:
-        persisted_records = sorted(list(records), key=lambda record: record.sequence_no)
+        persisted_records = sorted(records, key=lambda record: record.sequence_no)
         with self._lock:
             self.persist_path.parent.mkdir(parents=True, exist_ok=True)
             self._rewrite(persisted_records, operation="replace_all")

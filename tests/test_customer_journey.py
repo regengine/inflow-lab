@@ -2,10 +2,10 @@ from __future__ import annotations
 
 import pytest
 
-from scripts.customer_journey import build_config, generate_batch, parse_redis_url, resp_command
 from app.engine import LegitFlowEngine
 from app.mock_service import validate_event_like_regengine
 from app.scenarios import ScenarioId
+from scripts.customer_journey import build_config, generate_batch, parse_redis_url, resp_command
 
 
 def test_parse_redis_url_defaults() -> None:

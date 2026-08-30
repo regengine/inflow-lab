@@ -7,7 +7,7 @@ import uuid
 from collections import defaultdict, deque
 from dataclasses import dataclass
 from datetime import UTC, datetime
-from typing import Any
+from typing import Any, Literal
 from urllib.parse import urlparse
 
 from .audit import summarize_scenario_audit
@@ -16,6 +16,14 @@ from .csv_importer import parse_csv_import
 from .demo_fixtures import get_demo_fixture
 from .engine import LegitFlowEngine
 from .mock_service import MockRegEngineHTTPError, MockRegEngineService
+from .regengine_client import (
+    DEFAULT_LIVE_INGEST_ENDPOINT,
+    WEBHOOK_HMAC_SECRET_ENV,
+    LiveRegEngineClient,
+    LiveRegEngineDeliveryError,
+)
+from .scenario_saves import ScenarioSaveStore
+from .scenarios import ScenarioId, get_scenario
 from .schemas.domain import DemoFixtureId, DestinationMode, StoredEventRecord
 from .schemas.ingestion import (
     CSVImportRequest,
@@ -26,6 +34,7 @@ from .schemas.ingestion import (
     ReplayRequest,
     ReplayResponse,
 )
+from .schemas.integration import IntegrationConfigureRequest, IntegrationStatusResponse
 from .schemas.scenarios import (
     DemoFixtureLoadRequest,
     DemoFixtureLoadResponse,
@@ -41,17 +50,7 @@ from .schemas.simulation import (
     SimulationConfig,
     StepResponse,
 )
-from .regengine_client import (
-    DEFAULT_LIVE_INGEST_ENDPOINT,
-    WEBHOOK_HMAC_SECRET_ENV,
-    LiveRegEngineClient,
-    LiveRegEngineDeliveryError,
-)
-from .schemas.integration import IntegrationConfigureRequest, IntegrationStatusResponse
-from .scenario_saves import ScenarioSaveStore
-from .scenarios import ScenarioId, get_scenario
 from .store import EventStore, mask_secret_in_payload, mask_secret_in_string
-
 
 logger = logging.getLogger(__name__)
 
@@ -59,7 +58,7 @@ logger = logging.getLogger(__name__)
 @dataclass(slots=True)
 class DeliveryOutcome:
     response: dict[str, Any] | None = None
-    delivery_status: str = "generated"
+    delivery_status: Literal["generated", "posted", "failed"] = "generated"
     posted: int = 0
     failed: int = 0
     delivery_attempts: int = 0
@@ -231,11 +230,12 @@ class SimulationController:
             else:
                 payload = IngestPayload(source=source, events=events)
                 outcome = await self._deliver_payload(payload, replay_config)
-                replay_status = {
+                _REPLAY_STATUS: dict[str, Literal["posted", "rebuilt", "failed"]] = {
                     "posted": "posted",
                     "failed": "failed",
                     "generated": "rebuilt",
-                }[outcome.delivery_status]
+                }
+                replay_status = _REPLAY_STATUS[outcome.delivery_status]
                 result = ReplayResponse(
                     status=replay_status,
                     read=len(records),
@@ -295,6 +295,7 @@ class SimulationController:
                 self.store.add_many(stored_records)
 
             rejected = parsed.total - len(parsed.events)
+            status: Literal["accepted", "partial", "rejected", "delivery_failed"]
             if outcome.delivery_status == "failed":
                 status = "delivery_failed"
             elif parsed.events and parsed.errors:
@@ -562,14 +563,15 @@ class SimulationController:
                     failed += outcome.failed
 
                 self.store.update_many(updated_records)
+                retry_status: Literal["empty", "posted", "partial", "failed", "skipped"]
                 if posted and failed:
-                    status = "partial"
+                    retry_status = "partial"
                 elif failed:
-                    status = "failed"
+                    retry_status = "failed"
                 else:
-                    status = "posted"
+                    retry_status = "posted"
                 result = DeliveryRetryResponse(
-                    status=status,
+                    status=retry_status,
                     requested=requested,
                     retryable=len(candidates),
                     attempted=len(candidates),
@@ -720,7 +722,7 @@ class SimulationController:
             else:
                 try:
                     await asyncio.wait_for(self._stop_event.wait(), timeout=self.config.interval_seconds)
-                except asyncio.TimeoutError:
+                except TimeoutError:
                     continue
 
     async def _publish_update(self) -> None:

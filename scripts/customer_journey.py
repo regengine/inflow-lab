@@ -47,15 +47,16 @@ from typing import Any
 from urllib.parse import urlparse
 
 import httpx
+from pydantic import HttpUrl
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from app.engine import LegitFlowEngine  # noqa: E402
 from app.regengine_client import LiveRegEngineClient, LiveRegEngineDeliveryError  # noqa: E402
+from app.scenarios import ScenarioId  # noqa: E402
+from app.schemas.domain import DestinationMode  # noqa: E402
 from app.schemas.ingestion import IngestPayload  # noqa: E402
 from app.schemas.simulation import DeliveryConfig, SimulationConfig  # noqa: E402
-from app.scenarios import ScenarioId  # noqa: E402
-
 
 DEFAULT_BASE_URL = "http://localhost:8000"
 DEFAULT_REDIS_URL = "redis://localhost:6379/0"
@@ -165,8 +166,8 @@ def build_config(endpoint: str, api_key: str, tenant_id: str) -> SimulationConfi
         source=JOURNEY_SOURCE,
         scenario=ScenarioId.FRESH_CUT_PROCESSOR,
         delivery=DeliveryConfig(
-            mode="live",
-            endpoint=endpoint,
+            mode=DestinationMode.LIVE,
+            endpoint=HttpUrl(endpoint),
             api_key=api_key,
             tenant_id=tenant_id,
         ),

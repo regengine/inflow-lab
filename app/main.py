@@ -16,8 +16,13 @@ from .build_info import APP_VERSION
 from .cors import cors_origins_from_env
 from .exceptions import handle_value_error
 from .routers import events, health, ingestion, integration, mock_regengine, operator, scenarios, simulation
-from .tenancy import controller, scenario_saves
 
+# Re-exported, not used here: `app.main` is the entry point tests and
+# scripts drive the default tenant's controller through. Removing these
+# because they look unused inside this module breaks four test modules
+# that import them from here.
+from .tenancy import controller as controller
+from .tenancy import scenario_saves as scenario_saves
 
 static_dir = Path(__file__).parent / "static"
 
@@ -62,7 +67,10 @@ def create_app() -> FastAPI:
     fastapi_app.include_router(ingestion.router)
     fastapi_app.include_router(events.router)
     fastapi_app.include_router(mock_regengine.router)
-    fastapi_app.add_exception_handler(ValueError, handle_value_error)
+    # Starlette types the second argument as taking `Exception`, so a handler
+    # narrowed to the exception class it is registered for never satisfies it.
+    # The narrowing is the point; the registration is what guarantees it.
+    fastapi_app.add_exception_handler(ValueError, handle_value_error)  # type: ignore[arg-type]
 
     @fastapi_app.get("/")
     async def root() -> FileResponse:

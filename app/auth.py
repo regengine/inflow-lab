@@ -9,7 +9,6 @@ from dataclasses import dataclass
 from fastapi import Request
 from fastapi.responses import JSONResponse
 
-
 DEFAULT_TENANT_ID = "local-demo"
 TENANT_HEADER = "X-RegEngine-Tenant"
 _TENANT_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,63}$")

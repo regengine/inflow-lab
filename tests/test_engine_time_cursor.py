@@ -39,7 +39,7 @@ def _timestamps(count: int) -> list[datetime]:
 
 
 def _gaps(stamps: list[datetime]) -> list[float]:
-    return [(later - earlier).total_seconds() for earlier, later in zip(stamps, stamps[1:])]
+    return [(later - earlier).total_seconds() for earlier, later in zip(stamps, stamps[1:], strict=False)]
 
 
 class _FrozenDatetime(datetime):

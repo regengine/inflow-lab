@@ -3,8 +3,8 @@ from __future__ import annotations
 from dataclasses import dataclass
 from datetime import UTC, datetime
 
-from .schemas.domain import CTEType, DemoFixtureId, RegEngineEvent
 from .scenarios import ScenarioId
+from .schemas.domain import CTEType, DemoFixtureId, RegEngineEvent
 
 
 @dataclass(frozen=True, slots=True)

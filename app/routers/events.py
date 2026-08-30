@@ -6,7 +6,6 @@ from ..controller import SimulationController
 from ..dependencies import get_active_controller
 from ..schemas.exports import EventListResponse, LineageResponse
 
-
 router = APIRouter(prefix="/api", tags=["Events"])
 
 

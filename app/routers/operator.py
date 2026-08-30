@@ -9,7 +9,6 @@ from .. import tenancy
 from ..dependencies import require_operator_auth
 from ..schemas.operator import TenantListResponse, TenantOperationResponse, TenantSummary
 
-
 router = APIRouter(prefix="/api/operator", tags=["Operator"])
 
 

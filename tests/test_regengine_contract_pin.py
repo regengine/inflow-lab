@@ -13,7 +13,6 @@ from __future__ import annotations
 from app.cte_rules import REQUIRED_KDES
 from app.schemas.domain import CTEType
 
-
 REGENGINE_REQUIRED_KDES_BY_CTE: dict[CTEType, tuple[str, ...]] = {
     CTEType.HARVESTING: (
         "traceability_lot_code",

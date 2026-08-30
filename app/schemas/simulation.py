@@ -7,7 +7,6 @@ from pydantic import BaseModel, ConfigDict, Field, HttpUrl, field_validator, mod
 from ..scenarios import ScenarioId
 from .domain import DestinationMode, OperationScale
 
-
 MockFrictionCode = Literal["invalid_key", "subscription_inactive", "rate_limit"]
 
 

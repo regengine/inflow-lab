@@ -1,0 +1,12 @@
+{
+  "name": "inflow-lab-console",
+  "private": true,
+  "description": "Lint tooling for the operator console. The console is plain browser JS with no build step; this exists only so app/static/app.js has the same kind of gate the Python side has.",
+  "scripts": {
+    "lint": "eslint app/static/app.js"
+  },
+  "devDependencies": {
+    "eslint": "^9.18.0",
+    "globals": "^15.14.0"
+  }
+}

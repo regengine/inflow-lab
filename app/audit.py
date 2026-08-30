@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import asdict
+from typing import Any
 
 from .cte_rules import CTEValidationWarning, audit_warnings_for_event, evaluate_audit_checks
 from .scenarios import ScenarioPreset

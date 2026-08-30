@@ -6,7 +6,6 @@ from typing import Any
 from .scenarios import ScenarioPreset
 from .schemas.domain import CTEType, RegEngineEvent, StoredEventRecord
 
-
 # Warning tiers, in descending order of how much they should worry a viewer.
 # "required" means the record is missing something the rule actually demands;
 # "recommended" means it is missing something that makes the record more useful

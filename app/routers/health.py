@@ -12,7 +12,6 @@ from ..controller import SimulationController
 from ..dependencies import get_active_controller, get_tenant_context
 from ..schemas.health import HealthResponse, HealthzResponse
 
-
 router = APIRouter(prefix="/api", tags=["Health"])
 
 

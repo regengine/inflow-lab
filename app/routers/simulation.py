@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import asyncio
 import json
 from typing import Any
 
@@ -19,7 +18,6 @@ from ..schemas.simulation import (
     StatusResponse,
     StepResponse,
 )
-
 
 router = APIRouter(prefix="/api/simulate", tags=["Simulation"])
 
@@ -51,7 +49,7 @@ async def simulate_stream(
                 break
             try:
                 last_revision = await active_controller.wait_for_revision(last_revision)
-            except asyncio.TimeoutError:
+            except TimeoutError:
                 yield ": keep-alive\n\n"
                 continue
 

@@ -4,10 +4,10 @@ import asyncio
 from datetime import UTC, datetime
 from typing import Any
 
+from app.regengine_client import DEFAULT_LIVE_INGEST_ENDPOINT, LiveRegEngineClient
 from app.schemas.domain import CTEType, RegEngineEvent
 from app.schemas.ingestion import IngestPayload
 from app.schemas.simulation import SimulationConfig
-from app.regengine_client import DEFAULT_LIVE_INGEST_ENDPOINT, LiveRegEngineClient
 
 
 class FakeResponse:
@@ -26,7 +26,7 @@ class RecordingAsyncClient:
     def __init__(self, *, timeout: float) -> None:
         self.timeout = timeout
 
-    async def __aenter__(self) -> "RecordingAsyncClient":
+    async def __aenter__(self) -> RecordingAsyncClient:
         return self
 
     async def __aexit__(self, exc_type: object, exc: object, tb: object) -> None:

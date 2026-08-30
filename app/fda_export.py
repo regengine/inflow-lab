@@ -2,11 +2,10 @@ from __future__ import annotations
 
 import csv
 import io
+from collections.abc import Callable, Iterable
 from dataclasses import dataclass
-from typing import Callable, Iterable
 
 from .schemas.domain import CTEType, FDAExportPreset, StoredEventRecord
-
 
 FDA_EXPORT_COLUMNS = [
     "Traceability Lot Code",

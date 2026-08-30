@@ -11,10 +11,9 @@ from fastapi.testclient import TestClient
 from app.build_info import BRANCH_ENV_VARS, COMMIT_SHA_ENV_VARS, DEPLOYMENT_ID_ENV_VARS
 from app.cors import DEFAULT_CORS_ORIGINS
 from app.main import app, controller, cors_origins_from_env, scenario_saves
-from app.schemas.simulation import SimulationConfig
 from app.regengine_client import LiveIngestResult, LiveRegEngineDeliveryError
 from app.scenarios import ScenarioId, get_scenario
-
+from app.schemas.simulation import SimulationConfig
 
 client = TestClient(app)
 
@@ -23,7 +22,7 @@ PUBLIC_ENDPOINT = "https://www.regengine.co/api/v1/webhooks/ingest"
 
 
 def basic_auth_header(username: str, password: str) -> dict[str, str]:
-    token = base64.b64encode(f"{username}:{password}".encode("utf-8")).decode("ascii")
+    token = base64.b64encode(f"{username}:{password}".encode()).decode("ascii")
     return {"Authorization": f"Basic {token}"}
 
 

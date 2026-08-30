@@ -19,7 +19,6 @@ from .schemas.scenarios import ScenarioSaveRequest
 from .schemas.simulation import SimulationConfig
 from .store import EventStore
 
-
 logger = logging.getLogger(__name__)
 
 DATA_ROOT = Path(os.getenv("REGENGINE_DATA_DIR", "data"))
@@ -77,7 +76,7 @@ def operator_tenant_id(raw_tenant_id: str) -> str:
 
 
 def known_tenant_ids() -> list[str]:
-    tenant_ids = set()
+    tenant_ids: set[str] = set()
     with _tenant_lock:
         tenant_ids.update(
             tenant_id for tenant_id in _tenant_controllers if tenant_id != DEFAULT_TENANT_ID

@@ -13,3 +13,6 @@ uvicorn.out.log
 uvicorn.err.log
 output/playwright/
 data/pytest-tmp/
+
+# Console lint tooling (see package.json)
+node_modules/

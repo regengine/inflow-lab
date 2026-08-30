@@ -218,7 +218,7 @@ const ONBOARDING_KEY = 'inflowLab.onboarded.v1';
 function onboardingSeen() {
   try {
     return window.localStorage.getItem(ONBOARDING_KEY) === 'done';
-  } catch (error) {
+  } catch {
     return true;
   }
 }
@@ -226,7 +226,7 @@ function onboardingSeen() {
 function markOnboarded() {
   try {
     window.localStorage.setItem(ONBOARDING_KEY, 'done');
-  } catch (error) {
+  } catch {
     // Storage unavailable — the welcome simply shows again next visit.
   }
 }

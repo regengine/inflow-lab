@@ -16,7 +16,6 @@ from .contract import INFLOW_CONTRACT_VERSION
 from .schemas.ingestion import IngestPayload
 from .schemas.simulation import SimulationConfig
 
-
 logger = logging.getLogger(__name__)
 
 

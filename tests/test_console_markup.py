@@ -15,7 +15,6 @@ from __future__ import annotations
 import re
 from pathlib import Path
 
-
 APP_JS = Path(__file__).resolve().parents[1] / "app" / "static" / "app.js"
 
 # An attribute value in a template literal: name="...${...}...".
@@ -32,14 +31,14 @@ def _unescaped_attribute_interpolations() -> list[str]:
     source = APP_JS.read_text(encoding="utf-8")
     offenders: list[str] = []
     for line_number, line in enumerate(source.splitlines(), start=1):
-        for attribute, value in _ATTRIBUTE.findall(line):
+        for _attribute, value in _ATTRIBUTE.findall(line):
             for expression in _INTERPOLATION.findall(value):
                 expression = expression.strip()
                 if expression.startswith("escapeHtml("):
                     continue
                 if _LITERAL_TERNARY.match(expression):
                     continue
-                offenders.append(f"{APP_JS.name}:{line_number} {attribute}=\"${{{expression}}}\"")
+                offenders.append(f"{APP_JS.name}:{line_number} {_attribute}=\"${{{expression}}}\"")
     return offenders
 
 
@@ -58,7 +57,7 @@ def test_the_check_would_catch_a_regression():
     # Guards the guard: if the scanner stopped matching, the two tests above
     # would pass vacuously against a file that had regressed.
     offenders = []
-    for attribute, value in _ATTRIBUTE.findall('<div data-tone="${readiness.tone}">'):
+    for _attribute, value in _ATTRIBUTE.findall('<div data-tone="${readiness.tone}">'):
         offenders.extend(_INTERPOLATION.findall(value))
 
     assert offenders == ["readiness.tone"]

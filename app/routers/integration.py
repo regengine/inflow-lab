@@ -12,7 +12,6 @@ from ..schemas.integration import (
     IntegrationStatusResponse,
 )
 
-
 router = APIRouter(prefix="/api/integration", tags=["RegEngine Integration"])
 
 

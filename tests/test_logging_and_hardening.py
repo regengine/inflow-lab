@@ -21,6 +21,7 @@ import logging
 from pathlib import Path
 
 import pytest
+from fastapi import HTTPException
 
 from app import tenancy
 from app.controller import SimulationController
@@ -136,11 +137,6 @@ def test_the_delivery_log_line_does_not_leak_the_api_key(tmp_path, caplog):
     controller.config = controller.config.model_copy(
         update={"delivery": DeliveryConfig(mode="mock", api_key=secret)}
     )
-    config = SimulationConfig(
-        persist_path=str(tmp_path / "events.jsonl"),
-        delivery=DeliveryConfig(mode="mock", api_key=secret, mock_friction=["invalid_key"]),
-    )
-
     with caplog.at_level(logging.ERROR, logger="app.controller"):
         controller._log_delivery_failure(
             "mock",
@@ -201,10 +197,10 @@ def test_delete_refuses_a_path_outside_the_tenant_root(tmp_path, monkeypatch):
     outside = tmp_path / "not-a-tenant"
     outside.mkdir(parents=True)
 
-    with pytest.raises(Exception) as excinfo:
+    with pytest.raises(HTTPException) as excinfo:
         tenancy.assert_within_tenant_root(outside)
 
-    assert "outside the tenant root" in str(excinfo.value)
+    assert "outside the tenant root" in str(excinfo.value.detail)
 
 
 def test_delete_refuses_the_tenant_root_itself(tmp_path, monkeypatch):
@@ -212,7 +208,7 @@ def test_delete_refuses_the_tenant_root_itself(tmp_path, monkeypatch):
     root.mkdir(parents=True)
     monkeypatch.setattr(tenancy, "TENANT_DATA_ROOT", root)
 
-    with pytest.raises(Exception):
+    with pytest.raises(HTTPException):
         tenancy.assert_within_tenant_root(root)
 
 
@@ -224,7 +220,7 @@ def test_delete_refuses_a_symlinked_tenant_directory(tmp_path, monkeypatch):
     elsewhere.mkdir()
     (root / "sneaky").symlink_to(elsewhere, target_is_directory=True)
 
-    with pytest.raises(Exception):
+    with pytest.raises(HTTPException):
         tenancy.assert_within_tenant_root(root / "sneaky")
 
 

@@ -6,10 +6,10 @@ import subprocess  # nosec B404
 import sys
 import tempfile
 import time
+from collections.abc import Iterator
 from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Iterator
 
 import httpx
 
@@ -18,7 +18,6 @@ if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
 from app.build_info import APP_VERSION
-
 
 CSV_WITH_KDE_WARNINGS = """cte_type,traceability_lot_code,product_description,quantity,unit_of_measure,location_name,timestamp,kdes
 harvesting,TLC-BROWSER-WARN,Romaine Lettuce,10,cases,Valley Fresh Farms,2026-02-10T08:00:00Z,"{""harvest_date"":""2026-02-10""}"
@@ -358,4 +357,4 @@ if __name__ == "__main__":
         raise SystemExit(main())
     except Exception as exc:
         print(f"Browser smoke failed: {exc}", file=sys.stderr)
-        raise SystemExit(1)
+        raise SystemExit(1) from exc

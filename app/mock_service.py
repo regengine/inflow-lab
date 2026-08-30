@@ -11,7 +11,6 @@ from .cte_rules import REQUIRED_KDES
 from .schemas.domain import RegEngineEvent
 from .schemas.ingestion import IngestPayload, IngestResponseEvent, MockIngestResponse
 
-
 # Mirrors RegEngine's WebhookPayload constraint: events accepts 1-500 items.
 MAX_BATCH_EVENTS = 500
 # Mirrors RegEngine's Pydantic timestamp validator: >24h in the future is rejected.
@@ -124,7 +123,7 @@ class MockRegEngineService:
 
             raw = json.dumps(event.model_dump(mode="json"), sort_keys=True, separators=(",", ":"))
             sha256_hash = hashlib.sha256(raw.encode("utf-8")).hexdigest()
-            chain_seed = f"{self._chain_hash}:{sha256_hash}".encode("utf-8")
+            chain_seed = f"{self._chain_hash}:{sha256_hash}".encode()
             self._chain_hash = hashlib.sha256(chain_seed).hexdigest()
             accepted += 1
             response_events.append(
