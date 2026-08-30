@@ -7,7 +7,7 @@ Use this checklist before tagging a demo-ready build or handing the simulator to
 - [ ] `uv run pytest`
 - [ ] `uv run python scripts/smoke_regression.py`
 - [ ] `uv run --no-dev --group browser python scripts/browser_smoke.py`
-- [ ] `node --check app/static/app.js`
+- [ ] `npm ci && npm run lint` (the operator console)
 - [ ] `python3 -m compileall app scripts`
 - [ ] `uv pip check`
 - [ ] `uv run pip-audit`

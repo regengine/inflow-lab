@@ -10,7 +10,7 @@ export default [
     files: ['app/static/*.js'],
     languageOptions: {
       ecmaVersion: 2022,
-      sourceType: 'script',
+      sourceType: 'module',
       globals: {
         ...globals.browser,
       },
@@ -22,14 +22,11 @@ export default [
       'no-unused-vars': ['error', { argsIgnorePattern: '^_' }],
       'no-undef': 'error',
       'no-async-promise-executor': 'error',
+      'no-implicit-globals': 'error',
       'no-var': 'error',
       'prefer-const': 'error',
       eqeqeq: ['error', 'smart'],
       // Deliberately off:
-      //   no-implicit-globals   -- the file is one non-module script by
-      //     design, so every top-level function trips it. Splitting it into
-      //     ES modules is #154; until that lands this rule reports the
-      //     architecture, not a defect.
       //   require-atomic-updates -- fires on every `ids.foo.value = ...` after
       //     an await. `ids` is a frozen table of DOM references resolved once
       //     at load, so there is no state to race on.

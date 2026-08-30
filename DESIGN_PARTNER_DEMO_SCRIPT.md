@@ -13,7 +13,7 @@ Run these checks before the call:
 ```bash
 uv run pytest
 uv run python scripts/smoke_regression.py
-node --check app/static/app.js
+npm ci && npm run lint
 python3 -m compileall app scripts
 git diff --check
 ```

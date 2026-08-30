@@ -10,7 +10,7 @@ pass before a change lands.
 | Lint | `uv run --frozen --group dev ruff check app scripts tests` | `app/`, `scripts/`, `tests/` |
 | Type-check | `uv run --frozen --group dev mypy` | `app/`, `scripts/` |
 | Tests | `uv run --frozen --group dev pytest` | `tests/` |
-| Console lint | `npm ci && npm run lint` | `app/static/app.js` |
+| Console lint | `npm ci && npm run lint` | `app/static/*.js` |
 
 `ruff check --fix` applies the mechanical fixes. Configuration lives in
 `pyproject.toml` (`[tool.ruff]`, `[tool.mypy]`) and `eslint.config.mjs`; each

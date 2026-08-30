@@ -1,4 +1,4 @@
-"""No unescaped interpolation may land inside an HTML attribute in app.js.
+"""No unescaped interpolation may land inside an HTML attribute.
 
 Regression cover for #153. `renderReadinessBanner()` interpolated the
 server-sourced `readiness.tone` straight into `data-tone="..."` while every
@@ -7,7 +7,8 @@ the file's escape-everything convention, and one widening of `tone`'s source
 away from an attribute breakout.
 
 This is a static check rather than a browser test on purpose: the point is the
-convention holding across the whole file, not one call site behaving today.
+convention holding everywhere, not one call site behaving today. It scans every
+console module, so a new one cannot quietly opt out.
 """
 
 from __future__ import annotations
@@ -15,7 +16,8 @@ from __future__ import annotations
 import re
 from pathlib import Path
 
-APP_JS = Path(__file__).resolve().parents[1] / "app" / "static" / "app.js"
+STATIC_DIR = Path(__file__).resolve().parents[1] / "app" / "static"
+CONSOLE_MODULES = sorted(STATIC_DIR.glob("*.js"))
 
 # An attribute value in a template literal: name="...${...}...".
 _ATTRIBUTE = re.compile(r'([a-zA-Z-]+)="([^"]*\$\{[^"]*)"')
@@ -28,18 +30,25 @@ _LITERAL_TERNARY = re.compile(r"^[^?]*\?\s*'[^']*'\s*:\s*'[^']*'$")
 
 
 def _unescaped_attribute_interpolations() -> list[str]:
-    source = APP_JS.read_text(encoding="utf-8")
     offenders: list[str] = []
-    for line_number, line in enumerate(source.splitlines(), start=1):
-        for _attribute, value in _ATTRIBUTE.findall(line):
-            for expression in _INTERPOLATION.findall(value):
-                expression = expression.strip()
-                if expression.startswith("escapeHtml("):
-                    continue
-                if _LITERAL_TERNARY.match(expression):
-                    continue
-                offenders.append(f"{APP_JS.name}:{line_number} {_attribute}=\"${{{expression}}}\"")
+    for module in CONSOLE_MODULES:
+        source = module.read_text(encoding="utf-8")
+        for line_number, line in enumerate(source.splitlines(), start=1):
+            for _attribute, value in _ATTRIBUTE.findall(line):
+                for expression in _INTERPOLATION.findall(value):
+                    expression = expression.strip()
+                    if expression.startswith("escapeHtml("):
+                        continue
+                    if _LITERAL_TERNARY.match(expression):
+                        continue
+                    offenders.append(
+                        f"{module.name}:{line_number} {_attribute}=\"${{{expression}}}\""
+                    )
     return offenders
+
+
+def _console_source() -> str:
+    return "\n".join(module.read_text(encoding="utf-8") for module in CONSOLE_MODULES)
 
 
 def test_no_unescaped_interpolation_inside_an_html_attribute():
@@ -47,10 +56,25 @@ def test_no_unescaped_interpolation_inside_an_html_attribute():
 
 
 def test_readiness_tone_is_escaped():
-    source = APP_JS.read_text(encoding="utf-8")
+    source = _console_source()
 
     assert 'data-tone="${escapeHtml(readiness.tone)}"' in source
     assert 'data-tone="${readiness.tone}"' not in source
+
+
+def test_every_console_module_is_scanned():
+    # Guards against the glob silently matching nothing after a rename.
+    assert {module.name for module in CONSOLE_MODULES} >= {
+        "actions.js",
+        "api.js",
+        "dom.js",
+        "format.js",
+        "main.js",
+        "onboarding.js",
+        "render.js",
+        "state.js",
+        "stream.js",
+    }
 
 
 def test_the_check_would_catch_a_regression():
