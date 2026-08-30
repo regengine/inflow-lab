@@ -19,6 +19,7 @@ from ..fda_export import (
 )
 from ..schemas.domain import FDAExportPreset
 from ..schemas.exports import FDAExportPresetListResponse, FDAExportPresetSummary
+from ..schemas.health import EPCISDocumentResponse
 from ..schemas.ingestion import IngestPayload, MockIngestResponse
 
 
@@ -75,7 +76,11 @@ async def mock_fda_request_export(
     )
 
 
-@router.get("/export/epcis")
+# The handler returns a JSONResponse directly (it sets Content-Disposition and
+# the JSON-LD media type), so FastAPI skips response-model serialisation here.
+# response_model is still declared so the generated OpenAPI document describes
+# the document envelope instead of an empty schema.
+@router.get("/export/epcis", response_model=EPCISDocumentResponse)
 async def mock_epcis_export(
     start_date: str | None = Query(default=None, description="Inclusive YYYY-MM-DD"),
     end_date: str | None = Query(default=None, description="Inclusive YYYY-MM-DD"),

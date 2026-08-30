@@ -10,12 +10,13 @@ from ..build_info import current_build_info
 from ..contract import INFLOW_CONTRACT_VERSION
 from ..controller import SimulationController
 from ..dependencies import get_active_controller, get_tenant_context
+from ..schemas.health import HealthResponse, HealthzResponse
 
 
 router = APIRouter(prefix="/api", tags=["Health"])
 
 
-@router.get("/health")
+@router.get("/health", response_model=HealthResponse)
 async def health(
     context: TenantContext = Depends(get_tenant_context),
     active_controller: SimulationController = Depends(get_active_controller),
@@ -36,7 +37,7 @@ async def health(
     }
 
 
-@router.get("/healthz")
+@router.get("/healthz", response_model=HealthzResponse)
 async def healthz() -> dict[str, Any]:
     return {
         "ok": True,

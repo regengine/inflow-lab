@@ -3,13 +3,18 @@ from __future__ import annotations
 from datetime import datetime
 from typing import Any, Literal
 
-from pydantic import BaseModel, Field, field_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 from .domain import CSVImportType, CTEType, DestinationMode, RegEngineEvent
 from .simulation import DeliveryConfig
 
 
 class IngestPayload(BaseModel):
+    # Deliberately NOT extra="forbid". This is the RegEngine wire contract, not
+    # one of this app's own control-plane bodies: RegEngine's own IngestEvent
+    # sets no model_config and so ignores unknown keys. Forbidding them here
+    # would make the mock reject batches live ingest accepts, which is the
+    # parity gap this simulator exists to close, pointing the wrong way.
     source: str = "codex-simulator"
     events: list[RegEngineEvent]
 
@@ -35,6 +40,8 @@ class MockIngestResponse(BaseModel):
 
 
 class DeliveryRetryRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
     record_ids: list[str] | None = None
     limit: int = 50
     source: str | None = None
@@ -63,6 +70,8 @@ class DeliveryRetryResponse(BaseModel):
 
 
 class ReplayRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
     persist_path: str | None = None
     source: str | None = None
     delivery: DeliveryConfig | None = None
@@ -83,6 +92,8 @@ class ReplayResponse(BaseModel):
 
 
 class CSVImportRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
     import_type: CSVImportType
     csv_text: str
     source: str | None = None

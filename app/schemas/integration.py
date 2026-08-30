@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from pydantic import BaseModel, Field, HttpUrl
+from pydantic import BaseModel, ConfigDict, Field, HttpUrl
 
 from .domain import DestinationMode
 from .simulation import MockFrictionCode
@@ -23,6 +23,8 @@ class IntegrationConfigureRequest(BaseModel):
     """Partial update: omitted fields keep their current values, so the
     settings page can toggle mode without re-entering the API key."""
 
+    model_config = ConfigDict(extra="forbid")
+
     mode: DestinationMode | None = None
     endpoint: HttpUrl | None = None
     api_key: str | None = None
@@ -32,6 +34,8 @@ class IntegrationConfigureRequest(BaseModel):
 
 class ConnectionTestRequest(BaseModel):
     """Optional overrides so credentials can be tested before saving."""
+
+    model_config = ConfigDict(extra="forbid")
 
     endpoint: HttpUrl | None = None
     api_key: str | None = None

@@ -219,6 +219,40 @@ def _run_dashboard_smoke(base_url: str, config: BrowserSmokeConfig) -> None:
             page.locator("#lotLookup").press("Enter")
             expect(page.locator("#statusMessage")).to_contain_text("Loaded lineage for TLC-DEMO-FC-OUT-001")
 
+            # A failing Refresh must surface in the status line rather than
+            # escaping the click handler as an unhandled rejection (#152).
+            # refresh() is the one bound handler with no try/catch of its own.
+            rejections: list[str] = []
+            console_errors_before = len(console_errors)
+            page.expose_function("__recordRejection", lambda reason: rejections.append(str(reason)))
+            page.evaluate(
+                "window.addEventListener('unhandledrejection',"
+                " (event) => window.__recordRejection(String(event.reason)))"
+            )
+            page.route(
+                "**/api/simulate/status",
+                lambda route: route.fulfill(status=500, body='{"detail":"forced failure"}'),
+            )
+            try:
+                page.locator("#refreshBtn").click()
+                expect(page.locator("#statusMessage")).to_have_attribute("data-tone", "error")
+                expect(page.locator("#statusMessage")).not_to_have_text("Ready.")
+                # The button must not be left stuck in its busy state either.
+                expect(page.locator("#refreshBtn")).to_be_enabled()
+            finally:
+                page.unroute("**/api/simulate/status")
+            page.wait_for_timeout(250)
+            if rejections:
+                raise RuntimeError(f"Refresh failure produced unhandled rejections: {rejections}")
+            # The 500 we injected surfaces as a console error. Drop exactly that
+            # one so the end-of-run console-error gate still catches everything
+            # else, including any error this step did not ask for.
+            injected = console_errors[console_errors_before:]
+            del console_errors[console_errors_before:]
+            unexpected = [text for text in injected if "500 (Internal Server Error)" not in text]
+            if unexpected:
+                raise RuntimeError(f"Unexpected console errors during refresh check: {unexpected}")
+
             browser.close()
     except Exception:
         failed = True

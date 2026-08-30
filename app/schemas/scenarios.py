@@ -3,7 +3,7 @@ from __future__ import annotations
 from datetime import UTC, datetime
 from typing import Any, Literal
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, ConfigDict, Field
 
 from ..scenarios import ScenarioId
 from .domain import DemoFixtureId, DestinationMode, StoredEventRecord
@@ -47,6 +47,8 @@ class ScenarioSaveListResponse(BaseModel):
 
 
 class ScenarioSaveRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
     config: SimulationConfig | None = None
 
 

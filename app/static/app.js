@@ -125,6 +125,11 @@ async function runWithBusy(button, handler) {
   button.disabled = true;
   try {
     await handler();
+  } catch (error) {
+    // Most handlers report their own failures and never reach here. `refresh`
+    // deliberately does not, so without this the Refresh button would spin and
+    // then go silent while the rejection escaped the click handler entirely.
+    setStatus(error.message, 'error', 5000);
   } finally {
     delete button.dataset.busy;
     button.classList.remove('is-busy');
@@ -702,7 +707,7 @@ function renderReadinessBanner(summary, events, status = state.status) {
   }
   const readiness = backendAudit(status, summary) || pendingAuditModel(summary);
   ids.readinessBanner.innerHTML = `
-    <div class="readiness-banner-shell" data-tone="${readiness.tone}">
+    <div class="readiness-banner-shell" data-tone="${escapeHtml(readiness.tone)}">
       <div class="readiness-score">
         <span>Readiness</span>
         <strong>${escapeHtml(readiness.score)}</strong>
@@ -871,7 +876,7 @@ function renderDeliverySummary(status) {
       ${cards
         .map(
           ([label, value, tone]) => `
-            <article class="delivery-card" data-tone="${tone}">
+            <article class="delivery-card" data-tone="${escapeHtml(tone)}">
               <span>${escapeHtml(label)}</span>
               <strong>${escapeHtml(value)}</strong>
             </article>
@@ -1083,7 +1088,7 @@ function renderEvents(events) {
             ${warnings.length ? `<small class="status-warning">${escapeHtml(warnings[0])}</small>` : ''}
           </td>
           <td>
-            <span class="status-pill" data-tone="${deliveryTone(record.delivery_status)}">${escapeHtml(record.delivery_status)}</span>
+            <span class="status-pill" data-tone="${escapeHtml(deliveryTone(record.delivery_status))}">${escapeHtml(record.delivery_status)}</span>
             ${record.error ? `<small class="status-error">${escapeHtml(record.error)}</small>` : ''}
           </td>
         </tr>
@@ -1243,7 +1248,7 @@ function renderImportResult(result) {
     })
     .join('');
   ids.importResults.innerHTML = `
-    <div class="import-summary" data-tone="${tone}">
+    <div class="import-summary" data-tone="${escapeHtml(tone)}">
       Accepted ${escapeHtml(result.accepted)} of ${escapeHtml(result.total)} row(s).
       Stored ${escapeHtml(result.stored)}; posted ${escapeHtml(result.posted)}; rejected ${escapeHtml(result.rejected)}.
       ${result.error ? `<span>${escapeHtml(result.error)}</span>` : ''}
@@ -1450,7 +1455,7 @@ async function testConnection() {
     const statusLine = result.status_code ? ` (HTTP ${result.status_code})` : '';
     if (ids.connectionResult) {
       ids.connectionResult.innerHTML = `
-        <div class="connection-verdict" data-tone="${tone}">
+        <div class="connection-verdict" data-tone="${escapeHtml(tone)}">
           <strong>${escapeHtml(result.verdict.replaceAll('_', ' '))}${escapeHtml(statusLine)}</strong>
           <p>${escapeHtml(result.detail)}</p>
         </div>
