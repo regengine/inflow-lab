@@ -1,9 +1,9 @@
 from __future__ import annotations
 
-from pydantic import BaseModel, ConfigDict, Field, HttpUrl
+from pydantic import BaseModel, ConfigDict, Field
 
 from .domain import DestinationMode
-from .simulation import MockFrictionCode
+from .simulation import GuardedEndpoint, MockFrictionCode
 
 
 class IntegrationStatusResponse(BaseModel):
@@ -26,7 +26,7 @@ class IntegrationConfigureRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     mode: DestinationMode | None = None
-    endpoint: HttpUrl | None = None
+    endpoint: GuardedEndpoint | None = None
     api_key: str | None = None
     tenant_id: str | None = None
     mock_friction: list[MockFrictionCode] | None = None
@@ -37,7 +37,7 @@ class ConnectionTestRequest(BaseModel):
 
     model_config = ConfigDict(extra="forbid")
 
-    endpoint: HttpUrl | None = None
+    endpoint: GuardedEndpoint | None = None
     api_key: str | None = None
     tenant_id: str | None = None
 

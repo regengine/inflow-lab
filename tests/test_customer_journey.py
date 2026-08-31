@@ -33,7 +33,12 @@ def test_journey_batches_are_canonical_for_regengine() -> None:
         assert validate_event_like_regengine(event) == [], event.cte_type
 
 
-def test_journey_config_targets_live_delivery() -> None:
+def test_journey_config_targets_live_delivery(monkeypatch) -> None:
+    # `--local` points at a loopback endpoint over http by design, which the
+    # egress guard rejects by default so the API key cannot be posted to an
+    # internal host. `run_journey` sets this for the local path; this test
+    # calls `build_config` directly, so it opts in the same way.
+    monkeypatch.setenv("REGENGINE_ALLOW_PRIVATE_ENDPOINTS", "1")
     config = build_config(
         "http://localhost:8000/api/v1/webhooks/ingest",
         "rge_test_key",

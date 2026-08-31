@@ -321,6 +321,12 @@ async def run_journey(args: argparse.Namespace) -> int:
             print("REGENGINE_ADMIN_KEY is required for --local (the stack's ADMIN_MASTER_KEY).")
             return 2
         batches, batch_size = args.batches, args.batch_size
+        # A local stack is exactly the case the egress guard's escape hatch
+        # exists for: the endpoint is loopback and over http by design, which
+        # the guard rejects by default to stop the API key being posted to an
+        # internal host. Opting in here keeps `--local` working without
+        # weakening the default for real deployments.
+        os.environ.setdefault("REGENGINE_ALLOW_PRIVATE_ENDPOINTS", "1")
 
     async with httpx.AsyncClient(timeout=30.0) as client:
         # 1. Reach RegEngine.

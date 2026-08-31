@@ -55,10 +55,24 @@ def tenant_context_from_request(request: Request) -> TenantContext | JSONRespons
             return _unauthorized_response()
 
         supplied_username, supplied_password = credentials
-        if not (
-            secrets.compare_digest(supplied_username, config.username or "")
-            and secrets.compare_digest(supplied_password, config.password or "")
-        ):
+        # Compare bytes, and compare both halves before combining.
+        #
+        # `secrets.compare_digest` on `str` raises TypeError unless both sides
+        # are ASCII-only, so a non-ASCII username or password -- which any
+        # unauthenticated caller can send -- turned a 401 into an unhandled
+        # HTTP 500. Encoding first makes every credential comparable.
+        #
+        # Binding both results before `and` also removes the short-circuit
+        # (#89): `A and B` skipped the password comparison entirely whenever
+        # the username was wrong, so the response time distinguished a valid
+        # username from an invalid one.
+        username_ok = secrets.compare_digest(
+            supplied_username.encode("utf-8"), (config.username or "").encode("utf-8")
+        )
+        password_ok = secrets.compare_digest(
+            supplied_password.encode("utf-8"), (config.password or "").encode("utf-8")
+        )
+        if not (username_ok and password_ok):
             return _unauthorized_response()
         username = supplied_username
 
