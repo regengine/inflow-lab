@@ -208,7 +208,8 @@ def test_not_configured_names_only_the_missing_field(body, named, not_named):
 
 def test_not_configured_names_both_when_both_are_missing():
     # An empty body stays in mock mode and short-circuits before the probe, so
-    # reach the branch with an endpoint and no credentials.
+    # reach the branch with an endpoint and no credentials. Nothing is stored,
+    # so the different-origin credential guard does not apply.
     detail = client.post(
         "/api/integration/test", json={"endpoint": "https://example.test/api/v1/webhooks/ingest"}
     ).json()["detail"]

@@ -171,7 +171,13 @@ class SimulationController:
             # subscribers needed to see.) Retrieve any exception so asyncio
             # does not log it as never retrieved.
             task.exception()
-        self._task = None
+        # Only clear the task this call was actually waiting on. `await task`
+        # yields, and a `start()` landing in that window sees `running` False
+        # (the old task is already done) and installs a new one -- which an
+        # unconditional clear then orphaned: a live run loop with `_task` None,
+        # unreachable by stop(), reset() or shutdown(), still writing records.
+        if self._task is task:
+            self._task = None
         await self._publish_update()
 
     async def shutdown(self) -> None:

@@ -8,6 +8,11 @@ from pydantic import BaseModel, ConfigDict, Field, field_validator
 from .domain import CSVImportType, CTEType, DestinationMode, RegEngineEvent
 from .simulation import DeliveryConfig
 
+# RegEngine's per-batch cap. Owned here rather than in `mock_service` so the
+# schema can enforce it before pydantic materialises the list; the service
+# re-exports it and still checks it for direct callers.
+MAX_BATCH_EVENTS = 500
+
 
 class IngestPayload(BaseModel):
     # Deliberately NOT extra="forbid". This is the RegEngine wire contract, not
@@ -16,7 +21,11 @@ class IngestPayload(BaseModel):
     # would make the mock reject batches live ingest accepts, which is the
     # parity gap this simulator exists to close, pointing the wrong way.
     source: str = "codex-simulator"
-    events: list[RegEngineEvent]
+    # Capped at the same 500 the service enforces, but here -- before pydantic
+    # materialises every model. The service-layer check ran after, so a 400k
+    # event batch allocated ~1.3 GB and only then raised. Matching the live
+    # limit keeps the parity honest rather than making the mock stricter.
+    events: list[RegEngineEvent] = Field(max_length=MAX_BATCH_EVENTS)
 
 
 class IngestResponseEvent(BaseModel):

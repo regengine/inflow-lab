@@ -9,10 +9,17 @@ from uuid import uuid4
 
 from .cte_rules import REQUIRED_KDES
 from .schemas.domain import RegEngineEvent
-from .schemas.ingestion import IngestPayload, IngestResponseEvent, MockIngestResponse
+from .schemas.ingestion import (
+    MAX_BATCH_EVENTS,
+    IngestPayload,
+    IngestResponseEvent,
+    MockIngestResponse,
+)
 
 # Mirrors RegEngine's WebhookPayload constraint: events accepts 1-500 items.
-MAX_BATCH_EVENTS = 500
+# Defined on the schema so it is enforced before the list is materialised;
+# re-exported here because the service still checks it for direct callers.
+__all__ = ["MAX_BATCH_EVENTS", "FRICTION_RESPONSES", "MockRegEngineHTTPError", "MockRegEngineService"]
 # Mirrors RegEngine's Pydantic timestamp validator: >24h in the future is rejected.
 MAX_FUTURE_HOURS = 24
 # Mirrors RegEngine's model-level location validator: at least one of these
@@ -83,15 +90,21 @@ class MockRegEngineService:
         # config paths to the known set; this guards a direct caller.
         # Validated up front so which code is reported does not depend on the
         # order they were listed in.
-        unknown = sorted({code for code in friction if code not in FRICTION_RESPONSES})
+        # Materialised once: the previous `for code in friction` accepted any
+        # iterable, and indexing `friction[0]` instead broke sets, dict views
+        # and generators -- an empty generator went from a clean no-op to a
+        # TypeError. Taking a tuple keeps the old tolerance and makes the
+        # membership scan safe against a one-shot iterator.
+        codes = tuple(friction)
+        unknown = sorted({code for code in codes if code not in FRICTION_RESPONSES})
         if unknown:
             raise MockRegEngineHTTPError(
                 422,
                 f"Unknown mock friction code(s): {', '.join(unknown)}. "
                 f"Known codes: {', '.join(sorted(FRICTION_RESPONSES))}.",
             )
-        if friction:
-            raise MockRegEngineHTTPError(*FRICTION_RESPONSES[friction[0]])
+        if codes:
+            raise MockRegEngineHTTPError(*FRICTION_RESPONSES[codes[0]])
 
         if len(payload.events) > MAX_BATCH_EVENTS:
             raise MockRegEngineHTTPError(

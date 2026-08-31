@@ -5,6 +5,7 @@ from contextlib import asynccontextmanager
 from pathlib import Path
 
 from fastapi import FastAPI
+from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
@@ -14,7 +15,12 @@ from .auth import basic_auth_config_from_env
 from .auth_middleware import auth_and_tenant_middleware
 from .build_info import APP_VERSION
 from .cors import cors_origins_from_env
-from .exceptions import handle_value_error
+from .exceptions import (
+    handle_mock_http_error,
+    handle_validation_error,
+    handle_value_error,
+)
+from .mock_service import MockRegEngineHTTPError
 from .routers import events, health, ingestion, integration, mock_regengine, operator, scenarios, simulation
 
 # Re-exported, not used here: `app.main` is the entry point tests and
@@ -71,6 +77,8 @@ def create_app() -> FastAPI:
     # narrowed to the exception class it is registered for never satisfies it.
     # The narrowing is the point; the registration is what guarantees it.
     fastapi_app.add_exception_handler(ValueError, handle_value_error)  # type: ignore[arg-type]
+    fastapi_app.add_exception_handler(RequestValidationError, handle_validation_error)  # type: ignore[arg-type]
+    fastapi_app.add_exception_handler(MockRegEngineHTTPError, handle_mock_http_error)  # type: ignore[arg-type]
 
     @fastapi_app.get("/")
     async def root() -> FileResponse:
