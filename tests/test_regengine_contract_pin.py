@@ -6,6 +6,11 @@ of truth for live ingest validation). If RegEngine changes its required
 KDEs, update BOTH this table and app/cte_rules.py — a mismatch here means
 the mock validates differently from live RegEngine, which resurrects the
 "green demo, failing live post" drift this pin exists to catch.
+
+NOTE (§1.1330(b)(7)): The TRANSFORMATION entry below already includes
+input_traceability_lot_codes and input_products as required, ahead of the
+live RegEngine contract. Update the live contract and remove this note once
+RegEngine's webhook_models.py is aligned.
 """
 
 from __future__ import annotations
@@ -82,6 +87,8 @@ REGENGINE_REQUIRED_KDES_BY_CTE: dict[CTEType, tuple[str, ...]] = {
         "transformation_date",
         "location_name",
         "reference_document",
+        "input_traceability_lot_codes",
+        "input_products",
     ),
 }
 

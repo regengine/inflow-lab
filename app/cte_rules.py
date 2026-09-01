@@ -99,6 +99,9 @@ REQUIRED_KDES: dict[CTEType, tuple[str, ...]] = {
         "reference_document",
         "tlc_source_reference",
     ),
+    # §1.1330(b)(7): input lot codes and products are required by regulation for
+    # transformation records. This anticipates the RegEngine contract pin being
+    # updated once the live webhook_models.py aligns.
     CTEType.TRANSFORMATION: (
         "traceability_lot_code",
         "product_description",
@@ -107,6 +110,8 @@ REQUIRED_KDES: dict[CTEType, tuple[str, ...]] = {
         "transformation_date",
         "location_name",
         "reference_document",
+        "input_traceability_lot_codes",
+        "input_products",
     ),
 }
 
@@ -124,7 +129,7 @@ RECOMMENDED_KDES: dict[CTEType, tuple[str, ...]] = {
     ),
     CTEType.SHIPPING: ("carrier", "reference_document_type"),
     CTEType.RECEIVING: ("reference_document_type",),
-    CTEType.TRANSFORMATION: ("input_traceability_lot_codes", "input_products", "reference_document_type"),
+    CTEType.TRANSFORMATION: ("input_quantities", "reference_document_type"),
 }
 
 INDUSTRY_EVENT_REQUIREMENTS: dict[str, tuple[EventRequirement, ...]] = {
