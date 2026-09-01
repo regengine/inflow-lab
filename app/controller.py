@@ -379,12 +379,10 @@ class SimulationController:
         await self._publish_update()
         return result
 
-    def list_scenario_saves(self) -> ScenarioSaveListResponse:
+    async def list_scenario_saves(self) -> ScenarioSaveListResponse:
+        snapshots = await asyncio.to_thread(self.scenario_saves.list)
         return ScenarioSaveListResponse(
-            saves=[
-                self._scenario_save_summary(snapshot)
-                for snapshot in self.scenario_saves.list()
-            ]
+            saves=[self._scenario_save_summary(snapshot) for snapshot in snapshots]
         )
 
     async def save_scenario(
@@ -398,21 +396,23 @@ class SimulationController:
             config = config.model_copy(update={"scenario": scenario_id}, deep=True)
             config = self._sanitize_saved_config(config)
             records = self.store.all_between()
-            snapshot = self.scenario_saves.save_snapshot(
-                scenario=scenario_id,
-                config=config,
-                records=records,
-            )
-            result = ScenarioSaveResponse(
-                status="saved",
-                save=self._scenario_save_summary(snapshot),
-                config=snapshot.config,
-            )
-        return result
+        # Write is done outside the lock so long delivery does not pin the data-plane.
+        # The snapshot values were captured under the lock above.
+        snapshot = await asyncio.to_thread(
+            self.scenario_saves.save_snapshot,
+            scenario=scenario_id,
+            config=config,
+            records=records,
+        )
+        return ScenarioSaveResponse(
+            status="saved",
+            save=self._scenario_save_summary(snapshot),
+            config=snapshot.config,
+        )
 
     async def load_scenario_save(self, scenario_id: ScenarioId) -> ScenarioLoadResponse:
         await self.stop()
-        snapshot = self.scenario_saves.get(scenario_id)
+        snapshot = await asyncio.to_thread(self.scenario_saves.get, scenario_id)
         if snapshot is None:
             raise KeyError(scenario_id.value)
 
