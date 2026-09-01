@@ -210,3 +210,92 @@ def test_lineage_for_transformed_output_includes_upstream_history_and_direct_que
     direct_input_lots = [record.event.traceability_lot_code for record in direct_input_lineage]
     assert "TLC-PACKED-A" in direct_input_lots
     assert "TLC-TRANSFORMED" in direct_input_lots
+
+
+# ---------------------------------------------------------------------------
+# ``_records`` orientation — newest-first is a contract, not a convention.
+#
+# ``add_many`` uses ``appendleft``, ``recent()`` reads a left-slice, and
+# ``maxlen`` eviction drops from the right. An inverted deque therefore does
+# not merely reorder reads: the next write evicts the newest record.
+#
+# Every test below reads back through the SAME store instance. That is the
+# whole point — the pre-existing tests reload into a fresh ``EventStore``,
+# where ``_load_from_disk`` re-sorts and re-reverses, which silently repaired
+# the state before anything was asserted about it.
+# ---------------------------------------------------------------------------
+
+
+def test_update_many_keeps_newest_first_in_the_same_instance(tmp_path):
+    """A delivery retry must not flip the store's read order.
+
+    ``update_many`` rebuilds the ring from ``_all_records()``, which sorts
+    *ascending* by ``sequence_no``. Rebuilding straight from that ordering
+    leaves the deque oldest-first, so ``recent()`` starts serving the oldest
+    events. One retry — a single click in the UI — is enough to trigger it.
+    """
+    store = EventStore(persist_path=str(tmp_path / "events.jsonl"))
+    stored = store.add_many(
+        [
+            make_record("TLC-ORDER-000001", CTEType.HARVESTING, 0),
+            make_record("TLC-ORDER-000002", CTEType.COOLING, 10),
+            make_record("TLC-ORDER-000003", CTEType.SHIPPING, 20),
+        ]
+    )
+    before = [record.event.traceability_lot_code for record in store.recent()]
+    assert before == ["TLC-ORDER-000003", "TLC-ORDER-000002", "TLC-ORDER-000001"]
+
+    retried = stored[0].model_copy(update={"delivery_status": "posted"})
+    store.update_many([retried])
+
+    after = [record.event.traceability_lot_code for record in store.recent()]
+    assert after == before, "update_many inverted the store's read order"
+
+
+def test_update_many_leaves_eviction_dropping_the_oldest(tmp_path):
+    """After a retry, the next write must still evict the oldest record.
+
+    This is the second-order failure and the more damaging one: with the
+    ring inverted, ``appendleft`` pushes the newest record in at the left
+    while ``maxlen`` evicts from the right — which is now where the *newest*
+    record lives. Writes silently delete the data just written.
+    """
+    store = EventStore(persist_path=str(tmp_path / "events.jsonl"), max_records=3)
+    stored = store.add_many(
+        [
+            make_record("TLC-EVICT-000001", CTEType.HARVESTING, 0),
+            make_record("TLC-EVICT-000002", CTEType.COOLING, 10),
+            make_record("TLC-EVICT-000003", CTEType.SHIPPING, 20),
+        ]
+    )
+
+    store.update_many([stored[0].model_copy(update={"delivery_status": "posted"})])
+    store.add_many([make_record("TLC-EVICT-000004", CTEType.RECEIVING, 30)])
+
+    lot_codes = [record.event.traceability_lot_code for record in store.recent()]
+    assert lot_codes[0] == "TLC-EVICT-000004", "the newest write was evicted by its own insert"
+    assert "TLC-EVICT-000001" not in lot_codes, "eviction dropped the wrong end"
+    assert lot_codes == ["TLC-EVICT-000004", "TLC-EVICT-000003", "TLC-EVICT-000002"]
+
+
+def test_replace_all_over_capacity_retains_the_newest_records(tmp_path):
+    """Over capacity, ``replace_all`` must keep the newest records.
+
+    ``deque(iterable, maxlen=n)`` keeps the *last* n items, so reversing an
+    oldest-first list before truncating retains the n oldest and discards
+    everything recent. Truncation has to happen while the sequence is still
+    oldest-first.
+    """
+    store = EventStore(persist_path=str(tmp_path / "events.jsonl"), max_records=2)
+    records = []
+    for index in range(5):
+        record = make_record(f"TLC-CAP-{index:06d}", CTEType.HARVESTING, index * 5)
+        record.sequence_no = index + 1
+        records.append(record)
+
+    store.replace_all(records)
+
+    lot_codes = [record.event.traceability_lot_code for record in store.recent()]
+    assert lot_codes == ["TLC-CAP-000004", "TLC-CAP-000003"], (
+        "replace_all retained the oldest records and discarded the newest"
+    )

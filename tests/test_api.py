@@ -9,6 +9,7 @@ import pytest
 from fastapi.testclient import TestClient
 
 from app.build_info import BRANCH_ENV_VARS, COMMIT_SHA_ENV_VARS, DEPLOYMENT_ID_ENV_VARS
+from app.cors import DEFAULT_CORS_ORIGINS
 from app.main import app, controller, cors_origins_from_env, scenario_saves
 from app.schemas.simulation import SimulationConfig
 from app.regengine_client import LiveIngestResult, LiveRegEngineDeliveryError
@@ -209,6 +210,42 @@ def test_cors_origins_can_be_configured_without_wildcard_credentials(monkeypatch
     monkeypatch.setenv("REGENGINE_CORS_ORIGINS", "https://demo.example.com/path")
     with pytest.raises(ValueError, match="HTTP\\(S\\) origins"):
         cors_origins_from_env()
+
+
+def test_cors_allowlist_always_trusts_the_platform_domain(monkeypatch):
+    monkeypatch.setenv("RAILWAY_PUBLIC_DOMAIN", "demo.up.railway.app")
+
+    # With no explicit config, the platform origin joins the local defaults.
+    monkeypatch.delenv("REGENGINE_CORS_ORIGINS", raising=False)
+    assert cors_origins_from_env() == [
+        *DEFAULT_CORS_ORIGINS,
+        "https://demo.up.railway.app",
+    ]
+
+    # An explicit-but-stale list can no longer lock the service out of its own
+    # domain — the regression that kept the nightly smokes red after the
+    # August 2026 cutover (issues #80/#81).
+    monkeypatch.setenv("REGENGINE_CORS_ORIGINS", "https://old.up.railway.app")
+    assert cors_origins_from_env() == [
+        "https://old.up.railway.app",
+        "https://demo.up.railway.app",
+    ]
+
+    # No duplicate when the platform origin is already configured.
+    monkeypatch.setenv("REGENGINE_CORS_ORIGINS", "https://demo.up.railway.app")
+    assert cors_origins_from_env() == ["https://demo.up.railway.app"]
+
+
+def test_cors_platform_domain_never_crashes_startup(monkeypatch):
+    monkeypatch.delenv("REGENGINE_CORS_ORIGINS", raising=False)
+
+    # A malformed platform value degrades to "no extra origin", not a raise —
+    # this path runs while the ASGI app is being constructed.
+    monkeypatch.setenv("RAILWAY_PUBLIC_DOMAIN", "demo.up.railway.app/?bad=1")
+    assert cors_origins_from_env() == list(DEFAULT_CORS_ORIGINS)
+
+    monkeypatch.setenv("RAILWAY_PUBLIC_DOMAIN", "   ")
+    assert cors_origins_from_env() == list(DEFAULT_CORS_ORIGINS)
 
 
 def test_basic_auth_is_optional_but_enforced_when_configured(monkeypatch):

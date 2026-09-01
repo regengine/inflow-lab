@@ -249,6 +249,85 @@ racing on one service make deploy history impossible to read.
 > for roughly 100 days: the ritual below is easy to forget and nothing failed
 > loudly when it was. Prefer the workflow.
 
+### Moving the demo to a new service (cutover checklist)
+
+Standing up a replacement service and retiring the old one has ordering
+traps. Work through these in sequence; every step is verifiable before the
+next one starts.
+
+1. **Set `REGENGINE_CORS_ORIGINS` to the NEW service's own origin — change
+   it, never copy or reference it.** This value names the host, so a Railway
+   reference variable (`${{old-service.REGENGINE_CORS_ORIGINS}}`) carries the
+   *old* URL and fails in two ways at once: browser requests lose their CORS
+   headers, and every state-changing request is rejected as an untrusted
+   origin (`app/auth_middleware.py` gates writes on the same list).
+   Verify: `curl -sD - -o /dev/null -H "Origin: https://<new-domain>" https://<new-domain>/api/healthz`
+   must echo the origin back in `access-control-allow-origin`.
+   (On Railway the service now also trusts its own `RAILWAY_PUBLIC_DOMAIN`
+   origin *in addition to* this list, so a stale configured value can no
+   longer lock the service out of its own domain — but explicit origins for
+   any other dashboard host still need this step.)
+2. **Replace secret reference variables with concrete values.**
+   `REGENGINE_BASIC_AUTH_USERNAME`, `REGENGINE_BASIC_AUTH_PASSWORD`, and
+   `REGENGINE_WEBHOOK_HMAC_SECRET` may reference the old service. Deleting
+   the old service while references remain breaks auth on the new one.
+3. **Retarget every consumer of the old URL.** In this repo that is the
+   smoke workflows (`remote-smoke.yml`, `remote-browser-smoke.yml`,
+   `smoke-failure-issue.yml`) and the docs. Outside this repo, the RegEngine
+   dashboard reaches the demo through a Next.js proxy route **hosted on
+   Vercel**, so `INFLOW_LAB_SERVICE_URL` (fallback
+   `NEXT_PUBLIC_INFLOW_LAB_SERVICE_URL`) is a *Vercel* env var — it is not
+   on any Railway service, and Vercel bakes env at build, so the change is
+   inert until production is redeployed.
+   Verify: `https://<dashboard-host>/api/inflow-lab/api/healthz` reports the
+   new commit with `commit_source: RAILWAY_GIT_COMMIT_SHA`.
+4. **Carry the persistent volume across before sending traffic.** The demo
+   writes its event history to `REGENGINE_DATA_DIR` (`app/tenancy.py:22`,
+   `/data/tenants/{tenant_id}/events.jsonl` in production), and on Railway that
+   path only survives a redeploy if a volume is mounted there. A service
+   created fresh has none, and nothing about the running service says so: it
+   answers 200, serves the right contract, reports the right build identity,
+   and quietly starts from an empty store after every deploy — which for a
+   GitHub-connected service is *every push to `main`*.
+   Verify: the new service's config must carry a `volumeMounts` entry whose
+   `mountPath` matches `REGENGINE_DATA_DIR` on the old one. In the August 2026
+   cutover the old service mounted a volume at `/data` and the replacement had
+   no `volumeMounts` key at all, which would have discarded the demo's history
+   on the first push after the switch.
+5. **Only then retire the old service.** Until step 3 lands everywhere, the
+   old service is the live backend for whatever still points at it. Note that
+   the volume belongs to the old service — deleting it destroys the data
+   unless it has been migrated or detached first.
+
+> Steps 1–2 are exactly what the GitHub-connected cutover missed in August
+> 2026: the new service referenced the old one's variables, the URL-bearing
+> CORS value came across stale, and both nightly smokes stayed red for three
+> days after the cutover PR merged — with the failure attributed to the wrong
+> cause until the allowlist was probed directly.
+
+`scripts/cutover_preflight.sh <old-url> <new-url>` mechanises what steps 1 and
+3 can be checked from outside: every read-only path in the dashboard's proxy
+contract answering alike on both services, the new service reporting
+GitHub-injected build identity rather than a stale `REGENGINE_BUILD_SHA`, and
+the new service trusting its own origin. It is read-only — the demo is shared,
+and the POST routes the dashboard proxies mutate its state.
+
+It deliberately cannot check steps 2 or 4, and says so on success rather than
+implying a clean bill of health. Both are invisible from outside: a service
+with the wrong credentials and a service with the right ones both answer 401,
+and a service with no volume is indistinguishable from one with a volume until
+the next redeploy discards the data. The Basic-auth credentials live as secrets on
+two different platforms, so from outside a service with the *wrong* credentials
+is indistinguishable from one with the right ones — both answer 401 to an
+unauthenticated probe. Vercel's `INFLOW_LAB_BASIC_AUTH_USERNAME` / `_PASSWORD`
+must equal the new service's `REGENGINE_BASIC_AUTH_USERNAME` / `_PASSWORD`, as
+concrete values. If they differ, every proxied call answers 401 the moment
+`INFLOW_LAB_SERVICE_URL` is flipped.
+
+Verify the flip on `/api/simulate/status`, not `/api/healthz`: the proxy
+answers HTTP 200 with `{"offline":true}` when the backend is unreachable
+(`optionalOfflineResponse`), so a 200 on the health path alone proves nothing.
+
 ### Manual CLI deploy (fallback)
 
 When deploying from the CLI, update the non-secret build variables before `railway up` so health checks can identify stale deployments:

@@ -4,9 +4,18 @@ name: Smoke Failure Issue
 # (runs 7 through 106) and nothing happened, because a red scheduled workflow
 # only exists on a tab nobody opens. This turns that signal into a filed issue.
 #
-# Called by the smoke workflows via `uses:` when their run fails. Reuses one
-# open issue per smoke workflow so a long outage produces a single thread with
-# a comment per failure rather than a hundred duplicate issues.
+# Called by the smoke workflows via `uses:` on both edges. Reuses one open
+# issue per smoke workflow so a long outage produces a single thread with a
+# comment per failure rather than a hundred duplicate issues, and closes that
+# thread when the smoke passes again.
+#
+# The recovery edge is not a nicety. Without it the tracker's open/closed state
+# says nothing about whether the demo is currently broken — #80 and #81 both
+# stayed open for days after the underlying failure was fixed. Worse, the
+# lookup below is scoped to `state: 'open'`, so a stale tracker from a resolved
+# incident silently absorbs the *next* genuine outage as one more comment on an
+# aged thread. The strongest signal GitHub offers — a brand-new issue — would
+# otherwise be spent exactly once, on the first failure ever.
 
 on:
   workflow_call:
@@ -16,9 +25,16 @@ on:
         required: true
         type: string
       run_url:
-        description: URL of the failing workflow run
+        description: URL of the workflow run
         required: true
         type: string
+      resolved:
+        description: >-
+          Set true from a passing run to close the tracker instead of opening
+          one. Callers wire this as a second job with `if: success()`.
+        required: false
+        default: false
+        type: boolean
 
 permissions:
   contents: read
@@ -30,7 +46,53 @@ jobs:
     timeout-minutes: 5
 
     steps:
+      - name: Close the tracker on recovery
+        if: inputs.resolved
+        uses: actions/github-script@v8
+        env:
+          SMOKE_NAME: ${{ inputs.smoke_name }}
+          RUN_URL: ${{ inputs.run_url }}
+        with:
+          script: |
+            const smokeName = process.env.SMOKE_NAME;
+            const runUrl = process.env.RUN_URL;
+            const marker = `<!-- smoke-failure-tracker:${smokeName} -->`;
+
+            const existing = await github.paginate(
+              github.rest.issues.listForRepo,
+              { owner: context.repo.owner, repo: context.repo.repo, state: 'open', per_page: 100 },
+            );
+            // Close every match, not just the first. Duplicates can exist from
+            // before this edge was wired, and leaving one open re-creates the
+            // stale-tracker problem this step exists to end.
+            const trackers = existing.filter(
+              (issue) => !issue.pull_request && (issue.body || '').includes(marker),
+            );
+
+            if (trackers.length === 0) {
+              core.info(`No open ${smokeName} tracker to close.`);
+              return;
+            }
+
+            for (const tracker of trackers) {
+              await github.rest.issues.createComment({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number: tracker.number,
+                body: `**${smokeName} is passing again.** Verified by ${runUrl} at \`${context.sha}\`.`,
+              });
+              await github.rest.issues.update({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number: tracker.number,
+                state: 'closed',
+                state_reason: 'completed',
+              });
+              core.notice(`Closed recovered ${smokeName} tracker #${tracker.number}`);
+            }
+
       - name: Open or update the failure issue
+        if: ${{ !inputs.resolved }}
         uses: actions/github-script@v8
         env:
           SMOKE_NAME: ${{ inputs.smoke_name }}
@@ -50,7 +112,9 @@ jobs:
               github.rest.issues.listForRepo,
               { owner: context.repo.owner, repo: context.repo.repo, state: 'open', per_page: 100 },
             );
-            const tracker = existing.find((issue) => (issue.body || '').includes(marker));
+            const tracker = existing.find(
+              (issue) => !issue.pull_request && (issue.body || '').includes(marker),
+            );
 
             const detail = [
               `**${smokeName}** failed against the deployed shared demo.`,
@@ -84,6 +148,6 @@ jobs:
               owner: context.repo.owner,
               repo: context.repo.repo,
               title,
-              body: `${marker}\n\n${detail}\n\nThis issue is reused for subsequent failures. Close it once the smoke passes again.`,
+              body: `${marker}\n\n${detail}\n\nThis issue is reused for subsequent failures and closes itself once the smoke passes again.`,
             });
             core.notice(`Opened failure issue #${created.data.number}`);
