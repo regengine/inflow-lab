@@ -3,7 +3,7 @@ from __future__ import annotations
 from datetime import datetime
 from typing import Any, Literal
 
-from pydantic import BaseModel, Field, field_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 from .domain import CSVImportType, CTEType, DestinationMode, RegEngineEvent
 from .simulation import DeliveryConfig
@@ -35,6 +35,8 @@ class MockIngestResponse(BaseModel):
 
 
 class DeliveryRetryRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
     record_ids: list[str] | None = None
     limit: int = 50
     source: str | None = None
@@ -63,6 +65,8 @@ class DeliveryRetryResponse(BaseModel):
 
 
 class ReplayRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
     persist_path: str | None = None
     source: str | None = None
     delivery: DeliveryConfig | None = None
@@ -83,6 +87,8 @@ class ReplayResponse(BaseModel):
 
 
 class CSVImportRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
     import_type: CSVImportType
     csv_text: str
     source: str | None = None

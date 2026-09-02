@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from typing import Any, Literal
 
-from pydantic import BaseModel, Field, HttpUrl, field_validator
+from pydantic import BaseModel, ConfigDict, Field, HttpUrl, field_validator
 
 from ..scenarios import ScenarioId
 from .domain import DestinationMode, OperationScale
@@ -12,6 +12,8 @@ MockFrictionCode = Literal["invalid_key", "subscription_inactive", "rate_limit"]
 
 
 class DeliveryConfig(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
     mode: DestinationMode = DestinationMode.MOCK
     endpoint: HttpUrl | None = None
     api_key: str | None = None
@@ -22,6 +24,8 @@ class DeliveryConfig(BaseModel):
 
 
 class SimulationConfig(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
     source: str = "codex-simulator"
     scenario: ScenarioId = ScenarioId.LEAFY_GREENS_SUPPLIER
     scale: OperationScale = OperationScale.MIDSIZE
@@ -47,10 +51,20 @@ class SimulationConfig(BaseModel):
 
 
 class StartRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
     config: SimulationConfig
 
 
+class ResetRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    config: SimulationConfig | None = None
+
+
 class StepRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
     config: SimulationConfig | None = None
 
 

@@ -1667,7 +1667,7 @@ async function resetState() {
   try {
     await api('/api/simulate/reset', {
       method: 'POST',
-      body: JSON.stringify(buildConfig()),
+      body: JSON.stringify({ config: buildConfig() }),
     });
     ids.lineageResults.innerHTML = '';
     setStatus('Cleared line state and shift log.', 'success', 2500);

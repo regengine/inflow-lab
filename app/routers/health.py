@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 from datetime import UTC, datetime
-from typing import Any
 
 from fastapi import APIRouter, Depends
 
@@ -10,37 +9,38 @@ from ..build_info import current_build_info
 from ..contract import INFLOW_CONTRACT_VERSION
 from ..controller import SimulationController
 from ..dependencies import get_active_controller, get_tenant_context
+from ..schemas.health import HealthResponse, HealthzResponse
 
 
 router = APIRouter(prefix="/api", tags=["Health"])
 
 
-@router.get("/health")
+@router.get("/health", response_model=HealthResponse)
 async def health(
     context: TenantContext = Depends(get_tenant_context),
     active_controller: SimulationController = Depends(get_active_controller),
-) -> dict[str, Any]:
+) -> HealthResponse:
     build = current_build_info().public_dict()
-    return {
-        "ok": True,
-        "utc_time": datetime.now(UTC).isoformat(),
-        "build": build,
-        "contract_version": INFLOW_CONTRACT_VERSION,
-        "tenant": context.tenant_id,
-        "auth": {
+    return HealthResponse(
+        ok=True,
+        utc_time=datetime.now(UTC).isoformat(),
+        build=build,
+        contract_version=INFLOW_CONTRACT_VERSION,
+        tenant=context.tenant_id,
+        auth={
             "enabled": context.auth_enabled,
             "username": context.username,
             "uses_default_storage": context.uses_default_storage,
         },
-        "status": active_controller.status(),
-    }
+        status=active_controller.status(),
+    )
 
 
-@router.get("/healthz")
-async def healthz() -> dict[str, Any]:
-    return {
-        "ok": True,
-        "utc_time": datetime.now(UTC).isoformat(),
-        "build": current_build_info().public_dict(),
-        "contract_version": INFLOW_CONTRACT_VERSION,
-    }
+@router.get("/healthz", response_model=HealthzResponse)
+async def healthz() -> HealthzResponse:
+    return HealthzResponse(
+        ok=True,
+        utc_time=datetime.now(UTC).isoformat(),
+        build=current_build_info().public_dict(),
+        contract_version=INFLOW_CONTRACT_VERSION,
+    )
