@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import shutil
 
-from fastapi import APIRouter, Depends
+from fastapi import APIRouter, Depends, HTTPException
 
 from .. import tenancy
 from ..dependencies import require_operator_auth

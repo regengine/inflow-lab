@@ -4,7 +4,7 @@ import argparse
 import os
 import sys
 from dataclasses import dataclass, field
-from typing import Any
+from typing import Any, Mapping
 from urllib.parse import urlparse
 
 import httpx
@@ -39,7 +39,7 @@ class LiveTrialConfig:
 def main(
     argv: list[str] | None = None,
     *,
-    environ: dict[str, str] | None = None,
+    environ: Mapping[str, str] | None = None,
     client: httpx.Client | None = None,
 ) -> int:
     try:
@@ -104,7 +104,7 @@ def validate_requested_mode(args: argparse.Namespace) -> None:
 
 
 def config_from_env(
-    environ: dict[str, str] | None = None,
+    environ: Mapping[str, str] | None = None,
     *,
     require_live: bool,
 ) -> LiveTrialConfig:

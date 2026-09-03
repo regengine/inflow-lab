@@ -3,21 +3,20 @@ from __future__ import annotations
 import hashlib
 import hmac
 import json
+import logging
 import os
 from collections import OrderedDict
 from datetime import UTC, datetime, timedelta
-from typing import Any, Callable, NamedTuple
+from typing import Any, Callable, Literal, NamedTuple
 from uuid import uuid4
-
-import logging
 
 from .cte_rules import REQUIRED_KDES
 from .regengine_client import WEBHOOK_HMAC_SECRET_ENV
-
-logger = logging.getLogger("inflow_lab")
 from .schemas.domain import DestinationMode, RegEngineEvent
 from .schemas.ingestion import IngestPayload, IngestResponseEvent, MockIngestResponse
 from .store import EventStore
+
+logger = logging.getLogger("inflow_lab")
 
 
 # Mirrors RegEngine's WebhookPayload constraint: events accepts 1-500 items.
@@ -354,7 +353,7 @@ class MockRegEngineService:
                 )
             )
 
-        window_mode = "enforced" if self._enforce_event_age_window else "bypassed"
+        window_mode: Literal["enforced", "bypassed"] = "enforced" if self._enforce_event_age_window else "bypassed"
         if out_of_window_events and not self._enforce_event_age_window:
             logger.warning(
                 "mock ingest bypassed %d event(s) outside the %d-day replay window "

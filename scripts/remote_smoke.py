@@ -4,7 +4,7 @@ import os
 import sys
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any
+from typing import Any, Mapping
 from urllib.parse import urlparse
 
 import httpx
@@ -72,7 +72,7 @@ def main() -> int:
     return 0
 
 
-def config_from_env(environ: dict[str, str] | None = None) -> RemoteSmokeConfig:
+def config_from_env(environ: Mapping[str, str] | None = None) -> RemoteSmokeConfig:
     environ = environ or os.environ
     missing = [
         name

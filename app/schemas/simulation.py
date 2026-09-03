@@ -70,7 +70,7 @@ def _resolved_addresses(host: str) -> list[ipaddress.IPv4Address | ipaddress.IPv
         return []
     resolved: list[ipaddress.IPv4Address | ipaddress.IPv6Address] = []
     for info in infos:
-        raw_ip = info[4][0].split("%", 1)[0]  # strip an IPv6 zone id, e.g. fe80::1%eth0
+        raw_ip = str(info[4][0]).split("%", 1)[0]  # strip an IPv6 zone id, e.g. fe80::1%eth0
         try:
             resolved.append(ipaddress.ip_address(raw_ip))
         except ValueError:

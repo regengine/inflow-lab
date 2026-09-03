@@ -164,11 +164,8 @@ def build_config(endpoint: str, api_key: str, tenant_id: str) -> SimulationConfi
     return SimulationConfig(
         source=JOURNEY_SOURCE,
         scenario=ScenarioId.FRESH_CUT_PROCESSOR,
-        delivery=DeliveryConfig(
-            mode="live",
-            endpoint=endpoint,
-            api_key=api_key,
-            tenant_id=tenant_id,
+        delivery=DeliveryConfig.model_validate(
+            {"mode": "live", "endpoint": endpoint, "api_key": api_key, "tenant_id": tenant_id}
         ),
     )
 

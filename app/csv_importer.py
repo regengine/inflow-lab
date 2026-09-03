@@ -4,6 +4,7 @@ import csv
 import io
 import json
 import re
+from collections.abc import Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from typing import Any
@@ -185,6 +186,9 @@ def _parse_seed_lot(
     if errors:
         return None, [], errors, []
 
+    # _parse_timestamp records an error whenever it returns None, so past the
+    # errors check above the timestamp is always present; say so for mypy.
+    assert timestamp is not None
     kdes.setdefault("harvest_date", timestamp.date().isoformat())
     kdes.setdefault("farm_location", row["location_name"])
     if row.get("field_name"):
@@ -281,7 +285,7 @@ def _build_event(
     return event, parent_lot_codes, [], warnings
 
 
-def _header_errors(fieldnames: list[str] | None) -> list[CSVImportError]:
+def _header_errors(fieldnames: Sequence[str] | None) -> list[CSVImportError]:
     if not fieldnames:
         return [CSVImportError(row=1, field="header", message="CSV header row is required")]
 
