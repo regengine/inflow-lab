@@ -34,6 +34,7 @@ only files this workstream owns.
 from __future__ import annotations
 
 import asyncio
+from datetime import UTC, datetime
 
 import app.controller as controller_module
 from app.main import controller
@@ -48,14 +49,10 @@ from app.schemas.domain import (
 )
 from app.schemas.ingestion import CSVImportRequest, DeliveryRetryRequest, IngestPayload, ReplayRequest
 from app.schemas.simulation import DeliveryConfig, SimulationConfig
-from tests.support.timestamps import CANONICAL_EVENT_DATE, CANONICAL_EVENT_TIME
 
 
-# The suite's canonical valid-event time, relative to now rather than a
-# fixed literal: the mock enforces RegEngine's 90-day replay window, so a
-# hardcoded date here would silently age these records out of it (#209).
-_BASE_TIME = CANONICAL_EVENT_TIME
-_VALID_KDES = {"harvest_date": CANONICAL_EVENT_DATE, "reference_document": "Harvest Log HL-BATCHING-DEFAULT"}
+_BASE_TIME = datetime(2026, 3, 1, 8, 0, tzinfo=UTC)
+_VALID_KDES = {"harvest_date": "2026-03-01", "reference_document": "Harvest Log HL-BATCHING-DEFAULT"}
 
 
 def setup_function() -> None:

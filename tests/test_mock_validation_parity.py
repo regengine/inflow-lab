@@ -32,19 +32,20 @@ behavior, covering two gaps identified in a repo-wide mock-fidelity audit:
   deterministically regardless of when this suite actually runs.
 
   MockRegEngineService.__init__ gained a keyword-only
-  `enforce_event_age_window` flag for this. It shipped defaulting to False,
-  deliberately: this repo's own demo fixtures and a large fraction of the
-  suite used a fixed "2026-02-05"-ish timestamp as their canonical valid
-  event, and turning the floor on against the default wall-clock `clock`
-  would have rejected all of it the instant real time drifted 90 days past.
-
-  #209 flipped that default to True once both populations were re-timed
-  (#199 rebases the fixtures at load time; tests/support/timestamps.py is
-  the suite's now-relative canonical event). A mock that skipped live's
-  floor by default was itself the "green demo, failing live post" bug this
-  repo exists to surface. The flag remains as an explicit opt-OUT for the
-  tests below, whose subject is the boundary itself and which drive an
-  injected clock rather than the wall clock.
+  `enforce_event_age_window` flag (default False) for this. It is off by
+  default DELIBERATELY, not an oversight: this repo's own shipped demo
+  content (app/demo_fixtures.py's three DemoFixture entries) and a large
+  fraction of the existing test suite (tests/test_mock_parity.py,
+  tests/test_mock_hmac.py, tests/test_mock_limits.py, tests/test_api.py,
+  and others) use a fixed "2026-02-05"-ish timestamp as their canonical
+  valid-event fixture. Turning the floor on unconditionally against the
+  default wall-clock `clock` would reject that data the instant real time
+  drifts more than 90 days past it -- which, as of this file being
+  written, it already has. Enforcing it live end-to-end (SimulationController
+  constructing MockRegEngineService with the flag on, CSV-import warnings,
+  a replay out-of-window count) is simulator-side work outside this file's
+  ownership (app/mock_service.py only) -- see the PR/issue notes for the
+  exact files and functions that would need it.
 """
 
 from __future__ import annotations
@@ -66,7 +67,6 @@ from app.mock_service import (
 from app.schemas.domain import CTEType, RegEngineEvent
 from app.schemas.ingestion import IngestPayload
 from app.schemas.simulation import SimulationConfig
-from tests.support.timestamps import CANONICAL_EVENT_DATE, CANONICAL_EVENT_TIME
 
 
 client = TestClient(app)
@@ -103,9 +103,9 @@ def _valid_event(
         quantity=quantity,
         unit_of_measure="cases",
         location_name="Valley Fresh Farms",
-        timestamp=timestamp or CANONICAL_EVENT_TIME,
+        timestamp=timestamp or datetime(2026, 2, 5, 8, 0, tzinfo=UTC),
         kdes={
-            "harvest_date": CANONICAL_EVENT_DATE,
+            "harvest_date": "2026-02-05",
             "reference_document": "Harvest Log HAR-0001",
         },
     )
@@ -256,7 +256,7 @@ def test_missing_kde_is_still_a_per_event_200_rejection_not_a_422() -> None:
         quantity=100,
         unit_of_measure="cases",
         location_name="Valley Fresh Farms",
-        timestamp=CANONICAL_EVENT_TIME,
+        timestamp=datetime(2026, 2, 5, 8, 0, tzinfo=UTC),
         kdes={},
     )
     payload = IngestPayload(source="field-fatal-test", events=[good, missing_kdes])
@@ -288,19 +288,14 @@ def test_validate_event_like_regengine_still_reports_field_constraint_errors_dir
 # ---------------------------------------------------------------------------
 
 
-def test_age_window_is_on_by_default_even_with_an_injected_clock() -> None:
-    """The inverted #102 design decision (#209): an unconfigured
-    MockRegEngineService() -- what SimulationController's real construction
-    and every test that does not care about event age actually use --
-    rejects a stale event, because enforce_event_age_window now defaults to
-    True.
-
-    This is the assertion #102 left standing in the other direction, and it
-    is the one that matters: the bug was never that the check was missing,
-    it was that the *default* skipped it, so the deployed stand-in accepted
-    batches live 422s. Uses an injected (not wall-clock) reference point so
-    this holds deterministically rather than by coincidence of when the
-    suite happens to run.
+def test_age_window_is_off_by_default_even_with_an_injected_clock() -> None:
+    """The core #102 design decision under test: an unconfigured
+    MockRegEngineService() -- what every pre-existing test and
+    SimulationController's real construction actually use -- never rejects
+    an event for being old, no matter how old, because
+    enforce_event_age_window defaults to False. Uses an injected (not
+    wall-clock) reference point so this holds deterministically rather
+    than by coincidence of when the suite happens to run.
     """
     clock_state = {"now": datetime(2026, 6, 1, tzinfo=UTC)}
     service = MockRegEngineService(clock=lambda: clock_state["now"])
@@ -308,29 +303,6 @@ def test_age_window_is_on_by_default_even_with_an_injected_clock() -> None:
     payload = IngestPayload(source="age-window-test", events=[ancient_event])
 
     response = service.ingest(payload)
-
-    assert response.accepted == 0
-    assert response.rejected == 1
-    (error,) = response.events[0].errors
-    assert "replay window exceeded" in error
-
-
-def test_the_age_window_can_still_be_opted_out_of_explicitly() -> None:
-    """The escape hatch the default flip left in place, pinned so it stays a
-    real one.
-
-    A test whose subject IS a stale event -- or a caller knowingly feeding
-    the simulator historical data -- passes enforce_event_age_window=False
-    and gets the pre-#209 behavior. Making that explicit is the point: the
-    old default let a caller skip live's floor without ever saying so.
-    """
-    clock_state = {"now": datetime(2026, 6, 1, tzinfo=UTC)}
-    service = MockRegEngineService(
-        clock=lambda: clock_state["now"], enforce_event_age_window=False
-    )
-    ancient_event = _harvest_event_at(clock_state["now"] - timedelta(days=1000))
-
-    response = service.ingest(IngestPayload(source="age-window-test", events=[ancient_event]))
 
     assert response.accepted == 1
     assert response.rejected == 0

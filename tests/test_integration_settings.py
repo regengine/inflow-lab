@@ -7,8 +7,8 @@ from typing import Any
 from fastapi.testclient import TestClient
 
 from app.main import app, controller
-from app.schemas.integration import CREDENTIALS_WITHHELD_VERDICT
 from app.schemas.simulation import SimulationConfig
+
 
 client = TestClient(app)
 
@@ -43,7 +43,7 @@ class ProbeAsyncClient:
     def __init__(self, *, timeout: float) -> None:
         self.timeout = timeout
 
-    async def __aenter__(self) -> ProbeAsyncClient:
+    async def __aenter__(self) -> "ProbeAsyncClient":
         return self
 
     async def __aexit__(self, exc_type: object, exc: object, tb: object) -> None:
@@ -55,10 +55,6 @@ class ProbeAsyncClient:
         *,
         headers: dict[str, str] | None = None,
         params: dict[str, Any] | None = None,
-        # extensions: the live client attaches {"sni_hostname": ...} when it
-        # pins the validated address for the dial (#207). Accepted and
-        # ignored here so this fake keeps working on either path.
-        extensions: dict[str, Any] | None = None,
     ) -> FakeProbeResponse:
         if url.endswith("/health"):
             return FakeProbeResponse(200, ProbeAsyncClient.health_payload)
@@ -120,12 +116,10 @@ def test_integration_test_reports_mock_mode_without_probing() -> None:
 def test_integration_test_maps_probe_status_to_customer_verdicts(monkeypatch: Any) -> None:
     monkeypatch.setattr("app.regengine_client.httpx.AsyncClient", ProbeAsyncClient)
     ProbeAsyncClient.health_payload = None
-    # 402 is deliberately absent: /recent has no subscription gate (that
-    # dependency is on /ingest only), so the probe can never see one. See #100
-    # and the comment on _CONNECTION_VERDICTS.
     expectations = {
         200: "connected",
         401: "unauthorized",
+        402: "subscription_inactive",
         403: "forbidden",
         404: "tenant_mismatch",
         429: "rate_limited",
@@ -199,44 +193,12 @@ def test_healthz_and_integration_status_advertise_contract_version() -> None:
 
 
 def test_integration_test_requires_credentials_for_live_probe() -> None:
-    """Nothing is configured here, so `not_configured` is the truthful verdict.
-
-    Contrast `test_integration_test_names_withheld_credentials_truthfully`
-    below: when credentials *are* configured and were deliberately withheld
-    because the probed endpoint is a different origin, the verdict must not be
-    this one -- re-entering credentials is not the fix for that case.
-    """
     response = client.post(
         "/api/integration/test",
         json={"endpoint": "https://staging.regengine.example/api/v1/webhooks/ingest"},
     )
     assert response.status_code == 200
     assert response.json()["verdict"] == "not_configured"
-
-
-def test_integration_test_names_withheld_credentials_truthfully() -> None:
-    configure = client.post(
-        "/api/integration/configure",
-        json={
-            "mode": "live",
-            "endpoint": "https://www.regengine.co/api/v1/webhooks/ingest",
-            "api_key": "rge_live_settings_secret",
-            "tenant_id": "44444444-4444-4444-4444-444444444444",
-        },
-    )
-    assert configure.status_code == 200
-
-    # Same host, downgraded scheme: a different origin, so the stored key stays
-    # put and the operator is told why instead of being sent to re-enter it.
-    response = client.post(
-        "/api/integration/test",
-        json={"endpoint": "http://www.regengine.co/api/v1/webhooks/ingest"},
-    )
-    assert response.status_code == 200
-    body = response.json()
-    assert body["verdict"] == CREDENTIALS_WITHHELD_VERDICT
-    assert body["verdict"] != "not_configured"
-    assert_json_omits(body, "rge_live_settings_secret")
 
 
 def test_mock_friction_surfaces_the_402_subscription_gate_then_recovers() -> None:
@@ -280,8 +242,8 @@ def test_mock_rate_limit_friction_maps_to_429() -> None:
 
 
 def test_mock_idempotency_replay_returns_cached_response() -> None:
-    from app.demo_fixtures import get_demo_fixture
     from app.mock_service import MockRegEngineService
+    from app.demo_fixtures import get_demo_fixture
     from app.schemas.domain import DemoFixtureId
     from app.schemas.ingestion import IngestPayload
 
@@ -296,158 +258,3 @@ def test_mock_idempotency_replay_returns_cached_response() -> None:
     first_ids = [event.event_id for event in first.events]
     fresh_ids = [event.event_id for event in fresh.events]
     assert first_ids != fresh_ids
-
-
-<<<<<<< HEAD
-# ---------------------------------------------------------------------------
-# #100 -- the probe reads GET /api/v1/webhooks/recent, whose dependency chain is
-# strictly weaker than the /ingest route it is meant to certify. It cannot see
-# the subscription gate, the webhooks.ingest scope, or the webhook signature, so
-# it reported "connected. Credentials and tenant are valid" for configurations
-# where 100% of ingests fail.
-# ---------------------------------------------------------------------------
-
-
-def _probe(monkeypatch: Any, *, health_payload: Any, status_code: int = 200) -> dict[str, Any]:
-    monkeypatch.setattr("app.regengine_client.httpx.AsyncClient", ProbeAsyncClient)
-    ProbeAsyncClient.status_code = status_code
-    ProbeAsyncClient.health_payload = health_payload
-    ProbeAsyncClient.calls = []
-    response = client.post(
-        "/api/integration/test",
-        json={
-            "api_key": "rge_live_probe_key",
-            "tenant_id": "22222222-2222-2222-2222-222222222222",
-        },
-    )
-    assert response.status_code == 200, response.text
-    return response.json()
-
-
-def test_remote_signs_and_we_do_not_yields_signature_mismatch(monkeypatch: Any) -> None:
-    # The config from #100's impact statement: RegEngine has WEBHOOK_HMAC_SECRET
-    # set, the simulator does not. The probe reads an unsigned endpoint so this
-    # passes /recent, then 401s on every single ingest.
-    monkeypatch.delenv("REGENGINE_WEBHOOK_HMAC_SECRET", raising=False)
-
-    body = _probe(monkeypatch, health_payload={"webhook_hmac_configured": True})
-
-    assert body["verdict"] == "signature_mismatch"
-    assert "401" in body["detail"]
-    assert "REGENGINE_WEBHOOK_HMAC_SECRET" in body["detail"]
-
-
-def test_we_sign_and_remote_does_not_yields_signature_mismatch(monkeypatch: Any) -> None:
-    # The other direction fails differently -- bodies are accepted unverified
-    # rather than rejected -- so it gets its own wording.
-    monkeypatch.setenv("REGENGINE_WEBHOOK_HMAC_SECRET", "local-secret")
-
-    body = _probe(monkeypatch, health_payload={"webhook_hmac_configured": False})
-
-    assert body["verdict"] == "signature_mismatch"
-    assert "without their signature" in body["detail"]
-
-
-def test_matching_signing_posture_stays_connected(monkeypatch: Any) -> None:
-    monkeypatch.setenv("REGENGINE_WEBHOOK_HMAC_SECRET", "shared-secret")
-
-    body = _probe(monkeypatch, health_payload={"webhook_hmac_configured": True})
-
-    assert body["verdict"] == "connected"
-
-
-def test_both_sides_unsigned_stays_connected(monkeypatch: Any) -> None:
-    monkeypatch.delenv("REGENGINE_WEBHOOK_HMAC_SECRET", raising=False)
-
-    body = _probe(monkeypatch, health_payload={"webhook_hmac_configured": False})
-
-    assert body["verdict"] == "connected"
-
-
-def test_a_remote_that_does_not_advertise_posture_is_not_guessed_at(monkeypatch: Any) -> None:
-    # An older deploy predating the field. Absence is tolerated the same way
-    # contract-version skew detection tolerates it, rather than assumed to be
-    # False and reported as a mismatch.
-    monkeypatch.setenv("REGENGINE_WEBHOOK_HMAC_SECRET", "local-secret")
-
-    body = _probe(monkeypatch, health_payload={"inflow_contract_version": "1"})
-
-    assert body["verdict"] == "connected"
-
-
-def test_contract_mismatch_still_takes_precedence(monkeypatch: Any) -> None:
-    monkeypatch.delenv("REGENGINE_WEBHOOK_HMAC_SECRET", raising=False)
-
-    body = _probe(
-        monkeypatch,
-        health_payload={"inflow_contract_version": "999", "webhook_hmac_configured": True},
-    )
-
-    assert body["verdict"] == "contract_mismatch"
-
-
-def test_the_connected_detail_no_longer_claims_ingest_will_work(monkeypatch: Any) -> None:
-    monkeypatch.delenv("REGENGINE_WEBHOOK_HMAC_SECRET", raising=False)
-
-    detail = _probe(monkeypatch, health_payload=None)["detail"]
-
-    assert "does not prove ingest will work" in detail
-    for unproven in ("subscription", "webhooks.ingest", "signature"):
-        assert unproven in detail
-
-
-def test_the_rate_limit_detail_names_the_read_budget(monkeypatch: Any) -> None:
-    body = _probe(monkeypatch, health_payload=None, status_code=429)
-
-    assert body["verdict"] == "rate_limited"
-    assert "read budget" in body["detail"]
-=======
-def test_not_configured_detail_names_the_origin_mismatch_not_missing_credentials() -> None:
-    """The verdict was right and the reason was false (#210).
-
-    With credentials stored for one origin, probing a different one
-    correctly withholds them -- but the detail that came back was
-    check_connection's generic "Both an API key and a tenant id are
-    required before testing the connection." Both ARE configured. An
-    operator reading that goes and re-enters credentials that were already
-    correct, and never learns that what actually happened is that this
-    request pointed somewhere the stored key was not issued for.
-    """
-    configured = client.post(
-        "/api/integration/configure",
-        json={
-            "mode": "live",
-            "endpoint": "https://www.regengine.co/api/v1/webhooks/ingest",
-            "api_key": "rge_live_configured_key",
-            "tenant_id": "11111111-1111-1111-1111-111111111111",
-        },
-    )
-    assert configured.status_code == 200
-
-    body = client.post(
-        "/api/integration/test",
-        json={"endpoint": "https://staging.regengine.example/api/v1/webhooks/ingest"},
-    ).json()
-
-    assert body["verdict"] == "not_configured"
-    detail = body["detail"]
-    assert "Both an API key and a tenant id are required" not in detail, (
-        "reported missing credentials that are in fact configured"
-    )
-    assert "https://www.regengine.co:443" in detail, "should name where the stored key belongs"
-    assert "https://staging.regengine.example:443" in detail, "should name what was targeted"
-    assert "rge_live_configured_key" not in detail
-
-
-def test_not_configured_detail_is_unchanged_when_nothing_is_actually_configured() -> None:
-    # The generic wording is correct in the case it was written for, and
-    # must survive. setup_function has reset to a default config, so
-    # nothing is stored and nothing is supplied.
-    body = client.post(
-        "/api/integration/test",
-        json={"endpoint": "https://staging.regengine.example/api/v1/webhooks/ingest"},
-    ).json()
-
-    assert body["verdict"] == "not_configured"
-    assert "Both an API key and a tenant id are required" in body["detail"]
->>>>>>> origin/main

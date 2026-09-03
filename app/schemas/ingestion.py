@@ -6,50 +6,31 @@ from typing import Any, Literal
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 from .domain import CSVImportType, CTEType, DestinationMode, RegEngineEvent
-from .simulation import STRICT_REQUEST, DeliveryConfig
-
-# RegEngine's per-batch cap. Owned here rather than in `mock_service` so the
-# schema can enforce it before pydantic materialises the list; the service
-# re-exports it and still checks it for direct callers.
-MAX_BATCH_EVENTS = 500
+from .simulation import DeliveryConfig
 
 
 class IngestPayload(BaseModel):
-<<<<<<< HEAD
-    # Deliberately NOT extra="forbid". This is the RegEngine wire contract, not
-    # one of this app's own control-plane bodies: RegEngine's own IngestEvent
-    # sets no model_config and so ignores unknown keys. Forbidding them here
-    # would make the mock reject batches live ingest accepts, which is the
-    # parity gap this simulator exists to close, pointing the wrong way.
+    # extra="forbid" (#143): this is a request body (POST /api/mock/regengine/
+    # ingest), constructed internally elsewhere with known kwargs only. A
+    # caller who misspells "events" or nests the payload under an extra
+    # wrapper key would otherwise get a silent 200 that ingested nothing,
+    # which is the exact failure mode this simulator exists to catch.
+    model_config = ConfigDict(extra="forbid")
+
     source: str = "codex-simulator"
-    # Capped at the same 500 the service enforces, but here -- before pydantic
-    # materialises every model. The service-layer check ran after, so a 400k
-    # event batch allocated ~1.3 GB and only then raised. Matching the live
-    # limit keeps the parity honest rather than making the mock stricter.
-    events: list[RegEngineEvent] = Field(max_length=MAX_BATCH_EVENTS)
-=======
-    # Deliberately NOT strict: this is the mock stand-in for RegEngine's own
-    # webhook receiver, and a receiver that 422s on an additive field a
-    # newer producer sends would misrepresent live behaviour.
-    source: str = "codex-simulator"
-    # NOT max_length=500, deliberately -- see tests/test_schema_bounds.py.
-    # RegEngine's own WebhookPayload does bound `events` at 1-500, and this
-    # model is the request body for the mock's /api/mock/regengine/ingest
-    # route, so a pydantic constraint here would be rejected by FastAPI as a
-    # RequestValidationError whose `detail` is a list of error dicts. The mock
-    # instead enforces the cap in MockRegEngineService.ingest so it can return
-    # RegEngine's own wording ("events accepts at most 500 items per batch")
-    # as a plain string detail, which tests/test_mock_parity.py pins. Adding
-    # the constraint here changes that response body and breaks the pin.
-    # Producers are already bounded: every bulk send goes through
-    # `delivery.chunk_events`, which chunks at MAX_BATCH_EVENTS (#103).
     events: list[RegEngineEvent]
->>>>>>> origin/main
 
 
 class IngestResponseEvent(BaseModel):
     # Mirrors RegEngine's EventResult: rejected events carry errors and no
     # event_id/hashes, accepted events carry all three.
+    #
+    # Response-only model (nested in MockIngestResponse) -- left permissive
+    # (no extra="forbid") on purpose. #143 targets request bodies, where an
+    # unrecognized field is a caller mistake worth a 422; here it is built
+    # by our own mock_service.py from known kwargs, so there is nothing to
+    # guard against and forbidding would only add risk if this ever needs
+    # to mirror a new field RegEngine's real response starts sending.
     traceability_lot_code: str
     cte_type: CTEType
     status: Literal["accepted", "rejected"]
@@ -68,8 +49,17 @@ class MockIngestResponse(BaseModel):
 
 
 class DeliveryRetryRequest(BaseModel):
+    # extra="forbid" (#143): request body for POST /api/delivery/retry. A
+    # typo like "record_id" (singular) would otherwise be silently dropped,
+    # parsing as an empty request that retries every failed record instead
+    # of the caller's intended subset -- a destructive default for a typo.
     model_config = ConfigDict(extra="forbid")
 
+    # None ("field omitted") means "no filter -- retry every failed record
+    # up to limit"; [] ("field present but empty") means "retry nothing".
+    # Pydantic already keeps these distinguishable at parse time; the fix
+    # for #144 is entirely in how SimulationController.retry_failed_delivery
+    # consumes this value -- see app/controller.py.
     record_ids: list[str] | None = None
     limit: int = 50
     source: str | None = None
@@ -98,6 +88,7 @@ class DeliveryRetryResponse(BaseModel):
 
 
 class ReplayRequest(BaseModel):
+    # extra="forbid" (#143): request body for POST /api/simulate/replay.
     model_config = ConfigDict(extra="forbid")
 
     persist_path: str | None = None
@@ -119,40 +110,12 @@ class ReplayResponse(BaseModel):
     error: str | None = None
 
 
-<<<<<<< HEAD
-# The importer parses the whole document into memory and turns every row into
-# a record, with no row cap of its own, so an unbounded `csv_text` is an
-# unbounded allocation. 2 MiB is roughly 13k rows at typical CTE row widths --
-# far more than any demo import -- and rejects as a 422 rather than dying in
-# the handler. Note this bounds what is *parsed*, not what is *received*:
-# the ASGI server still buffers the request body first, so a hard byte limit
-# belongs in front of the app.
-MAX_CSV_TEXT_CHARS = 2 * 1024 * 1024
-=======
-# Upper bound on a single CSV import body, in characters.
-#
-# `parse_csv_import` is CPU-bound and runs synchronously on the app's single
-# event loop, so an unbounded `csv_text` makes the worst-case stall unbounded
-# too: one oversized import blocks every other request in the process. The
-# limit is enforced by pydantic, which means it rejects with a 422 before the
-# parser ever sees the body.
-#
-# 4 MiB of characters is roughly 25k-40k typical CTE rows -- far above any
-# real demo or design-partner import, and far below a body that would stall
-# the loop noticeably.
-MAX_CSV_IMPORT_CHARS = 4 * 1024 * 1024
->>>>>>> origin/main
-
-
 class CSVImportRequest(BaseModel):
+    # extra="forbid" (#143): request body for POST /api/import/csv.
     model_config = ConfigDict(extra="forbid")
 
     import_type: CSVImportType
-<<<<<<< HEAD
-    csv_text: str = Field(max_length=MAX_CSV_TEXT_CHARS)
-=======
-    csv_text: str = Field(max_length=MAX_CSV_IMPORT_CHARS)
->>>>>>> origin/main
+    csv_text: str
     source: str | None = None
     delivery: DeliveryConfig | None = None
 

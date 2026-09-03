@@ -1,14 +1,3 @@
-<<<<<<< HEAD
-// First-run welcome overlay and the guided tour.
-//
-// Self-contained: nothing else in the console reads its state, and it reads
-// nothing but `ids` and the tour step table.
-
-import { ONBOARDING_KEY, TOUR_STEPS } from './state.js';
-import { setStatus, tourEls, welcomeEls } from './dom.js';
-
-export const tour = { active: false, index: 0 };
-=======
 // First-run welcome dialog and the guided tour, including the modal focus
 // trap the welcome overlay's role="dialog" aria-modal="true" promises.
 
@@ -18,16 +7,11 @@ import { setStatus } from './ui.js';
 // Seen-state lives in localStorage so the welcome only interrupts once per
 // browser; private-mode storage failures degrade to "never show".
 export const ONBOARDING_KEY = 'inflowLab.onboarded.v1';
->>>>>>> origin/main
 
 export function onboardingSeen() {
   try {
     return window.localStorage.getItem(ONBOARDING_KEY) === 'done';
-<<<<<<< HEAD
-  } catch {
-=======
   } catch (error) {
->>>>>>> origin/main
     return true;
   }
 }
@@ -35,17 +19,11 @@ export function onboardingSeen() {
 export function markOnboarded() {
   try {
     window.localStorage.setItem(ONBOARDING_KEY, 'done');
-<<<<<<< HEAD
-  } catch {
-=======
   } catch (error) {
->>>>>>> origin/main
     // Storage unavailable — the welcome simply shows again next visit.
   }
 }
 
-<<<<<<< HEAD
-=======
 // Fuller copy than the guide rail's one-liners: each tour stop explains what
 // the panel is for and what to actually click.
 export const TOUR_STEPS = [
@@ -88,7 +66,6 @@ export const tourEls = {
   skip: document.getElementById('tourSkipBtn'),
 };
 
->>>>>>> origin/main
 export function clearTourHighlight() {
   document.querySelectorAll('.tour-highlight').forEach((node) => node.classList.remove('tour-highlight'));
 }
@@ -134,10 +111,6 @@ export function advanceTour(delta) {
   showTourStep(next);
 }
 
-<<<<<<< HEAD
-export function hideWelcome() {
-  welcomeEls.overlay.hidden = true;
-=======
 export const welcomeEls = {
   overlay: document.getElementById('welcomeOverlay'),
   tour: document.getElementById('welcomeTourBtn'),
@@ -185,7 +158,6 @@ export function trapWelcomeFocus(event) {
 export function hideWelcome() {
   welcomeEls.overlay.hidden = true;
   document.removeEventListener('keydown', trapWelcomeFocus, true);
->>>>>>> origin/main
   markOnboarded();
 }
 
@@ -194,9 +166,6 @@ export function maybeShowWelcome() {
     return;
   }
   welcomeEls.overlay.hidden = false;
-<<<<<<< HEAD
-=======
   document.addEventListener('keydown', trapWelcomeFocus, true);
->>>>>>> origin/main
   welcomeEls.tour.focus();
 }

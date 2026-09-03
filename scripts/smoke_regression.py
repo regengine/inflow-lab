@@ -12,12 +12,8 @@ from fastapi.testclient import TestClient
 REPO_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(REPO_ROOT))
 
-# Imported after the sys.path bootstrap above so
-# `python scripts/smoke_regression.py` works from a clean checkout; hence the
-# E402 waivers.
-from app.main import app  # noqa: E402
-from app.tenancy import tenant_dir, tenant_events_path  # noqa: E402
-from scripts import _smoke_common as smoke  # noqa: E402
+from app.main import app
+
 
 TENANTS = ["release-smoke-main", "release-smoke-other"]
 
@@ -74,14 +70,9 @@ def run_smoke(client: TestClient) -> None:
 
     status = assert_json(client.get("/api/simulate/status", headers=main_headers), 200)
     assert_equal(status["stats"]["total_records"], 13, "fixture status total")
-    # Derived from app.tenancy rather than written out, because the app
-    # resolves the data root from REGENGINE_DATA_DIR at import time. A literal
-    # made this assertion fail -- on a cosmetic path string, saying nothing
-    # about correctness -- for any operator whose shell exports that variable,
-    # which DEPLOYMENT_PROFILES.md tells them to do.
     assert_equal(
         status["config"]["persist_path"],
-        str(tenant_events_path(TENANTS[0])),
+        "data/tenants/release-smoke-main/events.jsonl",
         "tenant persist path",
     )
 
@@ -172,54 +163,36 @@ def request_headers(tenant_id: str) -> dict[str, str]:
     username = os.getenv("REGENGINE_BASIC_AUTH_USERNAME")
     password = os.getenv("REGENGINE_BASIC_AUTH_PASSWORD")
     if username and password:
-        token = base64.b64encode(f"{username}:{password}".encode()).decode("ascii")
+        token = base64.b64encode(f"{username}:{password}".encode("utf-8")).decode("ascii")
         headers["Authorization"] = f"Basic {token}"
     return headers
 
 
 def cleanup_smoke_tenants() -> None:
-    """Remove the smoke tenants from the data root the app actually used.
-
-    Hardcoding ``data/`` deleted the wrong directory whenever
-    REGENGINE_DATA_DIR pointed elsewhere, leaving release-smoke-main and
-    release-smoke-other in the shared demo's persistent store, where
-    ``known_tenant_ids()`` then surfaced them in /api/operator/tenants forever.
-    """
     for tenant_id in TENANTS:
-        shutil.rmtree(tenant_dir(tenant_id), ignore_errors=True)
+        shutil.rmtree(Path("data") / "tenants" / tenant_id, ignore_errors=True)
 
 
 def assert_json(response, expected_status: int) -> dict[str, Any]:
     assert_status(response, expected_status)
-    return smoke.response_json(response, response.request.url.path, failure=SmokeFailure)
+    return response.json()
 
 
 def assert_status(response, expected_status: int) -> None:
-    smoke.assert_status(
-        response,
-        expected_status,
-        f"{response.request.method} {response.request.url.path}",
-        failure=SmokeFailure,
-        redact=redact,
-    )
-
-
-def redact(value: str) -> str:
-    """Scrub anything credential-shaped in the environment out of a body.
-
-    The release smoke runs in-process against a TestClient, so an echoed 500
-    body can carry whatever REGENGINE_BASIC_AUTH_PASSWORD (or any other
-    credential env var) is set to on the operator's machine.
-    """
-    return smoke.redact_secrets(value, sorted(smoke.secret_values()))
+    if response.status_code != expected_status:
+        raise SmokeFailure(
+            f"Expected status {expected_status}, got {response.status_code}: {response.text}"
+        )
 
 
 def assert_equal(actual: Any, expected: Any, label: str) -> None:
-    smoke.assert_equal(actual, expected, label, failure=SmokeFailure)
+    if actual != expected:
+        raise SmokeFailure(f"{label}: expected {expected!r}, got {actual!r}")
 
 
 def assert_in(member: Any, container: Any, label: str) -> None:
-    smoke.assert_in(member, container, label, failure=SmokeFailure)
+    if member not in container:
+        raise SmokeFailure(f"{label}: expected {member!r} to be present")
 
 
 if __name__ == "__main__":
@@ -227,4 +200,4 @@ if __name__ == "__main__":
         raise SystemExit(main())
     except SmokeFailure as exc:
         print(f"Release smoke regression failed: {exc}", file=sys.stderr)
-        raise SystemExit(1) from exc
+        raise SystemExit(1)

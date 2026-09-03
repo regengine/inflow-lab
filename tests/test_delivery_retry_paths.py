@@ -22,7 +22,7 @@ ownership across parallel workstreams).
 from __future__ import annotations
 
 import asyncio
-from datetime import timedelta
+from datetime import UTC, datetime, timedelta
 from typing import Any
 
 from fastapi.testclient import TestClient
@@ -30,16 +30,12 @@ from fastapi.testclient import TestClient
 from app.main import app, controller
 from app.schemas.domain import CTEType, DestinationMode, RegEngineEvent, StoredEventRecord
 from app.schemas.simulation import SimulationConfig
-from tests.support.timestamps import CANONICAL_EVENT_DATE, CANONICAL_EVENT_TIME
 
 
 client = TestClient(app)
 
-# The suite's canonical valid-event time, relative to now rather than a
-# fixed literal: the mock enforces RegEngine's 90-day replay window, so a
-# hardcoded date here would silently age these records out of it (#209).
-_BASE_TIME = CANONICAL_EVENT_TIME
-_VALID_KDES = {"harvest_date": CANONICAL_EVENT_DATE, "reference_document": "Harvest Log HL-RETRY-DEFAULT"}
+_BASE_TIME = datetime(2026, 3, 1, 8, 0, tzinfo=UTC)
+_VALID_KDES = {"harvest_date": "2026-03-01", "reference_document": "Harvest Log HL-RETRY-DEFAULT"}
 
 
 def setup_function() -> None:

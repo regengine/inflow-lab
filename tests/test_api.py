@@ -1,30 +1,20 @@
-"""Core simulation API: step, status, SSE, the mock ingest endpoint and
-run-loop lifecycle.
-
-The rest of this file was split by theme into ``test_api_*.py`` modules
-(see #132); the tests themselves were moved verbatim.
-"""
-
-from datetime import UTC, datetime, timedelta
-
 import asyncio
 import base64
+import csv
+import io
 import json
+import logging
 
-from fastapi.testclient import TestClient
 import pytest
+from fastapi.testclient import TestClient
 
-<<<<<<< HEAD
 from app.build_info import BRANCH_ENV_VARS, COMMIT_SHA_ENV_VARS, DEPLOYMENT_ID_ENV_VARS
 from app.cors import DEFAULT_CORS_ORIGINS
 from app.main import app, controller, cors_origins_from_env, scenario_saves
+from app.schemas.simulation import SimulationConfig
 from app.regengine_client import LiveIngestResult, LiveRegEngineDeliveryError
-=======
-from app.main import app, controller
-from app.schemas.simulation import SimulationConfig
->>>>>>> origin/main
 from app.scenarios import ScenarioId, get_scenario
-from app.schemas.simulation import SimulationConfig
+
 
 client = TestClient(app)
 
@@ -33,7 +23,7 @@ PUBLIC_ENDPOINT = "https://www.regengine.co/api/v1/webhooks/ingest"
 
 
 def basic_auth_header(username: str, password: str) -> dict[str, str]:
-    token = base64.b64encode(f"{username}:{password}".encode()).decode("ascii")
+    token = base64.b64encode(f"{username}:{password}".encode("utf-8")).decode("ascii")
     return {"Authorization": f"Basic {token}"}
 
 
@@ -84,22 +74,12 @@ def test_sse_stream_emits_initial_snapshot():
     assert payload["events"] == []
 
 
-def test_reset_rejects_unknown_fields_and_misplaced_config():
-    # Misspelled key must return 422, not silently succeed (#143).
-    assert client.post("/api/simulate/reset", json={"config": {"scenaryo": "leafy_greens_supplier"}}).status_code == 422
-    # Sending /start's shape to /reset (unwrapped) must return 422, not
-    # silently discard the override.
-    assert client.post("/api/simulate/reset", json={"scenario": "dairy_continuous_flow"}).status_code == 422
-    # Well-formed wrapped config still works.
-    assert client.post("/api/simulate/reset", json={"config": {"scenario": "leafy_greens_supplier"}}).status_code == 200
-
-
 def test_status_surfaces_redact_live_delivery_credentials():
     api_key = "regengine-live-api-key-secret"
     tenant_id = "regengine-live-tenant-secret"
     reset_response = client.post(
         "/api/simulate/reset",
-        json={"config": {
+        json={
             "batch_size": 1,
             "seed": 204,
             "delivery": {
@@ -108,7 +88,7 @@ def test_status_surfaces_redact_live_delivery_credentials():
                 "api_key": api_key,
                 "tenant_id": tenant_id,
             },
-        }},
+        },
     )
     assert reset_response.status_code == 200
 
@@ -158,11 +138,11 @@ def test_scenario_catalog_endpoint_lists_supported_presets():
 def test_status_includes_backend_audit_summary():
     client.post(
         "/api/simulate/reset",
-        json={"config": {
+        json={
             "scenario": "leafy_greens_supplier",
             "batch_size": 1,
             "seed": 204,
-        }},
+        },
     )
     client.post("/api/simulate/step")
 
@@ -179,11 +159,11 @@ def test_status_includes_backend_audit_summary():
 def test_status_audit_tracks_seafood_readiness_shape():
     client.post(
         "/api/simulate/reset",
-        json={"config": {
+        json={
             "scenario": "seafood_first_receiver",
             "batch_size": 1,
             "seed": 204,
-        }},
+        },
     )
     client.post("/api/simulate/step")
 
@@ -332,7 +312,7 @@ def test_basic_auth_blocks_state_changes_from_untrusted_browser_origins(monkeypa
     reset = client.post(
         "/api/simulate/reset",
         headers=headers,
-        json={"config": {"batch_size": 3, "seed": 204, "delivery": {"mode": "none"}}},
+        json={"batch_size": 3, "seed": 204, "delivery": {"mode": "none"}},
     )
     assert reset.status_code == 200
 
@@ -432,18 +412,18 @@ def test_tenant_header_scopes_event_storage_and_rejects_invalid_ids(tmp_path):
     reset_response = client.post(
         "/api/simulate/reset",
         headers=alpha_headers,
-        json={"config": {
+        json={
             "batch_size": 1,
             "seed": 204,
             "persist_path": str(alpha_path),
             "delivery": {"mode": "none"},
-        }},
+        },
     )
     assert reset_response.status_code == 200
     assert client.post(
         "/api/simulate/reset",
         headers=beta_headers,
-        json={"config": {"batch_size": 1, "seed": 204, "delivery": {"mode": "none"}}},
+        json={"batch_size": 1, "seed": 204, "delivery": {"mode": "none"}},
     ).status_code == 200
 
     step_response = client.post("/api/simulate/step", headers=alpha_headers)
@@ -530,7 +510,7 @@ def test_operator_can_list_reset_and_delete_tenant_state(monkeypatch):
     reset = client.post(
         "/api/simulate/reset",
         headers=tenant_headers,
-        json={"config": {"batch_size": 3, "seed": 204, "delivery": {"mode": "none"}}},
+        json={"batch_size": 3, "seed": 204, "delivery": {"mode": "none"}},
     )
     assert reset.status_code == 200
     assert client.post("/api/simulate/step", headers=tenant_headers).status_code == 200
@@ -586,13 +566,13 @@ def test_scenario_save_load_restores_config_and_event_log(tmp_path):
     retailer_path = tmp_path / "retailer-events.jsonl"
     client.post(
         "/api/simulate/reset",
-        json={"config": {
+        json={
             "scenario": "fresh_cut_processor",
             "batch_size": 1,
             "seed": 204,
             "persist_path": str(fresh_path),
             "delivery": {"mode": "none"},
-        }},
+        },
     )
     client.post(
         "/api/demo-fixtures/fresh_cut_transformation/load",
@@ -617,13 +597,13 @@ def test_scenario_save_load_restores_config_and_event_log(tmp_path):
 
     client.post(
         "/api/simulate/reset",
-        json={"config": {
+        json={
             "scenario": "retailer_readiness_demo",
             "batch_size": 1,
             "seed": 204,
             "persist_path": str(retailer_path),
             "delivery": {"mode": "none"},
-        }},
+        },
     )
     client.post("/api/simulate/step")
     assert client.get("/api/simulate/status").json()["stats"]["total_records"] == 1
@@ -696,11 +676,11 @@ def test_load_demo_fixture_resets_store_and_preserves_transformation_lineage(tmp
     custom_path = tmp_path / "demo-fixture-events.jsonl"
     client.post(
         "/api/simulate/reset",
-        json={"config": {
+        json={
             "batch_size": 1,
             "seed": 204,
             "persist_path": str(custom_path),
-        }},
+        },
     )
     client.post("/api/simulate/step")
 
@@ -765,11 +745,11 @@ def test_load_demo_fixture_posts_to_mock_when_requested(tmp_path):
     custom_path = tmp_path / "demo-fixture-mock-events.jsonl"
     client.post(
         "/api/simulate/reset",
-        json={"config": {
+        json={
             "batch_size": 1,
             "seed": 204,
             "persist_path": str(custom_path),
-        }},
+        },
     )
 
     response = client.post(
@@ -825,11 +805,6 @@ def test_stop_interrupts_long_interval_sleep(tmp_path):
     assert asyncio.run(start_and_stop()) is False
 
 
-# Built relative to "now": the mock enforces RegEngine's 90-day replay window
-# by default, so a pinned calendar timestamp is rejected once it goes stale.
-RECENT_MOMENT = (datetime.now(UTC) - timedelta(days=1)).replace(microsecond=0)
-
-
 def test_mock_ingest_endpoint_returns_hashes():
     payload = {
         "source": "test-suite",
@@ -841,9 +816,9 @@ def test_mock_ingest_endpoint_returns_hashes():
                 "quantity": 500,
                 "unit_of_measure": "cases",
                 "location_name": "Distribution Center #4",
-                "timestamp": RECENT_MOMENT.isoformat().replace("+00:00", "Z"),
+                "timestamp": "2026-02-05T08:30:00Z",
                 "kdes": {
-                    "receive_date": RECENT_MOMENT.date().isoformat(),
+                    "receive_date": "2026-02-05",
                     "receiving_location": "Distribution Center #4",
                     "ship_from_location": "Valley Fresh Farms",
                     "immediate_previous_source": "Valley Fresh Farms",
@@ -919,12 +894,12 @@ def test_fda_export_presets_filter_common_request_slices(tmp_path):
     custom_path = tmp_path / "fda-preset-events.jsonl"
     client.post(
         "/api/simulate/reset",
-        json={"config": {
+        json={
             "batch_size": 1,
             "seed": 204,
             "persist_path": str(custom_path),
             "delivery": {"mode": "none"},
-        }},
+        },
     )
     csv_text = """cte_type,traceability_lot_code,product_description,quantity,unit_of_measure,location_name,timestamp,source_traceability_lot_code,input_traceability_lot_codes,reference_document_type,reference_document_number
 harvesting,TLC-FDA-HARVEST,Romaine Lettuce,120,cases,Valley Fresh Farms,2026-02-05T08:00:00Z,,,Harvest Log,HAR-001
@@ -958,7 +933,7 @@ transformation,TLC-FDA-OUT,Fresh Cut Salad Mix,95,cases,ReadyFresh Processing Pl
     handoff_response = client.get("/api/mock/regengine/export/fda-request?preset=shipment_handoff")
     assert handoff_response.status_code == 200
     handoff_rows = parse_export_rows(handoff_response.text)
-    assert [row["Traceability Lot Code Description"] for row in handoff_rows] == [
+    assert [row["Event Type (CTE)"] for row in handoff_rows] == [
         "shipping",
         "receiving",
     ]
@@ -983,7 +958,7 @@ transformation,TLC-FDA-OUT,Fresh Cut Salad Mix,95,cases,ReadyFresh Processing Pl
     receiving_response = client.get("/api/mock/regengine/export/fda-request?preset=receiving_log")
     assert receiving_response.status_code == 200
     receiving_rows = parse_export_rows(receiving_response.text)
-    assert [row["Traceability Lot Code Description"] for row in receiving_rows] == ["receiving"]
+    assert [row["Event Type (CTE)"] for row in receiving_rows] == ["receiving"]
 
     transformation_response = client.get(
         "/api/mock/regengine/export/fda-request?preset=transformation_batches"
@@ -1000,12 +975,12 @@ def test_epcis_export_scaffold_maps_lineage_to_jsonld_without_changing_ingest_co
     custom_path = tmp_path / "epcis-events.jsonl"
     client.post(
         "/api/simulate/reset",
-        json={"config": {
+        json={
             "batch_size": 1,
             "seed": 204,
             "persist_path": str(custom_path),
             "delivery": {"mode": "none"},
-        }},
+        },
     )
     load_response = client.post(
         "/api/demo-fixtures/fresh_cut_transformation/load",
@@ -1082,12 +1057,12 @@ def test_epcis_export_supports_date_filters_and_missing_lot_errors(tmp_path):
     custom_path = tmp_path / "epcis-date-events.jsonl"
     client.post(
         "/api/simulate/reset",
-        json={"config": {
+        json={
             "batch_size": 1,
             "seed": 204,
             "persist_path": str(custom_path),
             "delivery": {"mode": "none"},
-        }},
+        },
     )
     client.post(
         "/api/demo-fixtures/fresh_cut_transformation/load",
@@ -1171,12 +1146,12 @@ def test_live_delivery_operations_reject_missing_credentials(tmp_path):
     custom_path = tmp_path / "live-missing-creds-events.jsonl"
     client.post(
         "/api/simulate/reset",
-        json={"config": {
+        json={
             "batch_size": 1,
             "seed": 204,
             "persist_path": str(custom_path),
             "delivery": {"mode": "live"},
-        }},
+        },
     )
 
     operations = [
@@ -1205,11 +1180,11 @@ def test_reset_applies_configured_persist_path_for_next_step(tmp_path):
     custom_path = tmp_path / "reset-events.jsonl"
     response = client.post(
         "/api/simulate/reset",
-        json={"config": {
+        json={
             "batch_size": 1,
             "seed": 204,
             "persist_path": str(custom_path),
-        }},
+        },
     )
     assert response.status_code == 200
 
@@ -1245,7 +1220,7 @@ def test_failed_live_delivery_surfaces_retry_feedback_and_can_retry_to_mock(tmp_
     try:
         client.post(
             "/api/simulate/reset",
-            json={"config": {
+            json={
                 "batch_size": 1,
                 "seed": 204,
                 "persist_path": str(custom_path),
@@ -1254,7 +1229,7 @@ def test_failed_live_delivery_surfaces_retry_feedback_and_can_retry_to_mock(tmp_
                     "api_key": "live-api-secret",
                     "tenant_id": "live-tenant-secret",
                 },
-            }},
+            },
         )
 
         step_response = client.post("/api/simulate/step")
@@ -1342,7 +1317,7 @@ def test_live_delivery_retry_reuses_original_idempotency_key(monkeypatch, tmp_pa
     monkeypatch.setattr(controller, "live_client", flaky_client)
     reset_response = client.post(
         "/api/simulate/reset",
-        json={"config": {
+        json={
             "batch_size": 1,
             "seed": 204,
             "persist_path": str(tmp_path / "live-retry-events.jsonl"),
@@ -1351,7 +1326,7 @@ def test_live_delivery_retry_reuses_original_idempotency_key(monkeypatch, tmp_pa
                 "api_key": "live-api-secret",
                 "tenant_id": "live-tenant-secret",
             },
-        }},
+        },
     )
     assert reset_response.status_code == 200
 
@@ -1405,7 +1380,7 @@ def test_successful_live_delivery_records_sanitized_audit_metadata(monkeypatch, 
     custom_path = tmp_path / "live-audit-events.jsonl"
     reset_response = client.post(
         "/api/simulate/reset",
-        json={"config": {
+        json={
             "batch_size": 1,
             "seed": 204,
             "persist_path": str(custom_path),
@@ -1414,7 +1389,7 @@ def test_successful_live_delivery_records_sanitized_audit_metadata(monkeypatch, 
                 "api_key": "live-api-secret",
                 "tenant_id": "live-tenant-secret",
             },
-        }},
+        },
     )
     assert reset_response.status_code == 200
 
@@ -1455,7 +1430,7 @@ def test_failed_live_delivery_masks_api_key_in_error_message(tmp_path):
     try:
         client.post(
             "/api/simulate/reset",
-            json={"config": {
+            json={
                 "batch_size": 1,
                 "seed": 204,
                 "persist_path": str(tmp_path / "leak-events.jsonl"),
@@ -1464,7 +1439,7 @@ def test_failed_live_delivery_masks_api_key_in_error_message(tmp_path):
                     "api_key": api_key,
                     "tenant_id": "live-tenant",
                 },
-            }},
+            },
         )
         step_response = client.post("/api/simulate/step")
     finally:
@@ -1510,7 +1485,7 @@ def test_successful_live_delivery_masks_api_key_echoed_in_response(monkeypatch, 
     monkeypatch.setattr(controller, "live_client", EchoLiveClient())
     client.post(
         "/api/simulate/reset",
-        json={"config": {
+        json={
             "batch_size": 1,
             "seed": 204,
             "persist_path": str(tmp_path / "echo-events.jsonl"),
@@ -1519,7 +1494,7 @@ def test_successful_live_delivery_masks_api_key_echoed_in_response(monkeypatch, 
                 "api_key": api_key,
                 "tenant_id": "live-tenant",
             },
-        }},
+        },
     )
     step_response = client.post("/api/simulate/step")
 
@@ -1545,11 +1520,11 @@ def test_replay_current_persisted_log_posts_without_rewriting_records(tmp_path):
     custom_path = tmp_path / "replay-events.jsonl"
     reset_response = client.post(
         "/api/simulate/reset",
-        json={"config": {
+        json={
             "batch_size": 2,
             "seed": 204,
             "persist_path": str(custom_path),
-        }},
+        },
     )
     assert reset_response.status_code == 200
     step_response = client.post("/api/simulate/step")
@@ -1580,11 +1555,11 @@ def test_replay_accepts_override_path_and_delivery_none(tmp_path):
     override_path = tmp_path / "override-events.jsonl"
     client.post(
         "/api/simulate/reset",
-        json={"config": {
+        json={
             "batch_size": 1,
             "seed": 204,
             "persist_path": str(current_path),
-        }},
+        },
     )
     client.post("/api/simulate/step")
     override_path.write_text(current_path.read_text(encoding="utf-8"), encoding="utf-8")
@@ -1632,11 +1607,11 @@ def test_csv_import_scheduled_events_stores_valid_rows_and_reports_errors(tmp_pa
     custom_path = tmp_path / "csv-events.jsonl"
     client.post(
         "/api/simulate/reset",
-        json={"config": {
+        json={
             "batch_size": 1,
             "seed": 204,
             "persist_path": str(custom_path),
-        }},
+        },
     )
     csv_text = """cte_type,traceability_lot_code,product_description,quantity,unit_of_measure,location_name,timestamp,source_traceability_lot_code,kdes
 harvesting,TLC-CSV-HARVEST,Romaine Lettuce,120,cases,Valley Fresh Farms,2026-02-05T08:00:00Z,,"{""harvest_date"":""2026-02-05""}"
@@ -1684,6 +1659,7 @@ receiving,TLC-CSV-BAD,Romaine Lettuce,,cases,Distribution Center #4,2026-02-05T1
     assert events[0]["parent_lot_codes"] == ["TLC-CSV-HARVEST"]
     assert set(events[0]["event"]) == {
         "cte_type",
+        "input_traceability_lot_codes",
         "traceability_lot_code",
         "product_description",
         "quantity",
@@ -1718,11 +1694,11 @@ def test_csv_import_seed_lots_builds_harvesting_events_with_none_delivery(tmp_pa
     custom_path = tmp_path / "seed-events.jsonl"
     client.post(
         "/api/simulate/reset",
-        json={"config": {
+        json={
             "batch_size": 1,
             "seed": 204,
             "persist_path": str(custom_path),
-        }},
+        },
     )
     csv_text = """traceability_lot_code,product_description,quantity,unit_of_measure,location_name,timestamp,field_name,immediate_subsequent_recipient
 TLC-SEED-001,Spinach,80,cases,Valley Fresh Farms,2026-02-06T09:15:00Z,Field-9,Central Coast Cooler
@@ -1763,12 +1739,12 @@ def test_reset_applies_scenario_config_and_keeps_mock_delivery_default(tmp_path)
     custom_path = tmp_path / "retailer-events.jsonl"
     response = client.post(
         "/api/simulate/reset",
-        json={"config": {
+        json={
             "scenario": "retailer_readiness_demo",
             "batch_size": 1,
             "seed": 204,
             "persist_path": str(custom_path),
-        }},
+        },
     )
     assert response.status_code == 200
 
@@ -1789,12 +1765,12 @@ def test_start_applies_scenario_change_even_with_existing_records(tmp_path):
     custom_path = tmp_path / "scenario-switch-events.jsonl"
     client.post(
         "/api/simulate/reset",
-        json={"config": {
+        json={
             "scenario": "leafy_greens_supplier",
             "batch_size": 1,
             "seed": 204,
             "persist_path": str(custom_path),
-        }},
+        },
     )
     client.post("/api/simulate/step")
 

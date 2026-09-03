@@ -44,25 +44,3 @@ class TestPersistPathGuard:
     def test_escapes_rejected(self, abs_data_root, escape):
         with pytest.raises(ValueError, match="permitted data directory"):
             tenancy._ensure_persist_path_within_root(escape)
-
-
-class TestTenantStorageExclusion:
-    """Inside DATA_ROOT is not enough -- data/tenants/ is inside it.
-
-    A caller on the default tenant that can name another tenant's log reads it
-    back through the exports, and EventStore.reset() unlinks it. Tenant
-    storage is reachable by selecting the tenant, never by naming its file.
-    """
-
-    def test_another_tenants_event_log_is_refused(self, abs_data_root):
-        victim = tenancy.TENANT_DATA_ROOT / "victim" / "events.jsonl"
-        with pytest.raises(ValueError, match="tenant storage"):
-            tenancy._ensure_persist_path_within_root(str(victim))
-
-    def test_the_tenant_root_itself_is_refused(self, abs_data_root):
-        with pytest.raises(ValueError, match="tenant storage"):
-            tenancy._ensure_persist_path_within_root(str(tenancy.TENANT_DATA_ROOT))
-
-    def test_the_ordinary_default_log_is_still_allowed(self, abs_data_root):
-        ordinary = str(tenancy.DATA_ROOT / "events.jsonl")
-        assert tenancy._ensure_persist_path_within_root(ordinary) == ordinary

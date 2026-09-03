@@ -32,8 +32,4 @@ HEALTHCHECK --interval=30s --timeout=5s --start-period=15s --retries=3 \
   CMD python -c "import json, os, urllib.request; port=os.getenv('PORT', '8000'); json.load(urllib.request.urlopen(f'http://127.0.0.1:{port}/api/healthz', timeout=3))"
 
 ENTRYPOINT ["docker-entrypoint.sh"]
-# `sh -c` is required for ${PORT} expansion, but `exec` is required inside it:
-# without it the shell forks uvicorn and stays as the container's final process,
-# so SIGTERM (every redeploy/`docker stop`) never reaches uvicorn and the FastAPI
-# lifespan shutdown never runs. Do not drop the `exec`.
 CMD ["sh", "-c", "exec uvicorn app.main:app --host 0.0.0.0 --port ${PORT:-8000}"]

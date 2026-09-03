@@ -12,15 +12,11 @@ description: Use this skill when working on RegEngine ingest payloads, FSMA 204 
 - you are changing ingest payload fields, simulator outputs, or lineage behavior
 - you are adding a new delivery target or export path
 
-## Contract reference
+## Contract source of truth
 
 Before changing any live-ingest behavior, read
-`references/contract.md`. It is this repository's record of the RegEngine
-webhook contract -- partly enforced, partly prose, and it says which is
-which at the top. `tests/test_contract_document.py` holds the enforced
-half to the generated artifact in `tests/data/` and to the code it
-describes; the rest was last confirmed by hand at the commit that file
-records. It covers:
+`references/contract.md`. That file is the local mirror of the RegEngine
+webhook contract and covers:
 
 - live ingest endpoint and required headers
 - tenant resolution and `X-Tenant-ID`
@@ -30,9 +26,7 @@ records. It covers:
 - strict RegEngine KDE requirements by CTE
 
 Do not duplicate the detailed contract shape here. Keeping one detailed
-reference avoids stale skill guidance when RegEngine's webhook handler
-changes -- and only that one file is under test, so a second copy would be
-unchecked by construction.
+reference avoids stale skill guidance when RegEngine's webhook handler changes.
 
 ## Guardrails
 

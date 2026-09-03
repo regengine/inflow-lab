@@ -4,24 +4,25 @@ from fastapi import APIRouter, Depends, HTTPException
 
 from .. import tenancy
 from ..auth import TenantContext
-from ..controller import SimulationController, request_with_stored_delivery_secrets
+from ..controller import SimulationController
 from ..demo_fixtures import list_demo_fixture_summaries
 from ..dependencies import get_active_controller, get_tenant_context
-from ..scenarios import ScenarioId, list_scenario_summaries
 from ..schemas.domain import DemoFixtureId
 from ..schemas.scenarios import (
     DemoFixtureListResponse,
     DemoFixtureLoadRequest,
     DemoFixtureLoadResponse,
     DemoFixtureSummary,
-    ScenarioListResponse,
     ScenarioLoadResponse,
+    ScenarioListResponse,
     ScenarioSaveListResponse,
     ScenarioSaveRequest,
     ScenarioSaveResponse,
     ScenarioSaveSummary,
     ScenarioSummary,
 )
+from ..scenarios import ScenarioId, list_scenario_summaries
+
 
 router = APIRouter(prefix="/api", tags=["Scenarios"])
 
@@ -40,7 +41,7 @@ async def list_saved_scenarios(
     return ScenarioSaveListResponse(
         saves=[
             ScenarioSaveSummary.model_validate(summary)
-            for summary in (await active_controller.list_scenario_saves()).saves
+            for summary in active_controller.list_scenario_saves().saves
         ]
     )
 
@@ -83,6 +84,4 @@ async def load_demo_fixture(
     fixture_request: DemoFixtureLoadRequest | None = None,
     active_controller: SimulationController = Depends(get_active_controller),
 ) -> DemoFixtureLoadResponse:
-    return await active_controller.load_demo_fixture(
-        fixture_id, request_with_stored_delivery_secrets(active_controller, fixture_request)
-    )
+    return await active_controller.load_demo_fixture(fixture_id, fixture_request)

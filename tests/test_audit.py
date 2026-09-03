@@ -3,7 +3,7 @@ from datetime import UTC, datetime
 from app.audit import audit_warnings_for_record
 from app.cte_rules import evaluate_audit_checks, merged_event_values, validate_event_kdes
 from app.scenarios import get_scenario
-from app.schemas.domain import CTEType, RegEngineEvent, StoredEventRecord
+from app.schemas.domain import CTEType, StoredEventRecord, RegEngineEvent
 
 
 def test_validate_event_kdes_uses_top_level_contract_fields():
@@ -47,7 +47,7 @@ def test_merged_event_values_bridges_source_reference_aliases():
             "ship_date": "2026-05-09",
             "ship_from_location": "Dock",
             "ship_to_location": "DC",
-            "reference_document": "GS1-128 (00)123456789012345675",
+            "reference_document": "GS1-128 (00)123456789012345678",
             "traceability_lot_code_source_reference": "SRC-1",
         },
     )

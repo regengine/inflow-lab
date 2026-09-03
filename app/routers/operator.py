@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import asyncio
 import shutil
 
 from fastapi import APIRouter, Depends
@@ -9,29 +8,17 @@ from .. import tenancy
 from ..dependencies import require_operator_auth
 from ..schemas.operator import TenantListResponse, TenantOperationResponse, TenantSummary
 
+
 router = APIRouter(prefix="/api/operator", tags=["Operator"])
 
 
 @router.get("/tenants", response_model=TenantListResponse)
 async def list_operator_tenants(_: None = Depends(require_operator_auth)) -> TenantListResponse:
-<<<<<<< HEAD
-    # `tenant_summary` stats the tenant's JSONL and, for uncached tenants,
-    # counts its lines -- blocking work that scales with the store and used to
-    # run on the event loop once per tenant.
-    tenant_ids = await asyncio.to_thread(tenancy.known_tenant_ids)
-    summaries = await asyncio.to_thread(
-        lambda: [tenancy.tenant_summary(tenant_id) for tenant_id in tenant_ids]
-    )
     return TenantListResponse(
-        tenants=[TenantSummary.model_validate(summary) for summary in summaries]
-=======
-    tenant_ids = await asyncio.to_thread(tenancy.known_tenant_ids)
-    raw_summaries = await asyncio.gather(
-        *(asyncio.to_thread(tenancy.tenant_summary, tid) for tid in tenant_ids)
-    )
-    return TenantListResponse(
-        tenants=[TenantSummary.model_validate(s) for s in raw_summaries]
->>>>>>> origin/main
+        tenants=[
+            TenantSummary.model_validate(tenancy.tenant_summary(tenant_id))
+            for tenant_id in tenancy.known_tenant_ids()
+        ]
     )
 
 
@@ -52,7 +39,7 @@ async def delete_operator_tenant(
     _: None = Depends(require_operator_auth),
 ) -> TenantOperationResponse:
     normalized_tenant = tenancy.operator_tenant_id(tenant_id)
-    tenant_dir = tenancy.assert_deletable_tenant_dir(tenancy.tenant_dir(normalized_tenant))
+    tenant_dir = tenancy.tenant_dir(normalized_tenant)
     removed_data = tenant_dir.exists()
 
     # pop_tenant_controller also opens a delete-in-progress window (#175):
@@ -68,15 +55,6 @@ async def delete_operator_tenant(
     finally:
         tenancy.finish_tenant_delete(normalized_tenant)
 
-<<<<<<< HEAD
-    # Safe as written -- `operator_tenant_id` applies a strict regex and a URL
-    # segment cannot contain a slash -- but a recursive delete should not rest
-    # on an upstream validator staying strict, and this also catches a
-    # symlinked tenant directory redirecting the delete somewhere else.
-    tenancy.assert_within_tenant_root(tenant_dir)
-    shutil.rmtree(tenant_dir, ignore_errors=True)
-=======
->>>>>>> origin/main
     return TenantOperationResponse(
         status="deleted",
         tenant_id=normalized_tenant,

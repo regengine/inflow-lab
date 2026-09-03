@@ -1,19 +1,14 @@
 from __future__ import annotations
 
-import logging
-
 import json
-from collections.abc import Iterable
 from pathlib import Path
 from threading import RLock
+from typing import Iterable
 
 from .scenarios import ScenarioId
 from .schemas.domain import StoredEventRecord
 from .schemas.scenarios import ScenarioSaveSnapshot
 from .schemas.simulation import SimulationConfig
-
-
-logger = logging.getLogger("inflow_lab.scenario_saves")
 
 
 class ScenarioSaveStore:
@@ -31,18 +26,7 @@ class ScenarioSaveStore:
         with self._lock:
             saves = []
             for scenario in ScenarioId:
-                try:
-                    snapshot = self.get(scenario)
-                except ValueError as exc:
-                    # One unreadable save file must not hide every other save.
-                    # This loop calls get() for every id, so before this a
-                    # single unparseable file turned the whole listing into a
-                    # 400 -- the operator lost sight of saves that were
-                    # perfectly fine. Skip and log; get() still raises for a
-                    # caller asking for that specific id, which is where the
-                    # error belongs.
-                    logger.warning("skipping unreadable scenario save for %s: %s", scenario.value, exc)
-                    continue
+                snapshot = self.get(scenario)
                 if snapshot is not None:
                     saves.append(snapshot)
             return saves
@@ -75,7 +59,6 @@ class ScenarioSaveStore:
         config: SimulationConfig,
         records: Iterable[StoredEventRecord],
     ) -> ScenarioSaveSnapshot:
-        """Blocking: callers on the event loop must go through asyncio.to_thread."""
         return self.save(
             ScenarioSaveSnapshot(
                 scenario=scenario,

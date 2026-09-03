@@ -13,12 +13,11 @@ covers the other two: in-batch duplicate rejection and cache eviction.
 
 from __future__ import annotations
 
-from datetime import datetime
+from datetime import UTC, datetime
 
 from app.mock_service import _IDEMPOTENCY_CACHE_LIMIT, MockRegEngineService
 from app.schemas.domain import CTEType, RegEngineEvent
 from app.schemas.ingestion import IngestPayload
-from tests.support.timestamps import CANONICAL_EVENT_DATE, CANONICAL_EVENT_TIME
 
 
 def _valid_event(
@@ -41,9 +40,9 @@ def _valid_event(
         quantity=100,
         unit_of_measure="cases",
         location_name=location,
-        timestamp=timestamp or CANONICAL_EVENT_TIME,
+        timestamp=timestamp or datetime(2026, 2, 5, 8, 0, tzinfo=UTC),
         kdes={
-            "harvest_date": CANONICAL_EVENT_DATE,
+            "harvest_date": "2026-02-05",
             "reference_document": "Harvest Log HAR-0001",
         },
     )

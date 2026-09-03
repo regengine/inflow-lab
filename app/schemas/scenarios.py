@@ -7,7 +7,7 @@ from pydantic import BaseModel, ConfigDict, Field
 
 from ..scenarios import ScenarioId
 from .domain import DemoFixtureId, DestinationMode, StoredEventRecord
-from .simulation import STRICT_REQUEST, DeliveryConfig, SimulationConfig
+from .simulation import DeliveryConfig, SimulationConfig
 
 
 class ScenarioSummary(BaseModel):
@@ -25,6 +25,13 @@ class ScenarioListResponse(BaseModel):
 
 
 class ScenarioSaveSnapshot(BaseModel):
+    # NOT forbidding extras here on purpose (contrast with the request
+    # models below, #143). This is a storage model: ScenarioSaveStore
+    # (app/scenario_saves.py) round-trips it verbatim to/from a JSON file
+    # per scenario via model_dump_json()/model_validate_json(). Forbidding
+    # extras would turn loading a save file written by an older or newer
+    # version of this schema -- one with a field this version doesn't know
+    # about -- into a hard failure instead of a harmless ignore.
     scenario: ScenarioId
     config: SimulationConfig
     records: list[StoredEventRecord] = Field(default_factory=list)
@@ -47,6 +54,10 @@ class ScenarioSaveListResponse(BaseModel):
 
 
 class ScenarioSaveRequest(BaseModel):
+    # extra="forbid" (#143): request body for POST /api/scenario-saves/{id}.
+    # Same failure mode as the /reset bug this issue was filed over -- a
+    # misnamed wrapper key (e.g. "configuration" instead of "config") would
+    # otherwise silently save hard-coded defaults with no error.
     model_config = ConfigDict(extra="forbid")
 
     config: SimulationConfig | None = None
@@ -79,6 +90,7 @@ class DemoFixtureListResponse(BaseModel):
 
 
 class DemoFixtureLoadRequest(BaseModel):
+    # extra="forbid" (#143): request body for POST /api/demo-fixtures/{id}/load.
     model_config = ConfigDict(extra="forbid")
 
     reset: bool = True

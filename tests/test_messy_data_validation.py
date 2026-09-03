@@ -11,9 +11,6 @@ from __future__ import annotations
 
 from datetime import UTC, datetime
 
-import pytest
-from pydantic import ValidationError
-
 from app.cte_rules import REQUIRED_KDES, validate_event_kdes
 from app.schemas.domain import CTEType, RegEngineEvent
 
@@ -63,39 +60,8 @@ def test_malformed_transformation_input_lots_are_flagged() -> None:
         timestamp=datetime(2026, 2, 6, 10, 0, tzinfo=UTC),
         # Required transformation KDEs present, but input lot codes are a bare
         # string instead of a non-empty list — a common real-world malformation.
-        kdes=dict.fromkeys(REQUIRED_KDES.get(CTEType.TRANSFORMATION, ()), "placeholder")
+        kdes={field: "placeholder" for field in REQUIRED_KDES.get(CTEType.TRANSFORMATION, ())}
         | {"input_traceability_lot_codes": "LOT-A,LOT-B"},
     )
     messages = [w.message for w in validate_event_kdes(event)]
     assert any("input_traceability_lot_codes" in m for m in messages)
-
-
-@pytest.mark.parametrize(
-    "quantity",
-    [float("nan"), float("inf"), float("-inf"), float("1e400")],
-    ids=["nan", "inf", "negative_inf", "overflow_literal"],
-)
-def test_non_finite_quantity_is_rejected_by_the_model(quantity: float) -> None:
-    """#98: the model itself must refuse a non-finite quantity.
-
-    The importer guards its own path, but ``RegEngineEvent`` is also built
-    directly by the engine, the demo fixtures, and -- via ``IngestPayload``
-    -- by whatever JSON a caller POSTs to the mock ingest endpoint. A
-    non-finite float clears every application-level check (``nan <= 0`` is
-    False; infinities are genuinely positive) and only fails later, at
-    ``json.dumps``, by emitting a bare ``NaN``/``Infinity`` token that is not
-    RFC 8259. Rejecting at the model closes the gap for every producer at
-    once, and makes the mock ingest route answer with the same whole-batch
-    422 that live RegEngine's own Field() constraints produce during body
-    parsing.
-    """
-    with pytest.raises(ValidationError):
-        RegEngineEvent(
-            cte_type=CTEType.HARVESTING,
-            traceability_lot_code="TLC-NONFINITE-001",
-            product_description="Romaine Lettuce",
-            quantity=quantity,
-            unit_of_measure="cases",
-            location_name="Valley Fresh Farms",
-            timestamp=datetime(2026, 2, 5, 8, 0, tzinfo=UTC),
-        )

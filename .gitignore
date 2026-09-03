@@ -1,5 +1,4 @@
 .venv/
-.venv-*/
 __pycache__/
 .pytest_cache/
 *.py[cod]
@@ -14,10 +13,3 @@ uvicorn.out.log
 uvicorn.err.log
 output/playwright/
 data/pytest-tmp/
-<<<<<<< HEAD
-
-# Console lint tooling (see package.json)
-node_modules/
-=======
-data/pytest-tmp-*/
->>>>>>> origin/main

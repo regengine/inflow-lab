@@ -1,13 +1,6 @@
-<<<<<<< HEAD
-// Pure display helpers: no DOM and no fetch. Two of them read the label tables
-// off `state`, which is the only dependency this module has.
-
-import { state } from './state.js';
-=======
 // Escaping and value formatting. escapeHtml() is what makes every `${...}`
 // inside a quoted HTML attribute safe, so it has no dependencies of its own
 // and can be imported from anywhere.
->>>>>>> origin/main
 
 export function escapeHtml(text) {
   return String(text)
@@ -35,24 +28,3 @@ export function formatKdeValue(value) {
   }
   return value ?? '';
 }
-<<<<<<< HEAD
-
-export function scenarioLabel(scenarioId) {
-  return state.scenarioLabels[scenarioId] || scenarioId || 'Unknown';
-}
-
-export function operationTypeLabel(operationType) {
-  return state.operationTypeLabels[operationType] || operationType || 'Unknown';
-}
-
-export function deliveryTone(deliveryStatus) {
-  if (deliveryStatus === 'posted') {
-    return 'success';
-  }
-  if (deliveryStatus === 'failed') {
-    return 'error';
-  }
-  return 'neutral';
-}
-=======
->>>>>>> origin/main

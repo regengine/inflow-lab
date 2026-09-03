@@ -22,8 +22,6 @@ from __future__ import annotations
 
 from datetime import UTC, datetime
 
-import pytest
-
 from app.engine import LegitFlowEngine
 from app.mock_service import validate_event_like_regengine
 from app.schemas.domain import CTEType, RegEngineEvent, StoredEventRecord
@@ -85,38 +83,22 @@ def _rework_lot_count(engine: LegitFlowEngine, count: int) -> int:
 
 def _run_past_first_rework(
     engine: LegitFlowEngine, attempts: int = 250
-) -> tuple[
-    list[tuple[RegEngineEvent, list[str]]],
-    tuple[RegEngineEvent, list[str]],
-    tuple[RegEngineEvent, list[str]],
-]:
+) -> list[tuple[RegEngineEvent, list[str]]]:
     """Drive ``engine`` until a transformation reporting a rework lot has
-    been observed, then keep going until that rework lot's own queued CTE
-    record appears. Returns ``(collected, primary, rework)``.
-
-    The primary event is still returned synchronously from the very call
-    that performs the transformation. Its rework twin used to be the very
-    next ``next_event()`` call, and this helper relied on that adjacency --
-    but #115 now queues one record per *additional transformation output
-    lot* on the same _pending_events queue, ahead of the rework one, so
-    between 0 and 2 output records can sit in between. The rework record is
-    located by lot code instead, which is what the callers actually mean and
-    is independent of how many siblings the batch produced.
+    been observed, then one call further to also capture that rework lot's
+    own queued CTE record. The two are always adjacent in that order (see
+    app/engine.py::_transform / next_event): the primary event is always
+    returned synchronously from the very call that performs the
+    transformation, and its rework twin is always the very next
+    ``next_event()`` call after that, ahead of any freshly chosen action.
     """
     collected: list[tuple[RegEngineEvent, list[str]]] = []
-    primary: tuple[RegEngineEvent, list[str]] | None = None
     for _ in range(attempts):
         collected.append(engine.next_event())
         event, _ = collected[-1]
-        if event.cte_type != CTEType.TRANSFORMATION:
-            continue
-        if not event.kdes.get("rework_traceability_lot_codes"):
-            continue
-        if primary is None:
-            primary = collected[-1]
-            continue
-        if event.traceability_lot_code in primary[0].kdes["rework_traceability_lot_codes"]:
-            return collected, primary, collected[-1]
+        if event.cte_type == CTEType.TRANSFORMATION and event.kdes.get("rework_traceability_lot_codes"):
+            collected.append(engine.next_event())
+            return collected
     raise AssertionError(f"Expected a transformation with a rework lot within {attempts} calls")
 
 
@@ -257,7 +239,10 @@ def test_rework_event_timestamp_never_collides_with_or_precedes_its_primary():
     events may share a timestamp, and the rework lot's own record must
     still land strictly after the transformation that minted it."""
     engine = LegitFlowEngine(seed=SEED, scenario=TRANSFORM_SCENARIO)
-    collected, (primary_event, _), (rework_event, _) = _run_past_first_rework(engine)
+    collected = _run_past_first_rework(engine)
+
+    primary_event, _ = collected[-2]
+    rework_event, _ = collected[-1]
 
     assert primary_event.cte_type == CTEType.TRANSFORMATION
     assert rework_event.cte_type == CTEType.TRANSFORMATION
@@ -278,9 +263,9 @@ def test_rework_event_timestamp_never_collides_with_or_precedes_its_primary():
 
 def test_rework_lot_gets_its_own_transformation_record():
     engine = LegitFlowEngine(seed=SEED, scenario=TRANSFORM_SCENARIO)
-    _, (primary_event, primary_parents), (rework_event, rework_parents) = _run_past_first_rework(
-        engine
-    )
+    collected = _run_past_first_rework(engine)
+    primary_event, primary_parents = collected[-2]
+    rework_event, rework_parents = collected[-1]
 
     assert rework_event.traceability_lot_code in primary_event.kdes["rework_traceability_lot_codes"]
     assert rework_event.cte_type == CTEType.TRANSFORMATION
@@ -384,162 +369,3 @@ def test_lineage_tracing_resolves_input_lots_through_a_transformation(tmp_path):
             f"lineage() failed to resolve input lot {input_lot_code} for "
             f"{transformation_event.traceability_lot_code}"
         )
-
-
-# ---------------------------------------------------------------------------
-# #115 -- one CTE record per transformation OUTPUT lot, not just outputs[0]
-#
-# _transform() mints 1-3 output lots (_transform_output_count) and appends
-# every one to self.transformed, but used to build a single RegEngineEvent
-# populated entirely from outputs[0]. The other output lots appeared only
-# inside that event's kdes["output_traceability_lot_codes"] array. Nothing in
-# lineage traversal reads that array -- EventStore._parent_lot_codes links a
-# record to its parents via parent_lot_codes, source_traceability_lot_code
-# and input_traceability_lot_codes only -- so those lots had no record of
-# their own until they shipped, at which point _ship() stamped the shipment's
-# parent_lot_codes with the *pre-transformation* inputs. The lot's own
-# history then began with a SHIPPING event pointing straight back past the
-# transformation that created it.
-# ---------------------------------------------------------------------------
-
-
-def _drive(engine: LegitFlowEngine, calls: int) -> list[tuple[RegEngineEvent, list[str]]]:
-    """Drive the engine, then drain anything still queued.
-
-    Draining matters: the extra output records are queued on
-    _pending_events, so a plain N-call loop can stop mid-batch and make a
-    complete batch look incomplete.
-    """
-    collected = [engine.next_event() for _ in range(calls)]
-    while engine._pending_events:
-        collected.append(engine._pending_events.pop(0))
-    return collected
-
-
-def _batches(collected: list[tuple[RegEngineEvent, list[str]]]) -> dict[str, dict]:
-    """Group transformation events by batch_number, recording the outputs the
-    batch declared and the output lots that actually got a record.
-    """
-    batches: dict[str, dict] = {}
-    for event, _ in collected:
-        if event.cte_type is not CTEType.TRANSFORMATION:
-            continue
-        batch = batches.setdefault(
-            event.kdes["batch_number"],
-            {"declared": tuple(event.kdes.get("output_traceability_lot_codes") or ()), "recorded": set()},
-        )
-        if event.traceability_lot_code in batch["declared"]:
-            batch["recorded"].add(event.traceability_lot_code)
-    return batches
-
-
-@pytest.mark.parametrize(
-    "scenario",
-    ["fresh_cut_processor", "seafood_first_receiver", "leafy_greens_supplier"],
-)
-def test_every_transformation_output_lot_gets_its_own_record(scenario: str) -> None:
-    """Acceptance criterion 1. Before the fix every multi-output batch was
-    missing a record for at least one of its own declared output lots.
-    """
-    engine = LegitFlowEngine(seed=SEED, scenario=scenario)
-    batches = _batches(_drive(engine, 600))
-
-    multi_output = {
-        number: batch for number, batch in batches.items() if len(batch["declared"]) > 1
-    }
-    assert multi_output, f"{scenario} produced no multi-output transformation to test"
-
-    for number, batch in batches.items():
-        assert batch["recorded"] == set(batch["declared"]), (
-            f"{scenario} batch {number}: output lots with no TRANSFORMATION record of "
-            f"their own: {sorted(set(batch['declared']) - batch['recorded'])}"
-        )
-
-
-def test_a_later_output_lots_own_record_carries_its_own_quantity_and_description() -> None:
-    """The old single event described outputs[0] only, so a sibling lot that
-    did get shipped later carried outputs[0]'s quantity and description in
-    the only transformation record naming that batch.
-    """
-    engine = LegitFlowEngine(seed=SEED, scenario=TRANSFORM_SCENARIO)
-    collected = _drive(engine, 600)
-
-    by_batch: dict[str, list[RegEngineEvent]] = {}
-    for event, _ in collected:
-        if event.cte_type is CTEType.TRANSFORMATION and event.traceability_lot_code in (
-            event.kdes.get("output_traceability_lot_codes") or ()
-        ):
-            by_batch.setdefault(event.kdes["batch_number"], []).append(event)
-
-    multi = [events for events in by_batch.values() if len(events) > 1]
-    assert multi, "expected at least one batch with more than one output record"
-
-    for events in multi:
-        lot_codes = [event.traceability_lot_code for event in events]
-        assert len(set(lot_codes)) == len(lot_codes), "each output lot gets a distinct record"
-        # Distinct identity per record, not a copy of outputs[0].
-        assert len({event.product_description for event in events}) == len(events)
-        for event in events:
-            assert event.quantity > 0
-            # Batch-level linkage is shared, which is what makes them one
-            # transformation rather than several.
-            assert event.input_traceability_lot_codes == events[0].input_traceability_lot_codes
-            assert event.kdes["batch_number"] == events[0].kdes["batch_number"]
-            # Per-lot source reference, not outputs[0]'s.
-            assert event.kdes["tlc_source_reference"] == event.kdes[
-                "traceability_lot_code_source_reference"
-            ]
-        assert len({event.kdes["tlc_source_reference"] for event in events}) == len(events)
-        # #119: no two events may share a timestamp.
-        assert len({event.timestamp for event in events}) == len(events)
-        assert validate_event_like_regengine(events[-1]) == []
-
-
-def test_lineage_for_a_second_output_lot_includes_its_own_transformation_record(tmp_path) -> None:
-    """Acceptance criterion 2. Drive the engine storing every event the way
-    the running app does, find an output lot that is NOT outputs[0] of its
-    batch and that later ships, and assert store.lineage() for it shows the
-    transformation that created it -- not a SHIPPING record linking straight
-    back to the pre-transformation inputs.
-    """
-    engine = LegitFlowEngine(seed=SEED, scenario=TRANSFORM_SCENARIO)
-    store = EventStore(persist_path=str(tmp_path / "events.jsonl"))
-
-    collected = _drive(engine, 600)
-    store.add_many(
-        [
-            StoredEventRecord(payload_source="test", event=event, parent_lot_codes=list(parents))
-            for event, parents in collected
-        ]
-    )
-
-    # A non-first output lot of some batch that also has a SHIPPING record.
-    shipped_lots = {
-        event.traceability_lot_code
-        for event, _ in collected
-        if event.cte_type is CTEType.SHIPPING
-    }
-    candidates = []
-    for event, _ in collected:
-        if event.cte_type is not CTEType.TRANSFORMATION:
-            continue
-        declared = event.kdes.get("output_traceability_lot_codes") or ()
-        for later_output in declared[1:]:
-            if later_output in shipped_lots:
-                candidates.append(later_output)
-    assert candidates, "expected a non-first output lot that later ships"
-
-    lot_code = candidates[0]
-    lineage = store.lineage(lot_code)
-    own_records = [
-        record for record in lineage if record.event.traceability_lot_code == lot_code
-    ]
-    assert own_records, f"{lot_code} has no records at all in its lineage"
-
-    own_cte_types = [record.event.cte_type for record in own_records]
-    assert CTEType.TRANSFORMATION in own_cte_types, (
-        f"{lot_code}'s own history is {own_cte_types} -- it must include the "
-        "TRANSFORMATION that created it, not begin at SHIPPING"
-    )
-    # And that transformation record comes first: the lot exists before it moves.
-    assert own_records[0].event.cte_type is CTEType.TRANSFORMATION

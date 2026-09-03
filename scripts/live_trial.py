@@ -3,33 +3,13 @@ from __future__ import annotations
 import argparse
 import os
 import sys
-<<<<<<< HEAD
-from collections.abc import Mapping
-=======
-from collections.abc import Mapping, Sequence
->>>>>>> origin/main
 from dataclasses import dataclass, field
-from pathlib import Path
 from typing import Any
+from urllib.parse import urlparse
 
 import httpx
 
-<<<<<<< HEAD
-=======
-REPO_ROOT = Path(__file__).resolve().parents[1]
-if str(REPO_ROOT) not in sys.path:
-    sys.path.insert(0, str(REPO_ROOT))
 
-# Imported after the sys.path bootstrap above so `python scripts/live_trial.py`
-# works from a clean checkout; hence the E402 waiver.
-from scripts import _smoke_common as smoke  # noqa: E402
-from scripts.remote_smoke import (  # noqa: E402
-    ALLOWED_HOSTS_ENV,
-    DEFAULT_ALLOWED_BASE_HOSTS,
-)
-
-
->>>>>>> origin/main
 DEFAULT_TIMEOUT_SECONDS = 30.0
 TRIAL_SCENARIO = "fresh_cut_processor"
 
@@ -50,10 +30,10 @@ class LiveTrialConfig:
     timeout_seconds: float = DEFAULT_TIMEOUT_SECONDS
 
     def redact(self, value: str) -> str:
-        return smoke.redact_secrets(
-            value,
-            sorted(secret_values(self.password, self.live_api_key, self.live_tenant_id)),
-        )
+        redacted = value
+        for secret in secret_values(self.password, self.live_api_key, self.live_tenant_id):
+            redacted = redacted.replace(secret, "[redacted]")
+        return redacted
 
 
 def main(
@@ -124,15 +104,11 @@ def validate_requested_mode(args: argparse.Namespace) -> None:
 
 
 def config_from_env(
-    environ: Mapping[str, str] | None = None,
+    environ: dict[str, str] | None = None,
     *,
     require_live: bool,
 ) -> LiveTrialConfig:
-<<<<<<< HEAD
-    resolved_environ: Mapping[str, str] = environ if environ is not None else os.environ
-=======
-    env: Mapping[str, str] = environ if environ else os.environ
->>>>>>> origin/main
+    environ = environ or os.environ
     required_names = [
         "REGENGINE_REMOTE_BASE_URL",
         "REGENGINE_REMOTE_USERNAME",
@@ -148,43 +124,22 @@ def config_from_env(
             ]
         )
 
-<<<<<<< HEAD
-    missing = [name for name in required_names if not resolved_environ.get(name)]
-=======
-    missing = [name for name in required_names if not env.get(name)]
->>>>>>> origin/main
+    missing = [name for name in required_names if not environ.get(name)]
     if missing:
         raise LiveTrialFailure(
             "Missing required environment variables: " + ", ".join(missing)
         )
 
     return LiveTrialConfig(
-<<<<<<< HEAD
-        base_url=normalize_base_url(resolved_environ["REGENGINE_REMOTE_BASE_URL"]),
-        username=resolved_environ["REGENGINE_REMOTE_USERNAME"],
-        password=resolved_environ["REGENGINE_REMOTE_PASSWORD"],
-        demo_tenant=resolved_environ["REGENGINE_REMOTE_TENANT"],
-        live_endpoint=normalize_base_url(resolved_environ["REGENGINE_LIVE_ENDPOINT"])
-        if resolved_environ.get("REGENGINE_LIVE_ENDPOINT")
+        base_url=normalize_base_url(environ["REGENGINE_REMOTE_BASE_URL"]),
+        username=environ["REGENGINE_REMOTE_USERNAME"],
+        password=environ["REGENGINE_REMOTE_PASSWORD"],
+        demo_tenant=environ["REGENGINE_REMOTE_TENANT"],
+        live_endpoint=normalize_base_url(environ["REGENGINE_LIVE_ENDPOINT"])
+        if environ.get("REGENGINE_LIVE_ENDPOINT")
         else None,
-        live_api_key=resolved_environ.get("REGENGINE_LIVE_API_KEY"),
-        live_tenant_id=resolved_environ.get("REGENGINE_LIVE_TENANT_ID"),
-=======
-        # The demo base URL carries the shared-demo Basic Auth header on every
-        # request, so it goes through the same host allowlist remote_smoke.py
-        # uses. The live ingest endpoint never sees those credentials (its own
-        # API key travels in the request body), so it only gets the scheme
-        # check -- allowlisting it would pin the trial to one RegEngine host.
-        base_url=normalize_base_url(env["REGENGINE_REMOTE_BASE_URL"], environ=env),
-        username=env["REGENGINE_REMOTE_USERNAME"],
-        password=env["REGENGINE_REMOTE_PASSWORD"],
-        demo_tenant=env["REGENGINE_REMOTE_TENANT"],
-        live_endpoint=normalize_live_endpoint(env["REGENGINE_LIVE_ENDPOINT"])
-        if env.get("REGENGINE_LIVE_ENDPOINT")
-        else None,
-        live_api_key=env.get("REGENGINE_LIVE_API_KEY"),
-        live_tenant_id=env.get("REGENGINE_LIVE_TENANT_ID"),
->>>>>>> origin/main
+        live_api_key=environ.get("REGENGINE_LIVE_API_KEY"),
+        live_tenant_id=environ.get("REGENGINE_LIVE_TENANT_ID"),
     )
 
 
@@ -203,14 +158,6 @@ def run_live_trial(
             verify=True,
         )
 
-    # Set the moment we are about to arm live delivery, so the finally below
-    # disarms even when the arming POST itself, the live step, or one of the
-    # assertions after it raises. Without this the tenant controller keeps the
-    # customer's endpoint + API key with delivery.mode=live for the lifetime of
-    # the server process, and the next Start/Step click posts simulated CTEs
-    # into their production ingest.
-    armed_live = False
-
     try:
         mock_step = run_mock_dry_run(client, config)
         summary = {
@@ -221,9 +168,6 @@ def run_live_trial(
         }
 
         if confirm_live:
-            require_live_credentials(config)
-            armed_live = True
-            arm_live_delivery(client, config)
             live_step = run_one_live_batch(client, config)
             summary.update(
                 {
@@ -235,25 +179,24 @@ def run_live_trial(
             )
         return summary
     finally:
-<<<<<<< HEAD
-        stop_simulation(client, config)
-        # Only close what we opened. A caller-supplied client stays the
-        # caller's to manage; the one built above was leaked, holding its
-        # connection pool open for the life of the process.
+        # Both calls below run on every exit from the try block above --
+        # normal return, a LiveTrialFailure from a failed assertion, any
+        # other exception (e.g. a dropped connection mid-batch), or a
+        # KeyboardInterrupt -- because they live in this `finally`, not
+        # after a `return` on the happy path (#105).
         if owns_client:
             client.close()
-=======
-        try:
-            stop_simulation(client, config)
-        finally:
-            try:
-                if armed_live:
-                    disarm_live_delivery(client, config)
-            finally:
-                # A caller-supplied client stays open -- it owns its own lifetime.
-                if owns_client:
-                    client.close()
->>>>>>> origin/main
+        stop_simulation(client, config)
+        if confirm_live:
+            # Only --confirm-live can arm live delivery, so only that path
+            # needs to disarm it again. A dry run never leaves delivery on
+            # anything but mock, and run_mock_dry_run's own reset already
+            # proves that. Guarded on the flag rather than on whether this
+            # run actually reached run_one_live_batch: the tenant may
+            # already have been armed by an earlier run (that is the exact
+            # failure mode #105 reports), so --confirm-live always tries to
+            # disarm it, even if this run's own mock dry-run failed first.
+            revert_delivery_to_mock(client, config)
 
 
 def run_mock_dry_run(client: httpx.Client, config: LiveTrialConfig) -> dict[str, Any]:
@@ -287,17 +230,10 @@ def run_mock_dry_run(client: httpx.Client, config: LiveTrialConfig) -> dict[str,
     return step
 
 
-def require_live_credentials(config: LiveTrialConfig) -> None:
+def run_one_live_batch(client: httpx.Client, config: LiveTrialConfig) -> dict[str, Any]:
     if not (config.live_endpoint and config.live_api_key and config.live_tenant_id):
         raise LiveTrialFailure("Live endpoint, API key, and tenant id are required for --confirm-live.")
 
-
-def arm_live_delivery(client: httpx.Client, config: LiveTrialConfig) -> None:
-    """Point the demo tenant at the customer's live ingest for one batch.
-
-    Always paired with :func:`disarm_live_delivery` in ``run_live_trial``'s
-    ``finally``.
-    """
     request_json(
         client,
         config,
@@ -316,50 +252,6 @@ def arm_live_delivery(client: httpx.Client, config: LiveTrialConfig) -> None:
             },
         },
     )
-
-
-def disarm_live_delivery(client: httpx.Client, config: LiveTrialConfig) -> None:
-    """Reset the demo tenant back to mock delivery and prove it took effect.
-
-    ``/api/simulate/reset`` replaces the controller's whole config, so a body
-    carrying ``delivery: {"mode": "mock"}`` drops the stored endpoint, API key
-    and tenant id along with the live mode -- ``DeliveryConfig`` defaults them
-    all to ``None``. The read-back through ``/api/integration/status`` is the
-    part that matters: it is the only endpoint that reports
-    ``api_key_configured``, because ``/api/simulate/status`` sanitizes the key
-    out of its response and so cannot distinguish a disarmed tenant from an
-    armed one.
-    """
-    request_json(
-        client,
-        config,
-        "POST",
-        "/api/simulate/reset",
-        json={
-            "source": "live-trial-disarm",
-            "scenario": TRIAL_SCENARIO,
-            "batch_size": 1,
-            "seed": 204,
-            "delivery": {"mode": "mock"},
-        },
-    )
-    integration = request_json(client, config, "GET", "/api/integration/status")
-    mode = integration.get("mode")
-    if mode != "mock":
-        raise LiveTrialFailure(
-            f"Delivery did not revert to mock for tenant {config.demo_tenant!r}: "
-            f"/api/integration/status still reports mode={mode!r}. Disarm it by "
-            "hand before anyone uses this demo."
-        )
-    if integration.get("api_key_configured") or integration.get("tenant_configured"):
-        raise LiveTrialFailure(
-            f"Live credentials are still configured for tenant {config.demo_tenant!r} "
-            "after the revert. Disarm it by hand before anyone uses this demo."
-        )
-    print(f"Delivery reverted to mock for tenant {config.demo_tenant}.")
-
-
-def run_one_live_batch(client: httpx.Client, config: LiveTrialConfig) -> dict[str, Any]:
     step = request_json(
         client,
         config,
@@ -385,6 +277,52 @@ def stop_simulation(client: httpx.Client, config: LiveTrialConfig) -> None:
         )
 
 
+def revert_delivery_to_mock(client: httpx.Client, config: LiveTrialConfig) -> None:
+    """Disarm live delivery for config.demo_tenant by resetting it to mock.
+
+    This is the safety-critical call #105 is about: skip it, or let it fail
+    silently, and the tenant controller keeps the customer's live endpoint,
+    API key and tenant id cached with delivery.mode == "live" for the
+    lifetime of the process -- so the next Start or Step click posts
+    simulated CTEs into a customer's production RegEngine.
+
+    Unlike stop_simulation() above, this must never swallow a failure: it
+    does not catch httpx.HTTPError (a dropped connection here is exactly as
+    dangerous as a bad status code), and it treats any non-200 response as
+    fatal rather than only status_code >= 500. A revert that failed silently
+    is indistinguishable from no revert at all, so this always raises
+    loudly instead -- carrying forward whatever trial failure was already in
+    flight, if any, so a single printed line captures both facts.
+    """
+    prior_failure = sys.exc_info()[1]
+    try:
+        request_json(
+            client,
+            config,
+            "POST",
+            "/api/simulate/reset",
+            json={
+                "delivery": {
+                    "mode": "mock",
+                    "endpoint": None,
+                    "api_key": None,
+                    "tenant_id": None,
+                }
+            },
+        )
+    except (LiveTrialFailure, httpx.HTTPError) as exc:
+        message = (
+            f"CRITICAL: failed to revert tenant {config.demo_tenant!r} delivery to mock "
+            f"after the trial ({config.base_url}). The tenant may still be armed for live "
+            "delivery -- verify GET /api/simulate/status by hand before anyone else uses "
+            f"this demo. Underlying error: {exc}"
+        )
+        if prior_failure is not None and prior_failure is not exc:
+            message += f" (the trial itself had already failed: {prior_failure})"
+        raise LiveTrialFailure(message) from exc
+    print(f"delivery reverted to mock for tenant {config.demo_tenant}")
+
+
 def request_json(
     client: httpx.Client,
     config: LiveTrialConfig,
@@ -396,9 +334,15 @@ def request_json(
 ) -> dict[str, Any]:
     response = request(client, config, method, path, json=json, params=params)
     assert_status(config, response, 200, path)
-    return smoke.response_json(
-        response, path, failure=LiveTrialFailure, redact=config.redact
-    )
+    try:
+        payload = response.json()
+    except ValueError as exc:
+        raise LiveTrialFailure(
+            f"{path}: expected JSON response, got {config.redact(response.text[:300])!r}"
+        ) from exc
+    if not isinstance(payload, dict):
+        raise LiveTrialFailure(f"{path}: expected JSON object response")
+    return payload
 
 
 def request(
@@ -410,8 +354,7 @@ def request(
     json: dict[str, Any] | None = None,
     params: dict[str, str] | None = None,
 ) -> httpx.Response:
-    return smoke.request(
-        client,
+    return client.request(
         method,
         path,
         headers={"X-RegEngine-Tenant": config.demo_tenant},
@@ -427,69 +370,37 @@ def assert_status(
     expected_status: int,
     label: str,
 ) -> None:
-    smoke.assert_status(
-        response,
-        expected_status,
-        label,
-        failure=LiveTrialFailure,
-        redact=config.redact,
-    )
+    if response.status_code != expected_status:
+        raise LiveTrialFailure(
+            f"{label}: expected HTTP {expected_status}, got "
+            f"{response.status_code}: {config.redact(response.text[:500])}"
+        )
 
 
 def assert_equal(actual: Any, expected: Any, label: str) -> None:
-    smoke.assert_equal(actual, expected, label, failure=LiveTrialFailure)
+    if actual != expected:
+        raise LiveTrialFailure(f"{label}: expected {expected!r}, got {actual!r}")
 
 
-def allowed_base_hosts(environ: Mapping[str, str] | None = None) -> tuple[str, ...]:
-    """Hosts the live trial may send the shared-demo Basic Auth secrets to.
-
-    Shares remote_smoke.py's allowlist and REGENGINE_REMOTE_ALLOWED_HOSTS
-    override, because it is the same demo instance and the same credentials.
-    """
-    return smoke.allowed_hosts_from_env(
-        ALLOWED_HOSTS_ENV, DEFAULT_ALLOWED_BASE_HOSTS, environ
-    )
+def normalize_base_url(value: str) -> str:
+    base_url = value.strip().rstrip("/")
+    parsed = urlparse(base_url)
+    if parsed.scheme not in {"http", "https"} or not parsed.netloc:
+        raise LiveTrialFailure(f"Expected an HTTP(S) URL, got {value!r}")
+    return base_url
 
 
-def normalize_base_url(
-    value: str,
-    allowed_hosts: Sequence[str] | None = None,
-    *,
-    environ: Mapping[str, str] | None = None,
-) -> str:
-    return smoke.normalize_base_url(
-        value,
-        allowed_hosts=(
-            allowed_hosts if allowed_hosts is not None else allowed_base_hosts(environ)
-        ),
-        failure=LiveTrialFailure,
-        scheme_error=f"Expected an HTTP(S) URL, got {value!r}",
-        host_error=lambda host, hosts: (
-            f"REGENGINE_REMOTE_BASE_URL host {host!r} is not allowed. The live "
-            "trial attaches the shared-demo Basic Auth credentials to every "
-            f"request, so it only runs against {', '.join(hosts)}. Set "
-            f"{ALLOWED_HOSTS_ENV} to extend the allowlist."
-        ),
-    )
-
-
-def normalize_live_endpoint(value: str) -> str:
-    """Scheme-check the live ingest endpoint.
-
-    Deliberately not host-allowlisted: the endpoint receives its own
-    REGENGINE_LIVE_API_KEY in the request body and never the shared-demo Basic
-    Auth header, and pinning it would stop the trial from targeting a
-    customer's own RegEngine deployment.
-    """
-    return smoke.normalize_base_url(
-        value,
-        allowed_hosts=None,
-        failure=LiveTrialFailure,
-        scheme_error=f"Expected an HTTP(S) URL, got {value!r}",
-    )
-
-
-secret_values = smoke.secret_values
+def secret_values(*extra_values: str | None) -> set[str]:
+    values = {value for value in extra_values if value}
+    for key, value in os.environ.items():
+        key_lower = key.lower()
+        credential_name = any(
+            token in key_lower
+            for token in ("password", "api_key", "apikey", "secret", "token")
+        )
+        if value and credential_name:
+            values.add(value)
+    return {value for value in values if len(value) >= 4}
 
 
 if __name__ == "__main__":

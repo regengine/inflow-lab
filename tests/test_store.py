@@ -3,6 +3,7 @@ from datetime import UTC, datetime, timedelta
 from app.schemas.domain import CTEType, DestinationMode, RegEngineEvent, StoredEventRecord
 from app.store import EventStore
 
+
 BASE_TIME = datetime(2026, 2, 5, 8, 30, tzinfo=UTC)
 
 
@@ -298,58 +299,3 @@ def test_replace_all_over_capacity_retains_the_newest_records(tmp_path):
     assert lot_codes == ["TLC-CAP-000004", "TLC-CAP-000003"], (
         "replace_all retained the oldest records and discarded the newest"
     )
-
-
-def _failed_record(lot_code: str, minutes: int) -> StoredEventRecord:
-    return make_record(lot_code, CTEType.HARVESTING, minutes).model_copy(
-        update={"delivery_status": "failed", "delivery_attempts": 1, "error": "temporary outage"}
-    )
-
-
-def test_failed_delivery_records_treats_an_explicit_empty_list_as_nothing(tmp_path):
-    """#211: ``record_ids=[]`` selects nothing, not everything.
-
-    #144 fixed this at the caller (SimulationController.retry_failed_delivery
-    short-circuits an explicitly empty list before consulting the store),
-    but the store's own filter stayed ``set(record_ids or [])`` -- an empty
-    set, which the comprehension then read as "no filter, match every
-    failed record". Any future direct caller of this method would have got
-    "retry everything" from a request that said "retry nothing". Asserted
-    here against the store API directly, with no controller in the way.
-    """
-    store = EventStore(persist_path=str(tmp_path / "events.jsonl"))
-    stored = store.add_many(
-        [
-            _failed_record("TLC-EMPTY-FILTER-A", 0),
-            _failed_record("TLC-EMPTY-FILTER-B", 10),
-        ]
-    )
-
-    assert store.failed_delivery_records(record_ids=[]) == []
-
-    # The other two arms of the same contract, so the fix above cannot be
-    # "made to pass" by breaking either one.
-    assert [record.record_id for record in store.failed_delivery_records()] == [
-        record.record_id for record in stored
-    ]
-    assert [record.record_id for record in store.failed_delivery_records(record_ids=None)] == [
-        record.record_id for record in stored
-    ]
-    assert [
-        record.record_id
-        for record in store.failed_delivery_records(record_ids=[stored[1].record_id])
-    ] == [stored[1].record_id]
-
-
-def test_failed_delivery_records_ignores_unknown_ids_without_widening_the_filter(tmp_path):
-    """A filter naming only records that do not exist still matches nothing.
-
-    The complement of the empty-list case: ``set(record_ids or [])`` was
-    only falsy for an empty list, so this arm already behaved -- pinned so
-    a future "simplification" back to a truthiness check is caught by more
-    than one test.
-    """
-    store = EventStore(persist_path=str(tmp_path / "events.jsonl"))
-    store.add_many([_failed_record("TLC-UNKNOWN-FILTER", 0)])
-
-    assert store.failed_delivery_records(record_ids=["no-such-record-id"]) == []

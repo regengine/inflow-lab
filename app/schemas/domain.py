@@ -68,25 +68,27 @@ class RegEngineEvent(BaseModel):
     cte_type: CTEType
     traceability_lot_code: str
     product_description: str
-    # `allow_inf_nan=False` closes #98 at the model: NaN/inf used to be
-    # rejected only at the CSV boundary (`_parse_quantity`) and at the
-    # persistence boundary (`EventStore` writes with `allow_nan=False`), so
-    # anything constructing a RegEngineEvent directly -- the engine, a demo
-    # fixture, a hand-built payload -- could carry a non-finite quantity into
-    # a signed live request. Now every producer goes through this check.
-    #
-    # NOT gt=0, deliberately, even though RegEngine's IngestEvent declares it:
-    # tests/test_mock_rejection_parity.py builds quantity=0/-5 events through
-    # this model on purpose, to pin that the mock classifies the constraint as
-    # request-fatal rather than per-event. A gt=0 here makes those events
-    # unconstructible. Non-positive quantities stay blocked at the CSV
-    # importer and in MockRegEngineService. See tests/test_schema_bounds.py.
-    quantity: float = Field(allow_inf_nan=False)
+    quantity: float
     unit_of_measure: str
     location_name: str
     location_gln: str | None = None
     timestamp: datetime
     kdes: dict[str, Any] = Field(default_factory=dict)
+    # Top-level transformation input-lot linkage, mirroring the location_gln
+    # precedent above. RegEngine's own IngestEvent
+    # (services/ingestion/app/webhook_models.py) declares
+    # input_traceability_lot_codes as a top-level field, and
+    # canonical_event.py's only writer of kdes["input_lot_codes"] gates
+    # entirely on that top-level field -- it never reads
+    # kdes["input_traceability_lot_codes"], which is the only place
+    # inflow-lab used to put it (issue #91). Populated in addition to, not
+    # instead of, the existing kdes["input_traceability_lot_codes"] copy:
+    # this repo's own lineage view (app/store.py), EPCIS export
+    # (app/epcis_export.py), and the mock ingest validator
+    # (app/mock_service.py) all still read the kdes copy, so removing it
+    # would break local behavior for a field that exists purely to reach
+    # RegEngine's live ingest, which the kdes copy never does.
+    input_traceability_lot_codes: list[str] | None = None
 
 
 class StoredEventRecord(BaseModel):

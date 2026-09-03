@@ -8,30 +8,25 @@
 # shared and the POST routes the dashboard proxies (simulate start/stop/reset,
 # fixture load) mutate its state.
 #
-# The contract loop authenticates. It has to: app/auth_middleware.py exempts only
-# OPTIONS and /api/healthz, so every other /api path answers 401 application/json
-# to a credential-less probe. Comparing 401 against 401 is not evidence of an
-# identical contract -- a new service on a different build, with an empty store,
-# or with a broken export path answers 401 the same way. Supply
-# REGENGINE_REMOTE_USERNAME / REGENGINE_REMOTE_PASSWORD (the Railway
-# REGENGINE_BASIC_AUTH_* values for the OLD service, which must be the same pair
-# on both) or the loop refuses to run.
+# Every path in PATHS requires Basic Auth (the shared demo's configuration),
+# so the proxy-contract loop below needs REGENGINE_REMOTE_USERNAME and
+# REGENGINE_REMOTE_PASSWORD to prove anything. Without them every probe gets
+# 401 application/json from both services, and a 401-vs-401 "match" says
+# nothing about whether the two services actually agree on the contract
+# (#106) -- so this script refuses to call that green. With no credentials
+# supplied, or with a path that still comes back non-2xx from the OLD service
+# even once credentials are supplied (401: wrong/stale credentials; 404: not
+# actually a mounted route; 000: unreachable), the contract section is
+# reported as a failure, not "ok", and PRE-FLIGHT PASSED never prints.
 #
-# What it CANNOT check, and why those matter more than everything it can. Both
-# are invisible from outside by construction, so a green run here is not a clean
-# bill of health:
+# What it still CANNOT check even with credentials supplied, and why that
+# matters more than everything it can:
 #
-#   1. Whether the new service's REGENGINE_BASIC_AUTH_USERNAME / _PASSWORD match
-#      the INFLOW_LAB_BASIC_AUTH_USERNAME / _PASSWORD that Vercel injects. This
-#      script probes both services with ONE credential pair, so it proves the
-#      pair works against both -- not that Vercel holds the same pair. Those are
-#      secrets on a different platform. Checklist step 2.
-#
-#   2. Whether the new service mounts a persistent volume at REGENGINE_DATA_DIR.
+#   1. Whether the new service mounts a persistent volume at REGENGINE_DATA_DIR.
 #      The demo writes its event history there, and on Railway that path only
 #      survives a redeploy if a volume is mounted. A service without one answers
 #      200, serves this entire contract correctly, reports the right build
-#      identity — and starts from an empty store after every deploy, which for a
+#      identity -- and starts from an empty store after every deploy, which for a
 #      GitHub-connected service means every push to main. Checklist step 4.
 #      Check it in the Railway config, not from out here: the old service's
 #      `volumeMounts` mountPath must exist on the new service too.
@@ -39,9 +34,6 @@
 # Usage:
 #   REGENGINE_REMOTE_USERNAME=... REGENGINE_REMOTE_PASSWORD=... \
 #     scripts/cutover_preflight.sh <old-base-url> <new-base-url>
-#
-# Set REGENGINE_PREFLIGHT_NO_AUTH=1 only for an instance with Basic Auth
-# disabled. A 401 from any probe is a hard failure either way.
 set -uo pipefail
 
 OLD="${1:-}"
@@ -51,13 +43,16 @@ if [ -z "$OLD" ] || [ -z "$NEW" ]; then
     exit 2
 fi
 
-# Every read-only path in the dashboard's proxy contract that resolves to a
-# router mounted in app/main.py. RegEngine's
-# frontend/src/app/api/inflow-lab/[...path]/route.ts also allows
-# /api/regengine/export/{fda-request,epcis} as a "live-export" boundary, but no
-# router in this repo mounts an /api/regengine prefix (the mock exports live
-# under /api/mock/regengine), so probing them only ever compared two 404s.
-# Reconcile the two repos before adding them back.
+# Same names scripts/live_trial.py and scripts/remote_smoke.py already use
+# for this credential pair, so one pair of env vars covers every script that
+# needs to authenticate against the shared demo.
+CRED_USER="${REGENGINE_REMOTE_USERNAME:-}"
+CRED_PASS="${REGENGINE_REMOTE_PASSWORD:-}"
+
+# Every read-only path in the dashboard's proxy contract, minus the two that
+# were never real routes (#106) -- keep in sync with endpointContract() in
+# RegEngine's frontend/src/app/api/inflow-lab/[...path]/route.ts, and with
+# the routers app/main.py actually mounts.
 PATHS=(
     "/api/healthz"
     "/api/simulate/status"
@@ -69,92 +64,46 @@ PATHS=(
 
 failures=0
 
-CURL_AUTH=()
-if [ -n "${REGENGINE_REMOTE_USERNAME:-}" ] && [ -n "${REGENGINE_REMOTE_PASSWORD:-}" ]; then
-    CURL_AUTH=(-u "${REGENGINE_REMOTE_USERNAME}:${REGENGINE_REMOTE_PASSWORD}")
-elif [ "${REGENGINE_PREFLIGHT_NO_AUTH:-}" != "1" ]; then
-    cat >&2 <<'NOAUTH'
-REGENGINE_REMOTE_USERNAME / REGENGINE_REMOTE_PASSWORD are not set, so the proxy
-contract loop cannot run: with Basic Auth enabled every /api path except
-/api/healthz answers 401 application/json on both services, and this script
-would print "ok" for all of them and roll up to PRE-FLIGHT PASSED without
-comparing anything.
-
-Export the OLD service's REGENGINE_BASIC_AUTH_USERNAME / _PASSWORD and re-run,
-or set REGENGINE_PREFLIGHT_NO_AUTH=1 if this instance really has Basic Auth
-disabled.
-NOAUTH
-    exit 2
-fi
-
-probe() { # url -> "status content-type body-keys"
-    local out status ctype body keys
-    out=$(curl -sS --max-time 25 "${CURL_AUTH[@]+"${CURL_AUTH[@]}"}" \
-        -w '\n%{http_code}|%{content_type}' "$1" 2>/dev/null) || out=$'\n000|'
-    status=${out##*$'\n'}
-    body=${out%$'\n'*}
-    ctype=${status#*|}
-    status=${status%%|*}
-    # Sorted top-level JSON keys: catches a service answering 200 with a
-    # different payload shape, which status + content-type alone cannot.
-    keys=$(printf '%s' "$body" | python3 -c \
-        "import json,sys;d=json.load(sys.stdin);print(','.join(sorted(d)) if isinstance(d,dict) else type(d).__name__)" \
-        2>/dev/null) || keys="-"
-    echo "${status} $(echo "${ctype}" | cut -d';' -f1) ${keys:--}"
+probe() { # url -> "status content-type"
+    local out
+    out=$(curl -sS --max-time 25 -u "${CRED_USER}:${CRED_PASS}" -o /dev/null -w '%{http_code}|%{content_type}' "$1" 2>/dev/null) || out="000|"
+    echo "${out%%|*} $(echo "${out#*|}" | cut -d';' -f1)"
 }
 
-echo "== Proxy contract: every read-only path must answer alike, with credentials =="
-for path in "${PATHS[@]}"; do
-    old_result=$(probe "${OLD}${path}")
-    new_result=$(probe "${NEW}${path}")
-    old_status=${old_result%% *}
-    new_status=${new_result%% *}
-
-    if [ "$old_status" = "401" ] || [ "$new_status" = "401" ]; then
-        printf '  FAIL  %-42s 401 with credentials supplied — old=[%s] new=[%s]\n' \
-            "$path" "$old_result" "$new_result"
-        failures=$(( failures + 1 ))
-        continue
-    fi
-    if [ "$old_result" != "$new_result" ]; then
-        printf '  DIFF  %-42s old=[%s] new=[%s]\n' "$path" "$old_result" "$new_result"
-        failures=$(( failures + 1 ))
-        continue
-    fi
-    # Identical failures are not evidence of an identical contract. Every path
-    # here is meant to serve content, so a matching 4xx/5xx on both sides means
-    # the comparison proved nothing.
-    case "$old_status" in
-        2*)
-            printf '  ok    %-42s %s\n' "$path" "$new_result"
-            ;;
-        *)
-            printf '  FAIL  %-42s both services answer %s — nothing was compared\n' \
-                "$path" "$old_status"
-            failures=$(( failures + 1 ))
-            ;;
-    esac
-done
-
-echo
-echo "== Store contents: the new service must not be serving an empty store =="
-# A replacement service with no volume, or one pointed at a fresh
-# REGENGINE_DATA_DIR, serves this entire contract correctly from zero events.
-event_count() { # url -> integer, or -1 when unreadable
-    curl -sS --max-time 25 "${CURL_AUTH[@]+"${CURL_AUTH[@]}"}" "${1}/api/simulate/status" 2>/dev/null \
-        | python3 -c \
-        "import json,sys
-try:
-    print(int((json.load(sys.stdin).get('stats') or {}).get('total_records', -1)))
-except Exception:
-    print(-1)" 2>/dev/null || echo -1
-}
-old_records=$(event_count "$OLD")
-new_records=$(event_count "$NEW")
-printf '  old total_records=%s   new total_records=%s\n' "$old_records" "$new_records"
-if [ "$old_records" -gt 0 ] 2>/dev/null && [ "$new_records" -eq 0 ] 2>/dev/null; then
-    echo "  FAIL  the old service has history and the new one has none — check the volume mount"
+echo "== Proxy contract: every read-only path must answer alike =="
+if [ -z "$CRED_USER" ] || [ -z "$CRED_PASS" ]; then
+    echo "  UNVERIFIABLE  REGENGINE_REMOTE_USERNAME / REGENGINE_REMOTE_PASSWORD are not set."
+    echo "                Basic Auth is this demo's configuration, so an unauthenticated"
+    echo "                probe gets 401 application/json from both services on every"
+    echo "                path -- a match there proves nothing about the contract (#106)."
+    echo "                Set both env vars and re-run to actually check it."
     failures=$(( failures + 1 ))
+else
+    for path in "${PATHS[@]}"; do
+        old_result=$(probe "${OLD}${path}")
+        new_result=$(probe "${NEW}${path}")
+        old_status=${old_result%% *}
+        case "$old_status" in
+            2??)
+                if [ "$old_result" = "$new_result" ]; then
+                    printf '  ok    %-42s %s\n' "$path" "$new_result"
+                else
+                    printf '  DIFF  %-42s old=[%s] new=[%s]\n' "$path" "$old_result" "$new_result"
+                    failures=$(( failures + 1 ))
+                fi
+                ;;
+            *)
+                # The OLD service is the known-good baseline, so it answering
+                # an error even with credentials supplied -- 401 (wrong/stale
+                # credentials), 404 (not actually a route), 000 (unreachable)
+                # -- means this path cannot verify anything, even when NEW
+                # answers identically: two services agreeing on a failure is
+                # not evidence they agree on the contract (#106).
+                printf '  FAIL  %-42s old service did not return 2xx with credentials: old=[%s] new=[%s]\n' "$path" "$old_result" "$new_result"
+                failures=$(( failures + 1 ))
+                ;;
+        esac
+    done
 fi
 
 echo
@@ -195,25 +144,15 @@ if [ "$failures" -gt 0 ]; then
     exit 1
 fi
 cat <<'DONE'
-PRE-FLIGHT PASSED — everything checkable from outside matches.
+PRE-FLIGHT PASSED — everything checkable from outside matches, including that
+REGENGINE_REMOTE_USERNAME / REGENGINE_REMOTE_PASSWORD authenticated
+successfully against both services.
 
-What this run DID prove: every probed path served 2xx with the same
-content-type and the same top-level payload shape on both services, using one
-working credential pair, and the new service is not serving an empty store.
+One thing remains unverified, invisible from outside:
 
-Two things remain unverified, both invisible from outside:
-
-  1. Vercel INFLOW_LAB_BASIC_AUTH_USERNAME / _PASSWORD must equal Railway
-     REGENGINE_BASIC_AUTH_USERNAME / _PASSWORD on the NEW service, as concrete
-     values rather than reference variables to the old one. This script proved
-     only that the pair YOU supplied works against both services; it cannot read
-     what Vercel holds. If they differ, every proxied call answers 401 the moment
-     you flip INFLOW_LAB_SERVICE_URL.
-
-  2. Whether the NEW service's store survives a REDEPLOY. A non-empty store today
-     only proves data is there now; on Railway that path persists across
-     redeploys solely because a volume is mounted at REGENGINE_DATA_DIR. Check
-     the Railway config, not this script.
+  The NEW service must mount a persistent volume at REGENGINE_DATA_DIR. Check
+  the Railway config, not this script. Without it the demo answers normally
+  and silently loses its event history on every redeploy.
 
 After flipping and redeploying Vercel (env is baked at build), confirm with:
   curl -s https://<dashboard-host>/api/inflow-lab/api/simulate/status

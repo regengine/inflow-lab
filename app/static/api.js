@@ -1,9 +1,3 @@
-<<<<<<< HEAD
-// The fetch wrapper, and the request bodies built from the setup form.
-
-import { DEFAULT_LIVE_INGEST_ENDPOINT } from './state.js';
-import { ids } from './dom.js';
-=======
 // The fetch wrapper and the error-message flattening behind it. Nothing in
 // here touches the DOM, so an error string is produced the same way for a
 // button handler, a stream reconnect, or a background refresh.
@@ -68,7 +62,6 @@ export async function errorMessageFor(response) {
   const snippet = raw.replace(/\s+/g, ' ').trim().slice(0, 160);
   return snippet ? `${statusLine} — ${snippet}` : statusLine;
 }
->>>>>>> origin/main
 
 export async function api(path, options = {}) {
   const response = await fetch(path, {
@@ -76,12 +69,7 @@ export async function api(path, options = {}) {
     ...options,
   });
   if (!response.ok) {
-<<<<<<< HEAD
-    const payload = await response.json().catch(() => ({}));
-    throw new Error(payload.detail || `Request failed: ${response.status}`);
-=======
     throw new Error(await errorMessageFor(response));
->>>>>>> origin/main
   }
   const contentType = response.headers.get('content-type') || '';
   if (contentType.includes('application/json')) {
@@ -89,35 +77,3 @@ export async function api(path, options = {}) {
   }
   return response.text();
 }
-<<<<<<< HEAD
-
-export function buildConfig() {
-  const endpoint = ids.endpoint.value.trim() || DEFAULT_LIVE_INGEST_ENDPOINT;
-  const apiKey = ids.apiKey.value.trim();
-  const tenantId = ids.tenantId.value.trim();
-  const seedValue = ids.seed.value.trim();
-  return {
-    source: ids.source.value.trim() || 'codex-simulator',
-    scenario: ids.scenario.value,
-    scale: ids.operationScale?.value || 'midsize',
-    interval_seconds: Number(ids.interval.value || 1.5),
-    batch_size: Number(ids.batchSize.value || 3),
-    seed: seedValue === '' ? null : Number(seedValue),
-    persist_path: 'data/events.jsonl',
-    delivery: {
-      mode: ids.deliveryMode.value,
-      endpoint: endpoint || null,
-      api_key: apiKey || null,
-      tenant_id: tenantId || null,
-      mock_friction: frictionSelections(),
-    },
-  };
-}
-
-export function frictionSelections() {
-  return [ids.frictionInvalidKey, ids.frictionSubscription, ids.frictionRateLimit]
-    .filter((checkbox) => checkbox && checkbox.checked)
-    .map((checkbox) => checkbox.value);
-}
-=======
->>>>>>> origin/main
