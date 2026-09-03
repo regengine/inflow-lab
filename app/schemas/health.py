@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from typing import Any
 
+<<<<<<< HEAD
 from pydantic import BaseModel, ConfigDict, Field
 
 from .simulation import StatusResponse
@@ -15,6 +16,13 @@ class BuildInfoResponse(BaseModel):
     """
 
     version: str | None = None
+=======
+from pydantic import BaseModel
+
+
+class BuildInfoResponse(BaseModel):
+    version: str
+>>>>>>> origin/main
     commit_sha: str | None = None
     commit_sha_short: str | None = None
     commit_source: str | None = None
@@ -24,12 +32,17 @@ class BuildInfoResponse(BaseModel):
     deployment_source: str | None = None
 
 
+<<<<<<< HEAD
 class HealthAuthResponse(BaseModel):
+=======
+class AuthInfoResponse(BaseModel):
+>>>>>>> origin/main
     enabled: bool
     username: str | None = None
     uses_default_storage: bool
 
 
+<<<<<<< HEAD
 class HealthResponse(BaseModel):
     """``GET /api/health`` — the authenticated, tenant-scoped health view."""
 
@@ -49,10 +62,20 @@ class HealthzResponse(BaseModel):
     the deploy contract and not merely documentation.
     """
 
+=======
+class StoreProbeResponse(BaseModel):
+    ok: bool
+    persist_path: str
+    error: str | None = None
+
+
+class HealthzResponse(BaseModel):
+>>>>>>> origin/main
     ok: bool
     utc_time: str
     build: BuildInfoResponse
     contract_version: str
+<<<<<<< HEAD
 
 
 class EPCISBody(BaseModel):
@@ -75,10 +98,36 @@ class EPCISDocumentResponse(BaseModel):
     """
 
     context: list[str] = Field(default_factory=list, alias="@context")
+=======
+    store: StoreProbeResponse
+
+
+class HealthResponse(HealthzResponse):
+    tenant: str
+    auth: AuthInfoResponse
+    status: dict[str, Any]
+
+
+class EpcisEventBodyResponse(BaseModel):
+    eventList: list[dict[str, Any]]
+
+
+class EpcisDocumentResponse(BaseModel):
+    """Top-level EPCIS 2.0 JSON-LD document.
+
+    The ``@context`` field is serialised as-is in the real response; it is
+    described here as ``dict | list`` because JSON-LD allows both shapes.
+    """
+
+>>>>>>> origin/main
     type: str
     schemaVersion: str
     creationDate: str
     sender: str
+<<<<<<< HEAD
     epcisBody: EPCISBody
 
     model_config = ConfigDict(populate_by_name=True)
+=======
+    epcisBody: EpcisEventBodyResponse
+>>>>>>> origin/main

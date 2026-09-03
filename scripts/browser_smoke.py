@@ -9,6 +9,7 @@ import time
 from collections.abc import Iterator
 from contextlib import contextmanager
 from dataclasses import dataclass
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
 
@@ -18,11 +19,51 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
-from app.build_info import APP_VERSION
+# Imported after the sys.path bootstrap above so
+# `python scripts/browser_smoke.py` works from a clean checkout; hence the E402
+# waivers.
+from app.build_info import APP_VERSION  # noqa: E402
+from scripts import _smoke_common as smoke  # noqa: E402
 
+<<<<<<< HEAD
 CSV_WITH_KDE_WARNINGS = """cte_type,traceability_lot_code,product_description,quantity,unit_of_measure,location_name,timestamp,kdes
 harvesting,TLC-BROWSER-WARN,Romaine Lettuce,10,cases,Valley Fresh Farms,2026-02-10T08:00:00Z,"{""harvest_date"":""2026-02-10""}"
 """
+=======
+
+# Basic Auth credential sources, most specific first. Each entry is a *pair*:
+# a username and a password are only ever used together with the partner they
+# were configured alongside. Mixing a fresh REGENGINE_BROWSER_USERNAME with a
+# stale REGENGINE_REMOTE_PASSWORD left over from an earlier remote_smoke or
+# live_trial session produced a credential pair that never existed in any
+# source, and the run then failed with a 401 that read as "the console is
+# broken" rather than "your environment does not match".
+CREDENTIAL_SOURCES = (
+    ("REGENGINE_BROWSER_USERNAME", "REGENGINE_BROWSER_PASSWORD"),
+    ("REGENGINE_REMOTE_USERNAME", "REGENGINE_REMOTE_PASSWORD"),
+)
+
+# The imported row must land inside RegEngine's replay window
+# (WEBHOOK_MAX_EVENT_AGE_DAYS=90), otherwise the mock rejects it outright and
+# the smoke never reaches the KDE-warning assertion it exists to make. Built
+# relative to "now" rather than pinned to a calendar date so it cannot go
+# stale again; a day back is recent enough to always be in-window and old
+# enough to never trip the 24h future ceiling.
+IMPORT_CSV_AGE = timedelta(days=1)
+
+
+def import_csv_with_kde_warnings(now: datetime | None = None) -> str:
+    """A one-row scheduled-events CSV that is valid except for missing KDEs."""
+    moment = (now or datetime.now(UTC)) - IMPORT_CSV_AGE
+    timestamp = moment.strftime("%Y-%m-%dT%H:%M:%SZ")
+    harvest_date = moment.date().isoformat()
+    return (
+        "cte_type,traceability_lot_code,product_description,quantity,"
+        "unit_of_measure,location_name,timestamp,kdes\n"
+        f"harvesting,TLC-BROWSER-WARN,Romaine Lettuce,10,cases,Valley Fresh Farms,"
+        f'{timestamp},"{{""harvest_date"":""{harvest_date}""}}"\n'
+    )
+>>>>>>> origin/main
 
 
 @dataclass(frozen=True, slots=True)
@@ -45,12 +86,7 @@ def main() -> int:
 
 
 def _load_config() -> BrowserSmokeConfig:
-    username = _env_text("REGENGINE_BROWSER_USERNAME") or _env_text("REGENGINE_REMOTE_USERNAME")
-    password = _env_text("REGENGINE_BROWSER_PASSWORD") or _env_text("REGENGINE_REMOTE_PASSWORD")
-    if bool(username) != bool(password):
-        raise RuntimeError(
-            "REGENGINE_BROWSER_USERNAME and REGENGINE_BROWSER_PASSWORD must be provided together"
-        )
+    username, password = _load_credentials()
 
     return BrowserSmokeConfig(
         base_url=_env_text("REGENGINE_BROWSER_BASE_URL") or _env_text("REGENGINE_REMOTE_BASE_URL"),
@@ -62,6 +98,25 @@ def _load_config() -> BrowserSmokeConfig:
         or _env_text("REGENGINE_EXPECTED_BUILD_SHA"),
         executable_path=_env_text("REGENGINE_BROWSER_EXECUTABLE"),
     )
+
+
+def _load_credentials() -> tuple[str | None, str | None]:
+    """Resolve Basic Auth as a pair from a single source, never field by field.
+
+    The first source with *either* half set wins, and that source must supply
+    both halves. See CREDENTIAL_SOURCES.
+    """
+    for username_var, password_var in CREDENTIAL_SOURCES:
+        username = _env_text(username_var)
+        password = _env_text(password_var)
+        if username is None and password is None:
+            continue
+        if not username or not password:
+            raise RuntimeError(
+                f"{username_var} and {password_var} must be provided together"
+            )
+        return username, password
+    return None, None
 
 
 @contextmanager
@@ -133,7 +188,11 @@ def _run_dashboard_smoke(base_url: str, config: BrowserSmokeConfig) -> None:
             page.on("pageerror", lambda error: console_errors.append(str(error)))
 
             page.goto(base_url, wait_until="domcontentloaded")
-            expect(page.get_by_role("heading", name="Plant Operations Console", exact=True)).to_be_visible()
+            # Use a CSS locator here, not get_by_role: the welcome overlay is
+            # aria-modal="true" at this point, which removes the rest of the
+            # document from the ARIA tree so get_by_role("heading") returns 0
+            # elements.  The accessible-name check comes after dismissal below.
+            expect(page.locator("h1", has_text="Plant Operations Console")).to_be_visible()
             expect(page.locator("#guideRail")).to_contain_text("How to use this console")
             expect(page.locator('#guideRail [data-guide-step="setup"]')).to_be_visible()
 
@@ -208,7 +267,7 @@ def _run_dashboard_smoke(base_url: str, config: BrowserSmokeConfig) -> None:
 
             csv_path = output_dir / "browser_smoke_import.csv"
             output_dir.mkdir(parents=True, exist_ok=True)
-            csv_path.write_text(CSV_WITH_KDE_WARNINGS, encoding="utf-8")
+            csv_path.write_text(import_csv_with_kde_warnings(), encoding="utf-8")
             page.locator("#csvImportType").select_option("scheduled_events")
             page.locator("#csvFile").set_input_files(str(csv_path))
             page.locator("#importCsvBtn").click()
@@ -303,10 +362,8 @@ def _check_healthz_build(base_url: str, expected_build_sha: str | None) -> None:
             )
 
 
-def _sha_prefix_match(actual: str, expected: str) -> bool:
-    actual = actual.strip().lower()
-    expected = expected.strip().lower()
-    return actual.startswith(expected) or expected.startswith(actual)
+# Single definition lives in scripts/_smoke_common.py.
+_sha_prefix_match = smoke.sha_prefix_match
 
 
 def _wait_for_healthz(base_url: str, process: subprocess.Popen[str]) -> None:

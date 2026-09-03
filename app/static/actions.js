@@ -1,3 +1,4 @@
+<<<<<<< HEAD
 // The handlers behind the console's buttons.
 //
 // Every one is wrapped in `action()`, which is the single place a failed action
@@ -29,6 +30,24 @@ export function action(handler) {
 }
 
 export const saveIntegrationSettings = action(async () => {
+=======
+// Operator actions. None of these report their own failures any more: they
+// let the error escape to the single reporter in ui.js, which is what
+// bindAsyncClick() (and the two direct runWithBusy() call sites) attach.
+
+import { ids, state } from './dom.js';
+import { escapeHtml } from './format.js';
+import { CONNECTION_VERDICT_TONES } from './labels.js';
+import { api } from './api.js';
+import { setStatus, reportActionError } from './ui.js';
+import { blockedByMissingCredentials, buildConfig, frictionSelections } from './config-form.js';
+import { applyConfigToForm, loadScenarioSaves, renderScenarioOptions, updateScenarioSaveDescription } from './catalog.js';
+import { preferredTraceLot, updateExportLink } from './exports.js';
+import { renderConnectionStatus, renderImportResult } from './panels.js';
+import { refresh } from './snapshot.js';
+
+export async function saveIntegrationSettings() {
+>>>>>>> origin/main
   const request = {
     mode: ids.deliveryMode.value,
     mock_friction: frictionSelections(),
@@ -52,9 +71,15 @@ export const saveIntegrationSettings = action(async () => {
   renderConnectionStatus(integration);
   setStatus('Saved RegEngine connection settings.', 'success', 2500);
   await refresh();
+<<<<<<< HEAD
 });
 
 export const testConnection = action(async () => {
+=======
+}
+
+export async function testConnection() {
+>>>>>>> origin/main
   if (ids.connectionResult) {
     ids.connectionResult.innerHTML = '<p class="note">Testing connection…</p>';
   }
@@ -91,17 +116,29 @@ export const testConnection = action(async () => {
     if (ids.connectionResult) {
       ids.connectionResult.innerHTML = `<div class="connection-verdict" data-tone="error"><p>${escapeHtml(error.message)}</p></div>`;
     }
+<<<<<<< HEAD
     throw error;
   }
 });
 
 export const startLoop = action(async () => {
+=======
+    reportActionError(error);
+  }
+}
+
+export async function startLoop() {
+  if (blockedByMissingCredentials()) {
+    return;
+  }
+>>>>>>> origin/main
   await api('/api/simulate/start', {
     method: 'POST',
     body: JSON.stringify({ config: buildConfig() }),
   });
   setStatus('Started production line.', 'success', 2500);
   await refresh();
+<<<<<<< HEAD
 });
 
 export const stopLoop = action(async () => {
@@ -111,6 +148,17 @@ export const stopLoop = action(async () => {
 });
 
 export const stepOnce = action(async () => {
+=======
+}
+
+export async function stopLoop() {
+  await api('/api/simulate/stop', { method: 'POST' });
+  setStatus('Paused production line.', 'success', 2500);
+  await refresh();
+}
+
+export async function stepOnce() {
+>>>>>>> origin/main
   const result = await api('/api/simulate/step', { method: 'POST' });
   const traceLot = preferredTraceLot(result.lot_codes || []);
   if (traceLot) {
@@ -128,9 +176,18 @@ export const stepOnce = action(async () => {
     setStatus(`Recorded and posted ${result.posted} event(s).`, 'success', 2500);
   }
   await refresh();
+<<<<<<< HEAD
 });
 
 export const retryFailedDeliveries = action(async () => {
+=======
+}
+
+export async function retryFailedDeliveries() {
+  if (blockedByMissingCredentials()) {
+    return;
+  }
+>>>>>>> origin/main
   const config = buildConfig();
   const result = await api('/api/delivery/retry', {
     method: 'POST',
@@ -146,9 +203,15 @@ export const retryFailedDeliveries = action(async () => {
     setStatus(`Retried and posted ${result.posted} failed delivery record(s).`, 'success', 3500);
   }
   await refresh();
+<<<<<<< HEAD
 });
 
 export const saveCurrentScenario = action(async () => {
+=======
+}
+
+export async function saveCurrentScenario() {
+>>>>>>> origin/main
   const config = buildConfig();
   const result = await api(`/api/scenario-saves/${encodeURIComponent(config.scenario)}`, {
     method: 'POST',
@@ -158,6 +221,7 @@ export const saveCurrentScenario = action(async () => {
   ids.scenarioSave.value = result.save.scenario;
   updateScenarioSaveDescription();
   setStatus(`Saved ${result.save.label} with ${result.save.record_count} event(s).`, 'success', 3500);
+<<<<<<< HEAD
 });
 
 export const loadSavedScenario = action(async () => {
@@ -165,6 +229,15 @@ export const loadSavedScenario = action(async () => {
   if (!scenarioId) {
   setStatus('Save a scenario first.', 'error', 5000);
   return;
+=======
+}
+
+export async function loadSavedScenario() {
+  const scenarioId = ids.scenarioSave.value;
+  if (!scenarioId) {
+    setStatus('Save a scenario first.', 'error', 5000);
+    return;
+>>>>>>> origin/main
   }
   const result = await api(`/api/scenario-saves/${encodeURIComponent(scenarioId)}/load`, {
     method: 'POST',
@@ -177,9 +250,18 @@ export const loadSavedScenario = action(async () => {
   ids.scenarioSave.value = result.save.scenario;
   updateScenarioSaveDescription();
   setStatus(`Loaded ${result.save.label} with ${result.loaded_records} saved event(s).`, 'success', 3500);
+<<<<<<< HEAD
 });
 
 export const loadSelectedDemoFixture = action(async () => {
+=======
+}
+
+export async function loadSelectedDemoFixture() {
+  if (blockedByMissingCredentials()) {
+    return;
+  }
+>>>>>>> origin/main
   const config = buildConfig();
   const fixtureId = ids.demoFixture.value || 'leafy_greens_trace';
   const result = await api(`/api/demo-fixtures/${encodeURIComponent(fixtureId)}/load`, {
@@ -211,9 +293,15 @@ export const loadSelectedDemoFixture = action(async () => {
     setStatus(`Loaded line data and posted ${result.posted} event(s).`, 'success', 3500);
   }
   await refresh();
+<<<<<<< HEAD
 });
 
 export const replayCurrentLog = action(async () => {
+=======
+}
+
+export async function replayCurrentLog() {
+>>>>>>> origin/main
   const result = await api('/api/simulate/replay', { method: 'POST' });
   const path = result.persist_path || 'current log';
   if (result.status === 'empty') {
@@ -226,6 +314,7 @@ export const replayCurrentLog = action(async () => {
     setStatus(`Replayed ${result.posted} event(s) from ${path}.`, 'success', 3500);
   }
   await refresh();
+<<<<<<< HEAD
 });
 
 export const importCsv = action(async () => {
@@ -233,6 +322,18 @@ export const importCsv = action(async () => {
   if (!file) {
   setStatus('Choose a CSV file first.', 'error', 5000);
   return;
+=======
+}
+
+export async function importCsv() {
+  if (blockedByMissingCredentials()) {
+    return;
+  }
+  const file = ids.csvFile.files[0];
+  if (!file) {
+    setStatus('Choose a CSV file first.', 'error', 5000);
+    return;
+>>>>>>> origin/main
   }
   const config = buildConfig();
   const result = await api('/api/import/csv', {
@@ -255,14 +356,24 @@ export const importCsv = action(async () => {
     setStatus(`Imported ${result.accepted} CSV row(s).`, 'success', 3500);
   }
   await refresh();
+<<<<<<< HEAD
 });
 
 export const resetState = action(async () => {
+=======
+}
+
+export async function resetState() {
+  if (blockedByMissingCredentials()) {
+    return;
+  }
+>>>>>>> origin/main
   await api('/api/simulate/reset', {
     method: 'POST',
     body: JSON.stringify(buildConfig()),
   });
   ids.lineageResults.innerHTML = '';
+<<<<<<< HEAD
   setStatus('Cleared line state and shift log.', 'success', 2500);
   await refresh();
 });
@@ -284,3 +395,13 @@ export const lookupLineage = action(async () => {
     throw error;
   }
 });
+=======
+  // The records these filters pointed at are gone; leaving them applied
+  // makes the next export silently return nothing.
+  ids.lotLookup.value = '';
+  ids.exportLot.value = '';
+  updateExportLink();
+  setStatus('Cleared line state and shift log.', 'success', 2500);
+  await refresh();
+}
+>>>>>>> origin/main

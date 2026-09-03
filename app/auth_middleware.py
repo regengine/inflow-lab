@@ -8,7 +8,7 @@ from fastapi import Request
 from fastapi.responses import JSONResponse
 
 from .auth import TenantContext, tenant_context_from_request
-from .cors import cors_origins_from_env
+from .cors import cors_origins_for_app
 from .dependencies import get_tenant_context
 from .tenancy import active_controller_for_context
 
@@ -76,7 +76,7 @@ def _reject_untrusted_unsafe_origin(request: Request, context: TenantContext) ->
     if request_origin is None:
         return None
 
-    if request_origin in cors_origins_from_env():
+    if request_origin in cors_origins_for_app():
         return None
 
     return JSONResponse(

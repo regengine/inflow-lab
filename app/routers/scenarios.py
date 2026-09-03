@@ -4,7 +4,7 @@ from fastapi import APIRouter, Depends, HTTPException
 
 from .. import tenancy
 from ..auth import TenantContext
-from ..controller import SimulationController
+from ..controller import SimulationController, request_with_stored_delivery_secrets
 from ..demo_fixtures import list_demo_fixture_summaries
 from ..dependencies import get_active_controller, get_tenant_context
 from ..scenarios import ScenarioId, list_scenario_summaries
@@ -83,4 +83,6 @@ async def load_demo_fixture(
     fixture_request: DemoFixtureLoadRequest | None = None,
     active_controller: SimulationController = Depends(get_active_controller),
 ) -> DemoFixtureLoadResponse:
-    return await active_controller.load_demo_fixture(fixture_id, fixture_request)
+    return await active_controller.load_demo_fixture(
+        fixture_id, request_with_stored_delivery_secrets(active_controller, fixture_request)
+    )

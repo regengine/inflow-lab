@@ -5,7 +5,7 @@ from dataclasses import dataclass, field, replace
 from enum import Enum
 from itertools import count
 
-from .schemas.domain import CTEType, OperationScale
+from .schemas.domain import OperationScale
 
 
 class ScenarioId(str, Enum):
@@ -54,7 +54,15 @@ class ScenarioPreset:
     industry_type: str
     operation_type: str
     reference_format: str
-    source_cte_type: CTEType = CTEType.HARVESTING
+    # source_cte_type deliberately absent (#164): an operation's source CTE
+    # type is a property of its *industry*, not of an individual scenario, and
+    # it lives on IndustryAdapter -- alongside source_reference_type, which the
+    # engine already reads from there. It used to be duplicated here as well,
+    # with engine.py reading this copy and nothing at all reading the adapter's,
+    # so the two had to be hand-synced across unrelated files and a new
+    # industry/scenario pairing that updated only one would have diverged
+    # silently. The engine now reads the adapter, which it derives from
+    # industry_type, so the pairing cannot be inconsistent.
     requires_cooling: bool = True
     harvest_target: int = 3
     packed_to_processor_probability: float = 0.45
@@ -292,7 +300,6 @@ SCENARIO_PRESETS: dict[ScenarioId, ScenarioPreset] = {
         industry_type="seafood",
         operation_type="first_receiver",
         reference_format="GS1",
-        source_cte_type=CTEType.FIRST_LAND_BASED_RECEIVING,
         requires_cooling=False,
         harvest_target=4,
         packed_to_processor_probability=0.65,
@@ -479,28 +486,28 @@ SCENARIO_PRESETS[ScenarioId.COPACKER_NUT_BUTTER] = ScenarioPreset(
     label="Co-packer (nut butters)",
     description="Contract manufacturer receiving ingredient nut lots from grower partners and transforming them into branded and private-label nut butters (FTL: nut butters).",
     farms=(
-        Location("Central Valley Almond Ranch", "farm", _gln(1101), {"gps": "36.7378,-119.7871"}),
-        Location("Georgia Grove Peanut Farm", "farm", _gln(1102), {"gps": "31.5785,-84.1557"}),
-        Location("Sunland Pecan Orchards", "farm", _gln(1103), {"gps": "32.3199,-106.7637"}),
+        Location("Central Valley Almond Ranch", "farm", _gln(1141), {"gps": "36.7378,-119.7871"}),
+        Location("Georgia Grove Peanut Farm", "farm", _gln(1142), {"gps": "31.5785,-84.1557"}),
+        Location("Sunland Pecan Orchards", "farm", _gln(1143), {"gps": "32.3199,-106.7637"}),
     ),
     coolers=(
-        Location("Hulling & Conditioning Station", "cooler", _gln(2101)),
+        Location("Hulling & Conditioning Station", "cooler", _gln(2141)),
     ),
     packers=(
-        Location("Ingredient Intake Dock", "packer", _gln(3101)),
-        Location("Roastline Staging", "packer", _gln(3102)),
+        Location("Ingredient Intake Dock", "packer", _gln(3141)),
+        Location("Roastline Staging", "packer", _gln(3142)),
     ),
     processors=(
-        Location("MillRight Contract Manufacturing — Line 1", "processor", _gln(4101)),
-        Location("MillRight Contract Manufacturing — Line 2", "processor", _gln(4102)),
+        Location("MillRight Contract Manufacturing — Line 1", "processor", _gln(4141)),
+        Location("MillRight Contract Manufacturing — Line 2", "processor", _gln(4142)),
     ),
     dcs=(
-        Location("Brand Fulfillment DC", "dc", _gln(5101)),
-        Location("Private Label DC East", "dc", _gln(5102)),
+        Location("Brand Fulfillment DC", "dc", _gln(5141)),
+        Location("Private Label DC East", "dc", _gln(5142)),
     ),
     retailers=(
-        Location("Retail Store #2210", "retail", _gln(6101)),
-        Location("Grocer Chain DC Receipt", "retail", _gln(6102)),
+        Location("Retail Store #2210", "retail", _gln(6141)),
+        Location("Grocer Chain DC Receipt", "retail", _gln(6142)),
     ),
     products=(
         ProductSpec("Raw Almonds", "totes", "tree_nuts", {"plu": "3339"}),

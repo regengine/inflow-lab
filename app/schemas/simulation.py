@@ -5,6 +5,7 @@ import os
 from typing import Annotated, Any, Literal
 from urllib.parse import urlparse
 
+<<<<<<< HEAD
 from pydantic import (
     AfterValidator,
     BaseModel,
@@ -14,12 +15,16 @@ from pydantic import (
     field_validator,
     model_validator,
 )
+=======
+from pydantic import BaseModel, ConfigDict, Field, HttpUrl, field_validator, model_validator
+>>>>>>> origin/main
 
 from ..scenarios import ScenarioId
 from .domain import DestinationMode, OperationScale
 
 MockFrictionCode = Literal["invalid_key", "subscription_inactive", "rate_limit"]
 
+<<<<<<< HEAD
 # Outbound delivery posts the configured RegEngine API key to whatever endpoint
 # is set, and nothing validated that endpoint. A link-local or loopback target
 # therefore reached internal services *and* received the credential:
@@ -108,6 +113,36 @@ def endpoint_rejection_reason(endpoint: str) -> str | None:
 class DeliveryConfig(BaseModel):
     # Unknown keys are rejected rather than dropped: a typo in a delivery
     # override used to return 200 having silently changed nothing.
+=======
+# Request bodies reject unknown members instead of dropping them. This is a
+# simulator whose job is to surface integration-contract mistakes, so a
+# misspelled or misnested field has to fail loudly: silently ignoring it
+# produced 200 OK responses that quietly applied nothing.
+STRICT_REQUEST = ConfigDict(extra="forbid")
+
+
+def default_persist_path() -> str:
+    """Where the default (non-tenant) scope writes its event log.
+
+    Derived from ``REGENGINE_DATA_DIR`` via ``app.tenancy.default_events_path``
+    -- the same helper every other storage path in the app already comes from
+    -- rather than the literal ``data/events.jsonl`` this used to be. That
+    literal was CWD-relative, so on a deployment whose persistent volume is
+    mounted at ``REGENGINE_DATA_DIR=/data`` it relocated tenant storage but not
+    the default tenant's events, which landed in a container-local ``data/``
+    and were discarded on every redeploy (DEPLOYMENT_PROFILES.md step 4).
+
+    Resolved on each instantiation, not frozen at import, so setting the
+    variable inside a process or a test still takes effect. The import is
+    deferred because ``app.tenancy`` imports this module.
+    """
+    from ..tenancy import default_events_path
+
+    return str(default_events_path())
+
+
+class DeliveryConfig(BaseModel):
+>>>>>>> origin/main
     model_config = ConfigDict(extra="forbid")
 
     mode: DestinationMode = DestinationMode.MOCK
@@ -129,7 +164,7 @@ class SimulationConfig(BaseModel):
     interval_seconds: float = 1.5
     batch_size: int = 3
     seed: int | None = 204
-    persist_path: str = "data/events.jsonl"
+    persist_path: str = Field(default_factory=default_persist_path)
     delivery: DeliveryConfig = Field(default_factory=DeliveryConfig)
 
     @field_validator("interval_seconds")
@@ -160,6 +195,7 @@ class StepRequest(BaseModel):
 
 
 class ResetRequest(BaseModel):
+<<<<<<< HEAD
     """Config override for ``POST /api/simulate/reset``.
 
     The canonical shape is ``/start``'s — ``{"config": {...}}`` — so the same
@@ -173,15 +209,42 @@ class ResetRequest(BaseModel):
     """
 
     model_config = ConfigDict(extra="forbid")
+=======
+    """Reset body, accepting both the wrapped and the historical flat shape.
+
+    ``/start`` has always wrapped its override as ``{"config": {...}}``
+    while ``/reset`` read the same fields unwrapped at the top level, so
+    posting one endpoint's body to the other parsed cleanly and applied
+    nothing. Both shapes are accepted here — the wrapped one so the two
+    endpoints agree, the flat one because the console and existing
+    integrations send it — and anything that is neither is a 422 rather
+    than a silent no-op.
+    """
+
+    model_config = STRICT_REQUEST
+>>>>>>> origin/main
 
     config: SimulationConfig | None = None
 
     @model_validator(mode="before")
     @classmethod
+<<<<<<< HEAD
     def _accept_bare_config(cls, data: Any) -> Any:
         if isinstance(data, dict) and data and "config" not in data:
             return {"config": data}
         return data
+=======
+    def accept_flat_config(cls, data: Any) -> Any:
+        if not isinstance(data, dict):
+            return data
+        if not data:
+            return {"config": None}
+        # A body carrying "config" is the wrapped shape; anything alongside
+        # it is a misnesting mistake and `extra="forbid"` will say so.
+        if "config" in data:
+            return data
+        return {"config": data}
+>>>>>>> origin/main
 
 
 class StatusResponse(BaseModel):

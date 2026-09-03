@@ -24,6 +24,7 @@ Inflow Lab plays the role of **a RegEngine customer's own software**: a fictiona
 - [Demo fixtures](#demo-fixtures)
 - [FDA export presets](#fda-export-presets)
 - [EPCIS 2.0 export scaffolding](#epcis-20-export-scaffolding)
+- [Export record caps and truncation](#export-record-caps-and-truncation)
 - [Full FSMA simulation](#full-fsma-simulation)
 - [Design-partner demo script](#design-partner-demo-script)
 - [Deployment profiles](#deployment-profiles)
@@ -53,7 +54,7 @@ Inflow Lab reproduces the full experience a RegEngine customer has in the wild, 
 - **Real integration mechanics.** Live delivery sends exactly what an integrator sends — `X-RegEngine-API-Key`, `X-Tenant-ID`, a required `Idempotency-Key`, optional HMAC body signing — and surfaces RegEngine's real per-event accept/reject responses. The built-in stand-in mirrors the live webhook's validation, so a payload that would fail in production fails here too.
 - **Real friction, on purpose.** Missing-KDE rejections, bad-key 401s, lapsed-billing 402s, and rate-limit 429s can all be rehearsed, with recovery guidance and idempotent retries that never double-ingest.
 
-Each accepted event is persisted with `event_id`, `sha256_hash`, and `chain_hash` so the flow feels production-like, and you can trace transitive lot lineage forward and backward through the console or API.
+Every event accepted by `mock` or `live` delivery is persisted with the ingest response's `event_id`, `sha256_hash`, and `chain_hash` (stored on the record as `delivery_response`) so the flow feels production-like, and you can trace transitive lot lineage forward and backward through the console or API. Records generated in `none` delivery mode are never sent anywhere, so they carry no ingest response and no hash fields — they stay stored, traceable, and exportable, but there is no evidence chain to inspect. They keep `delivery_status: generated`, and `POST /api/delivery/retry` only picks up records whose status is `failed`, so a fixture seeded in `none` mode never acquires hashes.
 
 ## Project layout
 
@@ -66,15 +67,18 @@ app/
   controller.py          # Simulator lifecycle (start/stop/step/reset) and delivery fan-out
   csv_importer.py        # CSV parsing for scheduled events and seed lots
   cte_rules.py           # Required/recommended KDEs per CTE (pinned to RegEngine's contract)
+  delivery.py            # Delivery outcomes, batching, and the POST mechanics
   demo_fixtures.py       # Deterministic demo playback fixtures (RegEngine-canonical KDEs)
   engine.py              # CTE generation and lot lineage logic
   epcis_export.py        # EPCIS 2.0 JSON-LD export scaffolding
   fda_export.py          # FDA-request CSV export presets and rendering
   industry_adapters.py   # Industry-specific event shaping (produce, seafood, dairy)
+  integration_config.py  # Delivery-config projections: validation, merge, sanitize, status
   main.py                # FastAPI app and route wiring
   mock_service.py        # RegEngine stand-in mirroring the live webhook's validation
   regengine_client.py    # HTTP client for live delivery + connection-check probe
   routers/               # API routers (simulation, integration, events, exports, ...)
+  runtime_guard.py       # Startup check refusing a multi-worker or multi-replica runtime
   scenario_saves.py      # Per-scenario saved config and event-log snapshots
   scenarios.py           # Named scenario presets for product/location/flow mixes
   schemas/               # Pydantic models (domain, simulation, ingestion, integration, ...)
@@ -152,6 +156,8 @@ The smoke starts a temporary local server with mock delivery, drives Chromium th
 
 Set `REGENGINE_BROWSER_BASE_URL` to run against an already-started local or remote instance instead of letting the script start one. For Basic Auth deployments, set `REGENGINE_BROWSER_USERNAME` and `REGENGINE_BROWSER_PASSWORD`; set `REGENGINE_BROWSER_TENANT` to send `X-RegEngine-Tenant` for an isolated smoke tenant. The script also accepts the equivalent `REGENGINE_REMOTE_*` variables used by `scripts/remote_smoke.py`.
 
+Set `REGENGINE_BROWSER_EXPECTED_BUILD_SHA` (falling back to `REGENGINE_EXPECTED_BUILD_SHA`) to fail the run when `/api/healthz` reports a different `build.commit_sha`; the check passes when either value is a prefix of the other, so a short SHA works. `.github/workflows/remote-browser-smoke.yml` sets it to the workflow commit on every scheduled and manual run, so a `build commit mismatch` failure there means the deployed instance is not running that commit rather than that a dashboard flow broke.
+
 ## Release smoke regression
 
 Run the release smoke harness before tagging or handing the simulator to a design partner:
@@ -177,6 +183,71 @@ uv run --no-dev python scripts/remote_smoke.py
 GitHub also has manual and nightly **Remote Smoke** and **Remote Browser Smoke** workflows for deployed demo validation. Configure repository secrets `REGENGINE_REMOTE_USERNAME` and `REGENGINE_REMOTE_PASSWORD`, then run `.github/workflows/remote-smoke.yml` for API/export checks or `.github/workflows/remote-browser-smoke.yml` for authenticated dashboard checks with optional `base_url` and `tenant` inputs. Scheduled runs target the Railway shared-demo URL with dedicated nightly tenants and compare `/api/healthz` build metadata to the workflow commit.
 
 Use `RELEASE_CHECKLIST.md` as the full demo-ready gate. Use `DESIGN_PARTNER_DEMO_SCRIPT.md` for the call flow, expected talking points, fixture reset commands, and recovery steps.
+
+## Export record caps and truncation
+
+Both evidence exports walk whole lot graphs or whole date ranges, so like
+`/api/lineage` they are bounded rather than unbounded. `GET
+/api/mock/regengine/export/fda-request` and `GET
+/api/mock/regengine/export/epcis` each take a `limit` query parameter:
+
+- **default `10000`, maximum `100000`** (`EXPORT_DEFAULT_LIMIT` /
+  `EXPORT_MAX_LIMIT` in `app/routers/mock_regengine.py`). Values outside
+  `1..100000` are rejected with `422`.
+- Records are kept **oldest event first**, so a truncated export is the head of
+  the record set rather than an arbitrary window.
+
+The cap is far more generous than the lineage one on purpose: an FDA request
+export is a compliance artifact, and the failure mode that matters is an
+operator handing a regulator a file that quietly stopped short. So the default
+only bites on genuinely huge exports — and when it bites, it is impossible to
+miss.
+
+**Every export response**, truncated or not, carries these headers so a client
+can assert on them unconditionally instead of inferring completeness from a row
+count:
+
+| Header | Meaning |
+|---|---|
+| `X-Export-Total-Records` | Records that matched the filters *before* `limit` was applied |
+| `X-Export-Returned-Records` | Records actually written to the file |
+| `X-Export-Limit` | The `limit` in effect for this request |
+| `X-Export-Truncated` | `true` or `false` |
+| `X-Export-Warning` | Human-readable truncation notice — **present only when truncated** |
+
+They are listed in `Access-Control-Expose-Headers` (with `X-Export-Warning`
+appended when truncated), because browsers only expose whitelisted headers to
+`fetch()` and the dashboard downloads these links directly.
+
+When an export *is* truncated, three more things happen:
+
+- The download filename is prefixed **`PARTIAL-`** (e.g.
+  `PARTIAL-fda_request_lot_trace.csv`, `PARTIAL-epcis_events.jsonld`).
+- The CSV gets a banner line written **above the header row** — the first thing
+  any reader or spreadsheet import sees — starting `# PARTIAL EXPORT - NOT A
+  COMPLETE RECORD SET`, followed by the returned/total counts, the limit in
+  effect, an explicit statement that later records are missing from the file,
+  and the suggestion to narrow the date range or lot code or re-request with a
+  higher limit. Note that this banner makes the file a valid CSV only if the
+  reader tolerates a leading comment line; that is the deliberate trade against
+  a partial file that looks complete.
+- The EPCIS document has no room for a comment banner, so the same numbers ride
+  along as a `regengine:exportSummary` member (`total_records`,
+  `returned_records`, `limit`, `truncated`, plus `warning` when truncated).
+  That member is present on **every** EPCIS export, so a consumer that checks it
+  once can trust it every time.
+
+```bash
+curl -sD - -o /dev/null \
+  "http://127.0.0.1:8000/api/mock/regengine/export/fda-request?limit=50"
+# ...
+# x-export-total-records: 1200
+# x-export-returned-records: 50
+# x-export-limit: 50
+# x-export-truncated: true
+# x-export-warning: PARTIAL EXPORT - NOT A COMPLETE RECORD SET: 50 of 1200 ...
+# content-disposition: attachment; filename=PARTIAL-fda_request_all_records.csv
+```
 
 ## Full FSMA simulation
 
@@ -206,7 +277,9 @@ simulate -> ingest -> validate -> trace -> export
 The simulator supports three delivery modes, configured via the `delivery.mode` field:
 
 ### `mock` (default)
-No credentials required. Events go to the built-in RegEngine stand-in, which **mirrors the live webhook's validation** rather than accepting everything: strict per-CTE KDE checks (exact key lookup, no aliasing), the location-identifier requirement, a 500-event batch cap, in-batch duplicate rejection, future-timestamp rejection, and 24-hour idempotency replays. Accepted events return a synthetic `event_id`, `sha256_hash`, and `chain_hash`; rejected events return the same per-event `errors` shape live RegEngine produces. Safe for demos and design-partner testing.
+No credentials required. Events go to the built-in RegEngine stand-in, which **mirrors the live webhook's validation** rather than accepting everything: strict per-CTE KDE checks (exact key lookup, no aliasing), the location-identifier requirement, a 1-500 event batch size (an empty batch and an oversized batch are both `422`), in-batch duplicate rejection, future-timestamp rejection, and idempotency replays that expire after 24 hours. Malformed JSON is a `400`, and a request body above `MAX_INGEST_BODY_BYTES` (4 MiB) is a `413` — refused from `Content-Length` where the client declares one, so an oversized body is never read. The ceiling is the mock's own resource bound rather than a mirrored live constraint; a client that stays inside the 500-event batch cap never reaches it. Accepted events return a synthetic `event_id`, `sha256_hash`, and `chain_hash`; rejected events return the same per-event `errors` shape live RegEngine produces. Safe for demos and design-partner testing.
+
+`POST /api/mock/regengine/ingest` honors the same request headers the live webhook does, so a client tested against this route behaves the same way in production: `Idempotency-Key` (replayed for 24 hours), `X-Mock-Friction` (comma-separated friction codes), and `X-Webhook-Signature`. When `REGENGINE_WEBHOOK_HMAC_SECRET` is set, the mock verifies that signature as HMAC-SHA256 over the exact request body bytes and answers `401` on a mismatch; with the secret unset, signature verification is a no-op.
 
 Mock delivery also supports **failure-mode rehearsal** via `delivery.mock_friction` (or the "Rehearse failure modes" toggles in the console): `invalid_key` (401), `subscription_inactive` (402), and `rate_limit` (429) inject the exact failures a live integration hits, so operators can practice diagnosing and retrying — retries reuse the stored idempotency key, so nothing double-ingests.
 
@@ -217,10 +290,17 @@ Sends real traffic to a RegEngine workspace. Configure from the dashboard or via
 - `tenant_id`
 - Optional `endpoint` override (defaults to `https://www.regengine.co/api/v1/webhooks/ingest`)
 
+**Live delivery endpoints are restricted.** Every live delivery and connection probe validates the endpoint *before* any credential header is built, so a misconfigured or hostile endpoint never receives the API key. Non-`http(s)` schemes are refused, as are loopback, private, link-local, reserved, and cloud-metadata hosts — including a public hostname that resolves to one — and cleartext `http` to a public host, which would put the API key on the wire unencrypted. A blocked endpoint fails the delivery and makes `POST /api/integration/test` return the `blocked_endpoint` verdict. Four environment variables tune it:
+
+- `REGENGINE_ALLOWED_DELIVERY_HOSTS` — optional strict allowlist, comma-separated. A leading dot matches subdomains (`.regengine.co` allows `www.regengine.co`). When unset, any public host is allowed; when set, everything outside the list is refused.
+- `REGENGINE_ALLOW_PRIVATE_DELIVERY_HOSTS=1` — opt back in to loopback/private/link-local targets. Required to point the simulator at a RegEngine stack running on `localhost` (see [Customer journey harness](#customer-journey-harness)); leave it unset for anything shared or deployed. It does not bypass `REGENGINE_ALLOWED_DELIVERY_HOSTS`.
+- `REGENGINE_ALLOW_CLEARTEXT_DELIVERY=1` — allow `http://` to a public host. Off by default: the API key travels in an `Authorization` header, so cleartext exposes it to anything on the path. `REGENGINE_ALLOW_PRIVATE_DELIVERY_HOSTS=1` already implies it, so a local stack on `http://localhost:8000` needs nothing extra. It relaxes the scheme only — a private or metadata host stays refused, and reports itself as such rather than as a scheme problem.
+- `REGENGINE_DELIVERY_DNS_GUARD=0` — skip the DNS resolution check for non-literal hostnames, for sealed environments with no resolver. Scheme, allowlist, hostname, and literal-address checks still apply.
+
 For controlled live workspace validation, use `scripts/live_trial.py`. It refuses to send live traffic unless `--confirm-live` is supplied, always performs a mock dry-run first, and sends exactly one live batch before stopping.
 
 ### `none`
-Generates and persists events locally without delivering them anywhere. Useful for seeding fixtures.
+Generates and persists events locally without delivering them anywhere. Useful for seeding fixtures. Because nothing is delivered, these records have no ingest response: `delivery_status` stays `generated` and there is no `event_id`, `sha256_hash`, or `chain_hash` to inspect. Load a fixture in `mock` mode when the demo is about the evidence chain.
 
 Every stored record tracks `delivery_status`, `destination_mode`, `delivery_attempts`, last delivery timestamps, and non-secret `delivery_metadata` such as delivery mode, attempted event count, live endpoint host/path, HTTP status, and idempotency key. The dashboard delivery monitor summarizes posted, failed, generated-only, and retryable records — with recovery guidance per failure class — and per-event **rejections** from RegEngine (or the mock) are stored as failed records carrying the validator's errors. Failed records can be retried through the dashboard or `POST /api/delivery/retry` after switching to a working `mock` or `live` delivery configuration; retries reuse each record's stored idempotency key.
 
@@ -230,9 +310,13 @@ The console treats RegEngine like any third-party integration a customer configu
 
 - `GET /api/integration/status` — sanitized connection state: mode, endpoint host, whether an API key / tenant are configured, whether HMAC signing is enabled, and active `mock_friction` codes. Secrets are never returned.
 - `POST /api/integration/configure` — partial update of `mode`, `endpoint`, `api_key`, `tenant_id`, and `mock_friction`; omitted fields keep their stored values so the settings page can switch modes without re-entering credentials.
+<<<<<<< HEAD
 - `POST /api/integration/test` — probes RegEngine with the configured (or request-supplied) credentials using the cheapest authenticated read (`GET /api/v1/webhooks/recent?limit=1`) and maps the response to an actionable verdict: `connected`, `contract_mismatch` (authenticated read succeeded but the two deploys advertise different ingest contract versions), `signature_mismatch` (the read succeeded but the two sides disagree about webhook signing, so every ingest would 401 — or would go unverified), `unauthorized` (401), `forbidden` (403), `tenant_mismatch` (404), `rate_limited` (429), `service_unavailable` (503), `unreachable`, or `not_configured`. In mock mode with no credentials it reports `mock` without touching the network.
 
   The probe reads a strictly weaker dependency chain than `/ingest`: `/recent` has no subscription gate, takes the `webhooks.read` scope rather than `webhooks.ingest`, and is unsigned. So a `connected` verdict proves the key and tenant are valid **for reads** and says so explicitly; it does not promise ingest will succeed. There is no `subscription_inactive` verdict because a 402 is unreachable from this probe. `signature_mismatch` closes the one gap that can be detected without posting, by comparing the local `REGENGINE_WEBHOOK_HMAC_SECRET` against RegEngine's `webhook_hmac_configured` flag on `/health`.
+=======
+- `POST /api/integration/test` — probes RegEngine with the configured (or request-supplied) credentials using the cheapest authenticated read (`GET /api/v1/webhooks/recent?limit=1`) and maps the response to an actionable verdict: `connected`, `blocked_endpoint` (the endpoint is not an allowed egress destination, so nothing was sent), `credentials_withheld` (the request named an endpoint other than the configured one, so the stored credentials were deliberately not sent — supply this endpoint's own `api_key`/`tenant_id` to probe it), `contract_mismatch` (authenticated read succeeded but the two deploys advertise different ingest contract versions), `unauthorized` (401), `subscription_inactive` (402), `forbidden` (403), `tenant_mismatch` (404), `rate_limited` (429), `service_unavailable` (503), `unreachable`, or `not_configured`. In mock mode with no credentials it reports `mock` without touching the network.
+>>>>>>> origin/main
 
 ## Customer journey harness
 
@@ -243,8 +327,11 @@ The console treats RegEngine like any third-party integration a customer configu
 export REGENGINE_ADMIN_KEY=...            # the stack's ADMIN_MASTER_KEY
 export REGENGINE_BASE_URL=http://localhost:8000
 export REGENGINE_REDIS_URL=redis://localhost:6379/0
+export REGENGINE_ALLOW_PRIVATE_DELIVERY_HOSTS=1   # localhost is a blocked delivery host by default
 uv run python scripts/customer_journey.py --local
 ```
+
+`--local` delivers to `http://localhost:8000/api/v1/webhooks/ingest`, which the delivery-endpoint guard blocks unless `REGENGINE_ALLOW_PRIVATE_DELIVERY_HOSTS=1` is set (see [Delivery modes](#delivery-modes)). Without it the run stops with a blocked-endpoint error instead of reaching the local stack.
 
 Steps: health probe → tenant + API key provisioning through `/v1/admin` → billing activation (seeds `billing:tenant:{id}` in Redis so the subscription gate passes) → connection test → several canonical CTE batches ingested with the same engine and live client the console uses → friction demos (a KDE-rejected event and an idempotency replay) → verification that RegEngine now holds the evidence (`/api/v1/webhooks/recent`, `/api/v1/webhooks/chain/verify`, `/api/v1/fda/export/all`).
 
@@ -261,7 +348,11 @@ export REGENGINE_BASIC_AUTH_PASSWORD=change-me
 
 When Basic Auth is enabled, requests without valid credentials receive `401` with a `WWW-Authenticate` challenge. If no tenant header is supplied, the authenticated username becomes the tenant id.
 
+Because "optional" is a bad default for anything reachable by someone else, a deployment can require it. When `REGENGINE_REQUIRE_AUTH` is set to a truthy value (`1`, `true`, `yes`, `on`), startup fails with a clear error unless both `REGENGINE_BASIC_AUTH_USERNAME` and `REGENGINE_BASIC_AUTH_PASSWORD` are configured — so a deploy that forgets the credentials refuses to boot instead of silently serving every state-changing endpoint open. The shipped container image sets `REGENGINE_REQUIRE_AUTH=1`; pass `REGENGINE_REQUIRE_AUTH=0` for a local loopback demo that intentionally runs without credentials.
+
 Use `X-RegEngine-Tenant` to select an explicit tenant scope. Tenant ids must be 1-64 characters and can contain only letters, numbers, dots, underscores, or hyphens. Tenant-scoped controllers keep separate simulator state, event logs, mock ingest responses, scenario saves, lineage, and exports under `data/tenants/{tenant_id}/`.
+
+Selecting a tenant materializes a whole controller plus an on-disk directory, and the header is honored whether or not Basic Auth is enabled, so the number of distinct tenants one process will serve is capped. `REGENGINE_MAX_TENANTS` (default `100`) bounds the non-default tenants counted across cached controllers *and* tenant directories already on disk. A request that would create a tenant beyond the cap is refused with `429` and a message naming the limit; tenants that already exist keep working. Delete unused tenants with `DELETE /api/operator/tenants/{tenant_id}` or raise the cap. A malformed or non-positive value is ignored (with a warning) in favor of the default.
 
 `GET /api/health` and the dashboard stats area expose the active tenant id, whether Basic Auth is enabled, and whether storage is local default or tenant-scoped. Passwords, API keys, and other credentials are never returned; live delivery status preserves the active mode and endpoint while redacting the RegEngine API key and tenant id.
 
@@ -380,7 +471,27 @@ The dashboard fixture loader resets the current event log before loading the sel
 
 ## FDA export presets
 
-`GET /api/mock/regengine/export/fda-request` still returns the same 11-column FDA request CSV and remains backward compatible with optional `start_date` and `end_date` filters. Date filters must be valid inclusive `YYYY-MM-DD` dates, and `start_date` must not be later than `end_date`. It now also accepts:
+`GET /api/mock/regengine/export/fda-request` returns a 15-column FDA request CSV and remains backward compatible with optional `start_date` and `end_date` filters. The first eleven columns keep RegEngine's documented request-export names and order; the last four are additive FSMA 204 KDE columns that the eleven-column shape has no home for:
+
+| # | Column |
+|---|---|
+| 1 | `Traceability Lot Code` |
+| 2 | `Traceability Lot Code Description` |
+| 3 | `Product Description` |
+| 4 | `Quantity` |
+| 5 | `Unit of Measure` |
+| 6 | `Location Description` |
+| 7 | `Location Identifier (GLN)` |
+| 8 | `Date` |
+| 9 | `Time` |
+| 10 | `Reference Document Type` |
+| 11 | `Reference Document Number` |
+| 12 | `Immediate Subsequent Recipient Location` |
+| 13 | `Immediate Previous Source Location` |
+| 14 | `Traceability Lot Code Source Reference` |
+| 15 | `Event Type (CTE)` |
+
+Date filters must be valid inclusive `YYYY-MM-DD` dates, and `start_date` must not be later than `end_date`. The endpoint also accepts:
 
 - `preset`: one of `all_records`, `lot_trace`, `shipment_handoff`, `receiving_log`, or `transformation_batches`
 - `traceability_lot_code`: optional for most presets, required for `lot_trace`
@@ -399,7 +510,7 @@ Supported query parameters:
 
 Invalid date formats, impossible dates, and inverted ranges return `400` so operators catch export filter mistakes before sharing files.
 
-The dashboard exposes a `Download EPCIS` control beside the FDA CSV export. It uses the same optional lot code and date filters as the CSV export panel, but does not apply FDA-only preset filters.
+The dashboard exposes an `EPCIS JSON` control in the *Export filters* panel; the FDA CSV comes from the `Compliance export` link in the page header. It uses the same optional lot code and date filters as the CSV export panel, but does not apply FDA-only preset filters.
 
 The export returns an `EPCISDocument` with `ObjectEvent` records for harvesting, cooling, packing, shipping, and receiving CTEs, plus `TransformationEvent` records for transformation CTEs. RegEngine-specific fields are preserved under the `regengine:` JSON-LD namespace so KDEs, parent lot codes, document references, product descriptions, and original CTE types remain visible while the current webhook contract stays unchanged.
 
@@ -424,7 +535,7 @@ The service wrapper examples below can be used with any profile; keep the profil
 | Method | Path | Purpose |
 |---|---|---|
 | `GET` | `/api/health` | Authenticated liveness probe, public build metadata, tenant/auth context, and current config snapshot |
-| `GET` | `/api/healthz` | Unauthenticated platform/container healthcheck with public build metadata |
+| `GET` | `/api/healthz` | Unauthenticated platform/container healthcheck with public build metadata; `503` when the event store cannot be written |
 | `GET` | `/api/scenarios` | List available scenario presets |
 | `GET` | `/api/scenario-saves` | List saved per-scenario demo states |
 | `POST` | `/api/scenario-saves/{scenario_id}` | Save the current or supplied config and event log for a scenario |
@@ -439,19 +550,46 @@ The service wrapper examples below can be used with any profile; keep the profil
 | `POST` | `/api/simulate/stop` | Stop the loop |
 | `POST` | `/api/simulate/step` | Emit one batch synchronously |
 | `POST` | `/api/simulate/replay` | Replay persisted JSONL events through the configured delivery mode |
-| `POST` | `/api/simulate/reset` | Clear state and persisted events |
+| `POST` | `/api/simulate/reset` | Clear state and persisted events (accepts a wrapped `{"config": {...}}` body or a flat config body) |
 | `GET` | `/api/simulate/stream` | Server-Sent Events snapshots for live dashboard updates |
 | `POST` | `/api/import/csv` | Bulk import scheduled events or seed lots from CSV text |
 | `POST` | `/api/delivery/retry` | Retry failed stored deliveries with the current or supplied delivery config |
 
 All routes accept optional `X-RegEngine-Tenant` for tenant-scoped storage. If Basic Auth is enabled, include standard HTTP Basic credentials.
 
+`POST /api/simulate/reset` accepts **both body shapes**: `/start`'s wrapped `{"config": {...}}` and the flat `SimulationConfig` object this route has always taken. The two used to disagree — posting one endpoint's body to the other parsed cleanly and applied nothing — so both are accepted now, the wrapped one so the endpoints agree and the flat one because the console and existing integrations send it. An empty body (or no body at all) clears state and persisted events while keeping the config already in effect. Anything that is neither shape, including a misnested or unrecognized field, is rejected with `422` rather than silently resetting to defaults with a `200`.
+
+```bash
+# flat
+curl -X POST http://127.0.0.1:8000/api/simulate/reset \
+  -H 'Content-Type: application/json' \
+  -d '{"scenario":"fresh_cut_processor","batch_size":1,"delivery":{"mode":"mock"}}'
+
+# wrapped — equivalent
+curl -X POST http://127.0.0.1:8000/api/simulate/reset \
+  -H 'Content-Type: application/json' \
+  -d '{"config":{"scenario":"fresh_cut_processor","batch_size":1,"delivery":{"mode":"mock"}}}'
+```
+
 ### Inspection
 
 | Method | Path | Purpose |
 |---|---|---|
 | `GET` | `/api/events` | List persisted events |
-| `GET` | `/api/lineage/{traceability_lot_code}` | Full lineage graph for a lot |
+| `GET` | `/api/lineage/{traceability_lot_code}` | Lineage graph for a lot, bounded by `limit` (default 500, max 5000) and reporting `total_records` / `returned_records` / `truncated` |
+
+`GET /api/events` takes `limit` (default `100`, max `500`).
+
+`GET /api/lineage/{traceability_lot_code}` walks a whole connected lot graph, so a single wide trace can match far more records than the paged `/api/events` feed ever returns. It is bounded like every other list endpoint here:
+
+- `limit` — maximum lineage records to return, **oldest event first**, so a clipped trace keeps the head of the chain (the part that explains where the lot came from). Default `500`, maximum `5000` (`LINEAGE_DEFAULT_LIMIT` / `LINEAGE_MAX_LIMIT` in `app/routers/events.py`); anything outside `1..5000` is a `422`.
+- The response reports the bound back so a caller can tell a complete trace from a clipped one instead of guessing: `total_records` (matches before the limit), `returned_records`, `limit`, and `truncated`.
+- `nodes` and `edges` are derived from exactly the records returned, never from records the caller cannot see, so a truncated graph is internally consistent rather than dangling.
+- An unknown lot code is a `404`.
+
+```bash
+curl "http://127.0.0.1:8000/api/lineage/TLC-DEMO-FC-OUT-001?limit=50"
+```
 
 ### RegEngine integration
 
@@ -467,8 +605,8 @@ All routes accept optional `X-RegEngine-Tenant` for tenant-scoped storage. If Ba
 |---|---|---|
 | `POST` | `/api/mock/regengine/ingest` | RegEngine-shaped ingest mirroring the live webhook's validation (per-event accept/reject) |
 | `GET` | `/api/mock/regengine/export/presets` | List FDA request export presets |
-| `GET` | `/api/mock/regengine/export/fda-request` | Mock 11-column FDA request CSV |
-| `GET` | `/api/mock/regengine/export/epcis` | Scaffolded EPCIS 2.0 JSON-LD export |
+| `GET` | `/api/mock/regengine/export/fda-request` | Mock 15-column FDA request CSV (11 documented columns plus four FSMA 204 KDE columns); `limit` bounded, truncation reported |
+| `GET` | `/api/mock/regengine/export/epcis` | Scaffolded EPCIS 2.0 JSON-LD export; `limit` bounded, truncation reported |
 
 ### Example: start the simulator in live mode
 
@@ -629,7 +767,7 @@ The live delivery client targets the current RegEngine webhook shape:
 
 Required KDEs per CTE are mirrored in `app/cte_rules.py` and pinned to RegEngine's `REQUIRED_KDES_BY_CTE` by `tests/test_regengine_contract_pin.py`; the detailed contract reference lives in `.agents/skills/regengine-api-contract/references/contract.md`.
 
-**Contract version handshake.** Both sides advertise an ingest contract version (`app/contract.py` here, `webhook_models.INFLOW_CONTRACT_VERSION` in RegEngine) — inflow-lab via `/api/healthz`, `/api/health`, and `/api/integration/status`; RegEngine via `/health`. The test-connection probe compares them and reports a `contract_mismatch` verdict when deployed instances have skewed (one side running an older deploy), so version drift is a visible, named state instead of a silent live-post failure. Bump the version in both repos together whenever the wire contract changes. The mock FDA export mirrors RegEngine's documented 11-column request export shape. The EPCIS 2.0 export is a separate derived JSON-LD scaffold and does not change this webhook contract.
+**Contract version handshake.** Both sides advertise an ingest contract version (`app/contract.py` here, `webhook_models.INFLOW_CONTRACT_VERSION` in RegEngine) — inflow-lab via `/api/healthz`, `/api/health`, and `/api/integration/status`; RegEngine via `/health`. The test-connection probe compares them and reports a `contract_mismatch` verdict when deployed instances have skewed (one side running an older deploy), so version drift is a visible, named state instead of a silent live-post failure. Bump the version in both repos together whenever the wire contract changes. The mock FDA export keeps RegEngine's documented eleven request-export columns, in name and order, as its first eleven columns, and appends four FSMA 204 KDE columns (`Immediate Subsequent Recipient Location`, `Immediate Previous Source Location`, `Traceability Lot Code Source Reference`, `Event Type (CTE)`) for fifteen in total. The EPCIS 2.0 export is a separate derived JSON-LD scaffold and does not change this webhook contract.
 
 ## Deployment
 
@@ -720,7 +858,7 @@ journalctl -u regengine -f    # live logs
 
 ### Docker (optional)
 
-The repository ships with a production-oriented `Dockerfile`. The entrypoint prepares the mounted data directory, drops to a non-root app user for Uvicorn, stores default simulator data under `/data`, and includes a healthcheck for `/api/healthz`.
+The repository ships with a production-oriented `Dockerfile`. The entrypoint prepares the mounted data directory, drops to a non-root app user for Uvicorn, stores default simulator data under `/data`, and includes a healthcheck for `/api/healthz`. The image also sets `REGENGINE_REQUIRE_AUTH=1`, so a container started without `REGENGINE_BASIC_AUTH_USERNAME` and `REGENGINE_BASIC_AUTH_PASSWORD` fails to start rather than serving open; pass `-e REGENGINE_REQUIRE_AUTH=0` for a deliberately credential-free local run.
 
 ```bash
 docker build -t regengine-inflow-lab .
@@ -735,7 +873,31 @@ docker run --rm \
 
 `railway.json` uses the same Dockerfile and healthcheck for Railway deployments. Mount persistent storage at `/data` and keep `REGENGINE_DATA_DIR=/data`.
 
-Expose non-secret build metadata so stale shared-demo deployments are obvious from `/api/healthz` and remote smoke failures:
+#### Build identity: which variable owns it
+
+`/api/healthz` reports `build.commit_source`, naming the environment variable it
+read the commit from. `app/build_info.py` checks them in order, and
+`REGENGINE_BUILD_SHA` outranks Railway's injected `RAILWAY_GIT_COMMIT_SHA`.
+
+**On the GitHub-connected demo service, `REGENGINE_BUILD_SHA` must be absent.**
+Railway injects `RAILWAY_GIT_COMMIT_SHA` on every auto-deploy, so leaving the
+manual variable set makes `/api/healthz` report whatever SHA someone last typed
+instead of what is actually running — and the nightly drift check, which
+compares against the real head commit, then reports green on a demo that is
+three commits behind. `scripts/cutover_preflight.sh` treats
+`commit_source != RAILWAY_GIT_COMMIT_SHA` as a failure for this reason. If the
+variable is set on that service, delete it:
+
+```bash
+railway variables --unset REGENGINE_BUILD_SHA --unset REGENGINE_BUILD_BRANCH
+```
+
+##### Manual CLI deploy (fallback only)
+
+Set these two variables **only** on a service you deploy by hand with
+`railway up`, where nothing injects `RAILWAY_GIT_COMMIT_SHA`. Delete them again
+if that service is later switched to Railway's GitHub integration
+(`DEPLOYMENT_PROFILES.md`).
 
 ```bash
 railway variable set --skip-deploys REGENGINE_BUILD_SHA="$(git rev-parse HEAD)" \
@@ -787,7 +949,11 @@ Common failure patterns:
 - Auth failures: request logs show `status=401` on `/api/...`; confirm `REGENGINE_BASIC_AUTH_USERNAME` and `REGENGINE_BASIC_AUTH_PASSWORD` are set as intended.
 - CORS failures: Railway HTTP logs may show successful `OPTIONS` but the browser blocks a follow-up request; confirm `REGENGINE_CORS_ORIGINS` is the exact HTTPS dashboard origin.
 - Volume/storage failures: `/api/health` should report tenant-scoped paths under `REGENGINE_DATA_DIR`; confirm Railway has a volume mounted at `/data` and `REGENGINE_DATA_DIR=/data`.
-- Stale deployment failures: `/api/healthz` should report the expected `build.commit_sha_short`; if it does not, redeploy current `main` and update `REGENGINE_BUILD_SHA`.
+- Stale deployment failures: `/api/healthz` should report the expected `build.commit_sha_short`. On the GitHub-connected demo, first confirm `build.commit_source` is `RAILWAY_GIT_COMMIT_SHA`; if it is `REGENGINE_BUILD_SHA`, the reported commit is a hand-entered constant that masks the real one, so delete that variable rather than refreshing it. Then redeploy current `main`. Only a manual CLI-deployed service should have `REGENGINE_BUILD_SHA` set at all.
+- Health check failures with a running process: `/api/healthz` answers `503` with `"ok": false` and a `store` block when the default tenant's event store cannot be written (full disk, unmounted or read-only volume, permission change). `/api/health` reports the same `store` block but stays `200` so the console still renders. Check the mount at `REGENGINE_DATA_DIR` before redeploying.
+- Startup failures with `REGENGINE_REQUIRE_AUTH is set but ...`: the deployment requires Basic Auth and is missing `REGENGINE_BASIC_AUTH_USERNAME`/`REGENGINE_BASIC_AUTH_PASSWORD`. Set both, or set `REGENGINE_REQUIRE_AUTH=0` for a local loopback demo.
+- `429` with `Tenant capacity reached`: the process is already serving `REGENGINE_MAX_TENANTS` distinct tenants. Delete unused tenant scopes or raise the cap.
+- `blocked_endpoint` connection verdicts or blocked live deliveries: the configured endpoint is not an allowed egress destination (non-`http(s)`, or a loopback/private/link-local/metadata host). For a local RegEngine stack, set `REGENGINE_ALLOW_PRIVATE_DELIVERY_HOSTS=1`.
 - Live delivery failures: request logs identify the route and tenant while dashboard delivery stats show the sanitized delivery error; confirm endpoint, API key, and tenant id before retrying.
 - Local dependency conflicts: remove `.venv`, run `uv sync --group dev`, and retry before diagnosing app failures; global Python packages such as OpenTelemetry or Semgrep can drift independently of this repo.
 - Railway startup log noise: Uvicorn startup messages may appear with `level=error` in Railway logs. Treat them as noise unless there is a traceback, failed deployment, or HTTP 5xx.

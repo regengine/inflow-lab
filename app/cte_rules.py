@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, Literal
 
 from .scenarios import ScenarioPreset
 from .schemas.domain import CTEType, RegEngineEvent, StoredEventRecord
@@ -14,15 +14,30 @@ SEVERITY_REQUIRED = "required"
 SEVERITY_RECOMMENDED = "recommended"
 
 
+#: A warning is either a gap that would fail live RegEngine ingest ("required")
+#: or a nice-to-have the audit lens would like to see ("recommended"). Before
+#: this existed the distinction lived only inside the prose of `message`, so no
+#: surface could tell a blocker from a suggestion.
+WarningSeverity = Literal["required", "recommended"]
+
+#: Sort key: required warnings come first wherever a list is rendered, so the
+#: gaps that would fail live ingest are what an operator reads first.
+SEVERITY_ORDER: dict[str, int] = {"required": 0, "recommended": 1}
+
+
 @dataclass(frozen=True, slots=True)
 class CTEValidationWarning:
     field: str
     message: str
+<<<<<<< HEAD
     # Defaulted so every existing construction site keeps working; the tiers
     # that matter set it explicitly.
     severity: str = SEVERITY_RECOMMENDED
     # The regulation the requirement comes from, when there is one to cite.
     citation: str | None = None
+=======
+    severity: WarningSeverity = "recommended"
+>>>>>>> origin/main
 
 
 @dataclass(frozen=True, slots=True)
@@ -111,6 +126,9 @@ REQUIRED_KDES: dict[CTEType, tuple[str, ...]] = {
         "reference_document",
         "tlc_source_reference",
     ),
+    # §1.1330(b)(7): input lot codes and products are required by regulation for
+    # transformation records. This anticipates the RegEngine contract pin being
+    # updated once the live webhook_models.py aligns.
     CTEType.TRANSFORMATION: (
         "traceability_lot_code",
         "product_description",
@@ -119,6 +137,8 @@ REQUIRED_KDES: dict[CTEType, tuple[str, ...]] = {
         "transformation_date",
         "location_name",
         "reference_document",
+        "input_traceability_lot_codes",
+        "input_products",
     ),
 }
 
@@ -154,7 +174,11 @@ RECOMMENDED_KDES: dict[CTEType, tuple[str, ...]] = {
     ),
     CTEType.SHIPPING: ("carrier", "reference_document_type"),
     CTEType.RECEIVING: ("reference_document_type",),
+<<<<<<< HEAD
     CTEType.TRANSFORMATION: ("reference_document_type",),
+=======
+    CTEType.TRANSFORMATION: ("input_quantities", "reference_document_type"),
+>>>>>>> origin/main
 }
 
 INDUSTRY_EVENT_REQUIREMENTS: dict[str, tuple[EventRequirement, ...]] = {
@@ -266,6 +290,7 @@ def validate_event_kdes(event: RegEngineEvent) -> list[CTEValidationWarning]:
                 CTEValidationWarning(
                     field=field,
                     message=f"Missing expected {event.cte_type.value} KDE: {field}",
+<<<<<<< HEAD
                     severity=SEVERITY_REQUIRED,
                 )
             )
@@ -281,6 +306,9 @@ def validate_event_kdes(event: RegEngineEvent) -> list[CTEValidationWarning]:
                     ),
                     severity=SEVERITY_REQUIRED,
                     citation=citation,
+=======
+                    severity="required",
+>>>>>>> origin/main
                 )
             )
 
@@ -290,6 +318,7 @@ def validate_event_kdes(event: RegEngineEvent) -> list[CTEValidationWarning]:
                 CTEValidationWarning(
                     field=field,
                     message=f"Missing recommended {event.cte_type.value} KDE: {field}",
+                    severity="recommended",
                 )
             )
 
@@ -319,7 +348,7 @@ def validate_event_kdes(event: RegEngineEvent) -> list[CTEValidationWarning]:
                 )
             )
 
-    return warnings
+    return sort_warnings(warnings)
 
 
 def audit_warnings_for_event(event: RegEngineEvent, scenario: ScenarioPreset) -> list[CTEValidationWarning]:
@@ -407,7 +436,12 @@ def dedupe_warnings(warnings: list[CTEValidationWarning]) -> list[CTEValidationW
             continue
         seen.add(key)
         deduped.append(warning)
-    return deduped
+    return sort_warnings(deduped)
+
+
+def sort_warnings(warnings: list[CTEValidationWarning]) -> list[CTEValidationWarning]:
+    """Required-severity warnings first, otherwise stable in discovery order."""
+    return sorted(warnings, key=lambda warning: SEVERITY_ORDER.get(warning.severity, 1))
 
 
 def _evaluate_check(records: list[StoredEventRecord], definition: AuditCheckDefinition) -> bool:

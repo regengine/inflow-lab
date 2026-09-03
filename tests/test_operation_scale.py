@@ -112,7 +112,7 @@ def test_scaled_runs_are_deterministic() -> None:
 def test_api_accepts_scale_and_reports_it() -> None:
     response = client.post(
         "/api/simulate/reset",
-        json={"scale": "enterprise", "delivery": {"mode": "mock"}},
+        json={"config": {"scale": "enterprise", "delivery": {"mode": "mock"}}},
     )
     assert response.status_code == 200
     status = client.get("/api/simulate/status").json()

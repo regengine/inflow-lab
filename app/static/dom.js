@@ -1,9 +1,53 @@
+<<<<<<< HEAD
 // The DOM handles the console owns, and the plumbing that touches them.
 //
 // `ids` is resolved once at load, so every other module refers to elements
 // through it rather than querying the document again.
 
 import { state } from './state.js';
+=======
+// Shared console state and the one-time #id lookup table. Every other
+// module reads the DOM through `ids` and the live snapshot through `state`,
+// so there is exactly one of each.
+
+export const state = {
+  status: null,
+  health: null,
+  events: [],
+  allScenarios: [],
+  scenarioCatalog: {},
+  eventSource: null,
+  fallbackTimer: null,
+  reconnectTimer: null,
+  reconnectDelayMs: 0,
+  statusHoldUntil: 0,
+  scenarioLabels: {
+    leafy_greens_supplier: 'Leafy greens supplier',
+    fresh_cut_processor: 'Fresh-cut processor',
+    retailer_readiness_demo: 'Retailer readiness demo',
+    seafood_first_receiver: 'Seafood first receiver',
+    dairy_continuous_flow: 'Dairy continuous flow',
+  },
+  demoFixtureDescriptions: {
+    leafy_greens_trace: 'Harvest through cooling, packout, shipment, and DC receipt for one leafy greens lot.',
+  },
+  scenarioSaves: [],
+  operationTypeLabels: {
+    all: 'All operations',
+    supplier: 'Supplier',
+    processor: 'Processor',
+    retailer: 'Retail / distribution',
+    first_receiver: 'First receiver',
+    copacker: 'Co-packer / contract manufacturer',
+    distributor: 'Distributor / wholesaler',
+    foodservice: 'Foodservice',
+    egg_producer: 'Egg producer',
+  },
+  exportPresetDescriptions: {
+    all_records: 'Full FDA-request export for the selected date range.',
+  },
+};
+>>>>>>> origin/main
 
 export const ids = {
   source: document.getElementById('source'),
@@ -34,6 +78,11 @@ export const ids = {
   exportEndDate: document.getElementById('exportEndDate'),
   exportDownloadLink: document.getElementById('exportDownloadLink'),
   epcisDownloadLink: document.getElementById('epcisDownloadLink'),
+<<<<<<< HEAD
+=======
+  navExportLink: document.getElementById('navExportLink'),
+  exportLotHint: document.getElementById('exportLotHint'),
+>>>>>>> origin/main
   exportPresetDescription: document.getElementById('exportPresetDescription'),
   statusMessage: document.getElementById('statusMessage'),
   nextActionText: document.getElementById('nextActionText'),
@@ -69,6 +118,7 @@ export const ids = {
   importCsvBtn: document.getElementById('importCsvBtn'),
   loadFixtureBtn: document.getElementById('loadFixtureBtn'),
 };
+<<<<<<< HEAD
 
 export const tourEls = {
   popover: document.getElementById('tourPopover'),
@@ -158,3 +208,5 @@ export async function traceLotCode(lotCode) {
   ids.lotLookup.value = lotCode;
   await lotTraceHandler();
 }
+=======
+>>>>>>> origin/main

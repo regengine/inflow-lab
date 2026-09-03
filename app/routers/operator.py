@@ -14,6 +14,7 @@ router = APIRouter(prefix="/api/operator", tags=["Operator"])
 
 @router.get("/tenants", response_model=TenantListResponse)
 async def list_operator_tenants(_: None = Depends(require_operator_auth)) -> TenantListResponse:
+<<<<<<< HEAD
     # `tenant_summary` stats the tenant's JSONL and, for uncached tenants,
     # counts its lines -- blocking work that scales with the store and used to
     # run on the event loop once per tenant.
@@ -23,6 +24,14 @@ async def list_operator_tenants(_: None = Depends(require_operator_auth)) -> Ten
     )
     return TenantListResponse(
         tenants=[TenantSummary.model_validate(summary) for summary in summaries]
+=======
+    tenant_ids = await asyncio.to_thread(tenancy.known_tenant_ids)
+    raw_summaries = await asyncio.gather(
+        *(asyncio.to_thread(tenancy.tenant_summary, tid) for tid in tenant_ids)
+    )
+    return TenantListResponse(
+        tenants=[TenantSummary.model_validate(s) for s in raw_summaries]
+>>>>>>> origin/main
     )
 
 
@@ -43,19 +52,31 @@ async def delete_operator_tenant(
     _: None = Depends(require_operator_auth),
 ) -> TenantOperationResponse:
     normalized_tenant = tenancy.operator_tenant_id(tenant_id)
-    tenant_dir = tenancy.tenant_dir(normalized_tenant)
+    tenant_dir = tenancy.assert_deletable_tenant_dir(tenancy.tenant_dir(normalized_tenant))
     removed_data = tenant_dir.exists()
 
+    # pop_tenant_controller also opens a delete-in-progress window (#175):
+    # until finish_tenant_delete runs below -- even if shutdown or rmtree
+    # raises -- a concurrent request for this tenant id is refused instead
+    # of racing the rmtree below and getting zombied.
     tenant_controller = tenancy.pop_tenant_controller(normalized_tenant)
-    if tenant_controller is not None:
-        await tenant_controller.shutdown()
+    try:
+        if tenant_controller is not None:
+            await tenant_controller.shutdown()
 
+        shutil.rmtree(tenant_dir, ignore_errors=True)
+    finally:
+        tenancy.finish_tenant_delete(normalized_tenant)
+
+<<<<<<< HEAD
     # Safe as written -- `operator_tenant_id` applies a strict regex and a URL
     # segment cannot contain a slash -- but a recursive delete should not rest
     # on an upstream validator staying strict, and this also catches a
     # symlinked tenant directory redirecting the delete somewhere else.
     tenancy.assert_within_tenant_root(tenant_dir)
     shutil.rmtree(tenant_dir, ignore_errors=True)
+=======
+>>>>>>> origin/main
     return TenantOperationResponse(
         status="deleted",
         tenant_id=normalized_tenant,

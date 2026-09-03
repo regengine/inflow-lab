@@ -5,9 +5,14 @@ Use this checklist before tagging a demo-ready build or handing the simulator to
 ## Required Verification
 
 - [ ] `uv run pytest`
-- [ ] `uv run python scripts/smoke_regression.py`
+- [ ] `uv run python scripts/smoke_regression.py` (safe to run with `REGENGINE_DATA_DIR` exported; it derives its paths from that root and cleans up under it)
+- [ ] `uv run python scripts/contract_pin_check.py` — RegEngine contract pin freshness and the documented wire shape
 - [ ] `uv run --no-dev --group browser python scripts/browser_smoke.py`
+<<<<<<< HEAD
 - [ ] `npm ci && npm run lint` (the operator console)
+=======
+- [ ] `for f in app/static/*.js; do node --check "$f"; done` — the console is ES modules now, so checking `app.js` alone leaves most of it unparsed (CI's `lint` job runs the same loop)
+>>>>>>> origin/main
 - [ ] `python3 -m compileall app scripts`
 - [ ] `uv pip check`
 - [ ] `uv run pip-audit`
@@ -19,19 +24,43 @@ Use this checklist before tagging a demo-ready build or handing the simulator to
 - [ ] Mock and live ingest payloads still use top-level `source` plus `events[]`.
 - [ ] Each event still includes `cte_type`, `traceability_lot_code`, `product_description`, `quantity`, `unit_of_measure`, `location_name`, `timestamp`, and `kdes`.
 - [ ] Mock mode remains the default delivery mode.
+- [ ] The mock FDA request export still emits the fifteen `FDA_EXPORT_COLUMNS` (`app/fda_export.py`), with RegEngine's documented eleven first and in order.
+- [ ] Mock ingest still rejects an empty batch and an over-500 batch with `422`, and replays `Idempotency-Key` for 24 hours.
 - [ ] Live delivery still requires `api_key` and `tenant_id`.
 - [ ] Live-trial tooling refuses live traffic without `--confirm-live` and mock mode remains the dry-run/default safety path.
+- [ ] `scripts/live_trial.py --confirm-live` disarms the demo tenant when it finishes, on the failure path too: it prints `Delivery reverted to mock for tenant <id>` and fails the run if `/api/integration/status` does not then report `mode: mock` with `api_key_configured: false`. After any live trial, confirm that yourself before leaving the demo — an armed tenant means the next Start or Step click posts simulated CTEs into a customer's production ingest.
 - [ ] New export or dashboard behavior is derived from stored records and does not mutate the ingest contract.
 
 ## Operator Flow Checks
 
 - [ ] Dashboard loads without credentials when Basic Auth env vars are unset.
-- [ ] `/api/healthz` remains available without credentials for container/platform healthchecks and reports the expected `build.commit_sha_short`.
+- [ ] `/api/healthz` remains available without credentials for container/platform healthchecks, returns 200 with the expected `build.commit_sha_short`, and returns `503` with `"ok": false` when the event store is not writable.
 - [ ] Basic Auth returns `401` without valid credentials when env vars are set.
 - [ ] Shared-demo or live-trial deployments set explicit `REGENGINE_CORS_ORIGINS` values instead of wildcard CORS.
 - [ ] Dashboard simulator actions do not return `403`; if they do, confirm the browser origin exactly matches `REGENGINE_CORS_ORIGINS`.
 - [ ] Shared-demo or live-trial deployments set `REGENGINE_DATA_DIR` to mounted persistent storage.
+- [ ] Shared-demo or live-trial deployments run with `REGENGINE_REQUIRE_AUTH=1` and both Basic Auth variables set; a deploy missing them fails to start rather than serving open.
+- [ ] `REGENGINE_ALLOW_PRIVATE_DELIVERY_HOSTS` is unset on any shared or deployed profile.
+- [ ] Creating tenants past `REGENGINE_MAX_TENANTS` returns `429` instead of materializing unbounded tenant scopes.
 - [ ] Demo fixture loading resets to a known event log.
+- [ ] The shipped demo fixtures still fall inside RegEngine's replay window. RegEngine rejects an event older than `WEBHOOK_MAX_EVENT_AGE_DAYS` (default 90; mirrored as `MAX_EVENT_AGE_DAYS` in `app/mock_service.py`, readable via `max_event_age_days()`), so a fixture that ages past it makes the design-partner demo unreplayable against a live tenant. Check the oldest timestamp actually shipped, not the date the fixture bodies were authored against:
+
+    ```bash
+    uv run python -c "
+    from datetime import UTC, datetime
+    from app.demo_fixtures import DEMO_FIXTURES
+    from app.mock_service import max_event_age_days
+    oldest = min(e.event.timestamp for f in DEMO_FIXTURES.values() for e in f.events)
+    age = (datetime.now(UTC) - oldest.astimezone(UTC)).days
+    window = max_event_age_days()
+    print(f'oldest shipped fixture event is {age}d old; replay window is {window}d')
+    raise SystemExit(age >= window)
+    "
+    ```
+
+  Insist on real margin rather than a pass at 89 days: an event one day inside the window is one slipped release from being outside it. Treat anything past roughly two-thirds of the window as a release blocker.
+
+  Note that nothing else in a green run will tell you: `REGENGINE_MOCK_EVENT_AGE_MODE` defaults to `warn`, so the mock stand-in logs an out-of-window event and still accepts it, and every fixture-based test, smoke and export keeps passing. Load one fixture with `REGENGINE_MOCK_EVENT_AGE_MODE=reject` to see what a live tenant would actually do with it. If the check trips, re-date the fixtures — do not ship a demo whose first live batch comes back "replay window exceeded".
 - [ ] Start, stop, single-step, and reset work from the dashboard.
 - [ ] Scenario save/load restores both config and event records.
 - [ ] Lot lineage for `TLC-DEMO-FC-OUT-001` includes upstream harvested and packed lots.
@@ -42,13 +71,14 @@ Use this checklist before tagging a demo-ready build or handing the simulator to
 - [ ] For shared-demo releases, `uv run --no-dev python scripts/remote_smoke.py` passes against the deployed HTTPS URL.
 - [ ] For shared-demo releases, the manual GitHub **Remote Smoke** workflow passes with repository secrets `REGENGINE_REMOTE_USERNAME` and `REGENGINE_REMOTE_PASSWORD`.
 - [ ] For shared-demo releases, the manual GitHub **Remote Browser Smoke** workflow passes with repository secrets `REGENGINE_REMOTE_USERNAME` and `REGENGINE_REMOTE_PASSWORD`.
-- [ ] For shared-demo releases, nightly GitHub **Remote Smoke** and **Remote Browser Smoke** schedules are enabled after those repository secrets are configured and `REGENGINE_BUILD_SHA` is kept current on Railway.
+- [ ] For shared-demo releases, nightly GitHub **Remote Smoke** and **Remote Browser Smoke** schedules are enabled after those repository secrets are configured.
+- [ ] The shared demo's `/api/healthz` reports `build.commit_source: RAILWAY_GIT_COMMIT_SHA`. That service is GitHub-connected, so `REGENGINE_BUILD_SHA` must be **absent**: it outranks Railway's injected SHA (`app/build_info.py`), and leaving it set makes the deploy-freshness check compare the real head commit against a hand-typed constant — a demo stuck several commits behind then reports green. Only a manual CLI-deployed service should set it.
 - [ ] For live-trial prep, `uv run python scripts/live_trial.py --dry-run-only` passes before any confirmed live batch.
 
 ## Handoff Notes
 
 - [ ] README has the current API surface and setup instructions.
-- [ ] `DESIGN_PARTNER_DEMO_SCRIPT.md` matches the current fixture names, lot codes, expected exports, and reset flow.
+- [ ] `DESIGN_PARTNER_DEMO_SCRIPT.md` matches the current fixture names, lot codes, expected exports, and reset flow, and every button or link it names by text still appears with that exact text in `app/static/index.html`.
 - [ ] `DESIGN_PARTNER_DEMO_SCRIPT.md` remote operator runbook uses env vars and mock delivery for shared-demo commands.
 - [ ] `DEPLOYMENT_PROFILES.md` matches the intended local, shared-demo, and live-ingest operating modes.
 - [ ] `AUTOPILOT_TASKS.md` reflects the current backlog state.

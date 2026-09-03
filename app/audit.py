@@ -25,16 +25,24 @@ def summarize_scenario_audit(
         tone = "progress"
         label = "Good signal coverage"
 
+    # `asdict` carries the warning's `severity` onto the wire alongside its
+    # field and message, and `audit_warnings_for_record` already returns
+    # required-severity warnings first, so every surface that renders this
+    # payload in order leads with the gaps that would fail live ingest.
     warnings_by_record: dict[str, list[dict[str, str]]] = {}
     total_warning_count = 0
+    required_warning_count = 0
+    records_with_required_warnings = 0
     for record in records:
-        warning_payload = [
-            asdict(warning)
-            for warning in audit_warnings_for_record(record, scenario)
-        ]
+        warnings = audit_warnings_for_record(record, scenario)
+        warning_payload = [asdict(warning) for warning in warnings]
         if warning_payload:
             warnings_by_record[record.record_id] = warning_payload
             total_warning_count += len(warning_payload)
+            required = sum(1 for warning in warnings if warning.severity == "required")
+            required_warning_count += required
+            if required:
+                records_with_required_warnings += 1
 
     return {
         "industry_type": scenario.industry_type,
@@ -48,7 +56,10 @@ def summarize_scenario_audit(
         "missing": total - passed,
         "checks": checks,
         "warning_count": total_warning_count,
+        "required_warning_count": required_warning_count,
+        "recommended_warning_count": total_warning_count - required_warning_count,
         "records_with_warnings": len(warnings_by_record),
+        "records_with_required_warnings": records_with_required_warnings,
         "warnings_by_record": warnings_by_record,
     }
 

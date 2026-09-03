@@ -47,7 +47,7 @@ def test_merged_event_values_bridges_source_reference_aliases():
             "ship_date": "2026-05-09",
             "ship_from_location": "Dock",
             "ship_to_location": "DC",
-            "reference_document": "GS1-128 (00)123456789012345678",
+            "reference_document": "GS1-128 (00)123456789012345675",
             "traceability_lot_code_source_reference": "SRC-1",
         },
     )

@@ -39,6 +39,10 @@ class RecordingAsyncClient:
         headers: dict[str, str],
         content: bytes | None = None,
         json: dict[str, Any] | None = None,
+        # extensions: the live client attaches {"sni_hostname": ...} when it
+        # pins the validated address for the dial (#207). Accepted and
+        # ignored here so this fake keeps working on either path.
+        extensions: dict[str, Any] | None = None,
     ) -> FakeResponse:
         # The live client now serializes the body once and sends it via
         # `content=` so the bytes we sign equal the bytes on the wire.
@@ -149,6 +153,7 @@ def test_live_client_sends_required_headers_and_contract_payload(monkeypatch: An
     event = payload["events"][0]
     assert set(event) == {
         "cte_type",
+        "input_traceability_lot_codes",
         "traceability_lot_code",
         "product_description",
         "quantity",
@@ -166,6 +171,7 @@ def test_live_client_sends_required_headers_and_contract_payload(monkeypatch: An
         "unit_of_measure": "cases",
         "location_name": "Distribution Center #4",
         "location_gln": None,
+        "input_traceability_lot_codes": None,
         "timestamp": "2026-02-05T08:30:00Z",
         "kdes": {
             "receive_date": "2026-02-05",
