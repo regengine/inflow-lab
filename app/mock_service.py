@@ -187,6 +187,7 @@ class MockRegEngineService:
         idempotency_ttl: timedelta = timedelta(hours=IDEMPOTENCY_TTL_HOURS),
         clock: Callable[[], datetime] = lambda: datetime.now(UTC),
         enforce_event_age_window: bool = False,
+        max_event_age_days: int = MAX_EVENT_AGE_DAYS,
     ) -> None:
         self._chain_hash = _resume_chain_hash(store) if store is not None else ""
         self._idempotency_cache: OrderedDict[str, _CachedIdempotencyEntry] = OrderedDict()
@@ -196,6 +197,7 @@ class MockRegEngineService:
         # (#120). Production callers get the real 24h window and wall clock.
         self.idempotency_ttl = idempotency_ttl
         self._clock = clock
+        self.max_event_age_days = max_event_age_days
         # Off by default -- deliberately, not an oversight (#102). Turning
         # this on unconditionally against the *default* wall-clock `clock`
         # would reject every one of this repo's own fixed-date fixtures the
@@ -302,7 +304,7 @@ class MockRegEngineService:
         rejected = 0
         seen_batch_keys: set[str] = set()
         for event in payload.events:
-            errors = _handler_level_errors(event, now=age_check_now)
+            errors = _handler_level_errors(event, now=age_check_now, max_age_days=self.max_event_age_days)
             batch_key = "|".join(
                 (
                     event.cte_type.value,
@@ -384,7 +386,7 @@ def validate_event_like_regengine(
     None (age check skipped) so every pre-existing direct caller of this
     function keeps its exact current behavior.
     """
-    return _field_constraint_errors(event) + _handler_level_errors(event, now=now)
+    return _field_constraint_errors(event) + _handler_level_errors(event, now=now, max_age_days=MAX_EVENT_AGE_DAYS)
 
 
 def _field_constraint_errors(event: RegEngineEvent) -> list[str]:
@@ -425,7 +427,7 @@ def _field_constraint_errors(event: RegEngineEvent) -> list[str]:
     return errors
 
 
-def _handler_level_errors(event: RegEngineEvent, *, now: datetime | None = None) -> list[str]:
+def _handler_level_errors(event: RegEngineEvent, *, now: datetime | None = None, max_age_days: int = MAX_EVENT_AGE_DAYS) -> list[str]:
     """Checks RegEngine applies per event, inside the route handler, after
     the request body as a whole has already passed Pydantic validation: the
     location-identifier requirement, required KDEs per CTE type, and
@@ -446,9 +448,9 @@ def _handler_level_errors(event: RegEngineEvent, *, now: datetime | None = None)
     timestamp = event.timestamp
     if timestamp.tzinfo is None:
         timestamp = timestamp.replace(tzinfo=UTC)
-    if now is not None and timestamp < now - timedelta(days=MAX_EVENT_AGE_DAYS):
+    if now is not None and timestamp < now - timedelta(days=max_age_days):
         errors.append(
-            f"timestamp is older than WEBHOOK_MAX_EVENT_AGE_DAYS={MAX_EVENT_AGE_DAYS} "
+            f"timestamp is older than WEBHOOK_MAX_EVENT_AGE_DAYS={max_age_days} "
             "— replay window exceeded"
         )
 

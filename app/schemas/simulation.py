@@ -126,6 +126,11 @@ def validate_egress_endpoint(url: HttpUrl | None) -> None:
     """
     if url is None or _private_endpoints_allowed():
         return
+    if url.username or url.password:
+        raise EgressBlockedError(
+            "Delivery endpoint must not contain userinfo (user:pass@host). "
+            "Use the api_key field instead."
+        )
     host = (url.host or "").strip("[]").lower()
     if not host:
         raise EgressBlockedError("Delivery endpoint is missing a host.")
