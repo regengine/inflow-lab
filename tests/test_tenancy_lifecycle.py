@@ -45,8 +45,8 @@ def _cleanup_tenant_dir(tenant_id: str) -> None:
 
 
 @pytest.fixture(autouse=True)
-def _isolated_tenant_registry(monkeypatch):
-    """Give every test in this file its own tenant registry.
+def _isolated_tenant_registry(monkeypatch, tmp_path):
+    """Give every test in this file its own tenant registry and data root.
 
     `_tenant_controllers` and `_tenants_being_deleted` are module-level
     globals shared with the rest of the test suite (and the running app).
@@ -54,9 +54,14 @@ def _isolated_tenant_registry(monkeypatch):
     each test -- makes the cap assertions below exact regardless of what
     other test files created before this one runs, and stops this file's own
     tenant floods from leaking entries into the rest of the session.
+
+    TENANT_DATA_ROOT is also pointed at a fresh temp directory so the
+    on-disk tenant enumeration (used by the cap check) starts clean and
+    tenant directories from other tests do not interfere.
     """
     monkeypatch.setattr(tenancy, "_tenant_controllers", {tenancy.DEFAULT_TENANT_ID: tenancy.controller})
     monkeypatch.setattr(tenancy, "_tenants_being_deleted", set())
+    monkeypatch.setattr(tenancy, "TENANT_DATA_ROOT", tmp_path / "tenants")
     yield
 
 
@@ -272,3 +277,26 @@ def test_delete_endpoint_race_returns_sane_error_not_500(monkeypatch):
         assert after.status_code == 200
     finally:
         _cleanup_tenant_dir(tenant_id)
+
+
+def test_tenant_cap_counts_on_disk_directories_across_restarts(monkeypatch):
+    """#217: tenant cap must count on-disk directories, not just in-memory
+    controllers. Simulates a restart by pre-creating tenant directories
+    without corresponding in-memory controllers."""
+    monkeypatch.setattr(tenancy, "MAX_TENANT_CONTROLLERS", 5)
+
+    # Pre-create 3 tenant directories to simulate a prior process having
+    # created them. The fixture already gave us a clean TENANT_DATA_ROOT.
+    for i in range(3):
+        tenancy.tenant_dir(f"pre-existing-{i}").mkdir(parents=True, exist_ok=True)
+
+    # Registry has 1 (default) + 3 on disk = 4 total. One more should succeed.
+    resp = client.get("/api/health", headers={"X-RegEngine-Tenant": "new-after-restart"})
+    assert resp.status_code == 200
+
+    try:
+        # Now at 5 total — the next one should be refused.
+        resp = client.get("/api/health", headers={"X-RegEngine-Tenant": "one-too-many"})
+        assert resp.status_code == 429
+    finally:
+        _cleanup_tenant_dir("new-after-restart")

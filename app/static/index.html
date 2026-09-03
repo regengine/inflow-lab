@@ -175,7 +175,7 @@
               <span class="status-pill" id="runStatePill">Idle</span>
             </div>
             <p class="panel-help"><strong>Start line</strong> records events continuously; <strong>Record next batch</strong> (up top) does one batch at a time. <strong>Clear shift</strong> wipes this workspace's records so you can start fresh.</p>
-            <p class="note status-message" id="statusMessage" role="status" aria-live="polite">Ready.</p>
+            <p class="note status-message" id="statusMessage" role="status" aria-live="polite" aria-atomic="true">Ready.</p>
             <div class="action-row">
               <button class="button" id="startBtn" type="button">Start line</button>
               <button class="button secondary" id="stopBtn" type="button">Pause line</button>
@@ -347,7 +347,7 @@
               <button class="button secondary" id="retryFailedBtn" type="button">Retry failed</button>
             </div>
             <p class="panel-help">Delivery health at a glance. <strong>Retry failed</strong> is always safe — retries reuse each record's original idempotency key, so nothing is ever ingested twice.</p>
-            <div id="deliverySummary" class="delivery-summary"></div>
+            <div id="deliverySummary" class="delivery-summary" role="status" aria-live="polite" aria-atomic="true"></div>
           </section>
 
           <section class="panel evidence-panel">

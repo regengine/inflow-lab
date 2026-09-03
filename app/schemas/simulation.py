@@ -25,6 +25,21 @@ _TRUSTED_REGENGINE_HOST = "www.regengine.co"
 # environment, since it disables the SSRF guard entirely.
 PRIVATE_ENDPOINTS_ENV = "REGENGINE_ALLOW_PRIVATE_ENDPOINTS"
 
+_BLOCKED_HOSTNAMES = frozenset({
+    "localhost",
+    "ip6-localhost",
+    "ip6-loopback",
+    "metadata",
+    "metadata.google.internal",
+    "instance-data",
+})
+
+_BLOCKED_HOST_SUFFIXES = (
+    ".localhost",
+    ".internal",
+    ".local",
+)
+
 
 class EgressBlockedError(ValueError):
     """A delivery endpoint failed the egress guard (see validate_egress_endpoint).
@@ -78,6 +93,12 @@ def _is_unsafe_address(address: ipaddress.IPv4Address | ipaddress.IPv6Address) -
     return mapped is not None and _is_unsafe_address(mapped)
 
 
+async def async_validate_egress_endpoint(url: HttpUrl | None) -> None:
+    """Async wrapper that offloads the blocking DNS resolution to a thread."""
+    import asyncio
+    await asyncio.to_thread(validate_egress_endpoint, url)
+
+
 def validate_egress_endpoint(url: HttpUrl | None) -> None:
     """Reject a RegEngine delivery endpoint before it is ever dialed.
 
@@ -105,11 +126,22 @@ def validate_egress_endpoint(url: HttpUrl | None) -> None:
     """
     if url is None or _private_endpoints_allowed():
         return
+    if url.username or url.password:
+        raise EgressBlockedError(
+            "Delivery endpoint must not contain userinfo (user:pass@host). "
+            "Use the api_key field instead."
+        )
     host = (url.host or "").strip("[]").lower()
     if not host:
         raise EgressBlockedError("Delivery endpoint is missing a host.")
     if host == _TRUSTED_REGENGINE_HOST:
         return
+    if host in _BLOCKED_HOSTNAMES or any(host.endswith(s) for s in _BLOCKED_HOST_SUFFIXES):
+        raise EgressBlockedError(
+            f"Delivery endpoint host {host!r} is blocked by name. "
+            f"Set {PRIVATE_ENDPOINTS_ENV}=1 to allow this for local "
+            "development."
+        )
     addresses = _resolved_addresses(host)
     if not addresses:
         # A host that does not resolve cannot be dialed, so it is not an SSRF

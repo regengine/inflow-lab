@@ -258,3 +258,81 @@ def test_mock_idempotency_replay_returns_cached_response() -> None:
     first_ids = [event.event_id for event in first.events]
     fresh_ids = [event.event_id for event in fresh.events]
     assert first_ids != fresh_ids
+
+
+def test_integration_test_strips_credentials_on_scheme_downgrade() -> None:
+    """Credential guard must compare scheme+host, not just host (#209.3).
+
+    An http:// endpoint matching the https:// stored host must still strip
+    credentials, since they would travel over cleartext."""
+    asyncio.run(
+        controller.configure_integration(
+            type(
+                "Req",
+                (),
+                {
+                    "mode": "live",
+                    "endpoint": "https://regengine.example.com/api/v1/webhooks/ingest",
+                    "api_key": "secret-key",
+                    "tenant_id": "t-123",
+                    "mock_friction": None,
+                },
+            )()
+        )
+    )
+    response = client.post(
+        "/api/integration/test",
+        json={"endpoint": "http://regengine.example.com/api/v1/webhooks/ingest"},
+    )
+    assert response.status_code == 200
+    data = response.json()
+    assert data["verdict"] == "not_configured"
+    assert "differs" in data["detail"]
+
+
+def test_integration_test_explains_credential_stripping_on_origin_change() -> None:
+    """#210.3: detail must explain WHY credentials are missing — they were
+    stripped because the endpoint changed, not because they were never set."""
+    asyncio.run(
+        controller.configure_integration(
+            type(
+                "Req",
+                (),
+                {
+                    "mode": "live",
+                    "endpoint": "https://regengine.example.com/api/v1/webhooks/ingest",
+                    "api_key": "secret-key",
+                    "tenant_id": "t-123",
+                    "mock_friction": None,
+                },
+            )()
+        )
+    )
+    response = client.post(
+        "/api/integration/test",
+        json={"endpoint": "https://other-host.example.com/api/v1/webhooks/ingest"},
+    )
+    assert response.status_code == 200
+    data = response.json()
+    assert data["verdict"] == "not_configured"
+    assert "differs" in data["detail"], (
+        "Detail should explain the endpoint changed, not give a generic 'credentials required' message"
+    )
+
+
+def test_integration_configure_rejects_extra_fields() -> None:
+    """extra='forbid' catches misspelled fields (#217)."""
+    response = client.post(
+        "/api/integration/configure",
+        json={"modee": "mock"},
+    )
+    assert response.status_code == 422
+
+
+def test_integration_test_rejects_extra_fields() -> None:
+    """extra='forbid' catches misspelled fields (#217)."""
+    response = client.post(
+        "/api/integration/test",
+        json={"endpont": "https://example.com/api"},
+    )
+    assert response.status_code == 422

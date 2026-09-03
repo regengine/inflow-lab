@@ -430,3 +430,85 @@ def test_pins_90_day_age_floor_and_24h_future_ceiling_against_regengine_defaults
     """
     assert MAX_EVENT_AGE_DAYS == 90
     assert MAX_FUTURE_HOURS == 24
+
+
+def test_configurable_max_event_age_days_shortens_replay_window() -> None:
+    """#217: max_event_age_days lets an operator tighten the replay window.
+
+    A service configured with max_event_age_days=7 should reject an event
+    that is 8 days old but accept one that is 6 days old, while the
+    default 90-day service accepts both.
+    """
+    clock_state = {"now": datetime(2026, 6, 1, tzinfo=UTC)}
+    short_window = MockRegEngineService(
+        clock=lambda: clock_state["now"],
+        enforce_event_age_window=True,
+        max_event_age_days=7,
+    )
+    default_window = MockRegEngineService(
+        clock=lambda: clock_state["now"],
+        enforce_event_age_window=True,
+    )
+
+    eight_days_old = _harvest_event_at(clock_state["now"] - timedelta(days=8), lot="TLC-AGE-8D")
+    six_days_old = _harvest_event_at(clock_state["now"] - timedelta(days=6), lot="TLC-AGE-6D")
+
+    # Short window rejects the 8-day-old event...
+    resp_short_8 = short_window.ingest(IngestPayload(source="cfg-age", events=[eight_days_old]))
+    assert resp_short_8.rejected == 1
+    assert "replay window exceeded" in resp_short_8.events[0].errors[0]
+
+    # ...but accepts the 6-day-old one.
+    resp_short_6 = short_window.ingest(IngestPayload(source="cfg-age", events=[six_days_old]))
+    assert resp_short_6.accepted == 1
+
+    # Default 90-day window accepts both.
+    resp_default_8 = default_window.ingest(
+        IngestPayload(source="cfg-age", events=[_harvest_event_at(clock_state["now"] - timedelta(days=8), lot="TLC-AGE-8D-2")])
+    )
+    assert resp_default_8.accepted == 1
+
+
+def test_bypass_window_counts_out_of_window_events_without_rejecting() -> None:
+    """#217: when enforce_event_age_window=False, events outside the window
+    are accepted but counted in out_of_window_events for visibility."""
+    clock_state = {"now": datetime(2026, 6, 1, tzinfo=UTC)}
+    service = MockRegEngineService(
+        clock=lambda: clock_state["now"],
+        enforce_event_age_window=False,
+    )
+    stale_event = _harvest_event_at(
+        clock_state["now"] - timedelta(days=MAX_EVENT_AGE_DAYS + 5), lot="TLC-BYPASS-STALE"
+    )
+    fresh_event = _harvest_event_at(clock_state["now"] - timedelta(days=1), lot="TLC-BYPASS-FRESH")
+    payload = IngestPayload(source="bypass-test", events=[stale_event, fresh_event])
+
+    response = service.ingest(payload)
+
+    assert response.accepted == 2
+    assert response.rejected == 0
+    assert response.out_of_window_events == 1
+    assert response.event_age_window_mode == "bypassed"
+    assert response.event_age_window_days == MAX_EVENT_AGE_DAYS
+
+
+def test_enforced_window_sets_mode_and_zero_bypass_count() -> None:
+    """#217: when enforced, out_of_window_events is 0 and mode is 'enforced'."""
+    clock_state = {"now": datetime(2026, 6, 1, tzinfo=UTC)}
+    service = MockRegEngineService(
+        clock=lambda: clock_state["now"],
+        enforce_event_age_window=True,
+    )
+    stale_event = _harvest_event_at(
+        clock_state["now"] - timedelta(days=MAX_EVENT_AGE_DAYS + 5), lot="TLC-ENF-STALE"
+    )
+    fresh_event = _harvest_event_at(clock_state["now"] - timedelta(days=1), lot="TLC-ENF-FRESH")
+    payload = IngestPayload(source="enforced-test", events=[stale_event, fresh_event])
+
+    response = service.ingest(payload)
+
+    assert response.accepted == 1
+    assert response.rejected == 1
+    assert response.out_of_window_events == 0
+    assert response.event_age_window_mode == "enforced"
+    assert response.event_age_window_days == MAX_EVENT_AGE_DAYS

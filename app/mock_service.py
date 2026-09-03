@@ -9,8 +9,12 @@ from datetime import UTC, datetime, timedelta
 from typing import Any, Callable, NamedTuple
 from uuid import uuid4
 
+import logging
+
 from .cte_rules import REQUIRED_KDES
 from .regengine_client import WEBHOOK_HMAC_SECRET_ENV
+
+logger = logging.getLogger("inflow_lab")
 from .schemas.domain import DestinationMode, RegEngineEvent
 from .schemas.ingestion import IngestPayload, IngestResponseEvent, MockIngestResponse
 from .store import EventStore
@@ -148,10 +152,12 @@ def _verify_webhook_signature(body: bytes | None, signature_header: str | None) 
             401, "Unsupported X-Webhook-Signature scheme (expected 'sha256=<hex>')"
         )
 
+    try:
+        provided_digest.encode("ascii")
+    except UnicodeEncodeError:
+        raise MockRegEngineHTTPError(401, "Invalid X-Webhook-Signature")
+
     expected_digest = hmac.new(secret.encode("utf-8"), body, hashlib.sha256).hexdigest()
-    # hmac.compare_digest, never == -- a time-variable comparison leaks how
-    # many leading hex characters matched, letting an attacker recover a
-    # valid signature one byte at a time.
     if not hmac.compare_digest(expected_digest, provided_digest):
         raise MockRegEngineHTTPError(401, "Invalid X-Webhook-Signature")
 
@@ -185,6 +191,7 @@ class MockRegEngineService:
         idempotency_ttl: timedelta = timedelta(hours=IDEMPOTENCY_TTL_HOURS),
         clock: Callable[[], datetime] = lambda: datetime.now(UTC),
         enforce_event_age_window: bool = False,
+        max_event_age_days: int = MAX_EVENT_AGE_DAYS,
     ) -> None:
         self._chain_hash = _resume_chain_hash(store) if store is not None else ""
         self._idempotency_cache: OrderedDict[str, _CachedIdempotencyEntry] = OrderedDict()
@@ -194,6 +201,7 @@ class MockRegEngineService:
         # (#120). Production callers get the real 24h window and wall clock.
         self.idempotency_ttl = idempotency_ttl
         self._clock = clock
+        self.max_event_age_days = max_event_age_days
         # Off by default -- deliberately, not an oversight (#102). Turning
         # this on unconditionally against the *default* wall-clock `clock`
         # would reject every one of this repo's own fixed-date fixtures the
@@ -236,8 +244,13 @@ class MockRegEngineService:
 
         for code in friction:
             failure = FRICTION_RESPONSES.get(code)
-            if failure is not None:
-                raise MockRegEngineHTTPError(*failure)
+            if failure is None:
+                raise MockRegEngineHTTPError(
+                    400,
+                    f"Unknown X-Mock-Friction code {code!r}. "
+                    f"Valid codes: {', '.join(sorted(FRICTION_RESPONSES))}",
+                )
+            raise MockRegEngineHTTPError(*failure)
 
         if len(payload.events) < MIN_BATCH_EVENTS:
             raise MockRegEngineHTTPError(
@@ -293,9 +306,14 @@ class MockRegEngineService:
         response_events: list[IngestResponseEvent] = []
         accepted = 0
         rejected = 0
+        out_of_window_events = 0
         seen_batch_keys: set[str] = set()
         for event in payload.events:
-            errors = _handler_level_errors(event, now=age_check_now)
+            errors = _handler_level_errors(event, now=age_check_now, max_age_days=self.max_event_age_days)
+            if not self._enforce_event_age_window:
+                age_errors = _handler_level_errors(event, now=now, max_age_days=self.max_event_age_days)
+                if any("replay window exceeded" in e for e in age_errors):
+                    out_of_window_events += 1
             batch_key = "|".join(
                 (
                     event.cte_type.value,
@@ -336,12 +354,23 @@ class MockRegEngineService:
                 )
             )
 
+        window_mode = "enforced" if self._enforce_event_age_window else "bypassed"
+        if out_of_window_events and not self._enforce_event_age_window:
+            logger.warning(
+                "mock ingest bypassed %d event(s) outside the %d-day replay window "
+                "(enforce_event_age_window=False); live RegEngine would reject them",
+                out_of_window_events,
+                self.max_event_age_days,
+            )
         response = MockIngestResponse(
             accepted=accepted,
             rejected=rejected,
             total=accepted + rejected,
             events=response_events,
             ingestion_timestamp=now,
+            out_of_window_events=out_of_window_events,
+            event_age_window_mode=window_mode,
+            event_age_window_days=self.max_event_age_days,
         )
         if idempotency_key:
             self._idempotency_cache[idempotency_key] = _CachedIdempotencyEntry(
@@ -377,7 +406,7 @@ def validate_event_like_regengine(
     None (age check skipped) so every pre-existing direct caller of this
     function keeps its exact current behavior.
     """
-    return _field_constraint_errors(event) + _handler_level_errors(event, now=now)
+    return _field_constraint_errors(event) + _handler_level_errors(event, now=now, max_age_days=MAX_EVENT_AGE_DAYS)
 
 
 def _field_constraint_errors(event: RegEngineEvent) -> list[str]:
@@ -418,7 +447,7 @@ def _field_constraint_errors(event: RegEngineEvent) -> list[str]:
     return errors
 
 
-def _handler_level_errors(event: RegEngineEvent, *, now: datetime | None = None) -> list[str]:
+def _handler_level_errors(event: RegEngineEvent, *, now: datetime | None = None, max_age_days: int = MAX_EVENT_AGE_DAYS) -> list[str]:
     """Checks RegEngine applies per event, inside the route handler, after
     the request body as a whole has already passed Pydantic validation: the
     location-identifier requirement, required KDEs per CTE type, and
@@ -439,9 +468,9 @@ def _handler_level_errors(event: RegEngineEvent, *, now: datetime | None = None)
     timestamp = event.timestamp
     if timestamp.tzinfo is None:
         timestamp = timestamp.replace(tzinfo=UTC)
-    if now is not None and timestamp < now - timedelta(days=MAX_EVENT_AGE_DAYS):
+    if now is not None and timestamp < now - timedelta(days=max_age_days):
         errors.append(
-            f"timestamp is older than WEBHOOK_MAX_EVENT_AGE_DAYS={MAX_EVENT_AGE_DAYS} "
+            f"timestamp is older than WEBHOOK_MAX_EVENT_AGE_DAYS={max_age_days} "
             "— replay window exceeded"
         )
 

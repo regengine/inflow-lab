@@ -21,11 +21,11 @@ from ..schemas.simulation import EgressBlockedError, SimulationConfig
 router = APIRouter(prefix="/api/integration", tags=["RegEngine Integration"])
 
 
-def _delivery_host(config: SimulationConfig) -> str:
-    """Host the stored config would actually deliver to right now (falls
-    back to the documented default when no endpoint is configured)."""
+def _delivery_origin(config: SimulationConfig) -> str:
+    """Origin (scheme + host) the stored config would deliver to right now."""
     endpoint = str(config.delivery.endpoint) if config.delivery.endpoint else DEFAULT_LIVE_INGEST_ENDPOINT
-    return (urlparse(endpoint).hostname or "").lower()
+    parsed = urlparse(endpoint)
+    return f"{parsed.scheme}://{(parsed.hostname or '').lower()}"
 
 
 @router.get("/status", response_model=IntegrationStatusResponse)
@@ -59,14 +59,15 @@ async def integration_test(
         }.items()
         if value is not None
     }
-    if request.endpoint is not None and (request.endpoint.host or "").lower() != _delivery_host(config):
-        # Caller is pointing the probe at a different host than the stored/
-        # default RegEngine endpoint. Never let the stored api_key/tenant_id
-        # ride along to a host they were never issued for — the caller must
-        # supply fresh credentials for THIS host (already captured above if
-        # they did; the setdefault below is then a no-op). Otherwise the
-        # probe runs uncredentialed and check_connection reports
-        # not_configured instead of leaking them.
+    credentials_stripped = False
+    if request.endpoint is not None:
+        req_parsed = urlparse(str(request.endpoint))
+        request_origin = f"{req_parsed.scheme}://{(req_parsed.hostname or '').lower()}"
+        if request_origin != _delivery_origin(config):
+            updates.setdefault("api_key", None)
+            updates.setdefault("tenant_id", None)
+            if "api_key" not in {k for k, v in updates.items() if v is not None}:
+                credentials_stripped = True
         updates.setdefault("api_key", None)
         updates.setdefault("tenant_id", None)
     delivery = config.delivery.model_copy(update=updates, deep=True)
@@ -79,6 +80,17 @@ async def integration_test(
                 "Delivery is in mock mode: events go to the built-in RegEngine "
                 "stand-in, no credentials required. Enter live credentials to "
                 "test a real connection."
+            ),
+            mode=config.delivery.mode,
+        )
+
+    if credentials_stripped and not delivery.api_key and not delivery.tenant_id:
+        return ConnectionTestResponse(
+            verdict="not_configured",
+            detail=(
+                "The test endpoint differs from the configured delivery endpoint, "
+                "so stored credentials were not forwarded. Provide api_key and "
+                "tenant_id for the new endpoint."
             ),
             mode=config.delivery.mode,
         )

@@ -13,7 +13,7 @@ import httpx
 
 from .contract import INFLOW_CONTRACT_VERSION
 from .schemas.ingestion import IngestPayload
-from .schemas.simulation import SimulationConfig, validate_egress_endpoint
+from .schemas.simulation import SimulationConfig, async_validate_egress_endpoint
 # Same masking convention store.py persists with and controller.py logs
 # with -- see _extract_error_body below (#138).
 from .store import mask_secret_in_payload, mask_secret_in_string
@@ -130,7 +130,7 @@ class LiveRegEngineClient:
         # docstring. This is the enforcement point: the check has to sit
         # immediately before the request, where the address it resolves is
         # the address actually dialed.
-        validate_egress_endpoint(config.delivery.endpoint)
+        await async_validate_egress_endpoint(config.delivery.endpoint)
 
         idempotency_key = idempotency_key or uuid.uuid4().hex
         # Serialize the body exactly once so the bytes we sign are the same
@@ -217,7 +217,7 @@ class LiveRegEngineClient:
         # the address checked is the address dialed. The caller (the /test
         # route) turns a raised EgressBlockedError into a clean 4xx rather
         # than letting it become an unhandled 500.
-        validate_egress_endpoint(config.delivery.endpoint)
+        await async_validate_egress_endpoint(config.delivery.endpoint)
 
         probe_url = f"{parsed.scheme}://{parsed.netloc}/api/v1/webhooks/recent"
         headers = {
