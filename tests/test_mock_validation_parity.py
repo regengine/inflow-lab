@@ -467,3 +467,48 @@ def test_configurable_max_event_age_days_shortens_replay_window() -> None:
         IngestPayload(source="cfg-age", events=[_harvest_event_at(clock_state["now"] - timedelta(days=8), lot="TLC-AGE-8D-2")])
     )
     assert resp_default_8.accepted == 1
+
+
+def test_bypass_window_counts_out_of_window_events_without_rejecting() -> None:
+    """#217: when enforce_event_age_window=False, events outside the window
+    are accepted but counted in out_of_window_events for visibility."""
+    clock_state = {"now": datetime(2026, 6, 1, tzinfo=UTC)}
+    service = MockRegEngineService(
+        clock=lambda: clock_state["now"],
+        enforce_event_age_window=False,
+    )
+    stale_event = _harvest_event_at(
+        clock_state["now"] - timedelta(days=MAX_EVENT_AGE_DAYS + 5), lot="TLC-BYPASS-STALE"
+    )
+    fresh_event = _harvest_event_at(clock_state["now"] - timedelta(days=1), lot="TLC-BYPASS-FRESH")
+    payload = IngestPayload(source="bypass-test", events=[stale_event, fresh_event])
+
+    response = service.ingest(payload)
+
+    assert response.accepted == 2
+    assert response.rejected == 0
+    assert response.out_of_window_events == 1
+    assert response.event_age_window_mode == "bypassed"
+    assert response.event_age_window_days == MAX_EVENT_AGE_DAYS
+
+
+def test_enforced_window_sets_mode_and_zero_bypass_count() -> None:
+    """#217: when enforced, out_of_window_events is 0 and mode is 'enforced'."""
+    clock_state = {"now": datetime(2026, 6, 1, tzinfo=UTC)}
+    service = MockRegEngineService(
+        clock=lambda: clock_state["now"],
+        enforce_event_age_window=True,
+    )
+    stale_event = _harvest_event_at(
+        clock_state["now"] - timedelta(days=MAX_EVENT_AGE_DAYS + 5), lot="TLC-ENF-STALE"
+    )
+    fresh_event = _harvest_event_at(clock_state["now"] - timedelta(days=1), lot="TLC-ENF-FRESH")
+    payload = IngestPayload(source="enforced-test", events=[stale_event, fresh_event])
+
+    response = service.ingest(payload)
+
+    assert response.accepted == 1
+    assert response.rejected == 1
+    assert response.out_of_window_events == 0
+    assert response.event_age_window_mode == "enforced"
+    assert response.event_age_window_days == MAX_EVENT_AGE_DAYS

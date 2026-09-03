@@ -9,8 +9,12 @@ from datetime import UTC, datetime, timedelta
 from typing import Any, Callable, NamedTuple
 from uuid import uuid4
 
+import logging
+
 from .cte_rules import REQUIRED_KDES
 from .regengine_client import WEBHOOK_HMAC_SECRET_ENV
+
+logger = logging.getLogger("inflow_lab")
 from .schemas.domain import DestinationMode, RegEngineEvent
 from .schemas.ingestion import IngestPayload, IngestResponseEvent, MockIngestResponse
 from .store import EventStore
@@ -302,9 +306,14 @@ class MockRegEngineService:
         response_events: list[IngestResponseEvent] = []
         accepted = 0
         rejected = 0
+        out_of_window_events = 0
         seen_batch_keys: set[str] = set()
         for event in payload.events:
             errors = _handler_level_errors(event, now=age_check_now, max_age_days=self.max_event_age_days)
+            if not self._enforce_event_age_window:
+                age_errors = _handler_level_errors(event, now=now, max_age_days=self.max_event_age_days)
+                if any("replay window exceeded" in e for e in age_errors):
+                    out_of_window_events += 1
             batch_key = "|".join(
                 (
                     event.cte_type.value,
@@ -345,12 +354,23 @@ class MockRegEngineService:
                 )
             )
 
+        window_mode = "enforced" if self._enforce_event_age_window else "bypassed"
+        if out_of_window_events and not self._enforce_event_age_window:
+            logger.warning(
+                "mock ingest bypassed %d event(s) outside the %d-day replay window "
+                "(enforce_event_age_window=False); live RegEngine would reject them",
+                out_of_window_events,
+                self.max_event_age_days,
+            )
         response = MockIngestResponse(
             accepted=accepted,
             rejected=rejected,
             total=accepted + rejected,
             events=response_events,
             ingestion_timestamp=now,
+            out_of_window_events=out_of_window_events,
+            event_age_window_mode=window_mode,
+            event_age_window_days=self.max_event_age_days,
         )
         if idempotency_key:
             self._idempotency_cache[idempotency_key] = _CachedIdempotencyEntry(

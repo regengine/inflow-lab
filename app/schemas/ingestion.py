@@ -46,6 +46,9 @@ class MockIngestResponse(BaseModel):
     total: int
     events: list[IngestResponseEvent]
     ingestion_timestamp: datetime
+    out_of_window_events: int = 0
+    event_age_window_mode: Literal["enforced", "bypassed"] | None = None
+    event_age_window_days: int | None = None
 
 
 class DeliveryRetryRequest(BaseModel):

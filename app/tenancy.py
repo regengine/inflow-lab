@@ -41,7 +41,23 @@ TENANT_DATA_ROOT = DATA_ROOT / "tenants"
 # the operator cleanup routes that could otherwise reclaim capacity require
 # Basic Auth and are unreachable on exactly the deployments most at risk.
 # Freeing a slot needs an operator reset/delete, or a process restart.
-MAX_TENANT_CONTROLLERS = int(os.getenv("REGENGINE_MAX_TENANT_CONTROLLERS", "50"))
+def _parse_tenant_cap() -> int:
+    raw = os.getenv("REGENGINE_MAX_TENANT_CONTROLLERS", "50")
+    try:
+        value = int(raw)
+        if value < 1:
+            raise ValueError
+        return value
+    except (ValueError, TypeError):
+        logger.warning(
+            "REGENGINE_MAX_TENANT_CONTROLLERS=%r is not a valid positive integer; "
+            "falling back to default (50)",
+            raw,
+        )
+        return 50
+
+
+MAX_TENANT_CONTROLLERS = _parse_tenant_cap()
 
 engine = LegitFlowEngine(seed=204)
 store = EventStore(persist_path=str(DATA_ROOT / "events.jsonl"))
@@ -106,10 +122,7 @@ def get_tenant_controller_for_id(tenant_id: str) -> SimulationController:
         if existing_controller is not None:
             return existing_controller
 
-        if len(_tenant_controllers) >= MAX_TENANT_CONTROLLERS:
-            # #174: refuse rather than grow once the cap is hit. An
-            # operator (Basic Auth required) can always make room via
-            # reset/delete on an existing tenant.
+        if _total_tenant_count() >= MAX_TENANT_CONTROLLERS:
             raise HTTPException(
                 status_code=429,
                 detail=(
@@ -150,6 +163,25 @@ def operator_tenant_id(raw_tenant_id: str) -> str:
     if tenant_id == DEFAULT_TENANT_ID:
         raise HTTPException(status_code=400, detail="Default local tenant cannot be managed here")
     return tenant_id
+
+
+def _total_tenant_count() -> int:
+    """Count all known tenants (in-memory + on-disk), for the cap check.
+
+    Must be called under _tenant_lock. Enumerates the tenant directory so
+    the cap holds across restarts: on-disk directories created before a
+    restart still count against the limit even though they have no
+    in-memory controller yet (#217).
+    """
+    ids: set[str] = set(_tenant_controllers.keys())
+    if TENANT_DATA_ROOT.exists():
+        for path in TENANT_DATA_ROOT.iterdir():
+            if path.is_dir():
+                try:
+                    ids.add(normalize_tenant_id(path.name))
+                except ValueError:
+                    continue
+    return len(ids)
 
 
 def known_tenant_ids() -> list[str]:
