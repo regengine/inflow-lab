@@ -22,11 +22,18 @@ class AuthInfoResponse(BaseModel):
     uses_default_storage: bool
 
 
+class StoreProbeResponse(BaseModel):
+    ok: bool
+    persist_path: str
+    error: str | None = None
+
+
 class HealthzResponse(BaseModel):
     ok: bool
     utc_time: str
     build: BuildInfoResponse
     contract_version: str
+    store: StoreProbeResponse
 
 
 class HealthResponse(HealthzResponse):

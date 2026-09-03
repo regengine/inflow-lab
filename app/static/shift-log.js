@@ -6,6 +6,7 @@ import { ids, state } from './dom.js';
 import { escapeHtml } from './format.js';
 import { deliveryTone } from './labels.js';
 import { activeScenarioSummary, recordWarnings } from './audit.js';
+import { lookupLineage } from './lineage.js';
 
 // The console must never make an operator read prose to learn whether a gap
 // would fail live ingest, so the severity is stamped on the front of the text.
@@ -13,7 +14,25 @@ function severityPrefix(warning) {
   return warning.severity === 'required' ? 'Required: ' : 'Recommended: ';
 }
 
+let lotClickBound = false;
+
+function bindLotLookupClick() {
+  if (lotClickBound || !ids.eventsBody) {
+    return;
+  }
+  ids.eventsBody.addEventListener('click', (event) => {
+    const button = event.target.closest('[data-lot]');
+    if (!button || !ids.eventsBody.contains(button)) {
+      return;
+    }
+    ids.lotLookup.value = button.dataset.lot || '';
+    lookupLineage();
+  });
+  lotClickBound = true;
+}
+
 export function renderEvents(events) {
+  bindLotLookupClick();
   const summary = activeScenarioSummary();
   const body = ids.eventsBody;
   if (!events.length) {
