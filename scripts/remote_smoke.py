@@ -364,10 +364,10 @@ def assert_build_info(config: RemoteSmokeConfig, build: Any) -> dict[str, Any]:
     if not isinstance(build, dict):
         raise RemoteSmokeFailure("healthz build: expected build metadata object")
     assert_equal(build.get("version"), APP_VERSION, "healthz build version")
-    for field in ("commit_sha", "commit_sha_short", "branch", "deployment_id"):
-        value = build.get(field)
+    for build_field in ("commit_sha", "commit_sha_short", "branch", "deployment_id"):
+        value = build.get(build_field)
         if value is not None and not isinstance(value, str):
-            raise RemoteSmokeFailure(f"healthz build {field}: expected string or null")
+            raise RemoteSmokeFailure(f"healthz build {build_field}: expected string or null")
     return build
 
 

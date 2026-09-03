@@ -184,6 +184,8 @@ def run_live_trial(
         # other exception (e.g. a dropped connection mid-batch), or a
         # KeyboardInterrupt -- because they live in this `finally`, not
         # after a `return` on the happy path (#105).
+        if owns_client:
+            client.close()
         stop_simulation(client, config)
         if confirm_live:
             # Only --confirm-live can arm live delivery, so only that path
