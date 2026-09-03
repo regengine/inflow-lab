@@ -8,8 +8,26 @@ from pydantic import BaseModel, ConfigDict, Field, field_validator
 from .domain import CSVImportType, CTEType, DestinationMode, RegEngineEvent
 from .simulation import STRICT_REQUEST, DeliveryConfig
 
+# RegEngine's per-batch cap. Owned here rather than in `mock_service` so the
+# schema can enforce it before pydantic materialises the list; the service
+# re-exports it and still checks it for direct callers.
+MAX_BATCH_EVENTS = 500
+
 
 class IngestPayload(BaseModel):
+<<<<<<< HEAD
+    # Deliberately NOT extra="forbid". This is the RegEngine wire contract, not
+    # one of this app's own control-plane bodies: RegEngine's own IngestEvent
+    # sets no model_config and so ignores unknown keys. Forbidding them here
+    # would make the mock reject batches live ingest accepts, which is the
+    # parity gap this simulator exists to close, pointing the wrong way.
+    source: str = "codex-simulator"
+    # Capped at the same 500 the service enforces, but here -- before pydantic
+    # materialises every model. The service-layer check ran after, so a 400k
+    # event batch allocated ~1.3 GB and only then raised. Matching the live
+    # limit keeps the parity honest rather than making the mock stricter.
+    events: list[RegEngineEvent] = Field(max_length=MAX_BATCH_EVENTS)
+=======
     # Deliberately NOT strict: this is the mock stand-in for RegEngine's own
     # webhook receiver, and a receiver that 422s on an additive field a
     # newer producer sends would misrepresent live behaviour.
@@ -26,6 +44,7 @@ class IngestPayload(BaseModel):
     # Producers are already bounded: every bulk send goes through
     # `delivery.chunk_events`, which chunks at MAX_BATCH_EVENTS (#103).
     events: list[RegEngineEvent]
+>>>>>>> origin/main
 
 
 class IngestResponseEvent(BaseModel):
@@ -100,6 +119,16 @@ class ReplayResponse(BaseModel):
     error: str | None = None
 
 
+<<<<<<< HEAD
+# The importer parses the whole document into memory and turns every row into
+# a record, with no row cap of its own, so an unbounded `csv_text` is an
+# unbounded allocation. 2 MiB is roughly 13k rows at typical CTE row widths --
+# far more than any demo import -- and rejects as a 422 rather than dying in
+# the handler. Note this bounds what is *parsed*, not what is *received*:
+# the ASGI server still buffers the request body first, so a hard byte limit
+# belongs in front of the app.
+MAX_CSV_TEXT_CHARS = 2 * 1024 * 1024
+=======
 # Upper bound on a single CSV import body, in characters.
 #
 # `parse_csv_import` is CPU-bound and runs synchronously on the app's single
@@ -112,13 +141,18 @@ class ReplayResponse(BaseModel):
 # real demo or design-partner import, and far below a body that would stall
 # the loop noticeably.
 MAX_CSV_IMPORT_CHARS = 4 * 1024 * 1024
+>>>>>>> origin/main
 
 
 class CSVImportRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     import_type: CSVImportType
+<<<<<<< HEAD
+    csv_text: str = Field(max_length=MAX_CSV_TEXT_CHARS)
+=======
     csv_text: str = Field(max_length=MAX_CSV_IMPORT_CHARS)
+>>>>>>> origin/main
     source: str | None = None
     delivery: DeliveryConfig | None = None
 

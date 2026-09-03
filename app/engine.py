@@ -1,16 +1,19 @@
 from __future__ import annotations
 
-import random
+import logging
 import os
+<<<<<<< HEAD
+import random
+=======
 from collections import deque
 from copy import deepcopy
+>>>>>>> origin/main
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 from itertools import count
 from typing import Any
 
 from .industry_adapters import get_industry_adapter
-from .schemas.domain import CTEType, OperationScale, RegEngineEvent
 from .scenarios import (
     SCALE_QUANTITY_MULTIPLIER,
     Location,
@@ -19,7 +22,9 @@ from .scenarios import (
     get_scenario,
     scale_scenario,
 )
+from .schemas.domain import CTEType, OperationScale, RegEngineEvent
 
+logger = logging.getLogger(__name__)
 
 DEFAULT_MAX_FUTURE_HOURS = 20
 # How far behind wall-clock time the simulated clock starts. The simulated
@@ -55,6 +60,18 @@ def sscc_from_base(base: str) -> str:
     if len(base) != 17 or not base.isdigit():
         raise ValueError(f"SSCC base must be 17 digits, got {base!r}")
     return f"{base}{gs1_check_digit(base)}"
+
+# How far behind real time the simulated clock starts. Together with
+# DEFAULT_MAX_FUTURE_HOURS this is the width of the window every generated
+# timestamp has to fit inside, and therefore how many hours-apart events a run
+# can produce before it has to start packing them closer together. The default
+# is unchanged; it is configurable so a long demo can be given room without
+# editing code. See `_advance_time`.
+DEFAULT_LOOKBACK_HOURS = 12
+
+# Floor on a single advance of the simulated clock, so two events generated
+# inside the same clock tick still get distinct, ordered timestamps.
+_MIN_TIME_STEP = timedelta(microseconds=1)
 
 
 @dataclass(slots=True)
@@ -115,8 +132,13 @@ class LegitFlowEngine:
         self.rng = random.Random(seed if seed is not None else self._initial_seed)  # nosec B311
         self._lot_counter = count(1)
         self._ref_counter = count(1)
+<<<<<<< HEAD
+        self._time_cursor = datetime.now(UTC) - timedelta(hours=_lookback_hours())
+        self._window_saturated = False
+=======
         self._time_cursor = datetime.now(UTC) - timedelta(hours=_history_hours())
         self._pending_events: deque[tuple[RegEngineEvent, list[str]]] = deque()
+>>>>>>> origin/main
         self.scale = OperationScale(scale or self._initial_scale)
         self.quantity_multiplier = SCALE_QUANTITY_MULTIPLIER[self.scale]
         self.scenario = scale_scenario(get_scenario(scenario or self._initial_scenario), self.scale)
@@ -591,6 +613,58 @@ class LegitFlowEngine:
         return reference_number or reference_type or ""
 
     def _advance_time(self, min_minutes: int, max_minutes: int) -> datetime:
+<<<<<<< HEAD
+        """Advance the simulated clock, keeping events inside the live window.
+
+        The cursor starts 12h behind real time and each event pushes it forward
+        by 10-240 simulated minutes, while the ceiling only creeps forward at
+        real time. A default-config run therefore fills the window within about
+        the first minute.
+
+        What used to happen at that point was that the *cursor* got clamped to
+        the ceiling. Every later call then added minutes and clamped straight
+        back down to a ceiling that had itself moved by a fraction of a second,
+        so consecutive event timestamps landed tens of microseconds apart
+        instead of hours -- measured at ~3e-05s per gap after ~30 events.
+
+        So cap the *step* instead, and never the cursor. Gaps do shrink as the
+        window fills, which is unavoidable: a window of bounded width cannot
+        hold an unbounded number of hours-apart events, and once it is full the
+        only room left is whatever real time has added since the last event. But
+        the sequence stays strictly increasing rather than piling onto one
+        instant, so lineage keeps a usable chronology and exports keep a stable
+        order.
+
+        How long a run keeps its full hours-apart spacing is therefore a
+        property of the window's width, not of this function:
+        `REGENGINE_SIM_LOOKBACK_HOURS` (default 12) sets how far back it starts
+        and `REGENGINE_SIM_MAX_FUTURE_HOURS` (default 20) how far forward it may
+        reach. At the default 32h and an average 125-minute gap that is roughly
+        15 events; widen the lookback to give a longer demo room to stay
+        realistic all the way through.
+        """
+        live_window_ceiling = datetime.now(UTC) + timedelta(hours=_max_future_hours())
+        step = timedelta(minutes=self.rng.randint(min_minutes, max_minutes))
+        headroom = live_window_ceiling - self._time_cursor
+        if step > headroom:
+            if not self._window_saturated:
+                self._window_saturated = True
+                logger.warning(
+                    "Simulated-time window is full (lookback=%sh, max_future=%sh); "
+                    "event timestamps from here on are spaced by elapsed real time "
+                    "rather than the scenario's own intervals. Raise "
+                    "REGENGINE_SIM_LOOKBACK_HOURS to keep a longer run realistic.",
+                    _lookback_hours(),
+                    _max_future_hours(),
+                )
+            # `_MIN_TIME_STEP` only applies when the window is full *and* the
+            # clock has not ticked since the last event -- the case that used to
+            # produce two events on the same instant exactly. It keeps them
+            # distinct and ordered; the overshoot it can cause is a microsecond
+            # per event, against hours of slack between this ceiling and the
+            # point live ingest starts rejecting future-dated events.
+            step = max(headroom, _MIN_TIME_STEP)
+=======
         # Draw the step unconditionally so the RNG stream stays deterministic
         # regardless of how close the cursor is to the live-window ceiling.
         step = timedelta(minutes=self.rng.randint(min_minutes, max_minutes))
@@ -601,6 +675,7 @@ class LegitFlowEngine:
             # onto the same instant. The cursor still always moves forward.
             headroom = live_window_ceiling - self._time_cursor
             step = headroom if headroom > MIN_TIME_ADVANCE else MIN_TIME_ADVANCE
+>>>>>>> origin/main
         self._time_cursor += step
         return self._time_cursor
 
@@ -679,6 +754,14 @@ class LegitFlowEngine:
 
     def _plu_code(self) -> str:
         return f"{self.rng.randint(3000, 4999)}"
+
+
+def _lookback_hours() -> int:
+    try:
+        hours = int(os.getenv("REGENGINE_SIM_LOOKBACK_HOURS", str(DEFAULT_LOOKBACK_HOURS)))
+    except ValueError:
+        return DEFAULT_LOOKBACK_HOURS
+    return hours if hours > 0 else DEFAULT_LOOKBACK_HOURS
 
 
 def _max_future_hours() -> int:

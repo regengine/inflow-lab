@@ -1,10 +1,18 @@
 from __future__ import annotations
 
+<<<<<<< HEAD
+from pydantic import BaseModel, ConfigDict, Field
+=======
 from pydantic import BaseModel, ConfigDict, Field, HttpUrl
+>>>>>>> origin/main
 
 from ..regengine_client import DEFAULT_LIVE_INGEST_ENDPOINT
 from .domain import DestinationMode
+<<<<<<< HEAD
+from .simulation import GuardedEndpoint, MockFrictionCode
+=======
 from .simulation import STRICT_REQUEST, MockFrictionCode
+>>>>>>> origin/main
 
 
 class IntegrationStatusResponse(BaseModel):
@@ -33,7 +41,7 @@ class IntegrationConfigureRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     mode: DestinationMode | None = None
-    endpoint: HttpUrl | None = None
+    endpoint: GuardedEndpoint | None = None
     api_key: str | None = None
     tenant_id: str | None = None
     mock_friction: list[MockFrictionCode] | None = None
@@ -44,7 +52,11 @@ class ConnectionTestRequest(BaseModel):
 
     model_config = ConfigDict(extra="forbid")
 
+<<<<<<< HEAD
+    endpoint: GuardedEndpoint | None = None
+=======
     endpoint: HttpUrl | None = None
+>>>>>>> origin/main
     api_key: str | None = None
     tenant_id: str | None = None
 

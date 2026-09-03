@@ -12,7 +12,6 @@ from .cors import cors_origins_for_app
 from .dependencies import get_tenant_context
 from .tenancy import active_controller_for_context
 
-
 UNSAFE_METHODS = {"POST", "PUT", "PATCH", "DELETE"}
 REQUEST_LOGGER = logging.getLogger("regengine.request")
 

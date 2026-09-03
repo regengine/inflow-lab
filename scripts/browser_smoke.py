@@ -6,11 +6,12 @@ import subprocess  # nosec B404
 import sys
 import tempfile
 import time
+from collections.abc import Iterator
 from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
-from typing import Iterator
+from typing import Any
 
 import httpx
 
@@ -24,6 +25,11 @@ if str(REPO_ROOT) not in sys.path:
 from app.build_info import APP_VERSION  # noqa: E402
 from scripts import _smoke_common as smoke  # noqa: E402
 
+<<<<<<< HEAD
+CSV_WITH_KDE_WARNINGS = """cte_type,traceability_lot_code,product_description,quantity,unit_of_measure,location_name,timestamp,kdes
+harvesting,TLC-BROWSER-WARN,Romaine Lettuce,10,cases,Valley Fresh Farms,2026-02-10T08:00:00Z,"{""harvest_date"":""2026-02-10""}"
+"""
+=======
 
 # Basic Auth credential sources, most specific first. Each entry is a *pair*:
 # a username and a password are only ever used together with the partner they
@@ -57,6 +63,7 @@ def import_csv_with_kde_warnings(now: datetime | None = None) -> str:
         f"harvesting,TLC-BROWSER-WARN,Romaine Lettuce,10,cases,Valley Fresh Farms,"
         f'{timestamp},"{{""harvest_date"":""{harvest_date}""}}"\n'
     )
+>>>>>>> origin/main
 
 
 @dataclass(frozen=True, slots=True)
@@ -170,7 +177,7 @@ def _run_dashboard_smoke(base_url: str, config: BrowserSmokeConfig) -> None:
     failed = False
     try:
         with sync_playwright() as playwright:
-            launch_options: dict[str, object] = {"headless": config.headless}
+            launch_options: dict[str, Any] = {"headless": config.headless}
             if config.executable_path:
                 launch_options["executable_path"] = config.executable_path
             browser = playwright.chromium.launch(**launch_options)
@@ -271,6 +278,40 @@ def _run_dashboard_smoke(base_url: str, config: BrowserSmokeConfig) -> None:
             page.locator("#lotLookup").press("Enter")
             expect(page.locator("#statusMessage")).to_contain_text("Loaded lineage for TLC-DEMO-FC-OUT-001")
 
+            # A failing Refresh must surface in the status line rather than
+            # escaping the click handler as an unhandled rejection (#152).
+            # refresh() is the one bound handler with no try/catch of its own.
+            rejections: list[str] = []
+            console_errors_before = len(console_errors)
+            page.expose_function("__recordRejection", lambda reason: rejections.append(str(reason)))
+            page.evaluate(
+                "window.addEventListener('unhandledrejection',"
+                " (event) => window.__recordRejection(String(event.reason)))"
+            )
+            page.route(
+                "**/api/simulate/status",
+                lambda route: route.fulfill(status=500, body='{"detail":"forced failure"}'),
+            )
+            try:
+                page.locator("#refreshBtn").click()
+                expect(page.locator("#statusMessage")).to_have_attribute("data-tone", "error")
+                expect(page.locator("#statusMessage")).not_to_have_text("Ready.")
+                # The button must not be left stuck in its busy state either.
+                expect(page.locator("#refreshBtn")).to_be_enabled()
+            finally:
+                page.unroute("**/api/simulate/status")
+            page.wait_for_timeout(250)
+            if rejections:
+                raise RuntimeError(f"Refresh failure produced unhandled rejections: {rejections}")
+            # The 500 we injected surfaces as a console error. Drop exactly that
+            # one so the end-of-run console-error gate still catches everything
+            # else, including any error this step did not ask for.
+            injected = console_errors[console_errors_before:]
+            del console_errors[console_errors_before:]
+            unexpected = [text for text in injected if "500 (Internal Server Error)" not in text]
+            if unexpected:
+                raise RuntimeError(f"Unexpected console errors during refresh check: {unexpected}")
+
             browser.close()
     except Exception:
         failed = True
@@ -286,8 +327,8 @@ def _run_dashboard_smoke(base_url: str, config: BrowserSmokeConfig) -> None:
             raise RuntimeError(f"Browser console errors: {console_errors}")
 
 
-def _browser_context_options(config: BrowserSmokeConfig) -> dict[str, object]:
-    options: dict[str, object] = {}
+def _browser_context_options(config: BrowserSmokeConfig) -> dict[str, Any]:
+    options: dict[str, Any] = {}
     if config.username and config.password:
         options["http_credentials"] = {
             "username": config.username,
@@ -374,4 +415,4 @@ if __name__ == "__main__":
         raise SystemExit(main())
     except Exception as exc:
         print(f"Browser smoke failed: {exc}", file=sys.stderr)
-        raise SystemExit(1)
+        raise SystemExit(1) from exc

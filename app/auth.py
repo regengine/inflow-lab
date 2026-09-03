@@ -9,7 +9,6 @@ from dataclasses import dataclass
 from fastapi import Request
 from fastapi.responses import JSONResponse
 
-
 DEFAULT_TENANT_ID = "local-demo"
 # Deployment signal: when truthy, the app refuses to start without Basic Auth.
 # The container image sets it, so a shared/remote deploy that forgets the auth
@@ -101,12 +100,33 @@ def tenant_context_from_request(request: Request) -> TenantContext | JSONRespons
             return _unauthorized_response()
 
         supplied_username, supplied_password = credentials
+<<<<<<< HEAD
+        # Compare bytes, and compare both halves before combining.
+        #
+        # `secrets.compare_digest` on `str` raises TypeError unless both sides
+        # are ASCII-only, so a non-ASCII username or password -- which any
+        # unauthenticated caller can send -- turned a 401 into an unhandled
+        # HTTP 500. Encoding first makes every credential comparable.
+        #
+        # Binding both results before `and` also removes the short-circuit
+        # (#89): `A and B` skipped the password comparison entirely whenever
+        # the username was wrong, so the response time distinguished a valid
+        # username from an invalid one.
+        username_ok = secrets.compare_digest(
+            supplied_username.encode("utf-8"), (config.username or "").encode("utf-8")
+        )
+        password_ok = secrets.compare_digest(
+            supplied_password.encode("utf-8"), (config.password or "").encode("utf-8")
+        )
+        if not (username_ok and password_ok):
+=======
         # Both comparisons must always run: `and` short-circuits, which would
         # skip the password comparison on a username miss and leak username
         # validity through response timing. Evaluate first, combine with `&`.
         username_ok = secrets.compare_digest(supplied_username, config.username or "")
         password_ok = secrets.compare_digest(supplied_password, config.password or "")
         if not (username_ok & password_ok):
+>>>>>>> origin/main
             return _unauthorized_response()
         username = supplied_username
 

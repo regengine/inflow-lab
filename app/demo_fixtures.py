@@ -31,9 +31,13 @@ import re
 from dataclasses import dataclass
 from datetime import UTC, date, datetime, timedelta
 
+<<<<<<< HEAD
+=======
 from .engine import SSCC_COMPANY_PREFIX, _history_hours, sscc_from_base
 from .schemas.domain import CTEType, DemoFixtureId, RegEngineEvent
+>>>>>>> origin/main
 from .scenarios import ScenarioId
+from .schemas.domain import CTEType, DemoFixtureId, RegEngineEvent
 
 #: The calendar the fixture bodies below are authored against. The oldest
 #: fixture event is ``FIXTURE_BASE_DATE`` at 08:00Z; everything else is

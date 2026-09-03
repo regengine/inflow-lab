@@ -2,16 +2,23 @@ from __future__ import annotations
 
 import json
 import logging
+<<<<<<< HEAD
+from collections import Counter, deque
+from collections.abc import Iterable
+=======
 import os
 from collections import Counter, deque
 from datetime import datetime
 from itertools import islice
+>>>>>>> origin/main
 from pathlib import Path
 from threading import RLock
-from typing import Any, Iterable
+from typing import Any
 
 from .schemas.domain import LineageEdge, LineageNode, StoredEventRecord
 
+<<<<<<< HEAD
+=======
 
 logger = logging.getLogger(__name__)
 
@@ -23,6 +30,7 @@ logger = logging.getLogger(__name__)
 # absent from it (see #97).
 LINEAGE_PLACEHOLDER_DESCRIPTION = "Unknown lot (no stored record)"
 
+>>>>>>> origin/main
 # Sentinel that replaces secrets in scrubbed output. Not a credential.
 MASKED_SECRET = "***MASKED***"  # nosec B105
 SECRET_FIELD_NAMES = {"api_key", "apikey", "x_regengine_api_key", "authorization"}
@@ -50,6 +58,10 @@ def default_max_history() -> int:
         logger.warning("Ignoring non-positive %s=%r; using default %s", MAX_HISTORY_ENV, raw_limit, DEFAULT_MAX_HISTORY)
         return DEFAULT_MAX_HISTORY
     return limit
+
+
+
+logger = logging.getLogger(__name__)
 
 
 def _scrub_secrets(value: Any) -> Any:
@@ -149,14 +161,25 @@ class EventStore:
         self._pending_archive: list[StoredEventRecord] = []
         self._counter = 0
         self._lock = RLock()
+<<<<<<< HEAD
+        # Parsed-log cache. `_all_records()` backs stats(), lineage(),
+        # all_between() and status(), and used to reparse the whole JSONL
+        # through Pydantic on every one of them -- once per /api/simulate/status
+        # poll. The cache is keyed on the file's (mtime_ns, size) so a write by
+        # any path, including one from outside this process, invalidates it.
+        self._records_cache: list[StoredEventRecord] | None = None
+        self._records_cache_key: tuple[int, int] | None = None
+=======
         # Lines the most recent read could not parse; see
         # ``read_persisted_records``.
         self.last_read_skipped = 0
+>>>>>>> origin/main
         self._load_from_disk()
 
     def configure(self, persist_path: str) -> None:
         with self._lock:
             self.persist_path = Path(persist_path)
+            self._invalidate_cache()
             self._load_from_disk()
 
     def _set_history(self, records: Iterable[StoredEventRecord]) -> None:
@@ -261,6 +284,7 @@ class EventStore:
             self._pending_archive.clear()
             self._persisted_count = 0
             self._counter = 0
+            self._invalidate_cache()
             if self.persist_path.exists():
                 self.persist_path.unlink()
             # The rotation archive is this store's own older records, so a
@@ -298,6 +322,26 @@ class EventStore:
             )
 
     def add_many(self, records: Iterable[StoredEventRecord]) -> list[StoredEventRecord]:
+<<<<<<< HEAD
+        stored: list[StoredEventRecord] = []
+        try:
+            with self._lock:
+                with self.persist_path.open("a", encoding="utf-8") as handle:
+                    for record in records:
+                        self._counter += 1
+                        record.sequence_no = self._counter
+                        self._records.appendleft(record)
+                        handle.write(json.dumps(_scrub_secrets(record.model_dump(mode="json"))) + "\n")
+                        stored.append(record)
+        except OSError as exc:
+            # A store that cannot write is the failure most likely to go
+            # unnoticed: the exception surfaces to one caller and nothing
+            # reaches the log stream at all. Verified against /dev/full, where
+            # this raised ENOSPC and emitted exactly zero log records.
+            logger.error("EventStore append failed: path=%s error=%s", self.persist_path, exc)
+            raise
+        return stored
+=======
         """Append records, exposing them in memory only once they are on disk.
 
         The in-memory deque and the sequence counter are the read path for
@@ -520,6 +564,7 @@ class EventStore:
             tmp_path.unlink(missing_ok=True)
             raise
         self._fsync_dir()
+>>>>>>> origin/main
 
     def update_many(self, records: Iterable[StoredEventRecord]) -> list[StoredEventRecord]:
         replacements = {record.record_id: record for record in records}
@@ -538,16 +583,28 @@ class EventStore:
                     updated_records.append(record)
 
             persisted_records = sorted(updated_records, key=lambda record: record.sequence_no)
+<<<<<<< HEAD
+            self._rewrite(persisted_records, operation="update_many")
+            self._counter = max((record.sequence_no for record in persisted_records), default=0)
+=======
             self._rewrite_persisted(persisted_records)
             self._commit_rewrite(persisted_records)
+>>>>>>> origin/main
 
         return [record for record in updated_records if record.record_id in replacements]
 
     def replace_all(self, records: Iterable[StoredEventRecord]) -> list[StoredEventRecord]:
-        persisted_records = sorted(list(records), key=lambda record: record.sequence_no)
+        persisted_records = sorted(records, key=lambda record: record.sequence_no)
         with self._lock:
+<<<<<<< HEAD
+            self.persist_path.parent.mkdir(parents=True, exist_ok=True)
+            self._rewrite(persisted_records, operation="replace_all")
+            self._set_records(persisted_records)
+            self._counter = max((record.sequence_no for record in persisted_records), default=0)
+=======
             self._rewrite_persisted(persisted_records)
             self._commit_rewrite(persisted_records)
+>>>>>>> origin/main
         return persisted_records
 
     def recent(self, limit: int = 100) -> list[StoredEventRecord]:
@@ -563,10 +620,19 @@ class EventStore:
         record_ids: list[str] | None = None,
         limit: int = 50,
     ) -> list[StoredEventRecord]:
+<<<<<<< HEAD
+        # `None` means "no filter, retry everything"; an explicit empty list
+        # means "these zero records", which is nothing. `set(record_ids or [])`
+        # collapsed the two, so a direct caller passing [] got every failed
+        # record back. The caller-visible half of this was fixed in the
+        # controller (#144); this is the same bug one layer down, which #211
+        # notes was left behind.
+=======
         # `record_ids is None` (filter omitted) and `record_ids == []`
         # (filter naming zero records) are different requests. Testing
         # truthiness conflates them and turns an explicitly empty selection
         # into "retry everything".
+>>>>>>> origin/main
         record_id_filter = None if record_ids is None else set(record_ids)
         if record_id_filter is not None and not record_id_filter:
             return []
@@ -779,7 +845,67 @@ class EventStore:
             filtered.append(record)
         return sorted(filtered, key=lambda record: record.event.timestamp)
 
+    def _rewrite(self, persisted_records: list[StoredEventRecord], operation: str) -> None:
+        """Rewrite the whole log through a temp file and an atomic rename.
+
+        Shared by `update_many` and `replace_all`, which had the same body
+        inline. A failure here loses the rewrite rather than one append, so it
+        logs before propagating, and a temp file left behind by a partial write
+        is cleaned up rather than accumulating beside the log.
+        """
+        tmp_path = self.persist_path.with_suffix(f"{self.persist_path.suffix}.tmp")
+        try:
+            with tmp_path.open("w", encoding="utf-8") as handle:
+                for record in persisted_records:
+                    handle.write(json.dumps(record.model_dump(mode="json")) + "\n")
+            tmp_path.replace(self.persist_path)
+        except OSError as exc:
+            logger.error(
+                "EventStore %s failed: path=%s records=%d error=%s",
+                operation,
+                self.persist_path,
+                len(persisted_records),
+                exc,
+            )
+            tmp_path.unlink(missing_ok=True)
+            raise
+
+    def _invalidate_cache(self) -> None:
+        self._records_cache = None
+        self._records_cache_key = None
+
+    def _persist_signature(self) -> tuple[int, int] | None:
+        try:
+            stat = self.persist_path.stat()
+        except OSError:
+            return None
+        return (stat.st_mtime_ns, stat.st_size)
+
     def _all_records(self) -> list[StoredEventRecord]:
+<<<<<<< HEAD
+        with self._lock:
+            signature = self._persist_signature()
+            if (
+                signature is not None
+                and self._records_cache is not None
+                and self._records_cache_key == signature
+            ):
+                return list(self._records_cache)
+
+            records = self.read_persisted_records()
+            if records:
+                ordered = sorted(records, key=lambda record: record.sequence_no)
+                # Re-read the signature after parsing: if the file changed while
+                # we were reading it, caching under the pre-read key would pin a
+                # torn view until the next write.
+                if signature is not None and self._persist_signature() == signature:
+                    self._records_cache = ordered
+                    self._records_cache_key = signature
+                return list(ordered)
+
+            self._invalidate_cache()
+            return sorted(self._records, key=lambda record: record.sequence_no)
+=======
         """Retained history, oldest first, without touching the disk.
 
         Every read path funnels through here. It used to re-read and
@@ -792,3 +918,4 @@ class EventStore:
         """
         with self._lock:
             return list(self._history)
+>>>>>>> origin/main

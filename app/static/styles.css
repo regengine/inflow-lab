@@ -811,6 +811,15 @@ th {
   color: var(--warning);
 }
 
+<<<<<<< HEAD
+/* A missing required KDE is a rule violation, not a nicety -- give it the
+   danger colour so it does not read as the same class of note as a missing
+   recommended one. */
+.status-warning[data-severity='required'],
+.lineage-warning[data-severity='required'] {
+  color: var(--danger);
+  font-weight: 600;
+=======
 /* A required-KDE gap would be rejected by live RegEngine ingest, so it reads
    as a blocker rather than sharing the advisory amber of a recommended one. */
 .status-blocker {
@@ -818,6 +827,7 @@ th {
   margin-top: 6px;
   font-weight: 600;
   color: var(--danger);
+>>>>>>> origin/main
 }
 
 tbody tr.has-audit-warning {

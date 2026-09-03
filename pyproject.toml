@@ -18,6 +18,8 @@ dev = [
   "pytest-asyncio>=0.23.0",
   "bandit>=1.7.10",
   "pip-audit>=2.7.0",
+  "ruff>=0.9.0",
+  "mypy>=1.14.0",
 ]
 browser = [
   "playwright>=1.58.0",
@@ -26,4 +28,52 @@ browser = [
 [tool.pytest.ini_options]
 pythonpath = ["."]
 testpaths = ["tests"]
+<<<<<<< HEAD
+
+[tool.ruff]
+target-version = "py311"
+line-length = 120
+src = ["."]
+
+[tool.ruff.lint]
+# Deliberately a starting set rather than everything ruff can do: the point of
+# #137 is to have a gate that fails on new problems, and a gate that arrives
+# alongside hundreds of pre-existing violations gets switched off.
+#   E,W  pycodestyle   F  pyflakes (undefined names, unused imports)
+#   I    import order  B  bugbear   UP  pyupgrade   C4  comprehensions
+select = ["E", "W", "F", "I", "B", "UP", "C4"]
+ignore = [
+  # Formatting-only; the repo has no formatter and this would be noise.
+  "E501",
+  # `x: T = Depends(...)` / `Query(...)` is FastAPI's documented idiom, and the
+  # whole router layer is written in it. The rule is right about plain Python
+  # and wrong here.
+  "B008",
+  # `class CTEType(str, Enum)` -> `StrEnum` is not behaviour-preserving:
+  # StrEnum's __str__ returns the value where Enum's returns "CTEType.X", and
+  # these types are interpolated into log lines, filenames and CSV cells. Worth
+  # doing deliberately, not as a lint fix.
+  "UP042",
+]
+
+[tool.ruff.lint.per-file-ignores]
+# Tests deliberately reach into private helpers and shadow names.
+"tests/*" = ["B011"]
+# Scripts bootstrap sys.path before importing `app`, so their imports cannot
+# all sit at the top of the file.
+"scripts/*" = ["E402"]
+
+[tool.mypy]
+python_version = "3.11"
+files = ["app", "scripts"]
+# Starting posture: catch real type errors in annotated code without demanding
+# the whole tree be annotated first. Tighten by removing these, not by adding
+# per-file ignores.
+ignore_missing_imports = true
+check_untyped_defs = true
+warn_unused_ignores = true
+warn_redundant_casts = true
+no_implicit_optional = true
+=======
 asyncio_mode = "auto"
+>>>>>>> origin/main

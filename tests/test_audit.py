@@ -3,7 +3,7 @@ from datetime import UTC, datetime
 from app.audit import audit_warnings_for_record
 from app.cte_rules import evaluate_audit_checks, merged_event_values, validate_event_kdes
 from app.scenarios import get_scenario
-from app.schemas.domain import CTEType, StoredEventRecord, RegEngineEvent
+from app.schemas.domain import CTEType, RegEngineEvent, StoredEventRecord
 
 
 def test_validate_event_kdes_uses_top_level_contract_fields():

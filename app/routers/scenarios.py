@@ -7,22 +7,21 @@ from ..auth import TenantContext
 from ..controller import SimulationController, request_with_stored_delivery_secrets
 from ..demo_fixtures import list_demo_fixture_summaries
 from ..dependencies import get_active_controller, get_tenant_context
+from ..scenarios import ScenarioId, list_scenario_summaries
 from ..schemas.domain import DemoFixtureId
 from ..schemas.scenarios import (
     DemoFixtureListResponse,
     DemoFixtureLoadRequest,
     DemoFixtureLoadResponse,
     DemoFixtureSummary,
-    ScenarioLoadResponse,
     ScenarioListResponse,
+    ScenarioLoadResponse,
     ScenarioSaveListResponse,
     ScenarioSaveRequest,
     ScenarioSaveResponse,
     ScenarioSaveSummary,
     ScenarioSummary,
 )
-from ..scenarios import ScenarioId, list_scenario_summaries
-
 
 router = APIRouter(prefix="/api", tags=["Scenarios"])
 

@@ -1,11 +1,11 @@
 from __future__ import annotations
 
+from collections.abc import Callable, Iterable
 from datetime import UTC, datetime
-from typing import Any, Callable, Iterable
+from typing import Any
 from urllib.parse import quote
 
 from .schemas.domain import CTEType, StoredEventRecord
-
 
 EPCIS_CONTEXT = "https://ref.gs1.org/standards/epcis/2.0.0/epcis-context.jsonld"
 REGENGINE_EPCIS_CONTEXT = {"regengine": "https://www.regengine.co/ns/epcis#"}
@@ -143,7 +143,11 @@ def _render_transformation_event(
         "inputQuantityList": [
             _quantity_element(
                 lot_code=lot_code,
+<<<<<<< HEAD
+                **_input_quantity_for(record, lot_code),
+=======
                 **input_details.get(lot_code, {}),
+>>>>>>> origin/main
             )
             for lot_code in _input_lot_codes(record)
         ],
@@ -195,6 +199,33 @@ def _quantity_element(
     return element
 
 
+<<<<<<< HEAD
+def _input_quantity_for(record: StoredEventRecord, lot_code: str) -> dict[str, Any]:
+    """The quantity consumed from one input lot, if the event recorded it.
+
+    Every input element used to render with no `quantity` at all, because the
+    quantity taken from each input lot was not captured anywhere upstream --
+    only an aggregate `yield_ratio`. The `input_quantities` KDE (21 CFR
+    1.1350(a)(6)) now carries it per lot, so the export can finally emit it.
+    Absent or malformed entries fall back to the previous shape rather than
+    guessing, and `validate_event_kdes` is what flags that as a gap.
+    """
+    entries = record.event.kdes.get("input_quantities")
+    if not isinstance(entries, list):
+        return {}
+    for entry in entries:
+        if not isinstance(entry, dict) or entry.get("lot_code") != lot_code:
+            continue
+        quantity = entry.get("quantity")
+        if not isinstance(quantity, (int, float)) or isinstance(quantity, bool):
+            return {}
+        unit_of_measure = entry.get("unit_of_measure")
+        return {
+            "quantity": quantity,
+            "unit_of_measure": unit_of_measure if isinstance(unit_of_measure, str) else None,
+        }
+    return {}
+=======
 def _input_lot_details(record: StoredEventRecord) -> dict[str, dict[str, Any]]:
     """Per-input-lot quantity/unit/product, keyed by traceability lot code.
 
@@ -245,6 +276,7 @@ def _input_lot_details(record: StoredEventRecord) -> dict[str, dict[str, Any]]:
             detail["product_description"] = product
 
     return details
+>>>>>>> origin/main
 
 
 def _input_lot_codes(record: StoredEventRecord) -> list[str]:

@@ -48,19 +48,24 @@ from typing import Any
 from urllib.parse import urlparse
 
 import httpx
+from pydantic import HttpUrl
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from app.engine import LegitFlowEngine  # noqa: E402
+<<<<<<< HEAD
+from app.regengine_client import LiveRegEngineClient, LiveRegEngineDeliveryError  # noqa: E402
+from app.scenarios import ScenarioId  # noqa: E402
+from app.schemas.domain import DestinationMode  # noqa: E402
+=======
 from app.regengine_client import (  # noqa: E402
     DEFAULT_LIVE_INGEST_ENDPOINT,
     LiveRegEngineClient,
     LiveRegEngineDeliveryError,
 )
+>>>>>>> origin/main
 from app.schemas.ingestion import IngestPayload  # noqa: E402
 from app.schemas.simulation import DeliveryConfig, SimulationConfig  # noqa: E402
-from app.scenarios import ScenarioId  # noqa: E402
-
 
 # The example URL in the usage text above is filled in from the single
 # Python definition of the default ingest endpoint, so the docs a user
@@ -322,8 +327,8 @@ def build_config(endpoint: str, api_key: str, tenant_id: str) -> SimulationConfi
         source=JOURNEY_SOURCE,
         scenario=ScenarioId.FRESH_CUT_PROCESSOR,
         delivery=DeliveryConfig(
-            mode="live",
-            endpoint=endpoint,
+            mode=DestinationMode.LIVE,
+            endpoint=HttpUrl(endpoint),
             api_key=api_key,
             tenant_id=tenant_id,
         ),
@@ -477,6 +482,12 @@ async def run_journey(args: argparse.Namespace) -> int:
             print("REGENGINE_ADMIN_KEY is required for --local (the stack's ADMIN_MASTER_KEY).")
             return 2
         batches, batch_size = args.batches, args.batch_size
+        # A local stack is exactly the case the egress guard's escape hatch
+        # exists for: the endpoint is loopback and over http by design, which
+        # the guard rejects by default to stop the API key being posted to an
+        # internal host. Opting in here keeps `--local` working without
+        # weakening the default for real deployments.
+        os.environ.setdefault("REGENGINE_ALLOW_PRIVATE_ENDPOINTS", "1")
 
     async with httpx.AsyncClient(timeout=30.0) as client:
         # 1. Reach RegEngine.

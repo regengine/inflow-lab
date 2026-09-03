@@ -1,9 +1,14 @@
 from collections import Counter
 
 from app.engine import LegitFlowEngine
+<<<<<<< HEAD
+from app.scenarios import ScenarioId, get_scenario, list_scenario_summaries
+from app.schemas.domain import CTEType
+=======
 from app.schemas.domain import CTEType
 from app.industry_adapters import IndustryAdapter, get_industry_adapter
 from app.scenarios import SCENARIO_PRESETS, ScenarioId, get_scenario, list_scenario_summaries
+>>>>>>> origin/main
 
 
 def event_signature(scenario: ScenarioId) -> list[tuple[str, str, str, tuple[str, ...]]]:

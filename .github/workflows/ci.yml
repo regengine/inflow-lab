@@ -93,6 +93,12 @@ jobs:
       - name: Install dependencies
         run: uv sync --frozen --group dev
 
+      - name: Lint (ruff)
+        run: uv run --frozen --group dev ruff check app scripts tests
+
+      - name: Type-check (mypy)
+        run: uv run --frozen --group dev mypy
+
       - name: Run tests
         run: uv run --frozen --group dev pytest
 
@@ -280,6 +286,27 @@ jobs:
       - name: Run browser smoke
         run: uv run --frozen --no-dev --group browser python scripts/browser_smoke.py
 
+<<<<<<< HEAD
+  console-lint:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v6
+
+      - name: Set up Node
+        uses: actions/setup-node@v4
+        with:
+          node-version-file: .nvmrc
+          cache: npm
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Lint the operator console
+        run: npm run lint
+=======
       # browser_smoke.py writes output/playwright/browser_smoke_failure.png on
       # any failure. Without this the screenshot dies with the runner and the
       # failure has to be reproduced locally to see what Playwright saw.
@@ -291,3 +318,4 @@ jobs:
           path: output/playwright/
           if-no-files-found: ignore
           retention-days: 7
+>>>>>>> origin/main

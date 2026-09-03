@@ -6,7 +6,6 @@ from ..controller import SimulationController, request_with_stored_delivery_secr
 from ..dependencies import get_active_controller
 from ..schemas.ingestion import CSVImportRequest, CSVImportResponse, DeliveryRetryRequest, DeliveryRetryResponse
 
-
 router = APIRouter(prefix="/api", tags=["Ingestion"])
 
 

@@ -2,7 +2,11 @@ from __future__ import annotations
 
 import os
 import sys
+<<<<<<< HEAD
+from collections.abc import Mapping
+=======
 from collections.abc import Mapping, Sequence
+>>>>>>> origin/main
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -17,7 +21,6 @@ if str(REPO_ROOT) not in sys.path:
 # works from a clean checkout; hence the E402 waivers.
 from app.build_info import APP_VERSION  # noqa: E402
 from scripts import _smoke_common as smoke  # noqa: E402
-
 
 DEFAULT_TENANT = "remote-smoke"
 # Hosts remote smoke is allowed to send the shared-demo Basic Auth secrets to.
@@ -84,8 +87,13 @@ def main() -> int:
     return 0
 
 
+<<<<<<< HEAD
+def config_from_env(environ: dict[str, str] | None = None) -> RemoteSmokeConfig:
+    resolved_environ: Mapping[str, str] = environ if environ is not None else os.environ
+=======
 def config_from_env(environ: Mapping[str, str] | None = None) -> RemoteSmokeConfig:
     env: Mapping[str, str] = environ if environ else os.environ
+>>>>>>> origin/main
     missing = [
         name
         for name in (
@@ -93,13 +101,31 @@ def config_from_env(environ: Mapping[str, str] | None = None) -> RemoteSmokeConf
             "REGENGINE_REMOTE_USERNAME",
             "REGENGINE_REMOTE_PASSWORD",
         )
+<<<<<<< HEAD
+        if not resolved_environ.get(name)
+=======
         if not env.get(name)
+>>>>>>> origin/main
     ]
     if missing:
         raise RemoteSmokeFailure(
             "Missing required environment variables: " + ", ".join(missing)
         )
 
+<<<<<<< HEAD
+    base_url = normalize_base_url(resolved_environ["REGENGINE_REMOTE_BASE_URL"])
+    return RemoteSmokeConfig(
+        base_url=base_url,
+        username=resolved_environ["REGENGINE_REMOTE_USERNAME"],
+        password=resolved_environ["REGENGINE_REMOTE_PASSWORD"],
+        tenant=resolved_environ.get("REGENGINE_REMOTE_TENANT") or DEFAULT_TENANT,
+        cors_origin=normalize_optional_origin(resolved_environ.get("REGENGINE_REMOTE_CORS_ORIGIN")),
+        untrusted_origin=normalize_optional_origin(
+            resolved_environ.get("REGENGINE_REMOTE_UNTRUSTED_ORIGIN")
+        )
+        or DEFAULT_UNTRUSTED_ORIGIN,
+        expected_build_sha=resolved_environ.get("REGENGINE_EXPECTED_BUILD_SHA") or None,
+=======
     base_url = normalize_base_url(
         env["REGENGINE_REMOTE_BASE_URL"],
         allowed_hosts=allowed_base_hosts(env),
@@ -115,6 +141,7 @@ def config_from_env(environ: Mapping[str, str] | None = None) -> RemoteSmokeConf
         )
         or DEFAULT_UNTRUSTED_ORIGIN,
         expected_build_sha=env.get("REGENGINE_EXPECTED_BUILD_SHA") or None,
+>>>>>>> origin/main
     )
 
 
@@ -370,7 +397,18 @@ def assert_in(member: Any, container: Any, label: str) -> None:
 
 
 def assert_build_info(config: RemoteSmokeConfig, build: Any) -> dict[str, Any]:
+<<<<<<< HEAD
+    if not isinstance(build, dict):
+        raise RemoteSmokeFailure("healthz build: expected build metadata object")
+    assert_equal(build.get("version"), APP_VERSION, "healthz build version")
+    for field_name in ("commit_sha", "commit_sha_short", "branch", "deployment_id"):
+        value = build.get(field_name)
+        if value is not None and not isinstance(value, str):
+            raise RemoteSmokeFailure(f"healthz build {field_name}: expected string or null")
+    return build
+=======
     return smoke.assert_build_info(build, APP_VERSION, failure=RemoteSmokeFailure)
+>>>>>>> origin/main
 
 
 def assert_build_sha(actual: Any, expected: str, label: str) -> None:

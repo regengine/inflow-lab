@@ -2,19 +2,26 @@ from __future__ import annotations
 
 import csv
 import io
+from collections.abc import Callable, Iterable
 from dataclasses import dataclass
+<<<<<<< HEAD
+=======
 from datetime import UTC
 from typing import Any, Callable, Iterable
+>>>>>>> origin/main
 
 from .cte_rules import merged_event_values
 from .schemas.domain import CTEType, FDAExportPreset, RegEngineEvent, StoredEventRecord
 
+<<<<<<< HEAD
+=======
 
 # The first eleven columns mirror RegEngine's documented FDA request export
 # shape and must keep their order. The trailing columns are additive and carry
 # the FSMA 204 KDEs the eleven-column shape has no home for: the second
 # location description Shipping/Receiving records each require, the
 # traceability lot code source reference, and the event's CTE.
+>>>>>>> origin/main
 FDA_EXPORT_COLUMNS = [
     "Traceability Lot Code",
     "Traceability Lot Code Description",
@@ -177,6 +184,20 @@ def apply_fda_export_preset(
     return sorted(filtered, key=lambda record: record.event.timestamp)
 
 
+# Excel, Google Sheets and LibreOffice all treat a cell beginning with one of
+# these as a formula to evaluate, so a value like `=cmd|'/c calc'!A1` arriving
+# through a product description or location name becomes live code the moment a
+# regulator opens the export. Neutralised with a leading apostrophe, which the
+# spreadsheet strips on display, per OWASP's CSV-injection guidance.
+_FORMULA_PREFIXES = ("=", "+", "-", "@", "\t", "\r")
+
+
+def _neutralize_formula(value: object) -> object:
+    if not isinstance(value, str) or not value.startswith(_FORMULA_PREFIXES):
+        return value
+    return "'" + value
+
+
 def render_fda_request_csv(
     records: Iterable[StoredEventRecord],
     location_gln: Callable[[str], str],
@@ -186,12 +207,32 @@ def render_fda_request_csv(
     writer.writeheader()
     for record in records:
         event = record.event
+<<<<<<< HEAD
+        writer.writerow(
+            {
+                key: _neutralize_formula(value)
+                for key, value in {
+                "Traceability Lot Code": event.traceability_lot_code,
+                "Traceability Lot Code Description": event.cte_type.value,
+                "Product Description": event.product_description,
+                "Quantity": event.quantity,
+                "Unit of Measure": event.unit_of_measure,
+                "Location Description": event.location_name,
+                "Location Identifier (GLN)": location_gln(event.location_name),
+                "Date": event.timestamp.date().isoformat(),
+                "Time": event.timestamp.time().isoformat(timespec="seconds"),
+                "Reference Document Type": event.kdes.get("reference_document_type", ""),
+                "Reference Document Number": event.kdes.get("reference_document_number", ""),
+                }.items()
+            }
+=======
         values = merged_event_values(event)
         # Normalize to UTC so two events at different absolute instants never
         # render the same Date/Time pair (the export carries no offset column).
         timestamp = event.timestamp
         timestamp = (
             timestamp.replace(tzinfo=UTC) if timestamp.tzinfo is None else timestamp.astimezone(UTC)
+>>>>>>> origin/main
         )
         previous_source = ""
         if event.cte_type in (CTEType.RECEIVING, CTEType.FIRST_LAND_BASED_RECEIVING):

@@ -10,7 +10,6 @@ from app.main import app, controller
 from app.schemas.integration import CREDENTIALS_WITHHELD_VERDICT
 from app.schemas.simulation import SimulationConfig
 
-
 client = TestClient(app)
 
 
@@ -44,7 +43,7 @@ class ProbeAsyncClient:
     def __init__(self, *, timeout: float) -> None:
         self.timeout = timeout
 
-    async def __aenter__(self) -> "ProbeAsyncClient":
+    async def __aenter__(self) -> ProbeAsyncClient:
         return self
 
     async def __aexit__(self, exc_type: object, exc: object, tb: object) -> None:
@@ -121,10 +120,12 @@ def test_integration_test_reports_mock_mode_without_probing() -> None:
 def test_integration_test_maps_probe_status_to_customer_verdicts(monkeypatch: Any) -> None:
     monkeypatch.setattr("app.regengine_client.httpx.AsyncClient", ProbeAsyncClient)
     ProbeAsyncClient.health_payload = None
+    # 402 is deliberately absent: /recent has no subscription gate (that
+    # dependency is on /ingest only), so the probe can never see one. See #100
+    # and the comment on _CONNECTION_VERDICTS.
     expectations = {
         200: "connected",
         401: "unauthorized",
-        402: "subscription_inactive",
         403: "forbidden",
         404: "tenant_mismatch",
         429: "rate_limited",
@@ -279,8 +280,8 @@ def test_mock_rate_limit_friction_maps_to_429() -> None:
 
 
 def test_mock_idempotency_replay_returns_cached_response() -> None:
-    from app.mock_service import MockRegEngineService
     from app.demo_fixtures import get_demo_fixture
+    from app.mock_service import MockRegEngineService
     from app.schemas.domain import DemoFixtureId
     from app.schemas.ingestion import IngestPayload
 
@@ -297,6 +298,110 @@ def test_mock_idempotency_replay_returns_cached_response() -> None:
     assert first_ids != fresh_ids
 
 
+<<<<<<< HEAD
+# ---------------------------------------------------------------------------
+# #100 -- the probe reads GET /api/v1/webhooks/recent, whose dependency chain is
+# strictly weaker than the /ingest route it is meant to certify. It cannot see
+# the subscription gate, the webhooks.ingest scope, or the webhook signature, so
+# it reported "connected. Credentials and tenant are valid" for configurations
+# where 100% of ingests fail.
+# ---------------------------------------------------------------------------
+
+
+def _probe(monkeypatch: Any, *, health_payload: Any, status_code: int = 200) -> dict[str, Any]:
+    monkeypatch.setattr("app.regengine_client.httpx.AsyncClient", ProbeAsyncClient)
+    ProbeAsyncClient.status_code = status_code
+    ProbeAsyncClient.health_payload = health_payload
+    ProbeAsyncClient.calls = []
+    response = client.post(
+        "/api/integration/test",
+        json={
+            "api_key": "rge_live_probe_key",
+            "tenant_id": "22222222-2222-2222-2222-222222222222",
+        },
+    )
+    assert response.status_code == 200, response.text
+    return response.json()
+
+
+def test_remote_signs_and_we_do_not_yields_signature_mismatch(monkeypatch: Any) -> None:
+    # The config from #100's impact statement: RegEngine has WEBHOOK_HMAC_SECRET
+    # set, the simulator does not. The probe reads an unsigned endpoint so this
+    # passes /recent, then 401s on every single ingest.
+    monkeypatch.delenv("REGENGINE_WEBHOOK_HMAC_SECRET", raising=False)
+
+    body = _probe(monkeypatch, health_payload={"webhook_hmac_configured": True})
+
+    assert body["verdict"] == "signature_mismatch"
+    assert "401" in body["detail"]
+    assert "REGENGINE_WEBHOOK_HMAC_SECRET" in body["detail"]
+
+
+def test_we_sign_and_remote_does_not_yields_signature_mismatch(monkeypatch: Any) -> None:
+    # The other direction fails differently -- bodies are accepted unverified
+    # rather than rejected -- so it gets its own wording.
+    monkeypatch.setenv("REGENGINE_WEBHOOK_HMAC_SECRET", "local-secret")
+
+    body = _probe(monkeypatch, health_payload={"webhook_hmac_configured": False})
+
+    assert body["verdict"] == "signature_mismatch"
+    assert "without their signature" in body["detail"]
+
+
+def test_matching_signing_posture_stays_connected(monkeypatch: Any) -> None:
+    monkeypatch.setenv("REGENGINE_WEBHOOK_HMAC_SECRET", "shared-secret")
+
+    body = _probe(monkeypatch, health_payload={"webhook_hmac_configured": True})
+
+    assert body["verdict"] == "connected"
+
+
+def test_both_sides_unsigned_stays_connected(monkeypatch: Any) -> None:
+    monkeypatch.delenv("REGENGINE_WEBHOOK_HMAC_SECRET", raising=False)
+
+    body = _probe(monkeypatch, health_payload={"webhook_hmac_configured": False})
+
+    assert body["verdict"] == "connected"
+
+
+def test_a_remote_that_does_not_advertise_posture_is_not_guessed_at(monkeypatch: Any) -> None:
+    # An older deploy predating the field. Absence is tolerated the same way
+    # contract-version skew detection tolerates it, rather than assumed to be
+    # False and reported as a mismatch.
+    monkeypatch.setenv("REGENGINE_WEBHOOK_HMAC_SECRET", "local-secret")
+
+    body = _probe(monkeypatch, health_payload={"inflow_contract_version": "1"})
+
+    assert body["verdict"] == "connected"
+
+
+def test_contract_mismatch_still_takes_precedence(monkeypatch: Any) -> None:
+    monkeypatch.delenv("REGENGINE_WEBHOOK_HMAC_SECRET", raising=False)
+
+    body = _probe(
+        monkeypatch,
+        health_payload={"inflow_contract_version": "999", "webhook_hmac_configured": True},
+    )
+
+    assert body["verdict"] == "contract_mismatch"
+
+
+def test_the_connected_detail_no_longer_claims_ingest_will_work(monkeypatch: Any) -> None:
+    monkeypatch.delenv("REGENGINE_WEBHOOK_HMAC_SECRET", raising=False)
+
+    detail = _probe(monkeypatch, health_payload=None)["detail"]
+
+    assert "does not prove ingest will work" in detail
+    for unproven in ("subscription", "webhooks.ingest", "signature"):
+        assert unproven in detail
+
+
+def test_the_rate_limit_detail_names_the_read_budget(monkeypatch: Any) -> None:
+    body = _probe(monkeypatch, health_payload=None, status_code=429)
+
+    assert body["verdict"] == "rate_limited"
+    assert "read budget" in body["detail"]
+=======
 def test_not_configured_detail_names_the_origin_mismatch_not_missing_credentials() -> None:
     """The verdict was right and the reason was false (#210).
 
@@ -345,3 +450,4 @@ def test_not_configured_detail_is_unchanged_when_nothing_is_actually_configured(
 
     assert body["verdict"] == "not_configured"
     assert "Both an API key and a tenant id are required" in body["detail"]
+>>>>>>> origin/main

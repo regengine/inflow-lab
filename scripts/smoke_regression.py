@@ -19,7 +19,6 @@ from app.main import app  # noqa: E402
 from app.tenancy import tenant_dir, tenant_events_path  # noqa: E402
 from scripts import _smoke_common as smoke  # noqa: E402
 
-
 TENANTS = ["release-smoke-main", "release-smoke-other"]
 
 
@@ -173,7 +172,7 @@ def request_headers(tenant_id: str) -> dict[str, str]:
     username = os.getenv("REGENGINE_BASIC_AUTH_USERNAME")
     password = os.getenv("REGENGINE_BASIC_AUTH_PASSWORD")
     if username and password:
-        token = base64.b64encode(f"{username}:{password}".encode("utf-8")).decode("ascii")
+        token = base64.b64encode(f"{username}:{password}".encode()).decode("ascii")
         headers["Authorization"] = f"Basic {token}"
     return headers
 
@@ -228,4 +227,4 @@ if __name__ == "__main__":
         raise SystemExit(main())
     except SmokeFailure as exc:
         print(f"Release smoke regression failed: {exc}", file=sys.stderr)
-        raise SystemExit(1)
+        raise SystemExit(1) from exc

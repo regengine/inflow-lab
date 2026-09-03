@@ -3,7 +3,6 @@ from datetime import UTC, datetime, timedelta
 from app.schemas.domain import CTEType, DestinationMode, RegEngineEvent, StoredEventRecord
 from app.store import EventStore
 
-
 BASE_TIME = datetime(2026, 2, 5, 8, 30, tzinfo=UTC)
 
 

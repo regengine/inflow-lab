@@ -22,6 +22,7 @@ from .schemas.scenarios import ScenarioSaveRequest
 from .schemas.simulation import SimulationConfig
 from .store import EventStore
 
+logger = logging.getLogger(__name__)
 
 logger = logging.getLogger(__name__)
 
@@ -100,6 +101,27 @@ _tenant_lock = RLock()
 
 
 async def shutdown_tenant_controllers() -> None:
+<<<<<<< HEAD
+    """Shut every tenant's controller down at once, not one after another.
+
+    Serially awaiting each `shutdown()` meant container shutdown paid the sum
+    of every tenant's stop latency. Each `shutdown()` is now individually
+    bounded (see `SimulationController.shutdown`), and running them
+    concurrently keeps the total near the slowest one rather than their sum.
+    `return_exceptions` so one wedged tenant cannot stop the others being
+    cleaned up.
+    """
+    controllers = set(_tenant_controllers.values())
+    if not controllers:
+        return
+    outcomes = await asyncio.gather(
+        *(tenant_controller.shutdown() for tenant_controller in controllers),
+        return_exceptions=True,
+    )
+    for outcome in outcomes:
+        if isinstance(outcome, BaseException):
+            logger.warning("Tenant controller shutdown failed: %s", outcome)
+=======
     """Stop every tenant's run loop, concurrently and under a bound.
 
     This used to await each `shutdown()` in turn. A controller parked on a
@@ -131,6 +153,7 @@ async def shutdown_tenant_controllers() -> None:
                 result,
                 exc_info=result,
             )
+>>>>>>> origin/main
 
 
 def active_controller_for_context(context: TenantContext) -> SimulationController:
@@ -256,7 +279,7 @@ def operator_tenant_id(raw_tenant_id: str) -> str:
 
 
 def known_tenant_ids() -> list[str]:
-    tenant_ids = set()
+    tenant_ids: set[str] = set()
     with _tenant_lock:
         tenant_ids.update(
             tenant_id for tenant_id in _tenant_controllers if tenant_id != DEFAULT_TENANT_ID
@@ -440,15 +463,39 @@ def _count_scenario_saves(path: Path) -> int:
     return sum(1 for candidate in path.glob("*.json") if candidate.is_file())
 
 
+def assert_within_tenant_root(path: Path) -> Path:
+    """Refuse to operate on a path that is not strictly inside the tenant root.
+
+    Resolves symlinks first, so a tenant directory symlinked elsewhere fails
+    here rather than at the point something recursive runs against it.
+    """
+    resolved_root = TENANT_DATA_ROOT.resolve()
+    resolved = path.resolve()
+    if resolved == resolved_root or not resolved.is_relative_to(resolved_root):
+        raise HTTPException(status_code=400, detail="Refusing to operate outside the tenant root")
+    return resolved
+
+
 def _create_tenant_controller(tenant_id: str) -> SimulationController:
     persist_path = tenant_events_path(tenant_id)
-    tenant_engine = LegitFlowEngine(seed=204)
-    tenant_store = EventStore(persist_path=str(persist_path))
-    tenant_saves = ScenarioSaveStore(save_dir=str(tenant_saves_path(tenant_id)))
+    try:
+        tenant_engine = LegitFlowEngine(seed=204)
+        tenant_store = EventStore(persist_path=str(persist_path))
+        tenant_saves = ScenarioSaveStore(save_dir=str(tenant_saves_path(tenant_id)))
+    except Exception as exc:
+        # Provisioning creates directories on disk, so it can fail for reasons
+        # that have nothing to do with the request that triggered it. Without
+        # this the only trace was the 500 the caller got.
+        logger.error("Tenant provisioning failed: tenant=%s error=%s", tenant_id, exc)
+        raise
+    # Tenants are minted lazily on first use, so this line is the only record
+    # that a new one came into existence and started consuming disk.
+    logger.info("Provisioned tenant controller: tenant=%s path=%s", tenant_id, persist_path)
     return SimulationController(
         engine=tenant_engine,
         store=tenant_store,
         scenario_saves=tenant_saves,
         mock_service=MockRegEngineService(),
         live_client=LiveRegEngineClient(),
+        tenant_id=tenant_id,
     )

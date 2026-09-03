@@ -15,14 +15,29 @@ from uuid import uuid4
 from pydantic import ValidationError
 
 from .cte_rules import REQUIRED_KDES
+<<<<<<< HEAD
+from .schemas.domain import RegEngineEvent
+from .schemas.ingestion import (
+    MAX_BATCH_EVENTS,
+    IngestPayload,
+    IngestResponseEvent,
+    MockIngestResponse,
+)
+=======
 from .regengine_client import WEBHOOK_HMAC_SECRET_ENV
 from .schemas.domain import RegEngineEvent, StoredEventRecord
 from .schemas.ingestion import IngestPayload, IngestResponseEvent, MockIngestResponse
 
+>>>>>>> origin/main
 
 logger = logging.getLogger(__name__)
 
 # Mirrors RegEngine's WebhookPayload constraint: events accepts 1-500 items.
+<<<<<<< HEAD
+# Defined on the schema so it is enforced before the list is materialised;
+# re-exported here because the service still checks it for direct callers.
+__all__ = ["MAX_BATCH_EVENTS", "FRICTION_RESPONSES", "MockRegEngineHTTPError", "MockRegEngineService"]
+=======
 MIN_BATCH_EVENTS = 1
 MAX_BATCH_EVENTS = 500
 # Hard ceiling on a single ingest request body, in bytes.
@@ -40,6 +55,7 @@ MAX_INGEST_BODY_BYTES = 4 * 1024 * 1024
 # headers as latin-1, so a signature header with any byte >= 0x80 used to reach
 # compare_digest and escape as an unauthenticated 500 (with a traceback).
 _HEX_DIGEST_RE = re.compile(r"[0-9a-f]+", re.IGNORECASE)
+>>>>>>> origin/main
 # Mirrors RegEngine's Pydantic timestamp validator: >24h in the future is rejected.
 MAX_FUTURE_HOURS = 24
 # Mirrors RegEngine's handler-level replay guard
@@ -267,6 +283,30 @@ class MockRegEngineService:
         idempotency_key: str | None = None,
         friction: tuple[str, ...] = (),
     ) -> MockIngestResponse:
+<<<<<<< HEAD
+        # An unrecognised code used to be skipped in silence and the batch
+        # accepted with a 200 -- an operator rehearsing a failure mode that
+        # never fires, which is the exact class of silent no-op this simulator
+        # exists to surface. `MockFrictionCode` already pins the HTTP and
+        # config paths to the known set; this guards a direct caller.
+        # Validated up front so which code is reported does not depend on the
+        # order they were listed in.
+        # Materialised once: the previous `for code in friction` accepted any
+        # iterable, and indexing `friction[0]` instead broke sets, dict views
+        # and generators -- an empty generator went from a clean no-op to a
+        # TypeError. Taking a tuple keeps the old tolerance and makes the
+        # membership scan safe against a one-shot iterator.
+        codes = tuple(friction)
+        unknown = sorted({code for code in codes if code not in FRICTION_RESPONSES})
+        if unknown:
+            raise MockRegEngineHTTPError(
+                422,
+                f"Unknown mock friction code(s): {', '.join(unknown)}. "
+                f"Known codes: {', '.join(sorted(FRICTION_RESPONSES))}.",
+            )
+        if codes:
+            raise MockRegEngineHTTPError(*FRICTION_RESPONSES[codes[0]])
+=======
         # Per-ingest, so a 422 or an idempotency replay never reports the
         # previous batch's out-of-window events.
         self.last_age_window_warnings = ()
@@ -275,6 +315,7 @@ class MockRegEngineService:
             failure = FRICTION_RESPONSES.get(code)
             if failure is not None:
                 raise MockRegEngineHTTPError(*failure)
+>>>>>>> origin/main
 
         if not payload.events:
             raise MockRegEngineHTTPError(
@@ -361,7 +402,7 @@ class MockRegEngineService:
 
             raw = json.dumps(event.model_dump(mode="json"), sort_keys=True, separators=(",", ":"))
             sha256_hash = hashlib.sha256(raw.encode("utf-8")).hexdigest()
-            chain_seed = f"{self._chain_hash}:{sha256_hash}".encode("utf-8")
+            chain_seed = f"{self._chain_hash}:{sha256_hash}".encode()
             self._chain_hash = hashlib.sha256(chain_seed).hexdigest()
             accepted += 1
             response_events.append(

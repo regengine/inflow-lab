@@ -3,13 +3,19 @@ from __future__ import annotations
 import argparse
 import os
 import sys
+<<<<<<< HEAD
+from collections.abc import Mapping
+=======
 from collections.abc import Mapping, Sequence
+>>>>>>> origin/main
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
 import httpx
 
+<<<<<<< HEAD
+=======
 REPO_ROOT = Path(__file__).resolve().parents[1]
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
@@ -23,6 +29,7 @@ from scripts.remote_smoke import (  # noqa: E402
 )
 
 
+>>>>>>> origin/main
 DEFAULT_TIMEOUT_SECONDS = 30.0
 TRIAL_SCENARIO = "fresh_cut_processor"
 
@@ -121,7 +128,11 @@ def config_from_env(
     *,
     require_live: bool,
 ) -> LiveTrialConfig:
+<<<<<<< HEAD
+    resolved_environ: Mapping[str, str] = environ if environ is not None else os.environ
+=======
     env: Mapping[str, str] = environ if environ else os.environ
+>>>>>>> origin/main
     required_names = [
         "REGENGINE_REMOTE_BASE_URL",
         "REGENGINE_REMOTE_USERNAME",
@@ -137,13 +148,28 @@ def config_from_env(
             ]
         )
 
+<<<<<<< HEAD
+    missing = [name for name in required_names if not resolved_environ.get(name)]
+=======
     missing = [name for name in required_names if not env.get(name)]
+>>>>>>> origin/main
     if missing:
         raise LiveTrialFailure(
             "Missing required environment variables: " + ", ".join(missing)
         )
 
     return LiveTrialConfig(
+<<<<<<< HEAD
+        base_url=normalize_base_url(resolved_environ["REGENGINE_REMOTE_BASE_URL"]),
+        username=resolved_environ["REGENGINE_REMOTE_USERNAME"],
+        password=resolved_environ["REGENGINE_REMOTE_PASSWORD"],
+        demo_tenant=resolved_environ["REGENGINE_REMOTE_TENANT"],
+        live_endpoint=normalize_base_url(resolved_environ["REGENGINE_LIVE_ENDPOINT"])
+        if resolved_environ.get("REGENGINE_LIVE_ENDPOINT")
+        else None,
+        live_api_key=resolved_environ.get("REGENGINE_LIVE_API_KEY"),
+        live_tenant_id=resolved_environ.get("REGENGINE_LIVE_TENANT_ID"),
+=======
         # The demo base URL carries the shared-demo Basic Auth header on every
         # request, so it goes through the same host allowlist remote_smoke.py
         # uses. The live ingest endpoint never sees those credentials (its own
@@ -158,6 +184,7 @@ def config_from_env(
         else None,
         live_api_key=env.get("REGENGINE_LIVE_API_KEY"),
         live_tenant_id=env.get("REGENGINE_LIVE_TENANT_ID"),
+>>>>>>> origin/main
     )
 
 
@@ -208,6 +235,14 @@ def run_live_trial(
             )
         return summary
     finally:
+<<<<<<< HEAD
+        stop_simulation(client, config)
+        # Only close what we opened. A caller-supplied client stays the
+        # caller's to manage; the one built above was leaked, holding its
+        # connection pool open for the life of the process.
+        if owns_client:
+            client.close()
+=======
         try:
             stop_simulation(client, config)
         finally:
@@ -218,6 +253,7 @@ def run_live_trial(
                 # A caller-supplied client stays open -- it owns its own lifetime.
                 if owns_client:
                     client.close()
+>>>>>>> origin/main
 
 
 def run_mock_dry_run(client: httpx.Client, config: LiveTrialConfig) -> dict[str, Any]:

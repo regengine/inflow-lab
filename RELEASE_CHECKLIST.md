@@ -8,7 +8,11 @@ Use this checklist before tagging a demo-ready build or handing the simulator to
 - [ ] `uv run python scripts/smoke_regression.py` (safe to run with `REGENGINE_DATA_DIR` exported; it derives its paths from that root and cleans up under it)
 - [ ] `uv run python scripts/contract_pin_check.py` — RegEngine contract pin freshness and the documented wire shape
 - [ ] `uv run --no-dev --group browser python scripts/browser_smoke.py`
+<<<<<<< HEAD
+- [ ] `npm ci && npm run lint` (the operator console)
+=======
 - [ ] `for f in app/static/*.js; do node --check "$f"; done` — the console is ES modules now, so checking `app.js` alone leaves most of it unparsed (CI's `lint` job runs the same loop)
+>>>>>>> origin/main
 - [ ] `python3 -m compileall app scripts`
 - [ ] `uv pip check`
 - [ ] `uv run pip-audit`

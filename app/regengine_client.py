@@ -5,6 +5,7 @@ import hashlib
 import hmac
 import ipaddress
 import json
+import logging
 import os
 import socket
 import uuid
@@ -17,6 +18,8 @@ import httpx
 from .contract import INFLOW_CONTRACT_VERSION
 from .schemas.ingestion import IngestPayload
 from .schemas.simulation import SimulationConfig
+
+logger = logging.getLogger(__name__)
 
 
 DEFAULT_LIVE_INGEST_ENDPOINT = "https://www.regengine.co/api/v1/webhooks/ingest"
@@ -498,6 +501,31 @@ class ConnectionCheckResult:
 # returns, so the settings page can give recovery guidance instead of a
 # bare status code.
 #
+<<<<<<< HEAD
+# The probe reads GET /api/v1/webhooks/recent, whose dependency chain is
+# strictly weaker than the /ingest route it is meant to certify. Verified
+# against RegEngine's tree, /ingest additionally carries:
+#
+#   * require_active_subscription  -- /recent has no subscription gate, so a
+#     402 is genuinely unreachable here and is deliberately not in this table.
+#   * require_permission("webhooks.ingest") -- /recent takes bare
+#     get_ingestion_principal, so a read-only-scoped key passes this probe and
+#     then 403s on every ingest.
+#   * _verify_webhook_signature -- /recent is unsigned, so an HMAC mismatch is
+#     invisible here. That one is covered separately by comparing posture
+#     against /health's webhook_hmac_configured; see check_connection.
+#
+# Nothing in this table can therefore promise ingest will work. The 200 detail
+# says what was actually proven and what was not.
+_CONNECTION_VERDICTS: dict[int, tuple[str, str]] = {
+    200: (
+        "connected",
+        "Authenticated read succeeded: the API key and tenant are valid for reads. "
+        "This does not prove ingest will work — the read path does not check the "
+        "subscription, the webhooks.ingest scope, or the webhook signature.",
+    ),
+    401: ("unauthorized", "RegEngine rejected the API key (HTTP 401). Check the key value and that it has not expired or been revoked."),
+=======
 # Scope caveat, deliberately reflected in the wording below: the probe is a
 # GET on /api/v1/webhooks/recent, whose dependency chain is strictly weaker
 # than POST /api/v1/webhooks/ingest. The read route carries neither the
@@ -525,13 +553,20 @@ _CONNECTION_VERDICTS: dict[int, tuple[str, str]] = {
         "RegEngine returned HTTP 402 for the read probe: the tenant's subscription is not "
         "active. Billing status must be active or trialing before ingestion resumes.",
     ),
+>>>>>>> origin/main
     403: ("forbidden", "RegEngine refused the request (HTTP 403). The key may be missing the webhooks.read scope, or the tenant does not match the key."),
     404: ("tenant_mismatch", "RegEngine returned HTTP 404. Webhook reads return 404 when the tenant does not match the API key's tenant."),
     429: (
         "rate_limited",
+<<<<<<< HEAD
+        "RegEngine is rate limiting this tenant's webhook reads (HTTP 429). This is the "
+        "read budget, which is a separate, smaller bucket from the ingest limit — ingest "
+        "may still have headroom. Wait for the window shown in Retry-After and try again.",
+=======
         "RegEngine is rate limiting this tenant's webhook reads (HTTP 429). Wait for the window "
         "shown in Retry-After and try again. Ingestion is metered separately, so this limit does "
         "not necessarily apply to delivery.",
+>>>>>>> origin/main
     ),
     503: ("service_unavailable", "RegEngine is up but a required backing service is unavailable (HTTP 503). Try again shortly."),
 }
@@ -600,12 +635,34 @@ class LiveRegEngineClient:
             async with _open_live_client(pin) as client:
                 response = await client.post(endpoint, headers=headers, content=body_bytes)
         except httpx.HTTPError as exc:
+            # The transport never reached RegEngine. Logged here as well as
+            # raised because the exception only ever reaches the one caller
+            # holding the request; nothing else recorded that live ingest was
+            # failing. Log the exception class rather than str(exc), which can
+            # contain the full URL.
+            logger.warning(
+                "Live ingest transport error: endpoint=%s idempotency_key=%s events=%d error=%s",
+                endpoint,
+                idempotency_key,
+                len(payload.events),
+                exc.__class__.__name__,
+            )
             raise LiveRegEngineDeliveryError(str(exc), metadata) from exc
 
         metadata = metadata | {"status_code": response.status_code}
         try:
             response.raise_for_status()
         except httpx.HTTPStatusError as exc:
+<<<<<<< HEAD
+            logger.warning(
+                "Live ingest rejected: endpoint=%s idempotency_key=%s events=%d status=%s",
+                endpoint,
+                idempotency_key,
+                len(payload.events),
+                response.status_code,
+            )
+            raise LiveRegEngineDeliveryError(str(exc), metadata) from exc
+=======
             # Keep RegEngine's own explanation (subscription status, rate-limit
             # window, key scope) instead of httpx's bare status-line text.
             detail = _response_error_detail(exc.response)
@@ -613,6 +670,7 @@ class LiveRegEngineClient:
                 metadata = metadata | {"error_body": detail}
             message = f"{exc}: {detail}" if detail else str(exc)
             raise LiveRegEngineDeliveryError(message, metadata) from exc
+>>>>>>> origin/main
         return LiveIngestResult(response=response.json(), metadata=metadata)
 
     async def check_connection(self, config: SimulationConfig) -> ConnectionCheckResult:
@@ -638,9 +696,17 @@ class LiveRegEngineClient:
                 endpoint_host=host,
             )
         if not api_key or not tenant_id:
+            # Name the field that is actually missing. Restating the rule
+            # ("both are required") left an operator who had set one of the two
+            # reading a message that described a condition they had already met.
+            missing = [
+                label
+                for label, value in (("an API key", api_key), ("a tenant id", tenant_id))
+                if not value
+            ]
             return ConnectionCheckResult(
                 verdict="not_configured",
-                detail="Both an API key and a tenant id are required before testing the connection.",
+                detail=f"Missing {' and '.join(missing)}. Both are required before testing the connection.",
                 endpoint_host=host,
             )
 
@@ -658,6 +724,11 @@ class LiveRegEngineClient:
                 )
                 remote_health = await _fetch_remote_health(client, parsed)
         except httpx.HTTPError as exc:
+            logger.warning(
+                "Connection test could not reach RegEngine: host=%s error=%s",
+                host,
+                exc.__class__.__name__,
+            )
             return ConnectionCheckResult(
                 verdict="unreachable",
                 detail=f"Could not reach RegEngine at {host}: {exc.__class__.__name__}",
@@ -668,6 +739,9 @@ class LiveRegEngineClient:
             response.status_code,
             ("error", f"Unexpected HTTP {response.status_code} from RegEngine."),
         )
+<<<<<<< HEAD
+        remote_contract = remote_health.contract_version
+=======
         # The read probe cannot see the ingest route's signature check, so
         # compare signing posture across the two sides instead. This is the one
         # ingest-only gate that is observable without writing, and the one most
@@ -681,6 +755,7 @@ class LiveRegEngineClient:
                 endpoint_host=host,
             )
         remote_contract = _remote_contract_version(remote_health)
+>>>>>>> origin/main
         if verdict == "connected" and remote_contract is not None and remote_contract != INFLOW_CONTRACT_VERSION:
             verdict = "contract_mismatch"
             detail = (
@@ -689,6 +764,15 @@ class LiveRegEngineClient:
                 "One side is running an older deploy — update it before ingesting, or "
                 "payloads may validate here and be rejected there (or vice versa)."
             )
+        elif verdict == "connected":
+            # The probe reads an unsigned endpoint, so an HMAC mismatch cannot
+            # show up in its status code -- it would show up later as a 401 on
+            # every single ingest. Compare posture instead. Both directions
+            # matter and they fail differently, so they are worded separately.
+            signature_detail = _signature_posture_detail(remote_health.hmac_configured)
+            if signature_detail is not None:
+                verdict = "signature_mismatch"
+                detail = signature_detail
         return ConnectionCheckResult(
             verdict=verdict,
             detail=detail,
@@ -697,6 +781,57 @@ class LiveRegEngineClient:
         )
 
 
+<<<<<<< HEAD
+def _signature_posture_detail(remote_hmac_configured: bool | None) -> str | None:
+    """Compare local and remote webhook-signing posture, if both are known.
+
+    Returns None when the postures agree, or when the remote does not advertise
+    its posture (an older deploy) -- absence is tolerated rather than guessed
+    at, the same way contract-version skew detection is.
+
+    This exists because the connection probe reads an unsigned endpoint. A
+    one-sided HMAC configuration is invisible to it and then fails 100% of
+    ingests, which is the exact "green demo, failing live post" shape the probe
+    is supposed to prevent.
+    """
+    if remote_hmac_configured is None:
+        return None
+
+    local_configured = bool(os.getenv(WEBHOOK_HMAC_SECRET_ENV, "").strip())
+    if local_configured == remote_hmac_configured:
+        return None
+
+    if remote_hmac_configured:
+        return (
+            "Reads succeed, but ingest will not: RegEngine requires signed webhooks and "
+            f"{WEBHOOK_HMAC_SECRET_ENV} is not set here, so every ingest will be rejected "
+            "with HTTP 401. Set the same secret on both sides."
+        )
+    return (
+        f"Reads succeed, but {WEBHOOK_HMAC_SECRET_ENV} is set here while RegEngine reports "
+        "webhook signing is off, so bodies will be accepted there without their signature "
+        "being verified. Either enable signing on RegEngine or clear the local secret."
+    )
+
+
+@dataclass(frozen=True, slots=True)
+class RemoteHealth:
+    """What RegEngine's /health tells us about the far side of the wire."""
+
+    contract_version: str | None = None
+    # None when the deployment predates the field, which is distinct from
+    # False ("HMAC is off there") -- posture comparison only engages when the
+    # remote actually advertises.
+    hmac_configured: bool | None = None
+
+
+async def _fetch_remote_health(client: httpx.AsyncClient, parsed) -> RemoteHealth:
+    """Best-effort read of RegEngine's advertised ingest posture.
+
+    Returns empty fields when the health endpoint is unreachable, non-JSON
+    (some deployments serve the frontend at /health), or predates a field —
+    skew detection only engages when both sides advertise.
+=======
 async def _fetch_remote_health(client: httpx.AsyncClient, parsed) -> dict[str, Any] | None:
     """Best-effort read of RegEngine's /health document.
 
@@ -704,11 +839,23 @@ async def _fetch_remote_health(client: httpx.AsyncClient, parsed) -> dict[str, A
     deployments serve the frontend at /health). Every skew check built on it
     engages only when the remote actually advertises the field it needs, so an
     older RegEngine simply yields no extra verdict.
+>>>>>>> origin/main
     """
     try:
         health = await client.get(f"{parsed.scheme}://{parsed.netloc}/health")
         payload = health.json()
     except (httpx.HTTPError, ValueError):
+<<<<<<< HEAD
+        return RemoteHealth()
+    if not isinstance(payload, dict):
+        return RemoteHealth()
+    version = payload.get("inflow_contract_version")
+    hmac_configured = payload.get("webhook_hmac_configured")
+    return RemoteHealth(
+        contract_version=str(version) if version is not None else None,
+        hmac_configured=hmac_configured if isinstance(hmac_configured, bool) else None,
+    )
+=======
         return None
     return payload if isinstance(payload, dict) else None
 
@@ -719,6 +866,7 @@ def _remote_contract_version(health: dict[str, Any] | None) -> str | None:
         return None
     value = health.get("inflow_contract_version")
     return str(value) if value is not None else None
+>>>>>>> origin/main
 
 
 # Key names RegEngine's /health may use for its `webhook_hmac_configured()`

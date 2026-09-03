@@ -6,7 +6,6 @@ import httpx
 
 from scripts.live_trial import main
 
-
 BASE_ENV = {
     "REGENGINE_REMOTE_BASE_URL": "https://demo.example.com",
     "REGENGINE_REMOTE_USERNAME": "demo",

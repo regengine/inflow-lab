@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import asyncio
 import json
 from typing import Any
 
@@ -12,8 +11,18 @@ from ..auth import TenantContext
 from ..controller import SimulationController
 from ..dependencies import get_active_controller, get_tenant_context
 from ..schemas.ingestion import ReplayRequest, ReplayResponse
+<<<<<<< HEAD
+from ..schemas.simulation import (
+    ResetRequest,
+    ResetResponse,
+    StartRequest,
+    StatusResponse,
+    StepResponse,
+)
+=======
 from ..schemas.simulation import ResetRequest, ResetResponse, StartRequest, StatusResponse, StepResponse
 
+>>>>>>> origin/main
 
 router = APIRouter(prefix="/api/simulate", tags=["Simulation"])
 
@@ -45,7 +54,7 @@ async def simulate_stream(
                 break
             try:
                 last_revision = await active_controller.wait_for_revision(last_revision)
-            except asyncio.TimeoutError:
+            except TimeoutError:
                 yield ": keep-alive\n\n"
                 continue
 

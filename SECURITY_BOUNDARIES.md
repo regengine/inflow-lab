@@ -12,6 +12,27 @@ Inflow Lab is a simulator. Its security boundary is designed for safe demos, tes
 - Reset and delete operations must not affect other tenant scopes. A tenant delete resolves its target and refuses to recurse into anything that is not a directory *inside* the tenant storage root, so the recursive delete is bounded by construction rather than by the tenant-id regex alone.
 - Retained history is bounded on disk as well as in memory. One retention bound (`REGENGINE_STORE_MAX_HISTORY`, default `50000`) governs both: records leave the live event log when they leave the in-memory history, and they leave by being appended to a `.1` archive beside it rather than deleted. The store therefore cannot hold a log it no longer fully represents, and disk growth is bounded for the same reason memory is. Reads are served from memory; the log stays the durable record and is what a restart reloads from.
 
+**Tenant isolation requires Basic Auth.** With `REGENGINE_BASIC_AUTH_USERNAME`
+and `REGENGINE_BASIC_AUTH_PASSWORD` unset, `TenantContext.uses_default_storage`
+is true for every request, so the `X-RegEngine-Tenant` header is accepted and
+then ignored: all requests share the single `local-demo` store. This is
+deliberate rather than an oversight — routing by an unauthenticated header would
+let any caller mint tenant directories without limit — but it does mean the
+isolation guarantee above holds **only when auth is enabled**. Since every
+non-loopback deployment must enable Basic Auth (see the Authentication Boundary
+below), the guarantee holds wherever it matters; a local no-auth run is
+single-tenant and should be treated as such.
+
+- The persisted event log is append-only and unbounded on disk, while the
+  in-memory ring is capped (`EventStore.max_records`, default 5000). Reads that
+  need the whole log go to disk, so they stay complete as it grows; `recent()`
+  is the ring and is bounded by design.
+- **Single-worker is a hard requirement.** Run state, the event ring and the
+  store's write lock all live in one process's memory, and the lock is
+  per-process, so two uvicorn workers would interleave appends and file
+  rewrites on the same JSONL with no coordination. Do not set `--workers` above
+  1 or run more than one replica against the same data directory.
+
 ## Authentication Boundary
 
 - Basic Auth is optional for local mock demos.

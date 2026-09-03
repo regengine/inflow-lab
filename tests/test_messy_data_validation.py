@@ -63,7 +63,7 @@ def test_malformed_transformation_input_lots_are_flagged() -> None:
         timestamp=datetime(2026, 2, 6, 10, 0, tzinfo=UTC),
         # Required transformation KDEs present, but input lot codes are a bare
         # string instead of a non-empty list — a common real-world malformation.
-        kdes={field: "placeholder" for field in REQUIRED_KDES.get(CTEType.TRANSFORMATION, ())}
+        kdes=dict.fromkeys(REQUIRED_KDES.get(CTEType.TRANSFORMATION, ()), "placeholder")
         | {"input_traceability_lot_codes": "LOT-A,LOT-B"},
     )
     messages = [w.message for w in validate_event_kdes(event)]

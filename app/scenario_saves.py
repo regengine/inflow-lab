@@ -3,9 +3,9 @@ from __future__ import annotations
 import logging
 
 import json
+from collections.abc import Iterable
 from pathlib import Path
 from threading import RLock
-from typing import Iterable
 
 from .scenarios import ScenarioId
 from .schemas.domain import StoredEventRecord
@@ -75,6 +75,7 @@ class ScenarioSaveStore:
         config: SimulationConfig,
         records: Iterable[StoredEventRecord],
     ) -> ScenarioSaveSnapshot:
+        """Blocking: callers on the event loop must go through asyncio.to_thread."""
         return self.save(
             ScenarioSaveSnapshot(
                 scenario=scenario,

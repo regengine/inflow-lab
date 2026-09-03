@@ -5,6 +5,7 @@ import io
 import json
 import math
 import re
+from collections.abc import Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from typing import Any
@@ -14,7 +15,6 @@ from pydantic import ValidationError
 from .cte_rules import validate_event_kdes
 from .schemas.domain import CSVImportType, CTEType, RegEngineEvent
 from .schemas.ingestion import CSVImportError, CSVImportWarning
-
 
 EVENT_REQUIRED_FIELDS = (
     "cte_type",
@@ -73,9 +73,30 @@ def parse_csv_import(
         )
 
     reader = csv.DictReader(io.StringIO(csv_text.lstrip("\ufeff")), skipinitialspace=True)
-    header_errors = _header_errors(reader.fieldnames)
-    if header_errors:
-        return ParsedCSVImport(total=0, events=[], parent_lot_codes=[], errors=header_errors, warnings=[])
+
+    # `csv` raises on a field wider than `csv.field_size_limit()` (131072 by
+    # default, i.e. 16x smaller than MAX_CSV_TEXT_CHARS), so a document well
+    # under the length cap could still raise here. `_csv.Error` is a plain
+    # Exception, so the ValueError handler did not catch it and the request
+    # became a 500. The limit is process-global, so it is reported rather than
+    # raised: this stays a row error like every other bad input.
+    #
+    # Reading `.fieldnames` is what parses the header, so it has to be inside
+    # the guard too -- an oversized first line raises there, before any row.
+    try:
+        fieldnames = reader.fieldnames
+        header_errors = _header_errors(fieldnames)
+        if header_errors:
+            return ParsedCSVImport(total=0, events=[], parent_lot_codes=[], errors=header_errors, warnings=[])
+        rows = list(enumerate(reader, start=2))
+    except csv.Error as exc:
+        return ParsedCSVImport(
+            total=0,
+            events=[],
+            parent_lot_codes=[],
+            errors=[CSVImportError(row=0, field="csv_text", message=f"CSV could not be parsed: {exc}")],
+            warnings=[],
+        )
 
     total = 0
     events: list[RegEngineEvent] = []
@@ -83,8 +104,12 @@ def parse_csv_import(
     errors: list[CSVImportError] = []
     warnings: list[CSVImportWarning] = []
 
+<<<<<<< HEAD
+    for row_number, raw_row in rows:
+=======
     column_count = len(reader.fieldnames or [])
     for row_number, raw_row in enumerate(reader, start=2):
+>>>>>>> origin/main
         row = _normalize_row(raw_row)
         overflow = _row_overflow(raw_row)
         if _is_blank(row) and not overflow:
@@ -183,6 +208,10 @@ def _parse_seed_lot(
     if errors:
         return None, [], errors, []
 
+    # `_parse_timestamp` returns None only after appending to `errors`, so the
+    # guard above already excludes it. Asserted rather than left implicit: the
+    # invariant is three call frames away from the attribute access.
+    assert timestamp is not None  # nosec B101
     kdes.setdefault("harvest_date", timestamp.date().isoformat())
     kdes.setdefault("farm_location", row["location_name"])
     if row.get("field_name"):
@@ -251,7 +280,7 @@ def _build_event(
     return event, parent_lot_codes, [], warnings
 
 
-def _header_errors(fieldnames: list[str] | None) -> list[CSVImportError]:
+def _header_errors(fieldnames: Sequence[str] | None) -> list[CSVImportError]:
     if not fieldnames:
         return [CSVImportError(row=1, field="header", message="CSV header row is required")]
 
@@ -324,6 +353,16 @@ def _parse_quantity(value: str, row_number: int, errors: list[CSVImportError]) -
         errors.append(CSVImportError(row=row_number, field="quantity", message="Quantity must be numeric"))
         return None
 
+<<<<<<< HEAD
+    # `float("nan")` and `float("inf")` both parse, and `nan <= 0` is False, so
+    # a non-finite quantity used to pass this guard untouched. It then reached
+    # the store, where `json.dumps` writes it as a bare `NaN`/`Infinity` token:
+    # legal for Python's own reader, but invalid JSON per RFC 8259, so a strict
+    # downstream consumer rejects the record and `jq` silently reads it as
+    # `null` -- a traceability quantity quietly becoming nothing.
+    if not math.isfinite(quantity):
+        errors.append(CSVImportError(row=row_number, field="quantity", message="Quantity must be a finite number"))
+=======
     # ``float()`` happily parses "nan", "inf" and "1e400", and none of those
     # trip the ``<= 0`` check below (``nan <= 0`` is False). They used to sail
     # through every validator and land in the durable JSONL as a bare
@@ -334,6 +373,7 @@ def _parse_quantity(value: str, row_number: int, errors: list[CSVImportError]) -
         errors.append(
             CSVImportError(row=row_number, field="quantity", message="Quantity must be a finite number")
         )
+>>>>>>> origin/main
         return None
 
     if quantity <= 0:

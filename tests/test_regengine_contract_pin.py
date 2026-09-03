@@ -25,7 +25,6 @@ from app.schemas.domain import CTEType
 from scripts import contract_pin_check
 from scripts.contract_pin_check import ContractPinFailure
 
-
 REGENGINE_REQUIRED_KDES_BY_CTE: dict[CTEType, tuple[str, ...]] = {
     CTEType.HARVESTING: (
         "traceability_lot_code",

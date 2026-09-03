@@ -5,9 +5,12 @@ import os
 from functools import lru_cache
 from urllib.parse import urlparse
 
+<<<<<<< HEAD
+=======
 
 logger = logging.getLogger(__name__)
 
+>>>>>>> origin/main
 DEFAULT_CORS_ORIGINS = ("http://127.0.0.1:8000", "http://localhost:8000")
 
 logger = logging.getLogger("inflow_lab.cors")

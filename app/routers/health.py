@@ -13,7 +13,10 @@ from ..contract import INFLOW_CONTRACT_VERSION
 from ..controller import SimulationController
 from ..dependencies import get_active_controller, get_tenant_context
 from ..schemas.health import HealthResponse, HealthzResponse
+<<<<<<< HEAD
+=======
 
+>>>>>>> origin/main
 
 logger = logging.getLogger(__name__)
 
@@ -45,6 +48,15 @@ async def health(
 
 
 @router.get("/healthz", response_model=HealthzResponse)
+<<<<<<< HEAD
+async def healthz() -> dict[str, Any]:
+    return {
+        "ok": True,
+        "utc_time": datetime.now(UTC).isoformat(),
+        "build": current_build_info().public_dict(),
+        "contract_version": INFLOW_CONTRACT_VERSION,
+    }
+=======
 async def healthz() -> JSONResponse:
     store_probe = tenancy.store.check_writable()
     ok = bool(store_probe.get("ok"))
@@ -64,3 +76,4 @@ async def healthz() -> JSONResponse:
         store=store_probe,
     )
     return JSONResponse(status_code=200 if ok else 503, content=body.model_dump(mode="json"))
+>>>>>>> origin/main
