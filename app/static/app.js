@@ -216,7 +216,7 @@ const ONBOARDING_KEY = 'inflowLab.onboarded.v1';
 function onboardingSeen() {
   try {
     return window.localStorage.getItem(ONBOARDING_KEY) === 'done';
-  } catch (error) {
+  } catch {
     return true;
   }
 }
@@ -224,7 +224,7 @@ function onboardingSeen() {
 function markOnboarded() {
   try {
     window.localStorage.setItem(ONBOARDING_KEY, 'done');
-  } catch (error) {
+  } catch {
     // Storage unavailable — the welcome simply shows again next visit.
   }
 }
@@ -712,7 +712,7 @@ function renderReadinessBanner(summary, events, status = state.status) {
   }
   const readiness = backendAudit(status, summary) || pendingAuditModel(summary);
   ids.readinessBanner.innerHTML = `
-    <div class="readiness-banner-shell" data-tone="${readiness.tone}">
+    <div class="readiness-banner-shell" data-tone="${escapeHtml(readiness.tone)}">
       <div class="readiness-score">
         <span>Readiness</span>
         <strong>${escapeHtml(readiness.score)}</strong>
@@ -882,7 +882,7 @@ function renderDeliverySummary(status) {
       ${cards
         .map(
           ([label, value, tone]) => `
-            <article class="delivery-card" data-tone="${tone}">
+            <article class="delivery-card" data-tone="${escapeHtml(tone)}">
               <span>${escapeHtml(label)}</span>
               <strong>${escapeHtml(value)}</strong>
             </article>
@@ -1096,7 +1096,7 @@ function renderEvents(events) {
             ${hasWarning ? `<small class="status-warning">${escapeHtml(warnings[0])}</small>` : auditNotEvaluated ? '<small class="status-muted">not evaluated</small>' : ''}
           </td>
           <td>
-            <span class="status-pill" data-tone="${deliveryTone(record.delivery_status)}">${escapeHtml(record.delivery_status)}</span>
+            <span class="status-pill" data-tone="${escapeHtml(deliveryTone(record.delivery_status))}">${escapeHtml(record.delivery_status)}</span>
             ${record.error ? `<small class="status-error">${escapeHtml(record.error)}</small>` : ''}
           </td>
         </tr>
@@ -1258,7 +1258,7 @@ function renderImportResult(result) {
     })
     .join('');
   ids.importResults.innerHTML = `
-    <div class="import-summary" data-tone="${tone}">
+    <div class="import-summary" data-tone="${escapeHtml(tone)}">
       Accepted ${escapeHtml(result.accepted)} of ${escapeHtml(result.total)} row(s).
       Stored ${escapeHtml(result.stored)}; posted ${escapeHtml(result.posted)}; rejected ${escapeHtml(result.rejected)}.
       ${result.error ? `<span>${escapeHtml(result.error)}</span>` : ''}
@@ -1465,7 +1465,7 @@ async function testConnection() {
     const statusLine = result.status_code ? ` (HTTP ${result.status_code})` : '';
     if (ids.connectionResult) {
       ids.connectionResult.innerHTML = `
-        <div class="connection-verdict" data-tone="${tone}">
+        <div class="connection-verdict" data-tone="${escapeHtml(tone)}">
           <strong>${escapeHtml(result.verdict.replaceAll('_', ' '))}${escapeHtml(statusLine)}</strong>
           <p>${escapeHtml(result.detail)}</p>
         </div>

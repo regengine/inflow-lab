@@ -14,6 +14,60 @@ permissions:
   contents: read
 
 jobs:
+  # Not a required check (branch protection names `pytest` and `browser-smoke`),
+  # but it is the gate that would have caught the #225 revert: ruff, mypy and
+  # eslint had all gone unrun. Rule selection and scope live in pyproject.toml
+  # ([tool.ruff], [tool.mypy]) and package.json.
+  lint:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Set up Python
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: '3.11'
+
+      - name: Cache uv
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ~/.cache/uv
+          key: uv-${{ runner.os }}-${{ hashFiles('uv.lock') }}
+          restore-keys: uv-${{ runner.os }}-
+
+      - name: Install uv
+        run: python -m pip install --upgrade uv
+
+      # ruff needs no project imports, so it runs from uvx. mypy does: it is
+      # layered over the synced project environment so fastapi, pydantic and
+      # httpx resolve to real types rather than to Any. Both are pinned to the
+      # versions the local gate runs, so CI and a contributor's machine only
+      # disagree when someone bumps both.
+      - name: Ruff
+        run: uvx ruff@0.16.5 check --output-format=github app scripts tests
+
+      - name: Install dependencies
+        run: uv sync --frozen --group dev
+
+      - name: Mypy
+        run: uv run --frozen --group dev --with mypy==2.3.1 mypy
+
+      - name: Install console lint toolchain
+        run: npm ci
+
+      - name: ESLint operator console
+        run: npm run lint
+
+      - name: Check operator console JavaScript parses
+        run: |
+          for file in app/static/*.js; do
+            echo "node --check $file"
+            node --check "$file"
+          done
+
   pytest:
     runs-on: ubuntu-latest
     timeout-minutes: 20
@@ -54,6 +108,39 @@ jobs:
           # image shipping a newer pip, which was never going to clear it.
           uv run --frozen --group dev pip-audit
           uv run --frozen --group dev bandit -q -r app scripts
+
+  # 3.12 coverage lives in its own job rather than a matrix over `pytest`:
+  # a matrix renames the checks it produces to `pytest (3.11)` / `pytest (3.12)`,
+  # so the required check named exactly `pytest` would never report again and
+  # every merge in the repo would block. tests/test_ci_workflow.py pins this.
+  pytest-py312:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Set up Python
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: '3.12'
+
+      - name: Cache uv
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ~/.cache/uv
+          key: uv-${{ runner.os }}-${{ hashFiles('uv.lock') }}
+          restore-keys: uv-${{ runner.os }}-
+
+      - name: Install uv
+        run: python -m pip install --upgrade uv
+
+      - name: Install dependencies
+        run: uv sync --frozen --group dev
+
+      - name: Run tests
+        run: uv run --frozen --group dev pytest
 
   browser-smoke:
     runs-on: ubuntu-latest

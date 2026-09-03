@@ -13,3 +13,6 @@ uvicorn.out.log
 uvicorn.err.log
 output/playwright/
 data/pytest-tmp/
+
+# Console lint toolchain (eslint) installed by `npm ci`; never committed.
+node_modules/

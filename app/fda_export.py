@@ -113,6 +113,25 @@ def apply_fda_export_preset(
     return sorted(filtered, key=lambda record: record.event.timestamp)
 
 
+# A cell that starts with one of these is executed as a formula the moment the
+# compliance CSV is opened in Excel, Sheets or LibreOffice (#65). Every value
+# passes through here at the single write site below, so a future column is
+# covered by construction rather than by memory. An apostrophe prefix is the
+# spreadsheet convention for "this is text": it is stripped on display and the
+# cell stays inert.
+CSV_FORMULA_PREFIXES = ("=", "+", "-", "@", "\t", "\r")
+
+
+def _neutralize_formula(value: object) -> object:
+    if isinstance(value, str) and value.startswith(CSV_FORMULA_PREFIXES):
+        return "'" + value
+    return value
+
+
+def _neutralize_row(row: dict[str, object]) -> dict[str, object]:
+    return {key: _neutralize_formula(value) for key, value in row.items()}
+
+
 def render_fda_request_csv(
     records: Iterable[StoredEventRecord],
     location_gln: Callable[[str], str],
@@ -125,7 +144,7 @@ def render_fda_request_csv(
         # Normalize before splitting -- see _normalize_to_utc below (issue #157).
         normalized_timestamp = _normalize_to_utc(event.timestamp)
         writer.writerow(
-            {
+            _neutralize_row({
                 "Traceability Lot Code": event.traceability_lot_code,
                 "Event Type (CTE)": event.cte_type.value,
                 "Product Description": event.product_description,
@@ -139,7 +158,7 @@ def render_fda_request_csv(
                 "Time": normalized_timestamp.time().isoformat(timespec="seconds"),
                 "Reference Document Type": event.kdes.get("reference_document_type", ""),
                 "Reference Document Number": event.kdes.get("reference_document_number", ""),
-            }
+            })
         )
     return output.getvalue()
 

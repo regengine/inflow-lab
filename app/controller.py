@@ -7,7 +7,7 @@ import uuid
 from collections import defaultdict, deque
 from dataclasses import dataclass
 from datetime import UTC, datetime
-from typing import Any, Iterable
+from typing import Any, Iterable, Literal
 from urllib.parse import urlparse
 
 from fastapi import HTTPException
@@ -59,11 +59,24 @@ from .store import EventStore, mask_secret_in_payload, mask_secret_in_string
 # failures land in the stream operators already watch (#182).
 logger = logging.getLogger("inflow_lab")
 
+# Response-status vocabularies, mirrored from the response models in
+# app/schemas so the controller cannot hand the API a status its schema
+# rejects -- mypy checks every assignment below against these.
+DeliveryStatus = Literal["generated", "posted", "failed"]
+ReplayStatus = Literal["empty", "posted", "rebuilt", "failed"]
+CSVImportStatus = Literal["accepted", "partial", "rejected", "delivery_failed"]
+RetryStatus = Literal["empty", "posted", "partial", "failed", "skipped"]
+_REPLAY_STATUS_BY_DELIVERY: dict[str, ReplayStatus] = {
+    "posted": "posted",
+    "failed": "failed",
+    "generated": "rebuilt",
+}
+
 
 @dataclass(slots=True)
 class DeliveryOutcome:
     response: dict[str, Any] | None = None
-    delivery_status: str = "generated"
+    delivery_status: DeliveryStatus = "generated"
     posted: int = 0
     failed: int = 0
     delivery_attempts: int = 0
@@ -301,11 +314,7 @@ class SimulationController:
                 # are still reported even if a later chunk fails.
                 chunks = await self._deliver_in_chunks(source, events, replay_config)
                 outcome = _aggregate_outcomes([chunk_outcome for _, chunk_outcome in chunks])
-                replay_status = {
-                    "posted": "posted",
-                    "failed": "failed",
-                    "generated": "rebuilt",
-                }[outcome.delivery_status]
+                replay_status = _REPLAY_STATUS_BY_DELIVERY[outcome.delivery_status]
                 result = ReplayResponse(
                     status=replay_status,
                     read=len(records),
@@ -377,6 +386,7 @@ class SimulationController:
                 outcome = _aggregate_outcomes([chunk_outcome for _, chunk_outcome in chunks])
 
             rejected = parsed.total - len(parsed.events)
+            status: CSVImportStatus
             if outcome.delivery_status == "failed":
                 status = "delivery_failed"
             elif parsed.events and parsed.errors:
@@ -657,6 +667,7 @@ class SimulationController:
                     failed += outcome.failed
 
                 await self._store_update_many(updated_records)
+                status: RetryStatus
                 if posted and failed:
                     status = "partial"
                 elif failed:
@@ -1288,6 +1299,7 @@ def _aggregate_outcomes(outcomes: list[DeliveryOutcome]) -> DeliveryOutcome:
     if len(outcomes) == 1:
         return outcomes[0]
 
+    delivery_status: DeliveryStatus
     if any(outcome.delivery_status == "failed" for outcome in outcomes):
         delivery_status = "failed"
     elif all(outcome.delivery_status == "generated" for outcome in outcomes):

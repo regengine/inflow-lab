@@ -185,7 +185,7 @@ def _total_tenant_count() -> int:
 
 
 def known_tenant_ids() -> list[str]:
-    tenant_ids = set()
+    tenant_ids: set[str] = set()
     with _tenant_lock:
         tenant_ids.update(
             tenant_id for tenant_id in _tenant_controllers if tenant_id != DEFAULT_TENANT_ID

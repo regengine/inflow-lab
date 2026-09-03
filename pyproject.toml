@@ -28,6 +28,8 @@ testpaths = ["tests"]
 
 [tool.ruff]
 target-version = "py311"
+line-length = 120
+src = ["."]
 
 [tool.ruff.lint]
 # #137 assessment: ruff's own default rule selection (pyflakes plus the
@@ -63,3 +65,20 @@ target-version = "py311"
 # This section does not add CI enforcement by itself -- no workflow step
 # runs `ruff check` yet.
 select = ["E4", "E7", "E9", "F"]
+
+[tool.ruff.lint.per-file-ignores]
+# Scripts bootstrap sys.path before importing `app`, so their imports cannot
+# all sit at the top of the file.
+"scripts/*" = ["E402"]
+
+[tool.mypy]
+python_version = "3.11"
+files = ["app", "scripts"]
+# Starting posture: catch real type errors in annotated code without demanding
+# the whole tree be annotated first. Tighten by removing these, not by adding
+# per-file ignores.
+ignore_missing_imports = true
+check_untyped_defs = true
+warn_unused_ignores = true
+warn_redundant_casts = true
+no_implicit_optional = true

@@ -4,5 +4,5 @@ from fastapi import Request
 from fastapi.responses import JSONResponse
 
 
-async def handle_value_error(_: Request, exc: ValueError) -> JSONResponse:
+async def handle_value_error(_: Request, exc: Exception) -> JSONResponse:
     return JSONResponse(status_code=400, content={"detail": str(exc)})

@@ -98,6 +98,36 @@ jobs:
             /tmp/codex-output.md
             /tmp/codex.diff
 
+      # The agent runs unsupervised with contents:write and pull-requests:write.
+      # Nothing else in this repo gates a workflow diff: there is no CODEOWNERS,
+      # and every autopilot PR carries the same generic title, so a reviewer
+      # skimming "Autopilot maintenance" has no signal that the diff loosened
+      # the very permissions and secrets usage that constrain the agent. Workflow
+      # files are therefore reverted here AND excluded from add-paths below --
+      # belt and braces, because add-paths alone would leave the edits sitting
+      # dirty in the workspace where a later step could stage them.
+      - name: Drop agent edits to CI/CD workflow files
+        id: workflow_guard
+        run: |
+          set -uo pipefail
+          changed=$(git status --porcelain -- .github/workflows | sed 's/^...//' | sort -u)
+          if [ -z "$changed" ]; then
+            echo "attempted=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          echo "attempted=true" >> "$GITHUB_OUTPUT"
+          echo "::warning::Codex modified .github/workflows; those changes were reverted and excluded from the PR."
+          printf '%s\n' "$changed"
+          git checkout -- .github/workflows 2>/dev/null || true
+          git clean -fd -- .github/workflows 2>/dev/null || true
+          {
+            echo '## Workflow edits dropped'
+            echo
+            echo 'Codex modified these workflow files. They were reverted; propose them in a human-authored PR instead.'
+            echo
+            printf '%s\n' "$changed" | sed 's/^/- /'
+          } >> "$GITHUB_STEP_SUMMARY"
+
       - name: Create or update pull request
         id: cpr
         uses: peter-evans/create-pull-request@5f6978faf089d4d20b00c7766989d076bb2fc7f1 # v8.1.1
@@ -108,9 +138,11 @@ jobs:
           author: github-actions[bot] <41898282+github-actions[bot]@users.noreply.github.com>
           branch: codex/autopilot
           delete-branch: true
-          title: '[Codex] Autopilot maintenance'
+          title: ${{ steps.workflow_guard.outputs.attempted == 'true' && '[Codex] Autopilot maintenance (workflow edits dropped - review)' || '[Codex] Autopilot maintenance' }}
           body: |
             This pull request was opened automatically by the Codex autopilot workflow.
+
+            ${{ steps.workflow_guard.outputs.attempted == 'true' && '> **This run tried to edit CI/CD workflow files.** Those edits were reverted and are NOT in this diff; the run summary lists them. Read the run log before merging, and raise any wanted workflow change as a human-authored PR.' || '' }}
 
             - Workflow run: https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}
             - Prompt file: `.github/codex/prompts/autobuild.md`
@@ -118,26 +150,14 @@ jobs:
             - Transcript + patch: download the workflow artifact from this run
             - Merge policy: this workflow only opens or updates a PR. A human review
               and required status checks must land the change.
-          # NOTE: .github/workflows/** is intentionally NOT listed here. This
-          # job holds contents:write and pull-requests:write, and the Codex
-          # step runs unsupervised with workspace-write access, so it could
-          # in principle edit a workflow file (e.g. loosen these very
-          # permissions, add a trigger, or touch secrets usage). add-paths
-          # is a git-pathspec allowlist: only paths listed below are ever
-          # `git add`-ed before this action commits and opens the PR, so any
-          # in-workspace edit to .github/workflows/** simply never gets
-          # staged, never gets committed, and evaporates with the ephemeral
-          # runner at the end of the job. It cannot land in the auto-PR even
-          # silently. See issue #128. If a workflow genuinely needs to
-          # change, that must go through a human-authored PR instead — which
-          # is also why .github/CODEOWNERS requires review on .github/**.
-          #
-          # Only .github/codex/prompts/** is allowed back in under .github/
-          # (the autopilot's own prompt file lives there today). Add other
-          # specific non-workflow .github/ paths here individually if they
-          # come up — do not widen this back to a bare `.github/**`.
+          # Deliberately NOT `.github/**`: that let agent-authored changes to
+          # .github/workflows/** ride along in a PR titled "Autopilot
+          # maintenance". Everything under .github that the agent legitimately
+          # maintains is listed individually; workflow and composite-action
+          # definitions are not, and are reverted by the guard step above.
           add-paths: |
-            .github/codex/prompts/**
+            .github/codex/**
+            .github/dependabot.yml
             .agents/**
             .codex/**
             AGENTS.md
