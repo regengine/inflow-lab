@@ -148,10 +148,12 @@ def _verify_webhook_signature(body: bytes | None, signature_header: str | None) 
             401, "Unsupported X-Webhook-Signature scheme (expected 'sha256=<hex>')"
         )
 
+    try:
+        provided_digest.encode("ascii")
+    except UnicodeEncodeError:
+        raise MockRegEngineHTTPError(401, "Invalid X-Webhook-Signature")
+
     expected_digest = hmac.new(secret.encode("utf-8"), body, hashlib.sha256).hexdigest()
-    # hmac.compare_digest, never == -- a time-variable comparison leaks how
-    # many leading hex characters matched, letting an attacker recover a
-    # valid signature one byte at a time.
     if not hmac.compare_digest(expected_digest, provided_digest):
         raise MockRegEngineHTTPError(401, "Invalid X-Webhook-Signature")
 
@@ -236,8 +238,13 @@ class MockRegEngineService:
 
         for code in friction:
             failure = FRICTION_RESPONSES.get(code)
-            if failure is not None:
-                raise MockRegEngineHTTPError(*failure)
+            if failure is None:
+                raise MockRegEngineHTTPError(
+                    400,
+                    f"Unknown X-Mock-Friction code {code!r}. "
+                    f"Valid codes: {', '.join(sorted(FRICTION_RESPONSES))}",
+                )
+            raise MockRegEngineHTTPError(*failure)
 
         if len(payload.events) < MIN_BATCH_EVENTS:
             raise MockRegEngineHTTPError(

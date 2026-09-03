@@ -428,3 +428,39 @@ def test_route_friction_header_agrees_with_direct_service_friction() -> None:
 
     assert response.status_code == exc_info.value.status_code == 401
     assert response.json()["detail"] == exc_info.value.detail
+
+
+def test_service_rejects_non_ascii_signature_header(monkeypatch: Any) -> None:
+    """Non-ASCII in the signature header must return 401, not a TypeError (#209.2)."""
+    monkeypatch.setenv(HMAC_ENV_VAR, "test-secret")
+    payload = IngestPayload.model_validate(_payload_dict())
+    with pytest.raises(MockRegEngineHTTPError) as exc_info:
+        MockRegEngineService().ingest(
+            payload,
+            raw_body=b'{}',
+            signature_header="sha256=caf\xe9babe",
+        )
+    assert exc_info.value.status_code == 401
+
+
+def test_route_rejects_unknown_friction_code() -> None:
+    """An unknown X-Mock-Friction code must be rejected, not silently ignored (#210.2)."""
+    response = client.post(
+        INGEST_URL,
+        json=_payload_dict(),
+        headers={"X-Mock-Friction": "typo_code"},
+    )
+    assert response.status_code == 400
+    assert "Unknown X-Mock-Friction code" in response.json()["detail"]
+
+
+def test_hmac_verified_before_body_parsed(monkeypatch: Any) -> None:
+    """An unsigned body with extra fields must get 401, not 422 (#209.1).
+
+    Previously FastAPI parsed the body first, so an unsigned caller
+    would see a 422 with field-level detail before the signature check."""
+    monkeypatch.setenv(HMAC_ENV_VAR, "test-secret")
+    malformed = {"events": [], "extra_field": "leak"}
+    response = client.post(INGEST_URL, json=malformed)
+    assert response.status_code == 401
+    assert "Missing X-Webhook-Signature" in response.json()["detail"]

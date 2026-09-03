@@ -78,6 +78,12 @@ def _is_unsafe_address(address: ipaddress.IPv4Address | ipaddress.IPv6Address) -
     return mapped is not None and _is_unsafe_address(mapped)
 
 
+async def async_validate_egress_endpoint(url: HttpUrl | None) -> None:
+    """Async wrapper that offloads the blocking DNS resolution to a thread."""
+    import asyncio
+    await asyncio.to_thread(validate_egress_endpoint, url)
+
+
 def validate_egress_endpoint(url: HttpUrl | None) -> None:
     """Reject a RegEngine delivery endpoint before it is ever dialed.
 
