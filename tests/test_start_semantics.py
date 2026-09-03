@@ -529,3 +529,49 @@ def test_live_delivery_validation_still_takes_precedence_over_the_running_confli
         asyncio.run(scenario())
     finally:
         asyncio.run(controller.stop())
+
+
+# ---------------------------------------------------------------------------
+# #217 -- run-loop crash reason is exposed in status()
+# ---------------------------------------------------------------------------
+
+
+def test_run_loop_crash_reason_exposed_in_status(tmp_path):
+    """When _run_loop crashes, the exception type and message appear in
+    status()['last_error'] and the controller stops running."""
+
+    async def scenario():
+        config = _config(tmp_path)
+        await controller.start(config)
+        assert controller.running is True
+        assert "last_error" not in controller.status()
+
+        # Force the run loop to crash by making step() raise.
+        original_step = controller.step
+
+        async def crashing_step(batch_size):
+            raise RuntimeError("simulated engine failure")
+
+        controller.step = crashing_step
+        # Give the loop time to hit the crash.
+        await asyncio.sleep(SETTLE_SECONDS)
+
+        assert controller.running is False
+        status = controller.status()
+        assert "last_error" in status
+        assert "RuntimeError" in status["last_error"]
+        assert "simulated engine failure" in status["last_error"]
+
+        # Restarting clears the error.
+        controller.step = original_step
+        await controller.start(config)
+        await asyncio.sleep(SETTLE_SECONDS)
+        assert controller.running is True
+        assert "last_error" not in controller.status()
+
+        await controller.stop()
+
+    try:
+        asyncio.run(scenario())
+    finally:
+        asyncio.run(controller.stop())

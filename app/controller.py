@@ -93,6 +93,7 @@ class SimulationController:
         self._lock = asyncio.Lock()
         self._revision = 0
         self._change_condition = asyncio.Condition()
+        self._last_error: str | None = None
 
     @property
     def running(self) -> bool:
@@ -149,6 +150,7 @@ class SimulationController:
             if not self.running and _engine_shaping_fields_changed(previous_config, config):
                 self.engine.reset(config.seed, scenario=config.scenario, scale=config.scale)
             if not self.running:
+                self._last_error = None
                 stop_event = asyncio.Event()
                 self._stop_event = stop_event
                 self._task = asyncio.create_task(self._run_loop(stop_event))
@@ -952,15 +954,22 @@ class SimulationController:
         # start() call that has nothing to do with it. Capturing the one
         # event this loop was created with, once, makes it deaf to any
         # later generation's event by construction.
-        while not stop_event.is_set():
-            await self.step(self.config.batch_size)
-            if self.config.interval_seconds <= 0:
-                await asyncio.sleep(0)
-            else:
-                try:
-                    await asyncio.wait_for(stop_event.wait(), timeout=self.config.interval_seconds)
-                except asyncio.TimeoutError:
-                    continue
+        try:
+            while not stop_event.is_set():
+                await self.step(self.config.batch_size)
+                if self.config.interval_seconds <= 0:
+                    await asyncio.sleep(0)
+                else:
+                    try:
+                        await asyncio.wait_for(stop_event.wait(), timeout=self.config.interval_seconds)
+                    except asyncio.TimeoutError:
+                        continue
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            self._last_error = f"{type(exc).__name__}: {exc}"
+            logger.exception("run loop crashed")
+            await self._publish_update()
 
     async def _publish_update(self) -> None:
         async with self._change_condition:
@@ -985,7 +994,7 @@ class SimulationController:
     def status(self) -> dict[str, Any]:
         records = self.store.all_between()
         scenario = get_scenario(self.config.scenario)
-        return {
+        result: dict[str, Any] = {
             "running": self.running,
             "config": self._sanitize_public_config(self.config).model_dump(mode="json"),
             "stats": {
@@ -994,6 +1003,9 @@ class SimulationController:
                 "engine": self.engine.snapshot(),
             },
         }
+        if self._last_error is not None:
+            result["last_error"] = self._last_error
+        return result
 
     def integration_status(self) -> IntegrationStatusResponse:
         delivery = self.config.delivery
