@@ -361,6 +361,7 @@ function setStatus(message, tone = 'neutral', holdMs = 0) {
     ids.statusMessage.textContent = message;
   }
   ids.statusMessage.dataset.tone = tone;
+  ids.statusMessage.setAttribute('aria-live', tone === 'error' ? 'assertive' : 'polite');
   state.statusHoldUntil = holdMs > 0 ? Date.now() + holdMs : 0;
 }
 

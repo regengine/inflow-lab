@@ -199,8 +199,13 @@ class SimulationController:
             self._task = None
         await self._publish_update()
 
-    async def shutdown(self) -> None:
-        await self.stop()
+    async def shutdown(self, timeout: float = 10.0) -> None:
+        try:
+            await asyncio.wait_for(self.stop(), timeout=timeout)
+        except asyncio.TimeoutError:
+            if self._task is not None and not self._task.done():
+                self._task.cancel()
+            logger.warning("shutdown timed out after %.1fs — cancelled run loop", timeout)
 
     async def reset(self, config: SimulationConfig | None = None) -> None:
         await self.stop()
