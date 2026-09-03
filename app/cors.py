@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import logging
 import os
+from functools import lru_cache
 from urllib.parse import urlparse
 
 
@@ -9,19 +10,81 @@ logger = logging.getLogger(__name__)
 
 DEFAULT_CORS_ORIGINS = ("http://127.0.0.1:8000", "http://localhost:8000")
 
+logger = logging.getLogger("inflow_lab.cors")
+
 
 def cors_origins_from_env() -> list[str]:
+    """Strict parse of REGENGINE_CORS_ORIGINS: raises ValueError on the first
+    malformed entry. Kept for direct/test callers that want that contract.
+    create_app() does not call this directly -- it calls
+    resolve_cors_origins() below, which never raises (#178): a single typo in
+    this hand-typed, operator-facing variable must not take the whole
+    process down before it binds a port.
+    """
+    return _with_platform_origin(_parsed_env_origins(strict=True))
+
+
+def resolve_cors_origins() -> list[str]:
+    """CORS origins for the running app: never raises.
+
+    Runs the same per-entry validation as cors_origins_from_env(), but a
+    malformed entry is skipped and logged instead of raised, so the other
+    origins an operator configured still take effect. This is the same
+    trade-off _platform_origin() below already makes for RAILWAY_PUBLIC_DOMAIN
+    -- degrade, don't crash, while the ASGI app is being constructed.
+    """
+    return _with_platform_origin(_parsed_env_origins(strict=False))
+
+
+@lru_cache(maxsize=16)
+def _resolved_origins_for_env(_raw_origins: str | None, _platform_domain: str | None) -> tuple[str, ...]:
+    # The two arguments are the cache KEY only -- resolve_cors_origins() reads
+    # both back out of os.environ itself. Passing them in is precisely what
+    # makes the cache invalidate the moment either variable changes, so a test
+    # (or an operator editing the deployment) never sees a stale answer.
+    return tuple(resolve_cors_origins())
+
+
+def resolve_cors_origins_cached() -> list[str]:
+    """resolve_cors_origins(), memoized on the environment it derives from.
+
+    For the request path (#200). auth_middleware consults the trusted-origin
+    list on every authenticated state-changing request; parsing the variable
+    from scratch each time is pure waste, since it only changes when the
+    process is reconfigured.
+    """
+    return list(
+        _resolved_origins_for_env(
+            os.getenv("REGENGINE_CORS_ORIGINS"), os.getenv("RAILWAY_PUBLIC_DOMAIN")
+        )
+    )
+
+
+def _parsed_env_origins(*, strict: bool) -> list[str]:
     raw_origins = os.getenv("REGENGINE_CORS_ORIGINS")
     if not raw_origins or not raw_origins.strip():
-        origins = list(DEFAULT_CORS_ORIGINS)
-    else:
-        origins = []
-        for raw_origin in raw_origins.split(","):
-            origin = _normalize_cors_origin(raw_origin)
-            if origin and origin not in origins:
-                origins.append(origin)
-        origins = origins or list(DEFAULT_CORS_ORIGINS)
+        return list(DEFAULT_CORS_ORIGINS)
 
+    origins: list[str] = []
+    for raw_origin in raw_origins.split(","):
+        try:
+            origin = _normalize_cors_origin(raw_origin)
+        except ValueError:
+            if strict:
+                raise
+            logger.warning(
+                "Ignoring malformed REGENGINE_CORS_ORIGINS entry %r; keeping the other "
+                "configured origins. Entries must be plain HTTP(S) origins such as "
+                "https://demo.example.com.",
+                raw_origin.strip(),
+            )
+            continue
+        if origin and origin not in origins:
+            origins.append(origin)
+    return origins or list(DEFAULT_CORS_ORIGINS)
+
+
+def _with_platform_origin(origins: list[str]) -> list[str]:
     # The service always trusts its own platform-issued domain, IN ADDITION to
     # whatever is configured. A union, not a fallback, on purpose: in the
     # August 2026 cutover REGENGINE_CORS_ORIGINS was set — to the previous
