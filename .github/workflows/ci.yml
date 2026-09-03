@@ -286,14 +286,25 @@ jobs:
       - name: Run browser smoke
         run: uv run --frozen --no-dev --group browser python scripts/browser_smoke.py
 
-<<<<<<< HEAD
+      # browser_smoke.py writes output/playwright/browser_smoke_failure.png on
+      # any failure. Without this the screenshot dies with the runner and the
+      # failure has to be reproduced locally to see what Playwright saw.
+      - name: Upload failure screenshots
+        if: failure()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: browser-smoke-failure-${{ github.run_id }}-${{ github.run_attempt }}
+          path: output/playwright/
+          if-no-files-found: ignore
+          retention-days: 7
+
   console-lint:
     runs-on: ubuntu-latest
     timeout-minutes: 10
 
     steps:
       - name: Check out repository
-        uses: actions/checkout@v6
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: Set up Node
         uses: actions/setup-node@v4
@@ -306,16 +317,3 @@ jobs:
 
       - name: Lint the operator console
         run: npm run lint
-=======
-      # browser_smoke.py writes output/playwright/browser_smoke_failure.png on
-      # any failure. Without this the screenshot dies with the runner and the
-      # failure has to be reproduced locally to see what Playwright saw.
-      - name: Upload failure screenshots
-        if: failure()
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
-        with:
-          name: browser-smoke-failure-${{ github.run_id }}-${{ github.run_attempt }}
-          path: output/playwright/
-          if-no-files-found: ignore
-          retention-days: 7
->>>>>>> origin/main
