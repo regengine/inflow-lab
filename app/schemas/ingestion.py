@@ -3,7 +3,7 @@ from __future__ import annotations
 from datetime import datetime
 from typing import Any, Literal
 
-from pydantic import BaseModel, Field, field_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 from .domain import CSVImportType, CTEType, DestinationMode, RegEngineEvent
 from .simulation import STRICT_REQUEST, DeliveryConfig
@@ -49,7 +49,7 @@ class MockIngestResponse(BaseModel):
 
 
 class DeliveryRetryRequest(BaseModel):
-    model_config = STRICT_REQUEST
+    model_config = ConfigDict(extra="forbid")
 
     record_ids: list[str] | None = None
     limit: int = 50
@@ -79,7 +79,7 @@ class DeliveryRetryResponse(BaseModel):
 
 
 class ReplayRequest(BaseModel):
-    model_config = STRICT_REQUEST
+    model_config = ConfigDict(extra="forbid")
 
     persist_path: str | None = None
     source: str | None = None
@@ -115,7 +115,7 @@ MAX_CSV_IMPORT_CHARS = 4 * 1024 * 1024
 
 
 class CSVImportRequest(BaseModel):
-    model_config = STRICT_REQUEST
+    model_config = ConfigDict(extra="forbid")
 
     import_type: CSVImportType
     csv_text: str = Field(max_length=MAX_CSV_IMPORT_CHARS)

@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from typing import Any, Literal
 
-from pydantic import BaseModel, ConfigDict, Field, HttpUrl, field_validator, model_validator
+from pydantic import BaseModel, ConfigDict, Field, HttpUrl, field_validator
 
 from ..scenarios import ScenarioId
 from .domain import DestinationMode, OperationScale
@@ -38,7 +38,7 @@ def default_persist_path() -> str:
 
 
 class DeliveryConfig(BaseModel):
-    model_config = STRICT_REQUEST
+    model_config = ConfigDict(extra="forbid")
 
     mode: DestinationMode = DestinationMode.MOCK
     endpoint: HttpUrl | None = None
@@ -50,7 +50,7 @@ class DeliveryConfig(BaseModel):
 
 
 class SimulationConfig(BaseModel):
-    model_config = STRICT_REQUEST
+    model_config = ConfigDict(extra="forbid")
 
     source: str = "codex-simulator"
     scenario: ScenarioId = ScenarioId.LEAFY_GREENS_SUPPLIER
@@ -77,13 +77,19 @@ class SimulationConfig(BaseModel):
 
 
 class StartRequest(BaseModel):
-    model_config = STRICT_REQUEST
+    model_config = ConfigDict(extra="forbid")
 
     config: SimulationConfig
 
 
+class ResetRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    config: SimulationConfig | None = None
+
+
 class StepRequest(BaseModel):
-    model_config = STRICT_REQUEST
+    model_config = ConfigDict(extra="forbid")
 
     config: SimulationConfig | None = None
 

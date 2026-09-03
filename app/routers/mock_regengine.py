@@ -28,12 +28,9 @@ from ..fda_export import (
     list_fda_export_preset_summaries,
     render_fda_request_csv,
 )
-from ..schemas.domain import FDAExportPreset, StoredEventRecord
-from ..schemas.exports import (
-    EpcisDocumentResponse,
-    FDAExportPresetListResponse,
-    FDAExportPresetSummary,
-)
+from ..schemas.domain import FDAExportPreset
+from ..schemas.health import EpcisDocumentResponse
+from ..schemas.exports import FDAExportPresetListResponse, FDAExportPresetSummary
 from ..schemas.ingestion import IngestPayload, MockIngestResponse
 
 
@@ -283,8 +280,7 @@ async def mock_fda_request_export(
 
 @router.get(
     "/export/epcis",
-    response_model=EpcisDocumentResponse,
-    response_model_exclude_none=True,
+    responses={200: {"model": EpcisDocumentResponse, "content": {"application/ld+json": {}}}},
 )
 async def mock_epcis_export(
     start_date: str | None = Query(default=None, description="Inclusive YYYY-MM-DD"),

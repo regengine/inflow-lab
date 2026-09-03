@@ -12,13 +12,7 @@ from ..auth import TenantContext
 from ..controller import SimulationController
 from ..dependencies import get_active_controller, get_tenant_context
 from ..schemas.ingestion import ReplayRequest, ReplayResponse
-from ..schemas.simulation import (
-    ResetRequest,
-    ResetResponse,
-    StartRequest,
-    StatusResponse,
-    StepResponse,
-)
+from ..schemas.simulation import ResetRequest, ResetResponse, StartRequest, StatusResponse, StepResponse
 
 
 router = APIRouter(prefix="/api/simulate", tags=["Simulation"])
@@ -93,13 +87,6 @@ async def simulate_reset(
     context: TenantContext = Depends(get_tenant_context),
     active_controller: SimulationController = Depends(get_active_controller),
 ) -> ResetResponse:
-    """Reset the simulation, optionally applying a config override.
-
-    Accepts ``/start``'s wrapped ``{"config": {...}}`` body as well as the
-    flat ``SimulationConfig`` body this route has always taken; see
-    ``ResetRequest``. Unknown or misnested fields are rejected rather than
-    dropped, so a wrong body no longer resets to defaults with a 200.
-    """
     config = reset_request.config if reset_request else None
     await active_controller.reset(tenancy.scope_config(context, config) if config else None)
     return ResetResponse(status="reset")

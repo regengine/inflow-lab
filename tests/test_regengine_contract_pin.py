@@ -7,13 +7,10 @@ KDEs, update BOTH this table and app/cte_rules.py — a mismatch here means
 the mock validates differently from live RegEngine, which resurrects the
 "green demo, failing live post" drift this pin exists to catch.
 
-Both sides of that assertion live in THIS repo, so on its own it cannot
-detect RegEngine-side drift (#140). The staleness guard at the bottom is
-what bounds how long an un-noticed upstream change can sit here: it fails
-the suite once the table has gone unconfirmed for
-scripts.contract_pin_check.MAX_PIN_AGE_DAYS. The real upstream comparison
-lives in that same module and runs in CI when a RegEngine checkout is
-available.
+NOTE (§1.1330(b)(7)): The TRANSFORMATION entry below already includes
+input_traceability_lot_codes and input_products as required, ahead of the
+live RegEngine contract. Update the live contract and remove this note once
+RegEngine's webhook_models.py is aligned.
 """
 
 from __future__ import annotations
@@ -97,6 +94,8 @@ REGENGINE_REQUIRED_KDES_BY_CTE: dict[CTEType, tuple[str, ...]] = {
         "transformation_date",
         "location_name",
         "reference_document",
+        "input_traceability_lot_codes",
+        "input_products",
     ),
 }
 

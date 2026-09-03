@@ -117,19 +117,8 @@ class IndustryAdapter:
             "location_name": processor.name,
             "input_traceability_lot_codes": [lot.lot_code for lot in inputs],
             "input_products": [lot.product_description for lot in inputs],
-            # FSMA 204 §1.1350(c): for each traceability lot used, the quantity
-            # and unit of measure of the food used from that lot. The engine
-            # consumes each sampled input lot in full (`_transform` removes them
-            # from processor inventory), so the quantity used is the lot's own
-            # quantity -- these sum to `total_input_qty`, keeping the recorded
-            # per-input mass balance consistent with `yield_ratio`. Shaped as
-            # the exporter's `_input_lot_details` already reads it.
             "input_quantities": [
-                {
-                    "lot_code": lot.lot_code,
-                    "quantity": lot.quantity,
-                    "unit_of_measure": lot.unit_of_measure,
-                }
+                {"lot_code": lot.lot_code, "quantity": lot.quantity, "unit_of_measure": lot.unit_of_measure}
                 for lot in inputs
             ],
             "output_traceability_lot_codes": [lot.lot_code for lot in outputs],

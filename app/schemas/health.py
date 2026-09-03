@@ -1,13 +1,11 @@
 from __future__ import annotations
 
-from pydantic import BaseModel
+from typing import Any
 
-from .simulation import StatusResponse
+from pydantic import BaseModel
 
 
 class BuildInfoResponse(BaseModel):
-    """Deploy provenance, as reported by ``build_info.public_dict()``."""
-
     version: str
     commit_sha: str | None = None
     commit_sha_short: str | None = None
@@ -18,35 +16,38 @@ class BuildInfoResponse(BaseModel):
     deployment_source: str | None = None
 
 
-class StoreProbeResponse(BaseModel):
-    """Result of the event store's non-destructive write probe."""
-
-    ok: bool
-    persist_path: str
-    error: str | None = None
-
-
-class HealthAuthResponse(BaseModel):
-    """Auth posture of the request that asked — never a credential."""
-
+class AuthInfoResponse(BaseModel):
     enabled: bool
     username: str | None = None
-    uses_default_storage: bool = True
+    uses_default_storage: bool
 
 
 class HealthzResponse(BaseModel):
-    """Liveness/readiness probe body. HTTP 503 when ``ok`` is false."""
-
     ok: bool
     utc_time: str
     build: BuildInfoResponse
     contract_version: str
-    store: StoreProbeResponse
 
 
 class HealthResponse(HealthzResponse):
-    """Tenant-aware health, adding who is asking and what the sim is doing."""
-
     tenant: str
-    auth: HealthAuthResponse
-    status: StatusResponse
+    auth: AuthInfoResponse
+    status: dict[str, Any]
+
+
+class EpcisEventBodyResponse(BaseModel):
+    eventList: list[dict[str, Any]]
+
+
+class EpcisDocumentResponse(BaseModel):
+    """Top-level EPCIS 2.0 JSON-LD document.
+
+    The ``@context`` field is serialised as-is in the real response; it is
+    described here as ``dict | list`` because JSON-LD allows both shapes.
+    """
+
+    type: str
+    schemaVersion: str
+    creationDate: str
+    sender: str
+    epcisBody: EpcisEventBodyResponse

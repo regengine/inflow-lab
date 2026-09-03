@@ -181,7 +181,11 @@ def _run_dashboard_smoke(base_url: str, config: BrowserSmokeConfig) -> None:
             page.on("pageerror", lambda error: console_errors.append(str(error)))
 
             page.goto(base_url, wait_until="domcontentloaded")
-            expect(page.get_by_role("heading", name="Plant Operations Console", exact=True)).to_be_visible()
+            # Use a CSS locator here, not get_by_role: the welcome overlay is
+            # aria-modal="true" at this point, which removes the rest of the
+            # document from the ARIA tree so get_by_role("heading") returns 0
+            # elements.  The accessible-name check comes after dismissal below.
+            expect(page.locator("h1", has_text="Plant Operations Console")).to_be_visible()
             expect(page.locator("#guideRail")).to_contain_text("How to use this console")
             expect(page.locator('#guideRail [data-guide-step="setup"]')).to_be_visible()
 
