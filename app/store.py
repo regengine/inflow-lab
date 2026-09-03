@@ -17,6 +17,14 @@ from .schemas.domain import LineageEdge, LineageNode, StoredEventRecord
 logger = logging.getLogger("inflow_lab")
 
 
+class RetiredStoreError(ValueError):
+    """Raised when a write is attempted through a deleted tenant's store (#175).
+
+    Subclasses ValueError so main.py's app-wide handler turns it into a clean
+    4xx rather than an unhandled 500.
+    """
+
+
 # Sentinel that replaces secrets in scrubbed output. Not a credential.
 MASKED_SECRET = "***MASKED***"  # nosec B105
 SECRET_FIELD_NAMES = {"api_key", "apikey", "x_regengine_api_key", "authorization"}
@@ -98,6 +106,10 @@ class EventStore:
         # the _load_from_disk() call a few lines down performs the first
         # real read.
         self.last_read_corrupt_lines: list[CorruptRecordLine] = []
+        # Set by retire() when this store's tenant is deleted; see retire().
+        # Declared here so the attribute always exists, including for the
+        # _load_from_disk() call below, which clears it.
+        self.retired = False
         # threading.RLock, not asyncio.Lock (#136). Two different kinds of
         # caller take it: EventStore.__init__/_load_from_disk and
         # MockRegEngineService.__init__ (mock_service.py, via
@@ -159,6 +171,11 @@ class EventStore:
         self._records = deque(reversed(newest_last), maxlen=self.max_records)
 
     def _load_from_disk(self) -> None:
+        # configure() routes here to repoint the store at a different file.
+        # That is a new backing store, not the retired one, so the retirement
+        # does not carry over -- otherwise a tenant id reused after a delete
+        # would inherit a permanently unwritable store.
+        self.retired = False
         self.persist_path.parent.mkdir(parents=True, exist_ok=True)
         records = self.read_persisted_records(str(self.persist_path))
         counter = max((record.sequence_no for record in records), default=0)
@@ -290,7 +307,36 @@ class EventStore:
             tmp_path.unlink(missing_ok=True)
             raise
 
+    def retire(self) -> None:
+        """Mark this store dead because its tenant is being deleted (#175).
+
+        A request that resolved its controller *before* the delete started
+        still holds that controller object, and every write path here does
+        ``mkdir(parents=True)`` on its own -- so a write through the popped
+        controller recreated the tenant directory after the rmtree, and
+        ``known_tenant_ids()`` then listed the tenant as present again. That
+        controller was a genuine zombie: the next request for the tenant
+        minted a second EventStore over the same file with an independent
+        ``_counter``, so two live objects handed out the same sequence
+        numbers.
+
+        Retiring makes those in-flight writes fail loudly instead of
+        silently resurrecting the tenant. Reads are deliberately still
+        allowed: a request already holding this object may legitimately
+        finish rendering what it had, and a read cannot recreate anything.
+        """
+        with self._lock:
+            self.retired = True
+
+    def _refuse_if_retired(self) -> None:
+        if self.retired:
+            raise RetiredStoreError(
+                "This tenant has been deleted; its event store is no longer writable. "
+                "Retry the request to work against a freshly created tenant."
+            )
+
     def add_many(self, records: Iterable[StoredEventRecord]) -> list[StoredEventRecord]:
+        self._refuse_if_retired()
         stored: list[StoredEventRecord] = []
         try:
             return self._append_many(records, stored)
@@ -328,6 +374,7 @@ class EventStore:
         return stored
 
     def update_many(self, records: Iterable[StoredEventRecord]) -> list[StoredEventRecord]:
+        self._refuse_if_retired()
         replacements = {record.record_id: record for record in records}
         if not replacements:
             return []
@@ -355,6 +402,7 @@ class EventStore:
         return [record for record in updated_records if record.record_id in replacements]
 
     def replace_all(self, records: Iterable[StoredEventRecord]) -> list[StoredEventRecord]:
+        self._refuse_if_retired()
         persisted_records = sorted(list(records), key=lambda record: record.sequence_no)
         with self._lock:
             self._write_records(persisted_records)

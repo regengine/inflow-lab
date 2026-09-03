@@ -149,7 +149,18 @@ def pop_tenant_controller(tenant_id: str) -> SimulationController | None:
     """
     with _tenant_lock:
         _tenants_being_deleted.add(tenant_id)
-        return _tenant_controllers.pop(tenant_id, None)
+        popped = _tenant_controllers.pop(tenant_id, None)
+    if popped is not None:
+        # Removing the controller from the registry only stops the NEXT
+        # request resolving it. A request that resolved it before the delete
+        # started still holds this object, and every EventStore write path
+        # mkdirs its own parent -- so that write would recreate the tenant
+        # directory after the rmtree. Retiring the store makes it fail loudly
+        # instead (#175). Done outside the registry lock: retire() takes the
+        # store's own lock, and holding both at once here would be the only
+        # place in the codebase that orders them.
+        popped.store.retire()
+    return popped
 
 
 def finish_tenant_delete(tenant_id: str) -> None:
@@ -190,6 +201,12 @@ def known_tenant_ids() -> list[str]:
         tenant_ids.update(
             tenant_id for tenant_id in _tenant_controllers if tenant_id != DEFAULT_TENANT_ID
         )
+        # Snapshotted under the same lock the registry is read under, so the
+        # two can never disagree about a tenant's state. Subtracted at the
+        # end: a directory whose pending rmtree has not reached it yet is
+        # still on disk, and reporting it as a live tenant is what made a
+        # deleted tenant reappear in the operator listing (#175).
+        being_deleted = set(_tenants_being_deleted)
 
     if TENANT_DATA_ROOT.exists():
         for path in TENANT_DATA_ROOT.iterdir():
@@ -198,7 +215,7 @@ def known_tenant_ids() -> list[str]:
                     tenant_ids.add(normalize_tenant_id(path.name))
                 except ValueError:
                     continue
-    return sorted(tenant_ids)
+    return sorted(tenant_ids - being_deleted)
 
 
 def tenant_summary(tenant_id: str) -> dict[str, Any]:

@@ -56,6 +56,12 @@ def _store_write_error(store: EventStore) -> str | None:
     EOF, which would turn a health check into a hang rather than a fast,
     correct "unhealthy".
     """
+    if store.retired:
+        # Short-circuit before the mkdir below. Probing a deleted tenant would
+        # otherwise recreate its directory tree and put the tenant back in the
+        # operator listing -- the health check itself resurrecting what the
+        # delete just removed (#175).
+        return "tenant deleted; event store retired"
     try:
         store.persist_path.parent.mkdir(parents=True, exist_ok=True)
         with store.persist_path.open("a", encoding="utf-8") as handle:

@@ -300,3 +300,120 @@ def test_tenant_cap_counts_on_disk_directories_across_restarts(monkeypatch):
         assert resp.status_code == 429
     finally:
         _cleanup_tenant_dir("new-after-restart")
+
+
+def _stored_record(lot_code: str):
+    from datetime import UTC, datetime
+
+    from app.schemas.domain import CTEType, DestinationMode, RegEngineEvent, StoredEventRecord
+
+    return StoredEventRecord(
+        payload_source="test-suite",
+        event=RegEngineEvent(
+            cte_type=CTEType.HARVESTING,
+            traceability_lot_code=lot_code,
+            product_description="Romaine Lettuce",
+            quantity=100,
+            unit_of_measure="cases",
+            location_name="Valley Fresh Farms",
+            timestamp=datetime(2026, 2, 5, 8, 30, tzinfo=UTC),
+            kdes={},
+        ),
+        destination_mode=DestinationMode.NONE,
+        delivery_status="generated",
+    )
+
+
+def test_an_already_resolved_controller_cannot_resurrect_a_deleted_tenant():
+    """The other half of #175's window, which the tests above do not reach.
+
+    ``_tenants_being_deleted`` only blocks *creating* a controller. A request
+    that resolved its controller BEFORE the delete started still holds that
+    object, and every ``EventStore`` write path calls
+    ``mkdir(parents=True, exist_ok=True)`` on its own -- so a write through the
+    popped controller recreated the tenant directory after the rmtree, and
+    ``known_tenant_ids()`` reported the tenant as present again. The popped
+    controller was a genuine zombie: the next request for that tenant minted a
+    second ``EventStore`` over the same file with an independent ``_counter``.
+
+    Retiring the store on pop makes that write fail loudly instead.
+    """
+    from app.store import RetiredStoreError
+
+    tenant_id = "zombie-tenant-alpha"
+
+    # A request resolves its controller and holds on to it -- this is the
+    # in-flight request the delete is about to race.
+    in_flight = tenancy.get_tenant_controller_for_id(tenant_id)
+    assert tenancy.tenant_dir(tenant_id).exists()
+
+    # The operator delete runs to completion while that request is still
+    # holding `in_flight`.
+    tenancy.pop_tenant_controller(tenant_id)
+    shutil.rmtree(tenancy.tenant_dir(tenant_id), ignore_errors=True)
+    tenancy.finish_tenant_delete(tenant_id)
+    assert not tenancy.tenant_dir(tenant_id).exists()
+
+    # The in-flight request now writes through the controller it still
+    # holds. Before the fix this silently recreated the directory.
+    with pytest.raises(RetiredStoreError):
+        in_flight.store.add_many([_stored_record("TLC-ZOMBIE-000001")])
+
+    assert not tenancy.tenant_dir(tenant_id).exists(), (
+        "a write through the popped controller recreated the deleted tenant's directory"
+    )
+    assert tenant_id not in tenancy.known_tenant_ids(), (
+        "the deleted tenant reappeared in the operator listing"
+    )
+
+    # The other two write paths are guarded the same way -- a retry path
+    # or a scenario load must not resurrect it either.
+    with pytest.raises(RetiredStoreError):
+        in_flight.store.update_many([_stored_record("TLC-ZOMBIE-000002")])
+    with pytest.raises(RetiredStoreError):
+        in_flight.store.replace_all([_stored_record("TLC-ZOMBIE-000003")])
+    assert not tenancy.tenant_dir(tenant_id).exists()
+
+
+def test_the_health_probe_does_not_resurrect_a_deleted_tenant():
+    """``_store_write_error`` mkdirs the store's parent before probing it.
+
+    Run against a retired store that is the health check itself recreating
+    the directory tree the delete just removed, putting the tenant back in
+    the operator listing.
+    """
+    from app.routers.health import _store_write_error
+
+    tenant_id = "zombie-tenant-health"
+
+    in_flight = tenancy.get_tenant_controller_for_id(tenant_id)
+    tenancy.pop_tenant_controller(tenant_id)
+    shutil.rmtree(tenancy.tenant_dir(tenant_id), ignore_errors=True)
+    tenancy.finish_tenant_delete(tenant_id)
+
+    assert _store_write_error(in_flight.store) is not None, "a retired store must not read as writable"
+    assert not tenancy.tenant_dir(tenant_id).exists(), "the health probe recreated the deleted tenant"
+
+
+def test_a_tenant_mid_delete_is_not_listed_even_while_its_directory_survives():
+    """``known_tenant_ids`` is what the operator listing renders.
+
+    Between ``pop_tenant_controller`` and the rmtree completing, the
+    directory is still on disk. Reporting it as live is how a deleted tenant
+    reappears in the listing.
+    """
+    tenant_id = "zombie-tenant-listing"
+
+    tenancy.get_tenant_controller_for_id(tenant_id)
+    assert tenant_id in tenancy.known_tenant_ids()
+
+    tenancy.pop_tenant_controller(tenant_id)
+    try:
+        # The rmtree has not run yet, so the directory is still there.
+        assert tenancy.tenant_dir(tenant_id).exists()
+        assert tenant_id not in tenancy.known_tenant_ids(), (
+            "a tenant whose delete is in flight is still being listed as live"
+        )
+    finally:
+        shutil.rmtree(tenancy.tenant_dir(tenant_id), ignore_errors=True)
+        tenancy.finish_tenant_delete(tenant_id)
