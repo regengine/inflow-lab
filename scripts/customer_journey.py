@@ -15,10 +15,6 @@ software up to RegEngine, against a real RegEngine stack:
     idempotency replay, exactly as a live integrator hits them.
 7.  Verify the evidence on the RegEngine side: recent events, hash-chain
     verification, and an FDA export.
-8.  Tear down: delete the tenant and API key step 2 provisioned, so a
-    stack used for repeated runs does not accumulate one of each per run
-    (local mode only, and from a finally block so it also runs when an
-    earlier step fails).
 
 Local mode (default):
 
@@ -29,7 +25,7 @@ Local mode (default):
 
 Deployed mode (never provisions, never touches Redis, small batch):
 
-    export REGENGINE_LIVE_ENDPOINT={live_ingest_endpoint}
+    export REGENGINE_LIVE_ENDPOINT={DEFAULT_LIVE_INGEST_ENDPOINT}
     export REGENGINE_LIVE_API_KEY=...
     export REGENGINE_LIVE_TENANT_ID=...
     uv run python scripts/customer_journey.py --confirm-live
@@ -42,7 +38,6 @@ from __future__ import annotations
 
 import argparse
 import asyncio
-import contextlib
 import os
 import socket
 import ssl
@@ -67,12 +62,12 @@ from app.schemas.simulation import DeliveryConfig, SimulationConfig  # noqa: E40
 from app.scenarios import ScenarioId  # noqa: E402
 
 
-# #155: the deployed-mode example above is rendered from the one live
-# ingest URL the repo keeps, rather than repeating the literal here, so
-# `--help` cannot drift from what the live client actually posts to.
-# str.replace rather than str.format: the docstring is free-form prose and
-# a brace someone adds to it later must not become a KeyError at import.
-_USAGE = (__doc__ or "").replace("{live_ingest_endpoint}", DEFAULT_LIVE_INGEST_ENDPOINT)
+# The example URL in the usage text above is filled in from the single
+# Python definition of the default ingest endpoint, so the docs a user
+# copy-pastes cannot drift from where the client actually posts.
+if __doc__:  # pragma: no branch - only false under `python -OO`
+    __doc__ = __doc__.replace("{DEFAULT_LIVE_INGEST_ENDPOINT}", DEFAULT_LIVE_INGEST_ENDPOINT)
+
 
 DEFAULT_BASE_URL = "http://localhost:8000"
 DEFAULT_REDIS_URL = "redis://localhost:6379/0"
@@ -120,155 +115,126 @@ def resp_command(*parts: str) -> bytes:
     return b"".join(encoded)
 
 
-# Human names for the RESP type bytes this client understands, used only to
-# make a wrong-type failure legible in the journey report.
-_RESP_TYPE_NAMES = {b"+": "simple string", b":": "integer", b"$": "bulk string"}
+class RedisReplyError(RuntimeError):
+    """A Redis reply that was absent, an error, or the wrong RESP type."""
 
 
-def _read_reply(conn_file: Any, label: str) -> tuple[bytes, bytes | None]:
-    """Read one RESP reply, or raise explaining why there wasn't one.
+def read_reply(conn_file: Any, label: str) -> tuple[str, bytes | None]:
+    """Read one RESP reply, raising on anything that is not a real reply.
 
-    The old version of this checked only for a leading b"-" and called
-    everything else success (#109). Two things that are not error replies
-    reached that check and passed it: an empty read, which is what a peer
-    that closed the connection returns, and arbitrary bytes such as a TLS
-    alert from a server expecting a handshake. Both made the journey print
-    PASS for the billing seed and then fail every subsequent ingest at the
-    subscription gate -- the operator staring at a green line for the step
-    that actually broke.
+    The previous version treated every reply that did not start with ``-`` as
+    success, which silently accepted the two failure shapes that actually
+    happen: an empty read (the peer closed the connection) and raw TLS alert
+    bytes from a server that expected a handshake. ``label`` rather than the
+    command itself goes into the messages, because the AUTH command carries
+    the password.
     """
     line = conn_file.readline()
     if not line:
-        raise RuntimeError(
-            f"Redis closed the connection without replying to {label}. "
-            "An empty read is not a success: check the server is reachable, "
-            "and that a TLS endpoint is addressed as rediss:// rather than redis://."
+        raise RedisReplyError(
+            f"Redis closed the connection without replying to {label}. If this "
+            "server speaks TLS, use a rediss:// URL."
         )
-    kind, body = line[:1], line[1:].rstrip(b"\r\n")
-    if kind == b"-":
-        raise RuntimeError(f"Redis rejected {label}: {body.decode('utf-8', 'replace')}")
-    if kind == b"$":
+    if not line.endswith(b"\r\n"):
+        raise RedisReplyError(
+            f"Truncated or non-RESP reply to {label}: {line[:40]!r}. Raw bytes "
+            "like this usually mean the server answered a plaintext command "
+            "with a TLS alert."
+        )
+    prefix, payload = line[:1], line[:-2][1:]
+    if prefix == b"-":
+        raise RedisReplyError(f"Redis error on {label}: {payload.decode(errors='replace')}")
+    if prefix == b"+":
+        return "status", payload
+    if prefix == b":":
+        return "integer", payload
+    if prefix == b"$":
         try:
-            length = int(body)
+            length = int(payload)
         except ValueError as exc:
-            raise RuntimeError(
-                f"Redis sent a malformed bulk-string header for {label}: {line[:64]!r}"
-            ) from exc
+            raise RedisReplyError(f"Malformed bulk length in reply to {label}: {payload!r}") from exc
         if length < 0:
-            return kind, None
-        chunk = conn_file.read(length + 2)
-        if len(chunk) < length:
-            raise RuntimeError(f"Redis sent a truncated reply to {label}.")
-        return kind, chunk[:length]
-    if kind in (b"+", b":"):
-        return kind, body
-    raise RuntimeError(
-        f"Redis replied to {label} with an unrecognized RESP type {kind!r}: {line[:64]!r}. "
-        "Bytes like these are what a TLS handshake alert, or a non-Redis service "
-        "on this port, looks like from here."
+            return "bulk", None
+        body = conn_file.read(length + 2)
+        if len(body) < length + 2:
+            raise RedisReplyError(f"Truncated bulk reply to {label}")
+        return "bulk", body[:-2]
+    raise RedisReplyError(
+        f"Unexpected RESP reply type {prefix!r} for {label}: {line[:40]!r}"
     )
 
 
-def _expect_reply(
-    conn_file: Any,
-    label: str,
-    kind: bytes,
-    value: bytes | None = None,
+def redis_command(
+    conn: Any, conn_file: Any, label: str, expected: str, *parts: str
 ) -> bytes | None:
-    actual_kind, actual_value = _read_reply(conn_file, label)
-    if actual_kind != kind:
-        raise RuntimeError(
-            f"{label}: expected a RESP {_RESP_TYPE_NAMES[kind]} reply, got "
-            f"{_RESP_TYPE_NAMES.get(actual_kind, repr(actual_kind))} {actual_value!r}."
+    """Send one command and require the RESP type it is documented to return.
+
+    ``expected`` is ``"status"`` for the ``+OK`` commands, ``"integer"`` for
+    HSET, and ``"bulk"`` for HGET. A reply of the wrong type is a failure even
+    when it is not an error reply -- that is the whole point.
+    """
+    conn.sendall(resp_command(*parts))
+    kind, reply = read_reply(conn_file, label)
+    if kind != expected:
+        raise RedisReplyError(
+            f"{label} returned a {kind} reply, expected {expected} ({reply!r})"
         )
-    if value is not None and actual_value != value:
-        raise RuntimeError(
-            f"{label}: expected {value!r}, got {actual_value!r}."
-        )
-    return actual_value
+    if expected == "status" and reply != b"OK":
+        raise RedisReplyError(f"{label} did not return +OK (got {reply!r})")
+    return reply
 
 
 def seed_billing_status(redis_url: str, tenant_id: str, status: str = "trialing") -> None:
     """HSET billing:tenant:{tenant_id} status <status> via a raw socket.
 
     Uses a minimal RESP client so the journey script needs no Redis
-    dependency. Every reply is checked for its expected RESP type, and the
-    value is read back with HGET before this returns -- so the PASS line the
-    caller prints means the key is actually set, not merely that no error
-    reply arrived.
-
-    rediss:// URLs negotiate TLS before anything is written. parse_redis_url
-    has always accepted that scheme, but the socket was never wrapped, so
-    the AUTH password went out in plaintext and the handshake then failed
-    (#109).
+    dependency. This is the one prerequisite the journey cannot recover from
+    -- without it every later ingest is rejected by the subscription gate --
+    so success is not inferred from the absence of an error: each reply is
+    checked for the RESP type its command is supposed to return, and the
+    seeded value is read back before this returns.
     """
-    scheme = (urlparse(redis_url).scheme or "").lower()
+    scheme = urlparse(redis_url).scheme
     host, port, db, password = parse_redis_url(redis_url)
-    conn: Any = socket.create_connection((host, port), timeout=5)
-    try:
+    key = f"billing:tenant:{tenant_id}"
+
+    with socket.create_connection((host, port), timeout=5) as raw_conn:
+        conn: Any = raw_conn
         if scheme == "rediss":
-            # Before any sendall below, so a failed handshake cannot leak the
-            # credential the next line would have written.
-            conn = ssl.create_default_context().wrap_socket(conn, server_hostname=host)
+            # Wrapped before anything is sent. Writing AUTH to a raw socket
+            # here put the Redis password on the wire in clear and *then*
+            # failed the handshake.
+            conn = ssl.create_default_context().wrap_socket(
+                raw_conn, server_hostname=host
+            )
         conn_file = conn.makefile("rb")
 
-        def send(*parts: str) -> None:
-            conn.sendall(resp_command(*parts))
-
         if password:
-            send("AUTH", password)
-            _expect_reply(conn_file, "AUTH", b"+", b"OK")
+            redis_command(conn, conn_file, "AUTH", "status", "AUTH", password)
         if db:
-            send("SELECT", str(db))
-            _expect_reply(conn_file, f"SELECT {db}", b"+", b"OK")
+            redis_command(conn, conn_file, "SELECT", "status", "SELECT", str(db))
+        redis_command(conn, conn_file, "HSET", "integer", "HSET", key, "status", status)
 
-        key = f"billing:tenant:{tenant_id}"
-        send("HSET", key, "status", status)
-        # HSET answers 1 for a new field and 0 for an overwritten one; both
-        # are successful writes, so only the integer type is asserted here.
-        _expect_reply(conn_file, "HSET", b":")
-
-        send("HGET", key, "status")
-        stored = _expect_reply(conn_file, "HGET", b"$")
-        if stored != status.encode("utf-8"):
-            raise RuntimeError(
-                f"Redis stored {stored!r} for {key} status, expected {status!r}."
+        seeded = redis_command(conn, conn_file, "HGET", "bulk", "HGET", key, "status")
+        if seeded != status.encode("utf-8"):
+            raise RedisReplyError(
+                f"Read-back of {key} status returned {seeded!r}, expected "
+                f"{status!r}; the billing seed did not take effect."
             )
-    finally:
-        conn.close()
 
 
-def record_billing_seed(report: JourneyReport, redis_url: str, tenant_id: str) -> None:
-    """Seed the subscription gate's billing status and report the outcome.
+@dataclass(slots=True)
+class ProvisionedTenant:
+    """The tenant + API key a --local run creates, and must clean up again."""
 
-    Split out of run_journey so the failure paths seed_billing_status now
-    raises on (#109) can be exercised end-to-end: what matters is not only
-    that it raises, but that the journey records FAIL rather than PASS.
-    """
-    try:
-        seed_billing_status(redis_url, tenant_id, "trialing")
-    except Exception as exc:  # noqa: BLE001 - the gate will 402/503 without it
-        report.record(
-            "Activate billing (Redis seed)",
-            False,
-            f"{exc} — without it the subscription gate returns 402/503. "
-            "Seed manually: redis-cli HSET billing:tenant:<id> status trialing, "
-            "or set SUBSCRIPTION_GATE_FAIL_OPEN=true on the stack.",
-        )
-        return
-    report.record("Activate billing (Redis seed)", True, "status=trialing")
+    tenant_id: str
+    api_key: str = field(repr=False)
+    key_id: str | None = None
 
 
 async def provision_tenant_and_key(
     client: httpx.AsyncClient, base_url: str, admin_key: str
-) -> tuple[str, str, str | None]:
-    """Create a journey tenant and a key scoped to it.
-
-    Returns (tenant_id, api_key, key_id). The key id is what
-    deprovision_tenant_and_key needs to delete the key on its own; it is
-    optional because deleting the tenant is expected to take its keys with
-    it, and not every admin API returns an id for a freshly minted key.
-    """
+) -> ProvisionedTenant:
     headers = {"X-Admin-Key": admin_key}
     tenant_response = await client.post(
         f"{base_url}/v1/admin/tenants",
@@ -293,63 +259,62 @@ async def provision_tenant_and_key(
     if not api_key:
         raise RuntimeError("Admin key creation response did not include the raw API key")
     key_id = key_payload.get("key_id") or key_payload.get("id")
-    return tenant_id, api_key, str(key_id) if key_id else None
+    return ProvisionedTenant(
+        tenant_id=tenant_id,
+        api_key=api_key,
+        key_id=str(key_id) if key_id else None,
+    )
 
 
 async def deprovision_tenant_and_key(
     client: httpx.AsyncClient,
     base_url: str,
     admin_key: str,
-    tenant_id: str,
-    key_id: str | None,
+    provisioned: ProvisionedTenant,
     report: JourneyReport,
 ) -> None:
-    """Delete what provision_tenant_and_key created, and say whether it worked.
+    """Delete everything a --local run provisioned.
 
-    Every --local run minted a fresh "Meridian Fresh Foods (journey ...)"
-    tenant and an API key and left both behind (#190), so a stack used for
-    iterating on the onboarding flow accumulated one of each per run --
-    surfacing later only as a cluttered tenant picker or a mysteriously
-    large local database. The two sibling release scripts both remove the
-    tenant footprint they create from a finally block; this is the same
-    contract for the one thing this script provisions.
+    Runs from a `finally` block so it executes on the failure path too,
+    mirroring cleanup_smoke_tenants() in scripts/smoke_regression.py and
+    cleanup_demo_tenant() in run_full_fsma_simulation.py. Without it every
+    iteration on the onboarding flow left one more "Meridian Fresh Foods
+    (journey ...)" tenant and key behind in the local stack.
 
-    The outcome is recorded as a journey step rather than logged and
-    swallowed. If the admin API has no delete route, that is a real leftover
-    tenant and the operator needs to see it, with the id needed to remove it
-    by hand.
+    Best effort by design: if the admin API exposes no delete route the
+    script says exactly what to remove by hand rather than failing the run.
     """
     headers = {"X-Admin-Key": admin_key}
-    # 204/200/202 are all "done"; 404 means it is already gone, which is the
-    # state we wanted either way.
-    gone = {200, 202, 204, 404}
-    problems: list[str] = []
+    targets = [("tenant", f"{base_url}/v1/admin/tenants/{provisioned.tenant_id}")]
+    if provisioned.key_id:
+        # Delete the key first: some admin APIs refuse to drop a tenant that
+        # still owns credentials. A tenant delete usually cascades to its keys
+        # anyway, so a 404 here is fine.
+        targets.insert(0, ("API key", f"{base_url}/v1/admin/keys/{provisioned.key_id}"))
 
-    if key_id:
+    leftovers: list[str] = []
+    for label, url in targets:
         try:
-            response = await client.delete(f"{base_url}/v1/admin/keys/{key_id}", headers=headers)
-            if response.status_code not in gone:
-                problems.append(f"key {key_id}: HTTP {response.status_code}")
+            response = await client.delete(url, headers=headers)
         except httpx.HTTPError as exc:
-            problems.append(f"key {key_id}: {exc.__class__.__name__}: {exc}")
+            leftovers.append(f"{label}: {exc.__class__.__name__}")
+            continue
+        if response.status_code not in {200, 202, 204, 404}:
+            leftovers.append(f"{label}: HTTP {response.status_code}")
 
-    try:
-        response = await client.delete(f"{base_url}/v1/admin/tenants/{tenant_id}", headers=headers)
-        if response.status_code not in gone:
-            problems.append(f"tenant {tenant_id}: HTTP {response.status_code}")
-    except httpx.HTTPError as exc:
-        problems.append(f"tenant {tenant_id}: {exc.__class__.__name__}: {exc}")
-
-    if problems:
+    if leftovers:
         report.record(
-            "Teardown: journey tenant + key removed",
+            "Teardown: provisioned tenant + key removed",
             False,
-            "; ".join(problems)
-            + f" — remove tenant {tenant_id} by hand, or the stack keeps one "
-            "journey tenant per run.",
+            f"{'; '.join(leftovers)} — remove by hand: "
+            f"DELETE /v1/admin/tenants/{provisioned.tenant_id}",
         )
-        return
-    report.record("Teardown: journey tenant + key removed", True, f"tenant {tenant_id}")
+    else:
+        report.record(
+            "Teardown: provisioned tenant + key removed",
+            True,
+            f"tenant {provisioned.tenant_id}",
+        )
 
 
 def build_config(endpoint: str, api_key: str, tenant_id: str) -> SimulationConfig:
@@ -480,17 +445,8 @@ async def verify_evidence(
         )
 
 
-async def run_journey(
-    args: argparse.Namespace,
-    *,
-    client: httpx.AsyncClient | None = None,
-) -> int:
+async def run_journey(args: argparse.Namespace) -> int:
     report = JourneyReport()
-    # Set the moment provisioning succeeds, so the teardown below knows a
-    # tenant exists even if the very next step raises. Stays None for
-    # --confirm-live, which provisions nothing.
-    provisioned: tuple[str, str | None] | None = None
-    admin_key = ""
 
     if args.confirm_live:
         endpoint = os.environ.get("REGENGINE_LIVE_ENDPOINT", "").strip()
@@ -522,14 +478,7 @@ async def run_journey(
             return 2
         batches, batch_size = args.batches, args.batch_size
 
-    # A caller-supplied client belongs to the caller, so it is wrapped in
-    # nullcontext instead of being closed on the way out of this block.
-    client_context = (
-        contextlib.nullcontext(client)
-        if client is not None
-        else httpx.AsyncClient(timeout=30.0)
-    )
-    async with client_context as client:
+    async with httpx.AsyncClient(timeout=30.0) as client:
         # 1. Reach RegEngine.
         try:
             health = await client.get(f"{base_url}/health")
@@ -538,25 +487,32 @@ async def run_journey(
             report.record("Reach RegEngine", False, f"{exc.__class__.__name__}: {base_url} unreachable")
             return 1
 
-        # 2-3. Onboarding (local only).
-        if not args.confirm_live:
-            try:
-                tenant_id, api_key, key_id = await provision_tenant_and_key(
-                    client, base_url, admin_key
-                )
-                provisioned = (tenant_id, key_id)
-                report.record("Onboard: tenant + API key provisioned", True, f"tenant {tenant_id}")
-            except Exception as exc:  # noqa: BLE001 - report and stop
-                report.record("Onboard: tenant + API key provisioned", False, str(exc))
-                return 1
-
-            record_billing_seed(
-                report,
-                os.environ.get("REGENGINE_REDIS_URL", DEFAULT_REDIS_URL),
-                tenant_id,
-            )
-
+        # 2-3. Onboarding (local only). Everything provisioned here is torn
+        # down in the `finally` below, on the failure path too.
+        provisioned: ProvisionedTenant | None = None
         try:
+            if not args.confirm_live:
+                try:
+                    provisioned = await provision_tenant_and_key(client, base_url, admin_key)
+                except Exception as exc:  # noqa: BLE001 - report and stop
+                    report.record("Onboard: tenant + API key provisioned", False, str(exc))
+                    return 1
+                tenant_id, api_key = provisioned.tenant_id, provisioned.api_key
+                report.record("Onboard: tenant + API key provisioned", True, f"tenant {tenant_id}")
+
+                redis_url = os.environ.get("REGENGINE_REDIS_URL", DEFAULT_REDIS_URL)
+                try:
+                    seed_billing_status(redis_url, tenant_id, "trialing")
+                    report.record("Activate billing (Redis seed)", True, "status=trialing")
+                except Exception as exc:  # noqa: BLE001 - the gate will 402/503 without it
+                    report.record(
+                        "Activate billing (Redis seed)",
+                        False,
+                        f"{exc} — without it the subscription gate returns 402/503. "
+                        "Seed manually: redis-cli HSET billing:tenant:<id> status trialing, "
+                        "or set SUBSCRIPTION_GATE_FAIL_OPEN=true on the stack.",
+                    )
+
             # 4. Test the connection like the console does.
             live_client = LiveRegEngineClient()
             config = build_config(endpoint, api_key, tenant_id)
@@ -601,16 +557,11 @@ async def run_journey(
 
             # 7. Verify the evidence RegEngine now holds.
             await verify_evidence(client, base_url, api_key, tenant_id, report, expected_min_events=ingested)
+
         finally:
-            # Runs on the success path, on any exception mid-journey, and
-            # on a KeyboardInterrupt. The tenant exists from the moment
-            # provisioning returned, so removing it cannot be conditional
-            # on the rest of the journey working (#190). --confirm-live
-            # provisions nothing, so provisioned stays None and this is a
-            # no-op there.
             if provisioned is not None:
                 await deprovision_tenant_and_key(
-                    client, base_url, admin_key, provisioned[0], provisioned[1], report
+                    client, base_url, admin_key, provisioned, report
                 )
 
     print()
@@ -620,7 +571,7 @@ async def run_journey(
 
 
 def main() -> int:
-    parser = argparse.ArgumentParser(description=_USAGE, formatter_class=argparse.RawDescriptionHelpFormatter)
+    parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     mode = parser.add_mutually_exclusive_group(required=True)
     mode.add_argument("--local", action="store_true", help="Run against a local RegEngine stack; provisions tenant + key + billing.")
     mode.add_argument("--confirm-live", action="store_true", help="Run against a deployed RegEngine with pre-provisioned credentials. Small batch, no provisioning, no Redis.")

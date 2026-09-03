@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import shutil
 
 from fastapi import APIRouter, Depends
@@ -14,11 +15,12 @@ router = APIRouter(prefix="/api/operator", tags=["Operator"])
 
 @router.get("/tenants", response_model=TenantListResponse)
 async def list_operator_tenants(_: None = Depends(require_operator_auth)) -> TenantListResponse:
+    tenant_ids = await asyncio.to_thread(tenancy.known_tenant_ids)
+    raw_summaries = await asyncio.gather(
+        *(asyncio.to_thread(tenancy.tenant_summary, tid) for tid in tenant_ids)
+    )
     return TenantListResponse(
-        tenants=[
-            TenantSummary.model_validate(tenancy.tenant_summary(tenant_id))
-            for tenant_id in tenancy.known_tenant_ids()
-        ]
+        tenants=[TenantSummary.model_validate(s) for s in raw_summaries]
     )
 
 
@@ -39,7 +41,7 @@ async def delete_operator_tenant(
     _: None = Depends(require_operator_auth),
 ) -> TenantOperationResponse:
     normalized_tenant = tenancy.operator_tenant_id(tenant_id)
-    tenant_dir = tenancy.tenant_dir(normalized_tenant)
+    tenant_dir = tenancy.assert_deletable_tenant_dir(tenancy.tenant_dir(normalized_tenant))
     removed_data = tenant_dir.exists()
 
     # pop_tenant_controller also opens a delete-in-progress window (#175):

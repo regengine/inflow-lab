@@ -3,14 +3,16 @@ from __future__ import annotations
 import asyncio
 import logging
 import os
+import shutil
+import time
 from pathlib import Path
 from threading import RLock
 from typing import Any
 
 from fastapi import HTTPException
 
-from .auth import DEFAULT_TENANT_ID, TenantContext, normalize_tenant_id
-from .controller import SimulationController
+from .auth import DEFAULT_TENANT_ID, TENANT_HEADER, TenantContext, normalize_tenant_id
+from .controller import DEFAULT_SHUTDOWN_TIMEOUT_SECONDS, SimulationController
 from .engine import LegitFlowEngine
 from .mock_service import MockRegEngineService
 from .regengine_client import LiveRegEngineClient
@@ -18,46 +20,72 @@ from .scenario_saves import ScenarioSaveStore
 from .schemas.ingestion import ReplayRequest
 from .schemas.scenarios import ScenarioSaveRequest
 from .schemas.simulation import SimulationConfig
-from .auth import TENANT_HEADER
 from .store import EventStore
 
 
-# Same name-keyed singleton logger main.py configures. Tenant creation is
-# the moment disk and memory get committed on a caller's say-so, so it is
-# worth a line an operator can correlate against (#182).
-logger = logging.getLogger("inflow_lab")
-
+logger = logging.getLogger(__name__)
 
 DATA_ROOT = Path(os.getenv("REGENGINE_DATA_DIR", "data"))
 TENANT_DATA_ROOT = DATA_ROOT / "tenants"
 
-# Hard ceiling on concurrently active tenant controllers (#174). Picking a
-# tenant is a single request header, and honoring one lazily mints a full
-# SimulationController (engine, store, scenario-save store, HTTP clients)
-# plus an on-disk directory -- with no auth required to choose an id, an
-# unbounded version of that lets any anonymous caller drive unbounded
-# memory/disk growth for free (25 headers -> 25 controllers, verified). A
-# fixed cap keeps the "try it with your own tenant id" no-auth demo
-# affordance (SECURITY_BOUNDARIES.md's local-mock-demo boundary) working
-# while bounding the damage; it is enforced regardless of auth state, since
-# the operator cleanup routes that could otherwise reclaim capacity require
-# Basic Auth and are unreachable on exactly the deployments most at risk.
-# Freeing a slot needs an operator reset/delete, or a process restart.
-MAX_TENANT_CONTROLLERS = int(os.getenv("REGENGINE_MAX_TENANT_CONTROLLERS", "50"))
+
+def data_root() -> Path:
+    """The simulator's storage root, resolved at call time.
+
+    ``DATA_ROOT`` above is a snapshot taken when this module is imported, which
+    is the right thing for the module-level stores it builds but the wrong
+    thing for anything asked for a path *later*: a process (or a test) that
+    exports ``REGENGINE_DATA_DIR`` after import would be ignored. So the
+    environment wins when it is set, and the module attribute is the fallback
+    -- the two agree whenever the variable was already set at import, and the
+    fallback is what lets tests relocate storage by monkeypatching
+    ``DATA_ROOT`` directly (see ``tests/test_release_scripts.py``).
+    """
+    configured = os.getenv("REGENGINE_DATA_DIR", "").strip()
+    if configured:
+        return Path(configured)
+    return DATA_ROOT
+
+
+def default_events_path() -> Path:
+    """Event log for the default (non-tenant) scope.
+
+    This is the single definition of that path. ``SimulationConfig`` defaults
+    ``persist_path`` to it rather than to a literal ``data/events.jsonl``:
+    the literal is CWD-relative, so on a deployment whose volume is mounted at
+    ``REGENGINE_DATA_DIR=/data`` the default tenant's events landed *outside*
+    the volume and were discarded on every redeploy, while tenant storage --
+    derived here -- survived. See DEPLOYMENT_PROFILES.md step 4.
+    """
+    return data_root() / "events.jsonl"
+
+
+# Selecting a tenant with ``X-RegEngine-Tenant`` lazily materializes a whole
+# controller (engine, event store, scenario saves, clients) plus an on-disk
+# directory. That header is honored even when Basic Auth is disabled — the
+# documented default for a local demo — so without a bound an unauthenticated
+# caller cycling the header value once per request could grow memory and disk
+# without limit, and on a no-auth deployment the operator cleanup routes that
+# could reclaim it are themselves unreachable. The cap below therefore applies
+# regardless of auth state: a process serves at most this many distinct
+# tenants (cached controllers plus tenant directories already on disk),
+# excluding the built-in default tenant. Requests for a *new* tenant beyond
+# the cap are refused with HTTP 429; existing tenants keep working.
+DEFAULT_MAX_TENANTS = 100
+
+# A tenant delete is pop-controller -> shutdown -> rmtree. Between the pop and
+# the rmtree a concurrent request used to re-create and re-register a fresh
+# controller, which the rmtree then left pointing at a missing directory (a
+# "zombie" tenant that 500s on its next write). While a delete is in flight the
+# tenant is quarantined: re-creation is refused rather than silently zombied.
+# The quarantine clears as soon as the directory is gone (delete finished), and
+# expires on its own so a failed rmtree cannot wedge a tenant permanently.
+_DELETE_QUARANTINE_SECONDS = 30.0
 
 engine = LegitFlowEngine(seed=204)
-store = EventStore(persist_path=str(DATA_ROOT / "events.jsonl"))
+store = EventStore(persist_path=str(default_events_path()))
 scenario_saves = ScenarioSaveStore(save_dir=str(DATA_ROOT / "scenario_saves"))
-# Seed the mock's hash chain from what is already persisted, so a restart
-# continues the chain instead of forking a second one from an empty hash.
-#
-# enforce_event_age_window is spelled out rather than inherited (#209): it
-# is MockRegEngineService's default, but this is the deployed stand-in real
-# customers post at, and "does the thing we ship enforce live's 90-day
-# replay window?" should be answerable from this line without chasing a
-# default. See app/mock_service.py's __init__ for why the default moved --
-# and for why the floor bounds replay rather than closing it.
-mock_service = MockRegEngineService(store=store, enforce_event_age_window=True)
+mock_service = MockRegEngineService()
 controller = SimulationController(
     engine=engine,
     store=store,
@@ -67,50 +95,42 @@ controller = SimulationController(
 )
 
 _tenant_controllers: dict[str, SimulationController] = {DEFAULT_TENANT_ID: controller}
+_tenants_being_deleted: dict[str, float] = {}
 _tenant_lock = RLock()
-
-# Tenant ids with a delete in progress -- guards the window between
-# pop_tenant_controller removing a controller from _tenant_controllers and
-# the operator route finishing shutil.rmtree on its directory (#175).
-# Without this, a request for the same tenant id landing in that window
-# recreates the controller (and its directory) via
-# get_tenant_controller_for_id, and the delete's still-pending rmtree then
-# deletes that directory out from under it: the tenant stays "cached" in
-# memory pointing at a path that no longer exists, and its next write
-# crashes with an unhandled FileNotFoundError. Mutated only under
-# _tenant_lock, alongside _tenant_controllers, so the two can never
-# disagree about a tenant's state.
-_tenants_being_deleted: set[str] = set()
 
 
 async def shutdown_tenant_controllers() -> None:
-    """Stop every live tenant controller, concurrently (#208, criterion 5).
+    """Stop every tenant's run loop, concurrently and under a bound.
 
-    Each ``shutdown()`` awaits that tenant's run-loop task, which may be
-    mid-step and therefore mid-delivery. Awaiting them one at a time made
-    container shutdown the *sum* of every tenant's in-flight delivery; with
-    MAX_TENANT_CONTROLLERS at 50 that is long enough for the platform to
-    SIGKILL the process partway through, leaving later tenants' loops
-    killed rather than stopped. Running them together makes it the max
-    instead of the sum.
+    This used to await each `shutdown()` in turn. A controller parked on a
+    delivery can take the full live-endpoint timeout to stop, so with N
+    tenants the serial version made container shutdown N x that timeout --
+    and on a 100-tenant process (the `DEFAULT_MAX_TENANTS` cap) that is long
+    enough for the orchestrator to SIGKILL instead, which is the one way a
+    store *can* be left torn (#208, criterion 5).
 
-    ``return_exceptions=True`` so one tenant failing to stop cannot skip
-    the shutdown of every tenant behind it -- the previous serial loop
-    abandoned the rest on the first raise. Failures are logged and the
-    first is re-raised afterwards, so nothing is silently swallowed.
+    Both halves matter: the shutdowns overlap, so the wall clock is one
+    timeout rather than N, and each is bounded, so a single wedged tenant
+    cannot hold the process open on its own.
     """
-    tenant_controllers = list(set(_tenant_controllers.values()))
-    if not tenant_controllers:
-        return
+    with _tenant_lock:
+        controllers = list({id(item): item for item in _tenant_controllers.values()}.values())
+
     results = await asyncio.gather(
-        *(tenant_controller.shutdown() for tenant_controller in tenant_controllers),
+        *(
+            tenant_controller.shutdown(timeout=DEFAULT_SHUTDOWN_TIMEOUT_SECONDS)
+            for tenant_controller in controllers
+        ),
         return_exceptions=True,
     )
-    failures = [result for result in results if isinstance(result, BaseException)]
-    for failure in failures:
-        logger.error("tenant controller shutdown failed: %s", failure)
-    if failures:
-        raise failures[0]
+    for tenant_controller, result in zip(controllers, results):
+        if isinstance(result, BaseException):
+            logger.warning(
+                "Shutting down controller for %s failed: %s",
+                tenant_controller.store.persist_path,
+                result,
+                exc_info=result,
+            )
 
 
 def active_controller_for_context(context: TenantContext) -> SimulationController:
@@ -122,71 +142,110 @@ def active_controller_for_context(context: TenantContext) -> SimulationControlle
 
 def get_tenant_controller_for_id(tenant_id: str) -> SimulationController:
     with _tenant_lock:
-        if tenant_id in _tenants_being_deleted:
-            # A delete for this tenant is mid-flight (#175): its directory
-            # has just been popped from the registry and is about to be (or
-            # already has been) rmtree'd by that delete. Creating a fresh
-            # controller now would either get its directory pulled out from
-            # under it by the pending rmtree, or resurrect a tenant the
-            # caller just asked to delete. 409 tells the caller this is a
-            # transient conflict to retry, instead of the unhandled
-            # FileNotFoundError this used to crash with on the next write.
-            raise HTTPException(
-                status_code=409,
-                detail=f"Tenant '{tenant_id}' delete is in progress; retry shortly",
-            )
-
+        _reject_while_delete_in_progress(tenant_id)
         existing_controller = _tenant_controllers.get(tenant_id)
         if existing_controller is not None:
             return existing_controller
 
-        if len(_tenant_controllers) >= MAX_TENANT_CONTROLLERS:
-            # #174: refuse rather than grow once the cap is hit. An
-            # operator (Basic Auth required) can always make room via
-            # reset/delete on an existing tenant.
-            raise HTTPException(
-                status_code=429,
-                detail=(
-                    f"Tenant capacity reached ({MAX_TENANT_CONTROLLERS} active); "
-                    "an operator must reset or delete an existing tenant before "
-                    "a new one can be created"
-                ),
-            )
-
+        _enforce_tenant_capacity(tenant_id)
         tenant_controller = _create_tenant_controller(tenant_id)
         _tenant_controllers[tenant_id] = tenant_controller
         return tenant_controller
 
 
-def pop_tenant_controller(tenant_id: str) -> SimulationController | None:
-    """Remove tenant_id's controller and open a delete-in-progress window.
+def max_tenant_count() -> int:
+    """Maximum number of distinct non-default tenants this process will serve."""
+    raw_limit = os.getenv("REGENGINE_MAX_TENANTS", "").strip()
+    if not raw_limit:
+        return DEFAULT_MAX_TENANTS
+    try:
+        limit = int(raw_limit)
+    except ValueError:
+        logger.warning(
+            "Ignoring malformed REGENGINE_MAX_TENANTS=%r; using default %s",
+            raw_limit,
+            DEFAULT_MAX_TENANTS,
+        )
+        return DEFAULT_MAX_TENANTS
+    if limit <= 0:
+        logger.warning(
+            "Ignoring non-positive REGENGINE_MAX_TENANTS=%r; using default %s",
+            raw_limit,
+            DEFAULT_MAX_TENANTS,
+        )
+        return DEFAULT_MAX_TENANTS
+    return limit
 
-    Callers MUST pair this with finish_tenant_delete(tenant_id) once the
-    tenant's directory has actually been removed -- typically in a
-    try/finally, so the window still closes if shutdown or the rmtree
-    raises. Until that call, get_tenant_controller_for_id refuses to
-    re-create a controller for this tenant id instead of racing the
-    in-flight delete (#175).
+
+def _enforce_tenant_capacity(tenant_id: str) -> None:
+    """Refuse to materialize a brand-new tenant once the cap is reached.
+
+    Counts cached controllers *and* tenant directories already on disk, so the
+    bound holds across restarts and covers both memory and disk growth.
+    """
+    limit = max_tenant_count()
+    known_tenants = set(known_tenant_ids())
+    if tenant_id in known_tenants or len(known_tenants) < limit:
+        return
+    logger.warning(
+        "Refusing to create tenant %r: tenant capacity of %s reached", tenant_id, limit
+    )
+    raise HTTPException(
+        status_code=429,
+        detail=(
+            f"Tenant capacity reached ({limit} tenants). Delete unused tenants or raise "
+            "REGENGINE_MAX_TENANTS before creating a new one."
+        ),
+    )
+
+
+def _reject_while_delete_in_progress(tenant_id: str) -> None:
+    """Block re-creating a tenant whose delete is mid-flight (see #175)."""
+    started_at = _tenants_being_deleted.get(tenant_id)
+    if started_at is None:
+        return
+    delete_finished = not tenant_dir(tenant_id).exists()
+    quarantine_expired = (time.monotonic() - started_at) > _DELETE_QUARANTINE_SECONDS
+    if delete_finished or quarantine_expired:
+        _tenants_being_deleted.pop(tenant_id, None)
+        return
+    raise HTTPException(
+        status_code=409,
+        detail="Tenant delete in progress; retry shortly",
+    )
+
+
+def pop_tenant_controller(tenant_id: str) -> SimulationController | None:
+    """Remove a tenant's controller and quarantine the tenant against re-creation.
+
+    The quarantine is what makes the caller's pop -> shutdown -> rmtree
+    sequence atomic with respect to concurrent traffic for the same tenant.
+    ``delete_tenant`` below clears it explicitly; callers that still run the
+    sequence by hand get it cleared as soon as the directory is gone.
     """
     with _tenant_lock:
-        _tenants_being_deleted.add(tenant_id)
-        popped = _tenant_controllers.pop(tenant_id, None)
-        if popped is not None:
-            # Removing it from the registry only stops NEW lookups. A request
-            # that resolved this controller before the delete started still
-            # holds the object, and every EventStore write path mkdirs its own
-            # directory -- so a write through it after the rmtree recreated the
-            # tenant tree, and known_tenant_ids() listed the tenant as present
-            # again. Retiring the store makes those in-flight writes fail
-            # loudly instead of silently resurrecting it (#175).
-            popped.store.retire()
-        return popped
+        _tenants_being_deleted[tenant_id] = time.monotonic()
+        return _tenant_controllers.pop(tenant_id, None)
 
 
-def finish_tenant_delete(tenant_id: str) -> None:
-    """Close the delete-in-progress window opened by pop_tenant_controller."""
-    with _tenant_lock:
-        _tenants_being_deleted.discard(tenant_id)
+async def delete_tenant(tenant_id: str) -> tuple[bool, bool]:
+    """Delete a tenant atomically with respect to concurrent traffic.
+
+    Returns ``(removed_cached_controller, removed_data)``. Safe to call twice
+    and safe to follow with a reset: once the directory is gone the tenant is
+    no longer quarantined, so the next request creates a clean controller.
+    """
+    directory = assert_deletable_tenant_dir(tenant_dir(tenant_id))
+    removed_data = directory.exists()
+    tenant_controller = pop_tenant_controller(tenant_id)
+    try:
+        if tenant_controller is not None:
+            await tenant_controller.shutdown()
+        shutil.rmtree(directory, ignore_errors=True)
+    finally:
+        with _tenant_lock:
+            _tenants_being_deleted.pop(tenant_id, None)
+    return tenant_controller is not None, removed_data
 
 
 def operator_tenant_id(raw_tenant_id: str) -> str:
@@ -202,10 +261,6 @@ def known_tenant_ids() -> list[str]:
         tenant_ids.update(
             tenant_id for tenant_id in _tenant_controllers if tenant_id != DEFAULT_TENANT_ID
         )
-        # Snapshot under the same lock the registry is mutated under, so the
-        # directory scan below cannot re-add a tenant whose delete is
-        # mid-flight (#175).
-        being_deleted = set(_tenants_being_deleted)
 
     if TENANT_DATA_ROOT.exists():
         for path in TENANT_DATA_ROOT.iterdir():
@@ -214,10 +269,7 @@ def known_tenant_ids() -> list[str]:
                     tenant_ids.add(normalize_tenant_id(path.name))
                 except ValueError:
                     continue
-    # A directory that a pending rmtree has not reached yet -- or that an
-    # in-flight write recreated before its store was retired -- must not be
-    # reported as a live tenant.
-    return sorted(tenant_ids - being_deleted)
+    return sorted(tenant_ids)
 
 
 def tenant_summary(tenant_id: str) -> dict[str, Any]:
@@ -262,6 +314,18 @@ def _ensure_persist_path_within_root(persist_path: str) -> str:
     Raises ValueError (mapped to HTTP 400 by ``handle_value_error``) on escape.
     The message deliberately omits the offending path to avoid reflecting it.
 
+    Staying inside the data root is necessary but not sufficient: the tenant
+    directories live *under* that root, so ``data/tenants/acme/events.jsonl``
+    passed the original check and pointed the shared default-tenant store
+    straight at tenant ``acme``'s log -- readable through the exports and,
+    because ``EventStore.reset`` unlinks its persist path, deletable by a
+    plain ``POST /api/simulate/reset``. That is exactly what
+    ``SECURITY_BOUNDARIES.md`` promises cannot happen ("Reset and delete
+    operations must not affect other tenant scopes"), and in the default
+    no-auth profile it needed no credentials at all. Tenant storage is
+    therefore reachable only by sending ``X-RegEngine-Tenant``, never by
+    naming a path.
+
     Note on relative paths: the UI submits the relative default
     ``data/events.jsonl``, while in deployments ``REGENGINE_DATA_DIR`` is often
     an *absolute* volume path. A strict within-DATA_ROOT check would then
@@ -273,31 +337,23 @@ def _ensure_persist_path_within_root(persist_path: str) -> str:
     candidate = Path(persist_path)
     resolved = candidate.resolve()
     root = DATA_ROOT.resolve()
+    _reject_tenant_storage_path(resolved)
     if resolved == root or root in resolved.parents:
-        _reject_tenant_storage_path(resolved)
         return persist_path
     if not candidate.is_absolute():
         cwd = Path.cwd().resolve()
         if resolved == cwd or cwd in resolved.parents:
-            _reject_tenant_storage_path(resolved)
             return persist_path
     raise ValueError("persist_path must stay within the permitted data directory")
 
 
 def _reject_tenant_storage_path(resolved: Path) -> None:
-    """Refuse a persist_path that points into per-tenant storage.
-
-    Being inside DATA_ROOT is not enough: ``data/tenants/`` is inside it, and
-    every other tenant's event log lives there. A caller on the default tenant
-    that can name one reads it back through the exports, and ``EventStore``'s
-    own reset unlinks it. Tenant storage is reachable only by selecting the
-    tenant, never by naming its file.
-    """
+    """Refuse a caller-supplied path that reaches into tenant storage."""
     tenant_root = TENANT_DATA_ROOT.resolve()
     if resolved == tenant_root or tenant_root in resolved.parents:
         raise ValueError(
-            "persist_path must not point into tenant storage; select a tenant "
-            f"with the {TENANT_HEADER} header instead"
+            "persist_path must not point into tenant storage; select a tenant with the "
+            f"{TENANT_HEADER} header instead"
         )
 
 
@@ -342,6 +398,27 @@ def tenant_dir(tenant_id: str) -> Path:
     return TENANT_DATA_ROOT / tenant_id
 
 
+def assert_deletable_tenant_dir(directory: Path) -> Path:
+    """Refuse to recursively delete anything outside the tenant data root.
+
+    A defensive assert, not a validator: every caller already runs the id
+    through ``operator_tenant_id`` (strict regex, and a URL path segment
+    cannot contain ``/``), so this is unreachable today. It exists because
+    the consequence of the day it *is* reachable -- a ``shutil.rmtree`` on an
+    attacker-influenced path -- is unrecoverable, and because the guarantee
+    should hold by construction rather than by the continued correctness of a
+    regex three call frames away. Resolves both sides so a symlinked tenant
+    directory cannot point the delete somewhere else.
+    """
+    resolved = directory.resolve()
+    tenant_root = TENANT_DATA_ROOT.resolve()
+    if resolved == tenant_root or not resolved.is_relative_to(tenant_root):
+        raise RuntimeError(
+            "refusing to delete a path outside the tenant data root"
+        )
+    return directory
+
+
 def tenant_events_path(tenant_id: str) -> Path:
     return tenant_dir(tenant_id) / "events.jsonl"
 
@@ -364,9 +441,6 @@ def _count_scenario_saves(path: Path) -> int:
 
 
 def _create_tenant_controller(tenant_id: str) -> SimulationController:
-    # Tenant id only -- never the caller's credentials, which the auth layer
-    # has already discarded by this point.
-    logger.info("creating tenant controller for %s", tenant_id)
     persist_path = tenant_events_path(tenant_id)
     tenant_engine = LegitFlowEngine(seed=204)
     tenant_store = EventStore(persist_path=str(persist_path))
@@ -375,10 +449,6 @@ def _create_tenant_controller(tenant_id: str) -> SimulationController:
         engine=tenant_engine,
         store=tenant_store,
         scenario_saves=tenant_saves,
-        # Explicit for the same reason as the default tenant's service
-        # above: a per-tenant stand-in that quietly accepted what live
-        # rejects would put every tenant demo back on the wrong side of
-        # the parity gap (#209).
-        mock_service=MockRegEngineService(store=tenant_store, enforce_event_age_window=True),
+        mock_service=MockRegEngineService(),
         live_client=LiveRegEngineClient(),
     )

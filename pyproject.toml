@@ -15,6 +15,7 @@ dependencies = [
 [dependency-groups]
 dev = [
   "pytest>=8.0.0",
+  "pytest-asyncio>=0.23.0",
   "bandit>=1.7.10",
   "pip-audit>=2.7.0",
 ]
@@ -25,58 +26,4 @@ browser = [
 [tool.pytest.ini_options]
 pythonpath = ["."]
 testpaths = ["tests"]
-
-[tool.ruff]
-target-version = "py311"
-
-[tool.ruff.lint]
-# #137 assessment: ruff's own default rule selection (pyflakes plus the
-# core pycodestyle error checks) is the one slice of its full rule
-# surface that is already near-zero-cost on this codebase.
-#
-# `ruff check .` is CLEAN as of #137's cleanup -- it exits 0. What that
-# took, from the 8 findings this comment used to enumerate as outstanding:
-#
-#   - 3x F401 in app/main.py, which were never dead code. They are
-#     re-exports the test suite reaches through `app.main`, and deleting
-#     them breaks collection in 11 modules. Now declared in that module's
-#     __all__, which is the form ruff accepts and which states the
-#     contract in code; tests/test_startup_safety.py pins it.
-#   - 1x F841 in scripts/live_trial.py: `owns_client` was computed and
-#     never read, so a client run_live_trial created itself was never
-#     closed. Fixed by actually closing it, matching the identical
-#     owns_client/close pair in scripts/remote_smoke.py.
-#   - 1x F402 in scripts/remote_smoke.py: a loop variable named `field`
-#     shadowing the `dataclasses.field` import the config dataclass uses.
-#     Loop variable renamed.
-#   - 3x E402 in scripts/ (now 4, after #124 added a second cross-script
-#     import to browser_smoke.py). These are DELIBERATE and must stay:
-#     each of these scripts is run directly, so the repo root is not on
-#     sys.path until the shim above the import puts it there. They now
-#     carry an inline `# noqa: E402` with the reason, so the exception is
-#     explicit and a genuinely misplaced import still gets reported.
-#
-# Broader rule families were evaluated and found to need a real cleanup
-# pass first, not a config flip: docstring coverage (D, ~800 findings --
-# this codebase documents "why" via inline comments instead, per its own
-# convention) and type-annotation completeness (ANN, ~450 findings) are
-# both sizeable standalone efforts; flake8-bandit's S mostly duplicates
-# the security-focused `bandit` step this project's CI already runs
-# separately, and its single largest contributor (S101, ~1300 hits) is
-# just `assert` in tests/, which is how this suite is written throughout.
-# A handful of narrower additions (isort's I, pyupgrade's UP, bugbear's B
-# once FastAPI's Depends()-in-defaults pattern is allow-listed,
-# comprehensions' C4, ruff-native RUF) are close to adoptable too, but
-# line-length alone goes from a clean run to ~170 findings at ruff's
-# 88-char default versus this codebase's actual ~110-120 char lines, so
-# that batch needs an explicit line-length choice plus a small manual
-# cleanup pass first. See issue #137 for the full counts.
-#
-# This section still does not add CI enforcement by itself -- no workflow
-# step runs `ruff check` yet, and adding one is the remaining half of
-# #137. Because the tree is clean, that step can be added without any
-# accompanying code churn.
-# Pinned explicitly here rather than left as ruff's implicit default, so a
-# future ruff version changing its default select can't silently change
-# what this enforces.
-select = ["E4", "E7", "E9", "F"]
+asyncio_mode = "auto"

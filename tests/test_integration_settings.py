@@ -7,6 +7,7 @@ from typing import Any
 from fastapi.testclient import TestClient
 
 from app.main import app, controller
+from app.schemas.integration import CREDENTIALS_WITHHELD_VERDICT
 from app.schemas.simulation import SimulationConfig
 
 
@@ -197,12 +198,44 @@ def test_healthz_and_integration_status_advertise_contract_version() -> None:
 
 
 def test_integration_test_requires_credentials_for_live_probe() -> None:
+    """Nothing is configured here, so `not_configured` is the truthful verdict.
+
+    Contrast `test_integration_test_names_withheld_credentials_truthfully`
+    below: when credentials *are* configured and were deliberately withheld
+    because the probed endpoint is a different origin, the verdict must not be
+    this one -- re-entering credentials is not the fix for that case.
+    """
     response = client.post(
         "/api/integration/test",
         json={"endpoint": "https://staging.regengine.example/api/v1/webhooks/ingest"},
     )
     assert response.status_code == 200
     assert response.json()["verdict"] == "not_configured"
+
+
+def test_integration_test_names_withheld_credentials_truthfully() -> None:
+    configure = client.post(
+        "/api/integration/configure",
+        json={
+            "mode": "live",
+            "endpoint": "https://www.regengine.co/api/v1/webhooks/ingest",
+            "api_key": "rge_live_settings_secret",
+            "tenant_id": "44444444-4444-4444-4444-444444444444",
+        },
+    )
+    assert configure.status_code == 200
+
+    # Same host, downgraded scheme: a different origin, so the stored key stays
+    # put and the operator is told why instead of being sent to re-enter it.
+    response = client.post(
+        "/api/integration/test",
+        json={"endpoint": "http://www.regengine.co/api/v1/webhooks/ingest"},
+    )
+    assert response.status_code == 200
+    body = response.json()
+    assert body["verdict"] == CREDENTIALS_WITHHELD_VERDICT
+    assert body["verdict"] != "not_configured"
+    assert_json_omits(body, "rge_live_settings_secret")
 
 
 def test_mock_friction_surfaces_the_402_subscription_gate_then_recovers() -> None:

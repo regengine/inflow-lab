@@ -3,13 +3,19 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Any
 
-from .schemas.domain import CTEType
-
 
 @dataclass(frozen=True, slots=True)
 class IndustryAdapter:
+    """Industry-specific KDE/location behaviour for the generator.
+
+    The source CTE type deliberately does *not* live here: the engine reads
+    it from the active ``ScenarioPreset`` (``app/scenarios.py``), which is
+    the single source of truth. A duplicate field on the adapter was dead
+    code that nothing consulted, and it invited a silent divergence where an
+    industry/scenario pairing updated only one of the two definitions.
+    """
+
     industry_type: str
-    source_cte_type: CTEType = CTEType.HARVESTING
     source_reference_type: str = "Harvest Log"
 
     def source_location(self, engine: Any) -> Any:
@@ -126,6 +132,10 @@ class IndustryAdapter:
                 for lot in inputs
             },
             "input_products": [lot.product_description for lot in inputs],
+            "input_quantities": [
+                {"lot_code": lot.lot_code, "quantity": lot.quantity, "unit_of_measure": lot.unit_of_measure}
+                for lot in inputs
+            ],
             "output_traceability_lot_codes": [lot.lot_code for lot in outputs],
             "reference_document": engine._reference_document(reference_type, reference_number),
             "reference_document_type": reference_type,
@@ -177,7 +187,6 @@ class SeafoodAdapter(IndustryAdapter):
     def __init__(self) -> None:
         super().__init__(
             industry_type="seafood",
-            source_cte_type=CTEType.FIRST_LAND_BASED_RECEIVING,
             source_reference_type="Landing Receipt",
         )
 

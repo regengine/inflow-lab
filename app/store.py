@@ -4,31 +4,52 @@ import json
 import logging
 import os
 from collections import Counter, deque
+from datetime import datetime
+from itertools import islice
 from pathlib import Path
 from threading import RLock
-from typing import Any, Iterable, NamedTuple
+from typing import Any, Iterable
 
-from .fda_export import normalize_to_utc
 from .schemas.domain import LineageEdge, LineageNode, StoredEventRecord
 
 
-# Same name-keyed singleton logger main.py configures. A write that never
-# reaches disk is the one failure this store cannot recover from, so it must
-# not be silent even though the exception propagates (#182).
-logger = logging.getLogger("inflow_lab")
+logger = logging.getLogger(__name__)
 
+
+# Stand-in description for a lot that other records name as a parent but
+# which has no stored record of its own. The console renders a node's
+# `product_description` verbatim, and such a node also reports
+# `event_count == 0`, so the gap is visible in the graph instead of silently
+# absent from it (see #97).
+LINEAGE_PLACEHOLDER_DESCRIPTION = "Unknown lot (no stored record)"
 
 # Sentinel that replaces secrets in scrubbed output. Not a credential.
-class RetiredStoreError(ValueError):
-    """Raised when a write is attempted through a deleted tenant's store (#175).
-
-    Subclasses ValueError so main.py's app-wide handler turns it into a clean
-    4xx rather than an unhandled 500.
-    """
-
-
 MASKED_SECRET = "***MASKED***"  # nosec B105
 SECRET_FIELD_NAMES = {"api_key", "apikey", "x_regengine_api_key", "authorization"}
+
+# How many records one store keeps -- in memory *and* on disk. The two used to
+# be governed by different rules: the deque capped at 5000 while ``add_many``
+# appended to the log forever, so a long run left a file the store no longer
+# fully represented and every read reparsed it from byte zero to find that
+# out. One bound now covers both (see ``_rotate_persisted``), so "what the
+# store serves" and "what the file holds" cannot drift apart.
+MAX_HISTORY_ENV = "REGENGINE_STORE_MAX_HISTORY"
+DEFAULT_MAX_HISTORY = 50_000
+
+
+def default_max_history() -> int:
+    raw_limit = (os.getenv(MAX_HISTORY_ENV) or "").strip()
+    if not raw_limit:
+        return DEFAULT_MAX_HISTORY
+    try:
+        limit = int(raw_limit)
+    except ValueError:
+        logger.warning("Ignoring malformed %s=%r; using default %s", MAX_HISTORY_ENV, raw_limit, DEFAULT_MAX_HISTORY)
+        return DEFAULT_MAX_HISTORY
+    if limit <= 0:
+        logger.warning("Ignoring non-positive %s=%r; using default %s", MAX_HISTORY_ENV, raw_limit, DEFAULT_MAX_HISTORY)
+        return DEFAULT_MAX_HISTORY
+    return limit
 
 
 def _scrub_secrets(value: Any) -> Any:
@@ -41,36 +62,6 @@ def _scrub_secrets(value: Any) -> Any:
     if isinstance(value, list):
         return [_scrub_secrets(item) for item in value]
     return value
-
-
-def _serialize_record(record: StoredEventRecord) -> str:
-    """Render one record as the JSONL line that goes on disk.
-
-    This is the single choke point every persisted-record write path funnels
-    through (append in ``add_many``, rewrite in ``update_many``/
-    ``replace_all``). Routing them all through the same function is what
-    keeps the ``_scrub_secrets`` pass from drifting out of sync between an
-    append and a rewrite of the same record.
-
-    ``allow_nan=False`` (#98) is the last line of defence for the file
-    format. Python's default ``allow_nan=True`` emits bare ``NaN`` /
-    ``Infinity`` tokens, which are *not* RFC 8259: a strict reader
-    (browser ``JSON.parse``, Go ``encoding/json``, Rust serde) rejects the
-    whole line and ``jq`` quietly coerces the value to ``null``. The
-    ``quantity`` field is now guarded at the model (``allow_inf_nan=False``),
-    so a validated record cannot reach here carrying NaN; this keeps the
-    guarantee at the file boundary itself, where it belongs, for any producer
-    that bypasses model validation. It matters specifically for *typed*
-    ``float`` fields: ``model_dump(mode="json")`` passes a non-finite typed
-    float through unchanged, while a non-finite value under an ``Any``-typed
-    field such as ``kdes`` is already coerced to ``None`` by pydantic. Both
-    write paths are safe against the resulting ``ValueError``:
-    ``_write_records`` builds a ``.tmp`` and only ``replace``s it on success,
-    and ``_append_locked`` flushes and commits one record at a time, so a
-    mid-batch failure behaves exactly like the mid-batch ``OSError`` those
-    paths already document.
-    """
-    return json.dumps(_scrub_secrets(record.model_dump(mode="json")), allow_nan=False)
 
 
 def mask_secret_in_string(message: str | None, secret: str | None) -> str | None:
@@ -96,68 +87,71 @@ def mask_secret_in_payload(value: Any, secret: str | None = None) -> Any:
     return value
 
 
-class CorruptRecordLine(NamedTuple):
-    """One JSONL line ``read_persisted_records`` could not parse and skipped.
+def _serialize_record(record: StoredEventRecord) -> str:
+    """The one and only on-disk serialization for a stored record.
 
-    Populated on ``EventStore.last_read_corrupt_lines`` after every
-    ``read_persisted_records()`` call (#93) so a caller holding the store
-    can tell a read that quietly dropped bad lines apart from one that
-    returned the tenant's complete history -- see
-    ``EventStore.last_read_was_complete``. Never carries the line's own
-    content: it failed to parse *as* a record, so it could still hold a
-    secret-named KDE the model never got a chance to scrub.
+    Every persistence path -- ``add_many`` (append) and the two rewrite
+    paths, ``update_many`` and ``replace_all`` -- goes through here so the
+    secret scrub cannot be applied on one path and silently skipped on
+    another. ``SECURITY_BOUNDARIES.md`` states the redaction guarantee
+    unconditionally, and one shared serializer is what keeps it that way:
+    previously a record written masked by ``add_many`` was rewritten in
+    clear by the next retry or scenario load.
     """
-
-    path: str
-    line_number: int
-    error: str
+    # ``allow_nan=False`` keeps the log strict RFC 8259 JSON. A non-finite
+    # quantity would otherwise be written as a bare ``NaN``/``Infinity``
+    # token that Python happily reads back but every strict parser (and the
+    # exports built on top of them) rejects -- see #98. Failing here means a
+    # bad value never reaches disk in the first place.
+    return json.dumps(_scrub_secrets(record.model_dump(mode="json")), allow_nan=False)
 
 
 class EventStore:
-    def __init__(self, persist_path: str = "data/events.jsonl", max_records: int = 5000) -> None:
+    """In-memory record history with the JSONL file as its write-ahead log.
+
+    Reads (``stats``, ``lineage``, ``all_between``, ``failed_delivery_records``
+    and everything the API builds on them) are served from memory. They used
+    to re-open the log and re-validate every line through Pydantic on each
+    call, so a status poll cost a full-file parse and the in-memory copy was
+    decorative -- while the writes it was meant to protect (fsync before
+    exposure, rollback on failure, one scrubbing serializer) all still go to
+    disk first. Disk therefore stays the durable record and the source of
+    truth on restart; it is simply not re-read to answer a question already
+    answered in memory.
+
+    ``max_records`` bounds the *recent* window ``recent()`` serves.
+    ``max_history`` bounds retained history, in memory and in the file
+    together.
+    """
+
+    def __init__(
+        self,
+        persist_path: str = "data/events.jsonl",
+        max_records: int = 5000,
+        max_history: int | None = None,
+    ) -> None:
         self.persist_path = Path(persist_path)
         self.max_records = max_records
-        self._records: deque[StoredEventRecord] = deque(maxlen=max_records)
+        self.max_history = max_history if max_history is not None else default_max_history()
+        # Oldest-first, unlike the newest-first ring this replaced: appends go
+        # to the right and ``maxlen`` evicts the oldest from the left, which
+        # is the direction retention actually wants. ``recent()`` reverses a
+        # slice of the tail instead of the deque carrying the inverted order.
+        self._history: deque[StoredEventRecord] = deque(maxlen=self.max_history)
+        # Records currently in the live persist file. Kept in step with the
+        # writes rather than recomputed, so nothing has to stat or reparse the
+        # file to know whether it is due for rotation.
+        self._persisted_count = 0
+        # Records evicted from memory but still in the live file, held until
+        # the next rotation copies them to the archive. Bounded by the
+        # rotation slack below, so this never grows past a fraction of
+        # ``max_history``.
+        self._pending_archive: list[StoredEventRecord] = []
         self._counter = 0
-        # Freshly overwritten by every read_persisted_records() call (#93);
-        # see that method and last_read_was_complete for why this exists.
-        # Initialized empty here so the attribute always exists even before
-        # the _load_from_disk() call a few lines down performs the first
-        # real read.
-        self.last_read_corrupt_lines: list[CorruptRecordLine] = []
-        # threading.RLock, not asyncio.Lock (#136). Two different kinds of
-        # caller take it: EventStore.__init__/_load_from_disk and
-        # MockRegEngineService.__init__ (mock_service.py, via
-        # read_persisted_records) call in from plain synchronous code with
-        # no event loop running at all, while app.controller offloads the
-        # write paths (add_many/update_many/replace_all/configure) and the
-        # replay read (read_persisted_records) onto worker threads via
-        # asyncio.to_thread so a large write or replay can't stall the
-        # single event loop (see the locking comment in
-        # SimulationController, app/controller.py).
-        #
-        # That split only works because every public method on this class
-        # is a plain `def`, never `async def`: each one acquires and fully
-        # releases this lock within its own synchronous call frame, with no
-        # `await` anywhere inside the locked section for it to suspend on.
-        # asyncio.to_thread runs one such call start-to-finish on a single
-        # worker thread, which preserves both guarantees this lock has to
-        # provide:
-        #   - cross-call mutual exclusion, because RLock serializes *any*
-        #     threads that ask for it, not just the event loop's own thread;
-        #   - same-call reentrancy (configure -> _load_from_disk ->
-        #     read_persisted_records; update_many -> _all_records ->
-        #     read_persisted_records), because RLock is only reentrant for
-        #     the thread that already holds it, and that nested chain never
-        #     leaves the one worker thread running it.
-        # Do NOT turn one of these methods into `async def` while it still
-        # holds this lock across an `await` -- that would let the event
-        # loop thread block waiting on a worker thread for the lock while
-        # that worker is itself waiting on the event loop to resume it: a
-        # deadlock. If a method here ever needs to suspend mid-critical-
-        # section, that is a sign it no longer belongs behind this lock as
-        # written, not a reason to relax the "no await while held" rule.
         self._lock = RLock()
+        # Lines the most recent read could not parse; see
+        # ``read_persisted_records``.
+        self.last_read_skipped = 0
         self._load_from_disk()
 
     def configure(self, persist_path: str) -> None:
@@ -165,363 +159,369 @@ class EventStore:
             self.persist_path = Path(persist_path)
             self._load_from_disk()
 
-    def _set_records(self, records_oldest_first: Iterable[StoredEventRecord]) -> None:
-        """Rebuild the in-memory ring from an oldest-first sequence.
+    def _set_history(self, records: Iterable[StoredEventRecord]) -> None:
+        """Rebuild retained history from any set of records.
 
-        ``_records`` is newest-first, and that is a contract rather than a
-        convention: ``add_many`` uses ``appendleft``, ``recent()`` reads a
-        left-slice, and ``maxlen`` eviction drops from the right — so an
-        inverted deque does not merely return records in the wrong order,
-        it evicts the newest record on the next write.
-
-        Order of operations matters and is easy to get backwards.
-        ``deque(iterable, maxlen=n)`` keeps the *last* n items, so the
-        truncation has to happen while the sequence is still oldest-first;
-        reversing before truncating retains the oldest n and throws the
-        newest away. Every rebuild goes through here so the three call
-        sites cannot drift apart again — they previously had three
-        different behaviours, only one of them right.
+        Sorted by ``sequence_no`` so history is always in write order
+        regardless of what the caller hands over, then truncated by
+        ``maxlen`` -- and the order of those two steps matters:
+        ``deque(iterable, maxlen=n)`` keeps the *last* n items, so sorting
+        first is what makes the retained tail the newest n rather than an
+        arbitrary n.
         """
-        newest_last: deque[StoredEventRecord] = deque(records_oldest_first, maxlen=self.max_records)
-        self._records = deque(reversed(newest_last), maxlen=self.max_records)
+        ordered = sorted(records, key=lambda record: record.sequence_no)
+        self._history = deque(ordered, maxlen=self.max_history)
 
     def _load_from_disk(self) -> None:
-        self.retired = False
         self.persist_path.parent.mkdir(parents=True, exist_ok=True)
         records = self.read_persisted_records(str(self.persist_path))
         counter = max((record.sequence_no for record in records), default=0)
 
-        self._set_records(records)
-        self._counter = counter
+        with self._lock:
+            # A reload can follow a ``configure`` onto a different file, so
+            # anything still pending from the previous log must not be
+            # archived beside the new one.
+            self._pending_archive.clear()
+            self._set_history(records)
+            self._persisted_count = len(records)
+            self._counter = counter
+            # A file inherited from a build with a larger retention bound (or
+            # from before there was one) is trimmed here rather than left to
+            # sit outside what this store can serve.
+            self._note_evicted(records[: max(0, len(records) - self.max_history)])
+            self._rotate_persisted_if_needed()
 
     def read_persisted_records(self, persist_path: str | None = None) -> list[StoredEventRecord]:
-        """Read the full persisted log from disk, synchronously.
+        """Every readable record in the log, skipping lines that will not parse.
 
-        Stays a plain synchronous method deliberately (#136): it is called
-        from EventStore.__init__/_load_from_disk and from
-        MockRegEngineService.__init__ (mock_service.py), both of which run
-        before/without any event loop, so an ``async def`` here would break
-        construction. Async callers with a loop running (app.controller's
-        ``replay``) instead offload a whole call to a worker thread via
-        ``asyncio.to_thread`` -- see the lock comment in ``__init__`` above
-        for why that is safe.
+        One unparseable line used to abort the whole read, which took out
+        every reader for that tenant (status, lineage, stats, exports,
+        ``/api/health``) and -- because the default store is built at import
+        time -- could stop the app from starting at all (#93). A torn final
+        line from an interrupted append, or a line written by an older
+        ``StoredEventRecord`` shape that survived a deploy, is not a reason
+        to lose the rest of the history.
 
-        A line that fails to parse -- a future StoredEventRecord/CTEType
-        schema change, a write torn by a crash mid-append, a hand-edited
-        file -- is skipped and logged rather than aborting the whole read
-        (#93): one bad line must not make a tenant's entire history
-        unreadable, and since __init__/_load_from_disk calls this too, it
-        must not stop the app from starting on a corrupt store either.
-
-        The return type deliberately stays a plain list so callers that
-        already unpack it directly keep working unchanged (mock_service.py's
-        ``_resume_chain_hash`` does ``sorted(store.read_persisted_records(),
-        ...)``; controller.py's ``_store_read_persisted_records`` awaits this
-        through ``asyncio.to_thread`` and hands the list straight to its own
-        caller). A skipped line is instead recorded on
-        ``self.last_read_corrupt_lines`` -- see ``last_read_was_complete``
-        for how a caller tells a read that dropped lines apart from one that
-        returned the complete history.
+        Skipping is never silent: each bad line is logged with its line
+        number and copied verbatim to a ``.quarantine`` sidecar next to the
+        store, and the count is exposed via :attr:`last_read_skipped` so
+        callers can surface "N unreadable lines" without re-reading the
+        file. The original line is left in place; nothing is rewritten here.
         """
         path = Path(persist_path) if persist_path else self.persist_path
         records: list[StoredEventRecord] = []
-        corrupt_lines: list[CorruptRecordLine] = []
+        malformed: list[tuple[int, str]] = []
 
         with self._lock:
             if path.exists():
-                # Opened in BINARY mode, deliberately (#93). A text-mode
-                # handle decodes as it iterates, so a run of invalid UTF-8
-                # bytes anywhere in the file raises UnicodeDecodeError out
-                # of the `for` statement itself -- outside the try below,
-                # and therefore past every skip-and-log guard here. That is
-                # the same whole-read abort this method exists to prevent,
-                # just triggered by byte corruption instead of a syntax
-                # error: torn writes, a truncated volume restore, or a file
-                # written by something that was not this app.
-                #
-                # Reading bytes and letting model_validate_json do the
-                # decoding moves that failure inside the try, where it
-                # arrives as a pydantic ValidationError (a ValueError) and
-                # is skipped and logged exactly like any other unparseable
-                # line. Iterating a binary handle still splits on b"\n",
-                # which is precisely what _serialize_record writes, so
-                # line numbering is unchanged.
-                with path.open("rb") as handle:
+                with path.open("r", encoding="utf-8") as handle:
                     for line_number, line in enumerate(handle, start=1):
                         if not line.strip():
                             continue
                         try:
                             records.append(StoredEventRecord.model_validate_json(line))
-                        except ValueError as exc:
-                            # Skip and log rather than abort (#93). The raw
-                            # line itself is never logged: it failed to
-                            # parse *as* a record, so it could still carry a
-                            # secret-named KDE the model never got a chance
-                            # to scrub.
-                            logger.error(
-                                "skipping unreadable event record at %s:%d (%s)",
-                                path,
-                                line_number,
-                                exc,
-                            )
-                            corrupt_lines.append(
-                                CorruptRecordLine(path=str(path), line_number=line_number, error=str(exc))
-                            )
-            # Overwritten every call, including empty, so this always
-            # reflects *this* read rather than stale state left by a
-            # previous one -- see last_read_was_complete.
-            self.last_read_corrupt_lines = corrupt_lines
+                        except ValueError:
+                            malformed.append((line_number, line))
+            if malformed:
+                self._quarantine_lines(path, malformed)
+            self.last_read_skipped = len(malformed)
         return records
 
-    @property
-    def last_read_was_complete(self) -> bool:
-        """False if the most recent ``read_persisted_records()`` skipped a line.
+    def _quarantine_lines(self, path: Path, malformed: list[tuple[int, str]]) -> None:
+        """Log and set aside lines that could not be parsed.
 
-        A short or empty read result can mean two very different things:
-        "this genuinely is the tenant's whole history" or "some of it was
-        unreadable and got skipped" (#93). Callers that need to tell those
-        apart -- rather than inferring completeness from record count alone
-        -- should check this immediately after the read. It reflects the
-        single most recent ``read_persisted_records()`` call on this store,
-        including nested/reentrant ones made while already holding this
-        store's lock (``_load_from_disk``, and ``update_many`` via
-        ``_all_records``).
+        Best effort by design: a store whose directory is read-only must
+        still serve the records it *could* read, so a failure to write the
+        sidecar is logged and swallowed rather than resurrecting the very
+        outage this method exists to prevent.
         """
-        return not self.last_read_corrupt_lines
+        for line_number, _line in malformed:
+            logger.error(
+                "event store skipped unreadable record",
+                extra={"persist_path": str(path), "line_number": line_number},
+            )
+        quarantine_path = path.with_suffix(f"{path.suffix}.quarantine")
+        try:
+            # Truncating rather than appending: every read of the same file
+            # finds the same bad lines, so appending would grow the sidecar
+            # without bound on a hot read path.
+            with quarantine_path.open("w", encoding="utf-8") as handle:
+                for line_number, line in malformed:
+                    handle.write(f"{line_number}\t{line.rstrip()}\n")
+        except OSError as exc:  # pragma: no cover - depends on the failure mode
+            logger.error(
+                "event store could not quarantine unreadable record(s)",
+                extra={"persist_path": str(path), "record_count": len(malformed)},
+                exc_info=exc,
+            )
 
     def reset(self) -> None:
         with self._lock:
-            self._records.clear()
+            self._history.clear()
+            self._pending_archive.clear()
+            self._persisted_count = 0
             self._counter = 0
-            # The file backing last_read_corrupt_lines is about to be
-            # deleted; carrying its stale diagnostics forward would make a
-            # freshly reset (empty, healthy) store still report a past
-            # corruption that reset() just removed.
-            self.last_read_corrupt_lines = []
             if self.persist_path.exists():
                 self.persist_path.unlink()
+            # The rotation archive is this store's own older records, so a
+            # reset that left it behind would resurrect them in the next
+            # export that reads it.
+            self._archive_path().unlink(missing_ok=True)
             self.persist_path.parent.mkdir(parents=True, exist_ok=True)
 
-    def _write_records(self, records_oldest_first: Iterable[StoredEventRecord]) -> None:
-        """Rewrite ``persist_path`` atomically from a full oldest-first list.
+    def _ends_with_newline(self, size: int) -> bool:
+        """Whether the persist file is newline-terminated (empty counts)."""
+        if size <= 0:
+            return True
+        try:
+            with self.persist_path.open("rb") as handle:
+                handle.seek(-1, os.SEEK_END)
+                return handle.read(1) == b"\n"
+        except OSError:  # pragma: no cover - depends on the failure mode
+            return True
 
-        Shared by ``update_many``/``replace_all`` so a rewrite always goes
-        through ``_serialize_record`` — the scrub can't be forgotten on one
-        path and not the other. The write itself lands via a ``.tmp`` +
-        ``replace`` swap, so ``persist_path`` on disk is always either the
-        old file or the fully-written new one, never a half-written file,
-        no matter where in the loop a write failure happens.
+    def _file_size(self) -> int:
+        try:
+            return self.persist_path.stat().st_size
+        except OSError:
+            return 0
 
-        Private, and assumes the caller already holds ``self._lock`` for the
-        surrounding read-modify-write — it does not take the lock itself, so
-        callers can invoke it without any reentrant-locking hazard. It says
-        nothing about in-memory state: this only guarantees the file: each
-        caller is responsible for its own ordering of ``_set_records``/
-        ``_counter`` around the call.
+    def _truncate_to(self, size: int) -> None:
+        """Best-effort rollback of a partially written append."""
+        try:
+            os.truncate(self.persist_path, size)
+        except OSError as exc:  # pragma: no cover - depends on the failure mode
+            logger.error(
+                "event store could not roll back partial write",
+                extra={"persist_path": str(self.persist_path), "target_size": size},
+                exc_info=exc,
+            )
+
+    def add_many(self, records: Iterable[StoredEventRecord]) -> list[StoredEventRecord]:
+        """Append records, exposing them in memory only once they are on disk.
+
+        The in-memory deque and the sequence counter are the read path for
+        ``recent()``/``stats()``, so mutating them before the append lands
+        makes a failed write look like a successful one until the next
+        reload. Everything is serialized first, written as a single append,
+        and only then committed to memory; a failed write is truncated back
+        to the pre-write size so no torn line survives.
+        """
+        record_list = list(records)
+        if not record_list:
+            return []
+
+        with self._lock:
+            self.persist_path.parent.mkdir(parents=True, exist_ok=True)
+            start_counter = self._counter
+            previous_sequence_numbers = [record.sequence_no for record in record_list]
+            lines: list[str] = []
+            for offset, record in enumerate(record_list, start=1):
+                record.sequence_no = start_counter + offset
+                lines.append(_serialize_record(record))
+
+            original_size = self._file_size()
+            # A previous append that was cut short leaves a line with no
+            # terminating newline. Appending straight onto it would splice the
+            # torn remains into the first new record, turning one unreadable
+            # line into two; a separator keeps the damage contained to the
+            # line that was already lost (#93).
+            separator = "" if self._ends_with_newline(original_size) else "\n"
+            try:
+                with self.persist_path.open("a", encoding="utf-8") as handle:
+                    handle.write(separator + "\n".join(lines) + "\n")
+                    handle.flush()
+                    os.fsync(handle.fileno())
+            except OSError as exc:
+                logger.error(
+                    "event store failed to persist %d record(s); rolling back",
+                    len(record_list),
+                    extra={
+                        "persist_path": str(self.persist_path),
+                        "record_count": len(record_list),
+                    },
+                    exc_info=exc,
+                )
+                self._truncate_to(original_size)
+                for record, sequence_no in zip(record_list, previous_sequence_numbers):
+                    record.sequence_no = sequence_no
+                raise
+
+            overflow = len(self._history) + len(record_list) - self.max_history
+            if overflow > 0:
+                self._note_evicted(list(islice(self._history, 0, overflow)))
+            self._history.extend(record_list)
+            self._persisted_count += len(record_list)
+            self._counter = start_counter + len(record_list)
+            self._rotate_persisted_if_needed()
+
+        logger.info(
+            "event store persisted %d record(s)",
+            len(record_list),
+            extra={
+                "persist_path": str(self.persist_path),
+                "record_count": len(record_list),
+                "last_sequence_no": self._counter,
+            },
+        )
+        return record_list
+
+    def check_writable(self) -> dict[str, Any]:
+        """Cheap, non-destructive probe that the persist path accepts writes.
+
+        Appends a single blank line (ignored by the JSONL reader) and
+        truncates it away again, so it exercises the real file on the real
+        volume without mutating stored records. Used by the health checks
+        so an unwritable data directory cannot report healthy.
+        """
+        with self._lock:
+            path = self.persist_path
+            try:
+                path.parent.mkdir(parents=True, exist_ok=True)
+                existed = path.exists()
+                original_size = self._file_size() if existed else 0
+                with path.open("a", encoding="utf-8") as handle:
+                    handle.write("\n")
+                    handle.flush()
+                if existed:
+                    self._truncate_to(original_size)
+                else:
+                    try:
+                        path.unlink()
+                    except OSError:  # pragma: no cover - benign cleanup race
+                        pass
+            except OSError as exc:
+                logger.error(
+                    "event store write probe failed",
+                    extra={"persist_path": str(path)},
+                    exc_info=exc,
+                )
+                return {"ok": False, "persist_path": str(path), "error": f"{type(exc).__name__}: {exc}"}
+        return {"ok": True, "persist_path": str(path), "error": None}
+
+    def _fsync_dir(self) -> None:
+        """Best-effort fsync of the persist directory so a rename is durable."""
+        try:
+            dir_fd = os.open(str(self.persist_path.parent), os.O_RDONLY)
+        except OSError:  # pragma: no cover - platform dependent
+            return
+        try:
+            os.fsync(dir_fd)
+        except OSError:  # pragma: no cover - platform dependent
+            pass
+        finally:
+            os.close(dir_fd)
+
+    def _archive_path(self) -> Path:
+        """Where rotated-out records go: ``events.jsonl.1`` beside the log."""
+        return self.persist_path.with_suffix(f"{self.persist_path.suffix}.1")
+
+    @property
+    def _rotation_slack(self) -> int:
+        """How far past ``max_history`` the live file may run before rotating.
+
+        Rotation rewrites the whole retained file, so doing it on the append
+        that first crosses the bound would make every subsequent append pay
+        for a full rewrite. The slack amortizes it: one rewrite per
+        ``max_history // 10`` records instead of one per batch.
+        """
+        return max(1, self.max_history // 10)
+
+    def _note_evicted(self, evicted: list[StoredEventRecord]) -> None:
+        """Remember records dropped from memory but still in the live file."""
+        if evicted:
+            self._pending_archive.extend(evicted)
+
+    def _rotate_persisted_if_needed(self) -> None:
+        if self._persisted_count <= self.max_history + self._rotation_slack:
+            return
+        self._rotate_persisted()
+
+    def _rotate_persisted(self) -> None:
+        """Move the log's oldest records to the archive and rewrite the rest.
+
+        The deque has always had a cap while the file had none, so a long run
+        produced a file the store could not fully serve and had no way to
+        report that. Retention is now one bound over both: records leave the
+        live log exactly when they leave memory, and they leave by being
+        appended to ``events.jsonl.1`` rather than deleted -- rotation is an
+        attic, not a shredder, which matters for a log whose whole purpose is
+        showing the shape of FSMA evidence.
+
+        Best effort on purpose. The records being rotated are already durably
+        appended, so a rotation that cannot write logs and returns, leaving
+        the file long and the pending set intact for the next attempt; it
+        never fails the write that triggered it.
+        """
+        retained = list(self._history)
+        pending = list(self._pending_archive)
+        try:
+            if pending:
+                archive_path = self._archive_path()
+                with archive_path.open("a", encoding="utf-8") as handle:
+                    for record in pending:
+                        handle.write(_serialize_record(record) + "\n")
+                    handle.flush()
+                    os.fsync(handle.fileno())
+            self._rewrite_persisted(retained)
+        except OSError as exc:
+            logger.error(
+                "event store could not rotate the persist file",
+                extra={
+                    "persist_path": str(self.persist_path),
+                    "record_count": self._persisted_count,
+                },
+                exc_info=exc,
+            )
+            return
+        self._pending_archive.clear()
+        self._persisted_count = len(retained)
+        logger.info(
+            "event store rotated %d record(s) out of the live log",
+            len(pending),
+            extra={
+                "persist_path": str(self.persist_path),
+                "archive_path": str(self._archive_path()),
+                "record_count": len(retained),
+            },
+        )
+
+    def _commit_rewrite(self, persisted_records: list[StoredEventRecord]) -> None:
+        """Adopt a freshly rewritten file as both history and live log."""
+        self._set_history(persisted_records)
+        self._persisted_count = len(persisted_records)
+        self._counter = max((record.sequence_no for record in persisted_records), default=0)
+        dropped = len(persisted_records) - len(self._history)
+        if dropped > 0:
+            self._note_evicted(persisted_records[:dropped])
+            self._rotate_persisted_if_needed()
+
+    def _rewrite_persisted(self, persisted_records: list[StoredEventRecord]) -> None:
+        """Durably replace the persist file with ``persisted_records``.
+
+        Shared by the two rewrite paths. Records are serialized through
+        ``_serialize_record`` (so the secret scrub applies to rewrites as
+        well as appends), the temp file is fsynced before the atomic
+        rename, and the containing directory is fsynced after it so the
+        rename itself survives a crash. A failed write leaves the previous
+        file untouched -- the temp file is removed and the error raised
+        before anything is committed to memory.
         """
         self.persist_path.parent.mkdir(parents=True, exist_ok=True)
         tmp_path = self.persist_path.with_suffix(f"{self.persist_path.suffix}.tmp")
         try:
             with tmp_path.open("w", encoding="utf-8") as handle:
-                for record in records_oldest_first:
+                for record in persisted_records:
                     handle.write(_serialize_record(record) + "\n")
+                handle.flush()
+                os.fsync(handle.fileno())
             tmp_path.replace(self.persist_path)
         except OSError:
-            # Re-raised, never swallowed: callers order their in-memory
-            # commit around this and depend on the failure propagating.
-            logger.exception("event store rewrite failed for %s", self.persist_path)
+            tmp_path.unlink(missing_ok=True)
             raise
-
-    def _truncate_torn_tail(self) -> None:
-        """Drop a trailing fragment left behind by a partially written append.
-
-        ``add_many`` writes ``json + "\n"`` in a single call, so a write that
-        fails partway through (ENOSPC, a detached volume) can leave JSON on
-        disk with no terminating newline. The next append opens the file in
-        ``"a"`` and writes straight onto that same physical line -- so the
-        fragment silently swallows the *next* record, one that was fully
-        written, flushed, and already acknowledged to the API caller. For a
-        traceability tool, losing a record the API confirmed is the worst
-        available failure mode.
-
-        Dropping the fragment confines the damage to the record whose write
-        actually failed. A healthy file always ends in a newline, so this is a
-        no-op on every normal call.
-        """
-        path = self.persist_path
-        # Regular files only. The persist path can legitimately point at a
-        # character device (tests use /dev/full to force ENOSPC), which has no
-        # tail to repair -- and reading one back streams zeros forever.
-        if not path.is_file():
-            return
-        with path.open("rb+") as handle:
-            handle.seek(0, os.SEEK_END)
-            size = handle.tell()
-            if size == 0:
-                return
-            handle.seek(size - 1)
-            if handle.read(1) == b"\n":
-                return
-            # Scan backwards in bounded chunks -- an event log can be large and
-            # this must not pull the whole file into memory to find one newline.
-            chunk_size = 64 * 1024
-            position = size
-            while position > 0:
-                start = max(0, position - chunk_size)
-                handle.seek(start)
-                block = handle.read(position - start)
-                newline_index = block.rfind(b"\n")
-                if newline_index != -1:
-                    handle.truncate(start + newline_index + 1)
-                    return
-                position = start
-            # No newline anywhere: the entire file is one torn fragment.
-            handle.truncate(0)
-
-    def _resync_counter_from_disk(self) -> None:
-        """Re-derive ``_counter`` from what is actually persisted.
-
-        ``add_many`` advances ``_counter`` only after ``flush()`` returns.
-        That is right for the common failure -- nothing reached disk -- but
-        wrong when the bytes landed and the flush still raised: the record sits
-        on disk holding sequence N while ``_counter`` still reads N-1, so the
-        next append hands out N a second time and the log carries a duplicate
-        ``sequence_no``.
-        """
-        # Same constraint as _truncate_torn_tail: never read back a path that
-        # is not a regular file. /dev/full answers reads with an unbounded
-        # stream of NUL bytes and no newline, so this would buffer until the
-        # process is OOM-killed rather than raising.
-        if not self.persist_path.is_file():
-            return
-        try:
-            persisted = self.read_persisted_records()
-        except ValueError:
-            # An unreadable line elsewhere in the file is a separate problem,
-            # surfaced by the read path. Do not compound a write failure by
-            # raising a different error out of the recovery path.
-            return
-        # Never move the counter *backwards* below a record already committed
-        # to memory: those sequence numbers have been handed out, and reissuing
-        # one would put two different records under the same sequence_no. Take
-        # the high-water mark of both sides.
-        persisted_max = max((record.sequence_no for record in persisted), default=0)
-        committed_max = max((record.sequence_no for record in self._records), default=0)
-        self._counter = max(persisted_max, committed_max)
-
-    def retire(self) -> None:
-        """Mark this store dead because its tenant is being deleted (#175).
-
-        A request that resolved its controller *before* the delete started
-        still holds that controller object, and every EventStore write path
-        does ``mkdir(parents=True)`` on its own -- so a write through the
-        popped controller recreated the tenant directory after the rmtree, and
-        ``known_tenant_ids()`` then listed the tenant as present again. The
-        controller was a zombie: the next request for that tenant minted a
-        second EventStore over the same file with an independent ``_counter``.
-
-        Retiring makes those in-flight writes fail loudly instead of silently
-        resurrecting the tenant.
-        """
-        with self._lock:
-            self.retired = True
-
-    def _refuse_if_retired(self) -> None:
-        if self.retired:
-            raise RetiredStoreError(
-                "This tenant has been deleted; its event store is no longer writable. "
-                "Retry the request to work against a freshly created tenant."
-            )
-
-    def add_many(self, records: Iterable[StoredEventRecord]) -> list[StoredEventRecord]:
-        stored: list[StoredEventRecord] = []
-        self._refuse_if_retired()
-        try:
-            return self._append_many(records, stored)
-        except OSError:
-            # Re-raised: the caller must see the failure, and the in-memory
-            # rollback below the append depends on it propagating.
-            logger.exception("event store append failed for %s", self.persist_path)
-            raise
-
-    def _append_many(
-        self, records: Iterable[StoredEventRecord], stored: list[StoredEventRecord]
-    ) -> list[StoredEventRecord]:
-        with self._lock:
-            # Repair before writing, so a fragment left by an earlier failed
-            # append -- possibly in a previous process -- cannot corrupt the
-            # good records this call is about to write.
-            self._truncate_torn_tail()
-            try:
-                return self._append_locked(records, stored)
-            except OSError:
-                self._truncate_torn_tail()
-                self._resync_counter_from_disk()
-                raise
-
-    def _append_locked(
-        self, records: Iterable[StoredEventRecord], stored: list[StoredEventRecord]
-    ) -> list[StoredEventRecord]:
-        with self._lock:
-            with self.persist_path.open("a", encoding="utf-8") as handle:
-                for record in records:
-                    next_sequence_no = self._counter + 1
-                    record.sequence_no = next_sequence_no
-                    handle.write(_serialize_record(record) + "\n")
-                    # write() only stages bytes in a userspace buffer --
-                    # flush() forces the OS-level write so a full disk (or
-                    # any other write failure) raises here, synchronously,
-                    # instead of being deferred to a later write's flush or
-                    # to the handle's close, by which point we could have
-                    # already committed more records to memory than ever
-                    # reached disk.
-                    handle.flush()
-                    # Commit to memory only once the line is confirmed on
-                    # disk. A write that fails partway through a batch (full
-                    # disk, detached volume, permission change) must not
-                    # leave a phantom record that recent()/stats() report
-                    # until the next reload silently drops it again.
-                    self._counter = next_sequence_no
-                    self._records.appendleft(record)
-                    stored.append(record)
-                if stored:
-                    self._fsync_appended(handle)
-        return stored
-
-    def _fsync_appended(self, handle: Any) -> None:
-        """Force this batch's appended bytes to stable storage (#93).
-
-        ``flush()`` in the loop above only pushes the bytes out of Python's
-        buffer into the OS page cache. That is enough to make a write error
-        surface synchronously and enough to survive the process dying, but
-        not enough to survive the machine losing power -- so an
-        acknowledged append could still be missing after a hard restart.
-        ``update_many``/``replace_all`` get their durability from the tmp +
-        ``os.replace`` swap in ``_write_records``; the append path had no
-        equivalent, which is the durability half of #93.
-
-        A tmp + rename would give the same guarantee here only by
-        rewriting the entire log on every append -- turning an O(1) append
-        into O(total records), on the hot path every step() takes. #93
-        names ``fsync`` as the alternative for exactly this reason.
-
-        One fsync per *batch*, not per record: the per-record ``flush()``
-        already supplies the error detection and the write-then-commit
-        ordering the loop depends on, and an fsync per record would make a
-        multi-thousand-row CSV import pay a disk round-trip per row.
-
-        Skipped for anything that is not a regular file: the persist path
-        can legitimately point at a character device (the durability tests
-        use /dev/full to force ENOSPC), which has no durable state to
-        flush. Same constraint ``_truncate_torn_tail`` and
-        ``_resync_counter_from_disk`` already carry, for the same reason.
-        """
-        if not self.persist_path.is_file():
-            return
-        os.fsync(handle.fileno())
+        self._fsync_dir()
 
     def update_many(self, records: Iterable[StoredEventRecord]) -> list[StoredEventRecord]:
-        self._refuse_if_retired()
         replacements = {record.record_id: record for record in records}
         if not replacements:
             return []
@@ -537,51 +537,39 @@ class EventStore:
                 else:
                     updated_records.append(record)
 
-            # Persist before publishing, for the same reason as add_many: a
-            # rewrite that fails here must leave the store matching the disk
-            # rather than a half-applied update that recent()/stats() report
-            # until the next reload silently drops it.
             persisted_records = sorted(updated_records, key=lambda record: record.sequence_no)
-            self._write_records(persisted_records)
-            self._set_records(updated_records)
-            self._counter = max((record.sequence_no for record in persisted_records), default=0)
+            self._rewrite_persisted(persisted_records)
+            self._commit_rewrite(persisted_records)
 
         return [record for record in updated_records if record.record_id in replacements]
 
     def replace_all(self, records: Iterable[StoredEventRecord]) -> list[StoredEventRecord]:
-        self._refuse_if_retired()
         persisted_records = sorted(list(records), key=lambda record: record.sequence_no)
         with self._lock:
-            self._write_records(persisted_records)
-            self._set_records(persisted_records)
-            self._counter = max((record.sequence_no for record in persisted_records), default=0)
+            self._rewrite_persisted(persisted_records)
+            self._commit_rewrite(persisted_records)
         return persisted_records
 
     def recent(self, limit: int = 100) -> list[StoredEventRecord]:
+        """The newest records first, capped by ``max_records``."""
+        window = min(limit, self.max_records)
+        if window <= 0:
+            return []
         with self._lock:
-            return list(self._records)[:limit]
+            return list(islice(reversed(self._history), window))
 
     def failed_delivery_records(
         self,
         record_ids: list[str] | None = None,
         limit: int = 50,
     ) -> list[StoredEventRecord]:
-        """Failed records, optionally narrowed to *record_ids*.
-
-        ``record_ids=None`` means "no filter -- every failed record".
-        ``record_ids=[]`` means "this explicitly empty set" and therefore
-        matches nothing. That distinction is #144's, and until #211 it
-        lived only in SimulationController.retry_failed_delivery, which
-        short-circuits the empty list before ever calling this method:
-        this method itself built its filter as ``set(record_ids or [])``
-        and then treated an empty filter as "match everything", so a
-        direct caller passing ``[]`` got every failed record retried --
-        exactly the behaviour #144 is about, one layer down. The
-        controller keeps its short-circuit (it is pinned by tests, and it
-        answers without touching the store at all); this makes the store
-        agree rather than depending on being called from there.
-        """
+        # `record_ids is None` (filter omitted) and `record_ids == []`
+        # (filter naming zero records) are different requests. Testing
+        # truthiness conflates them and turns an explicitly empty selection
+        # into "retry everything".
         record_id_filter = None if record_ids is None else set(record_ids)
+        if record_id_filter is not None and not record_id_filter:
+            return []
         records = self._all_records()
         failed_records = [
             record
@@ -632,16 +620,6 @@ class EventStore:
                 "last_error": latest_failure.error if latest_failure else None,
             },
             "persist_path": str(self.persist_path),
-            # #93: lets a caller of the already-wired /api/simulate/status
-            # and /api/health (both flow stats() into their response) tell
-            # a read that skipped unreadable lines apart from one that
-            # returned the tenant's complete history -- without changing
-            # the shape of anything that already unpacks stats()'s return
-            # value (it stays a plain dict; this only adds a key).
-            "store_integrity": {
-                "complete": self.last_read_was_complete,
-                "corrupt_lines_skipped": len(self.last_read_corrupt_lines),
-            },
         }
 
     def lineage(self, traceability_lot_code: str) -> list[StoredEventRecord]:
@@ -674,8 +652,9 @@ class EventStore:
         return matched
 
     def lineage_nodes(self, records: Iterable[StoredEventRecord]) -> list[LineageNode]:
+        records_list = list(records)
         lots: dict[str, list[StoredEventRecord]] = {}
-        for record in records:
+        for record in records_list:
             lots.setdefault(record.event.traceability_lot_code, []).append(record)
 
         nodes: list[LineageNode] = []
@@ -701,19 +680,66 @@ class EventStore:
                     locations=locations,
                 )
             )
+        for lot_code, first_reference in self._unbacked_parent_lot_codes(records_list).items():
+            nodes.append(
+                LineageNode(
+                    lot_code=lot_code,
+                    product_description=LINEAGE_PLACEHOLDER_DESCRIPTION,
+                    # Zero events is the honest count and the signal the
+                    # console already renders ("0 event(s)"): this lot is
+                    # named by another record's lineage but nothing in the
+                    # store describes it.
+                    event_count=0,
+                    cte_types=[],
+                    first_seen=first_reference,
+                    last_seen=first_reference,
+                    locations=[],
+                )
+            )
         nodes.sort(key=lambda node: (node.first_seen, node.lot_code))
         return nodes
 
+    def _unbacked_parent_lot_codes(
+        self, records: list[StoredEventRecord]
+    ) -> dict[str, datetime]:
+        """Parent lots named by these records that have no record of their own.
+
+        Maps each such lot code to the earliest timestamp that references it,
+        which is where its placeholder node sorts into the graph.
+        """
+        present = {record.event.traceability_lot_code for record in records}
+        missing: dict[str, datetime] = {}
+        for record in records:
+            child_lot_code = record.event.traceability_lot_code
+            for parent_lot_code in self._parent_lot_codes(record):
+                if parent_lot_code == child_lot_code or parent_lot_code in present:
+                    continue
+                timestamp = record.event.timestamp
+                earliest = missing.get(parent_lot_code)
+                if earliest is None or timestamp < earliest:
+                    missing[parent_lot_code] = timestamp
+        return missing
+
     def lineage_edges(self, records: Iterable[StoredEventRecord]) -> list[LineageEdge]:
+        """Every declared parent link, including ones with no backing record.
+
+        A parent lot with no record of its own used to be skipped outright,
+        so an input that *was* declared on the wire simply vanished from the
+        rendered graph -- which is what kept the rework-lot gap (#97)
+        invisible until it was found by reading payloads. The producer gap is
+        fixed at the source, but the swallow is not a safe default for the
+        next one: the edge is now emitted and `lineage_nodes` gives it a
+        placeholder node, so a missing producer shows up as a hole in the
+        graph rather than as a graph that quietly agrees with itself.
+        """
         record_list = list(records)
-        related_lot_codes = {record.event.traceability_lot_code for record in record_list}
         edges: list[LineageEdge] = []
         seen_edges: set[tuple[str, str, int]] = set()
 
         for record in sorted(record_list, key=lambda item: (item.event.timestamp, item.sequence_no)):
             target_lot_code = record.event.traceability_lot_code
             for source_lot_code in sorted(self._parent_lot_codes(record)):
-                if source_lot_code == target_lot_code or source_lot_code not in related_lot_codes:
+                if source_lot_code == target_lot_code:
                     continue
                 edge_key = (source_lot_code, target_lot_code, record.sequence_no)
                 if edge_key in seen_edges:
@@ -745,16 +771,7 @@ class EventStore:
             return sorted(records, key=lambda record: record.event.timestamp)
         filtered: list[StoredEventRecord] = []
         for record in records:
-            # Normalize before taking .date(), using the SAME helper the FDA
-            # export uses to build its Date column (#157). event.timestamp
-            # keeps whatever offset the source carried -- a CSV row's explicit
-            # "+05:00" survives import -- so filtering on the raw local date
-            # while the export prints the UTC one desynced the two: a
-            # day-scoped request could omit exactly the rows whose exported
-            # Date column reads that day, and return rows printing a different
-            # one. Before #157 both sides read the raw local date and agreed;
-            # normalizing only the column is what split them.
-            day = normalize_to_utc(record.event.timestamp).date().isoformat()
+            day = record.event.timestamp.date().isoformat()
             if start_date and day < start_date:
                 continue
             if end_date and day > end_date:
@@ -763,8 +780,15 @@ class EventStore:
         return sorted(filtered, key=lambda record: record.event.timestamp)
 
     def _all_records(self) -> list[StoredEventRecord]:
-        records = self.read_persisted_records()
-        if records:
-            return sorted(records, key=lambda record: record.sequence_no)
+        """Retained history, oldest first, without touching the disk.
+
+        Every read path funnels through here. It used to re-read and
+        re-validate the whole JSONL on each call -- for a status poll, a
+        lineage query, an export -- which made read cost grow with the log
+        and made the durable write path pay for reads it had already
+        satisfied. History is kept in step with the log by the write paths
+        above and reloaded from it on ``configure``/restart, so the file
+        remains the durable record while the answer comes from memory.
+        """
         with self._lock:
-            return sorted(self._records, key=lambda record: record.sequence_no)
+            return list(self._history)

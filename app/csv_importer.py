@@ -6,13 +6,12 @@ import json
 import math
 import re
 from dataclasses import dataclass
-from datetime import UTC, datetime, timedelta
+from datetime import UTC, datetime
 from typing import Any
 
 from pydantic import ValidationError
 
 from .cte_rules import validate_event_kdes
-from .mock_service import MAX_EVENT_AGE_DAYS
 from .schemas.domain import CSVImportType, CTEType, RegEngineEvent
 from .schemas.ingestion import CSVImportError, CSVImportWarning
 
@@ -38,14 +37,11 @@ CONTROL_FIELDS = {
     "parent_lot_codes",
     "import_type",
 }
-TOP_LEVEL_EVENT_FIELDS = set(EVENT_REQUIRED_FIELDS) | {
-    # location_gln is a dedicated RegEngineEvent field (schemas/domain.py)
-    # but optional, so it isn't in EVENT_REQUIRED_FIELDS. It still has to be
-    # excluded from the generic KDE mapping in _parse_kdes -- otherwise a
-    # `location_gln` column falls through into kdes["location_gln"], where
-    # neither exporter's location_gln(name) callback ever looks (#162).
-    "location_gln",
-}
+TOP_LEVEL_EVENT_FIELDS = set(EVENT_REQUIRED_FIELDS)
+# Optional columns that map to a dedicated RegEngineEvent field rather than
+# into `kdes` - without this a `location_gln` column lands in kdes where no
+# exporter can see it.
+EVENT_OPTIONAL_FIELDS = {"location_gln"}
 LIST_KDE_FIELDS = {
     "input_traceability_lot_codes",
     "input_products",
@@ -87,30 +83,30 @@ def parse_csv_import(
     errors: list[CSVImportError] = []
     warnings: list[CSVImportWarning] = []
 
+    column_count = len(reader.fieldnames or [])
     for row_number, raw_row in enumerate(reader, start=2):
-        # Checked before normalization/blank-filtering so a row can never be
-        # silently treated as "blank" just because its mapped columns are
-        # empty while it also carries unmapped overflow data (#160).
+        row = _normalize_row(raw_row)
         overflow = _row_overflow(raw_row)
+        if _is_blank(row) and not overflow:
+            continue
+        total += 1
         if overflow:
-            total += 1
+            # csv.DictReader parks fields past the header under the None
+            # restkey. Dropping them silently turns a shifted row (usually an
+            # unescaped comma in a free-text value) into a clean "0 errors"
+            # import that quietly lost data.
             errors.append(
                 CSVImportError(
                     row=row_number,
                     field="row",
                     message=(
-                        f"Row has {len(overflow)} more column(s) than the header "
-                        f"(unmatched value(s): {', '.join(overflow)}); check for an "
-                        "unescaped comma inside a field"
+                        f"Row has {len(overflow)} value(s) beyond the {column_count} header "
+                        f"column(s); check for an unescaped comma or a missing quote. "
+                        f"Extra values: {', '.join(overflow)}"
                     ),
                 )
             )
             continue
-
-        row = _normalize_row(raw_row)
-        if _is_blank(row):
-            continue
-        total += 1
         if import_type == CSVImportType.SCHEDULED_EVENTS:
             event, parents, row_errors, row_warnings = _parse_scheduled_event(row, row_number)
         else:
@@ -127,7 +123,6 @@ def parse_csv_import(
         events.append(event)
         parent_lot_codes.append(parents)
         warnings.extend(row_warnings)
-        warnings.extend(_replay_window_warnings(event, row_number, now=default_timestamp))
 
     if total == 0 and not errors:
         errors.append(CSVImportError(row=0, field="csv_text", message="CSV contains no data rows"))
@@ -199,44 +194,20 @@ def _parse_seed_lot(
     kdes.setdefault("tlc_source_reference", f"CSV-SEED-{row['traceability_lot_code']}")
     kdes.setdefault("traceability_lot_code_source_reference", f"CSV-SEED-{row['traceability_lot_code']}")
 
-    event, parents, build_errors, warnings = _build_event(
+    return _build_event(
         row=row,
         row_number=row_number,
         cte_type=CTEType.HARVESTING,
         quantity=quantity,
         timestamp=timestamp,
         kdes=kdes,
-        # Deliberately not _derive_parent_lot_codes(row, kdes) here, unlike
-        # _parse_scheduled_event -- seed lots always become `harvesting`
-        # events (README "CSV import" section), and Harvesting is the CTE
-        # where a traceability lot code is first established (21 CFR
-        # 1.1330 lists commodity/variety, farm location, and harvester name
-        # as its KDEs -- no source/parent lot). DEMO_FIXTURES follows the
-        # same rule: every HARVESTING fixture event leaves parent_lot_codes
-        # at its default empty tuple; only downstream CTEs set it. So a
-        # `parent_lot_codes` value on a seed-lot row isn't a value this
-        # import type failed to honor -- it's an input that doesn't apply.
-        parent_lot_codes=[],
+        # `parent_lot_codes` is a control column for *both* import types, so it
+        # is excluded from the catch-all KDE sweep. Hard-coding [] here meant a
+        # seed-lot row carrying lineage had it dropped with no error and no
+        # warning (#99). Seed lots are usually parentless, but when a caller
+        # supplies parents they are honored exactly as for scheduled events.
+        parent_lot_codes=_derive_parent_lot_codes(row, kdes),
     )
-    if event is not None and row.get("parent_lot_codes"):
-        # CONTROL_FIELDS still excludes this column from the catch-all KDE
-        # sweep in _parse_kdes, so without this the value above vanishes
-        # with no trace: not stored, not a KDE, not reported (#99). Make
-        # the drop visible instead of silent, same as any other column this
-        # import type can't use.
-        warnings = [
-            *warnings,
-            CSVImportWarning(
-                row=row_number,
-                field="parent_lot_codes",
-                message=(
-                    "parent_lot_codes is ignored for seed_lots imports: seed lots "
-                    "become harvesting events, which establish a traceability lot "
-                    "code rather than descend from one"
-                ),
-            ),
-        ]
-    return event, parents, build_errors, warnings
 
 
 def _build_event(
@@ -260,10 +231,6 @@ def _build_event(
             quantity=quantity,
             unit_of_measure=row["unit_of_measure"],
             location_name=row["location_name"],
-            # Threaded through explicitly, like the other top-level fields
-            # above -- _parse_kdes excludes "location_gln" from the generic
-            # KDE mapping (see TOP_LEVEL_EVENT_FIELDS) specifically so it
-            # lands here instead of in kdes (#162).
             location_gln=row.get("location_gln") or None,
             timestamp=timestamp,
             kdes=kdes,
@@ -278,61 +245,10 @@ def _build_event(
         return None, [], errors, []
 
     warnings = [
-        CSVImportWarning(
-            row=row_number,
-            field=warning.field,
-            message=warning.message,
-            severity=warning.severity,
-        )
+        CSVImportWarning(row=row_number, field=warning.field, message=warning.message)
         for warning in validate_event_kdes(event)
     ]
     return event, parent_lot_codes, [], warnings
-
-
-def _replay_window_warnings(
-    event: RegEngineEvent, row_number: int, *, now: datetime
-) -> list[CSVImportWarning]:
-    """Warn about rows live RegEngine will reject for being too old (#102).
-
-    RegEngine refuses any event older than WEBHOOK_MAX_EVENT_AGE_DAYS (90)
-    with "replay window exceeded". Historical backfill is a first-class use
-    of a food-traceability tool -- seeding last season's harvest and cooling
-    records is the natural thing to do -- so the import that fails this way
-    is the one a design partner is most likely to try.
-
-    This fires at parse time, before any delivery is attempted, which is
-    the whole point: the operator learns the rows are outside live's window
-    while they are still deciding what to import, not from a pile of
-    per-event rejections afterwards. Since #209 the mock enforces the same
-    floor on delivery, so the warning is advance notice of a refusal the
-    simulator itself will now issue -- not, as it was under the old default,
-    the only thing standing between a green mock result and a wholesale
-    rejection against live.
-
-    A warning rather than an error, deliberately: importing historical data
-    into the simulator is legitimate and useful (export rehearsal, lineage
-    inspection, audit scoring all work on rows live would refuse to ingest),
-    so the rows are still parsed and still stored. Required severity,
-    because unlike a missing recommended KDE this is a row live WILL reject.
-    """
-    timestamp = _ensure_timezone(event.timestamp)
-    cutoff = now - timedelta(days=MAX_EVENT_AGE_DAYS)
-    if timestamp >= cutoff:
-        return []
-    return [
-        CSVImportWarning(
-            row=row_number,
-            field="timestamp",
-            message=(
-                f"timestamp is {(now - timestamp).days} days old, past RegEngine's "
-                f"{MAX_EVENT_AGE_DAYS}-day replay window (WEBHOOK_MAX_EVENT_AGE_DAYS) — live "
-                "ingest rejects this row with 'replay window exceeded'. The built-in mock "
-                "now rejects it the same way, so the row imports and is stored but will "
-                "not deliver."
-            ),
-            severity="required",
-        )
-    ]
 
 
 def _header_errors(fieldnames: list[str] | None) -> list[CSVImportError]:
@@ -355,7 +271,7 @@ def _header_errors(fieldnames: list[str] | None) -> list[CSVImportError]:
     return []
 
 
-def _normalize_row(raw_row: dict[str | None, Any]) -> dict[str, str]:
+def _normalize_row(raw_row: dict[str | None, str | None]) -> dict[str, str]:
     normalized: dict[str, str] = {}
     for key, value in raw_row.items():
         if key is None:
@@ -364,18 +280,19 @@ def _normalize_row(raw_row: dict[str | None, Any]) -> dict[str, str]:
     return normalized
 
 
-def _row_overflow(raw_row: dict[str | None, Any]) -> list[str]:
-    """Non-empty values csv.DictReader couldn't match to a header column.
+def _row_overflow(raw_row: dict[str | None, str | None]) -> list[str]:
+    """Values a row carried past the end of the header row.
 
-    When a row has more fields than the header, DictReader doesn't raise --
-    it collects the surplus into a list under the `None` restkey, which
-    `_normalize_row` above then quietly drops. That surplus is almost always
-    a real authoring mistake (e.g. an unescaped comma inside a free-text
-    value shifting every later column), so callers must treat it as an
-    error instead of discarding it with no record it ever existed (#160).
+    ``csv.DictReader`` collects them under the ``None`` restkey; an empty
+    trailing field (a stray comma at end of line) is ignored so a merely
+    untidy file still imports.
     """
-    overflow = raw_row.get(None) or []
-    return [value.strip() for value in overflow if value and value.strip()]
+    extras = raw_row.get(None)
+    if not extras:
+        return []
+    if isinstance(extras, str):
+        extras = [extras]
+    return [(value or "").strip() for value in extras if (value or "").strip()]
 
 
 def _normalize_header(header: str) -> str:
@@ -407,13 +324,12 @@ def _parse_quantity(value: str, row_number: int, errors: list[CSVImportError]) -
         errors.append(CSVImportError(row=row_number, field="quantity", message="Quantity must be numeric"))
         return None
 
-    # float() happily accepts the literal tokens "nan", "inf", "-inf" and
-    # overflowing decimals like "1e400", and NaN compares False against every
-    # ordering operator -- so `nan <= 0` is False and the positivity check
-    # below waves it straight through (#98). Non-finite floats have no JSON
-    # representation: json.dumps would emit a bare NaN/Infinity token, which
-    # is not RFC 8259 and is rejected by strict parsers downstream. Reject
-    # here, before the value reaches the model, the store, or the wire.
+    # ``float()`` happily parses "nan", "inf" and "1e400", and none of those
+    # trip the ``<= 0`` check below (``nan <= 0`` is False). They used to sail
+    # through every validator and land in the durable JSONL as a bare
+    # ``NaN``/``Infinity`` token that is not valid JSON, and on the signed
+    # live wire (#98). Rejected here, at the only caller-controlled entry
+    # point that can introduce one.
     if not math.isfinite(quantity):
         errors.append(
             CSVImportError(row=row_number, field="quantity", message="Quantity must be a finite number")
@@ -476,32 +392,30 @@ def _parse_kdes(
             else:
                 kdes.update(parsed)
 
-    excluded_fields = TOP_LEVEL_EVENT_FIELDS | CONTROL_FIELDS | {"kdes", "timestamp"}
-    # Two differently-named columns can target the same KDE key -- a bare
-    # column (e.g. "vessel_identifier") and its kde_-prefixed twin
-    # ("kde_vessel_identifier") both strip down to "vessel_identifier".
-    # Track which column claimed each target key so a second column
-    # mapping to the same key is reported instead of silently overwriting
-    # the first one in row/header order (#162).
-    claimed_by: dict[str, str] = {}
+    excluded_fields = TOP_LEVEL_EVENT_FIELDS | CONTROL_FIELDS | {"kdes", "timestamp"} | EVENT_OPTIONAL_FIELDS
+    # Two columns can normalize onto the same KDE key ("vessel_identifier" and
+    # "kde_vessel_identifier"), in which case dict order silently picked a
+    # winner. Remember which column claimed each key so the clash is reported
+    # instead of resolved by luck.
+    source_columns: dict[str, str] = {}
     for field, value in row.items():
         if not value or field in excluded_fields:
             continue
         target = field.removeprefix("kde_") if field.startswith("kde_") else field
-        claiming_field = claimed_by.get(target)
-        if claiming_field is not None:
+        previous_column = source_columns.get(target)
+        if previous_column is not None:
             errors.append(
                 CSVImportError(
                     row=row_number,
                     field=field,
                     message=(
-                        f"Columns '{claiming_field}' and '{field}' both map to KDE "
-                        f"'{target}'; rename one so the mapping is unambiguous"
+                        f"Columns '{previous_column}' and '{field}' both map to KDE "
+                        f"'{target}'; keep only one of them."
                     ),
                 )
             )
             continue
-        claimed_by[target] = field
+        source_columns[target] = field
         kdes[target] = _coerce_kde_value(target, value)
     return kdes
 

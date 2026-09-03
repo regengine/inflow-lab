@@ -1,54 +1,49 @@
 # HMAC Staging Validation Runbook
 
-Validate end-to-end HMAC signing between Inflow Lab (this repository) and a RegEngine staging deployment before enabling production enforcement.
+Validate end-to-end HMAC signing between Inflow Lab and a RegEngine staging deployment before enabling production enforcement.
 
-Source references used in this runbook. These name **symbols**, not line
-numbers: the anchors here were originally `file:line` pairs and two of them
-rotted into nothing — one named a module deleted in `6cd8dbf`, the other a
-line range four hundred lines past the end of the file it cited, left behind
-when that module was split into `app/routers/` (#110). A symbol survives an
-ordinary refactor; a line number does not.
+The commands below use two environment variables so the runbook works from a
+checkout at any path. Set them once before you start:
 
-Inflow Lab (this repo, paths relative to the repo root):
-- Signing path: `LiveRegEngineClient.ingest` and `_build_signature_header` in `app/regengine_client.py`. The env var carrying the shared secret is named by `WEBHOOK_HMAC_SECRET_ENV` in the same module.
-- Live-ingest result shape: `LiveIngestResult` and `_delivery_metadata` in `app/regengine_client.py`.
-- Trial runner: `main`, `run_one_live_batch` and `revert_delivery_to_mock` in `scripts/live_trial.py`.
-- Stored delivery metadata: the `delivery_status`, `delivery_attempts`, `delivery_response` and `delivery_metadata` fields of `StoredEventRecord` in `app/schemas/domain.py`. They are populated by `SimulationController._deliver_payload` in `app/controller.py` and served by `list_events` in `app/routers/events.py` (`GET /api/events`).
+```bash
+export INFLOW_LAB_DIR="$(git rev-parse --show-toplevel)"   # run from an inflow-lab checkout
+export REGENGINE_DIR="<path to your RegEngine checkout>"
+```
 
-RegEngine (separate repository, paths relative to *its* root):
-- Ingest response model: `IngestResponse` in `services/ingestion/app/webhook_models.py`.
-- API key rejection text: the webhook ingest route in `services/ingestion/app/webhook_router_v2.py`.
-- Signature utility log/event names: `services/shared/webhook_security.py`.
+Source references used in this runbook. Symbol names rather than line numbers
+wherever possible: the previous `app/models.py:102-116` / `app/main.py:474-479`
+anchors both rotted through ordinary refactors (the module was deleted, and
+`app/main.py` is 74 lines long), which cost a reader the verification step at
+exactly the point this runbook asks for one.
+
+- Inflow Lab signing path: `app/regengine_client.py` (`_build_signature_header`, `assert_delivery_endpoint_allowed`)
+- Inflow Lab trial runner: `scripts/live_trial.py`
+- Inflow Lab stored delivery metadata: `StoredEventRecord` in `app/schemas/domain.py`, written by `app/controller.py`
+- RegEngine ingest response model: `services/ingestion/app/webhook_models.py:253-262`
+- RegEngine API key rejection text: `services/ingestion/app/webhook_router_v2.py:106-122`
+- RegEngine signature utility log/event names: `services/shared/webhook_security.py:248-259`
 
 ## 1. Pre-flight Checklist
 
 Run all checks before touching secrets.
 
-Run the first block from anywhere inside your Inflow Lab checkout; it derives
-the repo root itself, and everything after it uses the two variables rather
-than any particular directory layout.
-
 ```bash
-# Both repos, wherever you keep them. INFLOW_LAB_REPO is derived from the
-# checkout you are standing in, so no path is baked into this runbook.
-export INFLOW_LAB_REPO="$(git rev-parse --show-toplevel)"
-export REGENGINE_REPO="${REGENGINE_REPO:-/path/to/your/RegEngine/checkout}"
-
 # Repo 1: Inflow Lab simulator must be on main with PR #43 merged.
-git -C "$INFLOW_LAB_REPO" checkout main
-git -C "$INFLOW_LAB_REPO" pull
-git -C "$INFLOW_LAB_REPO" merge-base --is-ancestor eefde6a HEAD && echo "PR #43 is in history"
+git -C "$INFLOW_LAB_DIR" checkout main
+git -C "$INFLOW_LAB_DIR" pull
+git -C "$INFLOW_LAB_DIR" merge-base --is-ancestor eefde6a HEAD && echo "PR #43 is in history"
 
 # Repo 2: RegEngine should be on main at current HEAD.
-git -C "$REGENGINE_REPO" checkout main
-git -C "$REGENGINE_REPO" rev-parse --short HEAD
+git -C "$REGENGINE_DIR" checkout main
+git -C "$REGENGINE_DIR" rev-parse --short HEAD
 
-# Staging health check (must return 2xx).
+# Staging health check (must return 2xx; Inflow Lab's own /api/healthz answers
+# 503 when its event store is unwritable, so a non-2xx here is a real fault).
 export REGEN_STAGING_BASE_URL="https://<staging-url>"
 curl -fsS "$REGEN_STAGING_BASE_URL/api/healthz" >/dev/null && echo "staging healthz ok"
 
 # Simulator local test baseline.
-cd "$INFLOW_LAB_REPO"
+cd "$INFLOW_LAB_DIR"
 uv run pytest
 ```
 
@@ -56,7 +51,7 @@ Expected pre-flight outcomes:
 - `git merge-base --is-ancestor eefde6a HEAD` exits 0 and prints `PR #43 is in history`.
 - RegEngine repo is on `main` and at current HEAD.
 - `curl` to `/api/healthz` returns 2xx.
-- `uv run pytest` passes with no failures. (Do not check for a specific count — the suite grows.)
+- `uv run pytest` passes with no failures.
 
 Operational prerequisites (manual, no SQL shortcuts):
 - Staging tenant exists.
@@ -114,7 +109,7 @@ Required interpretation:
 Configure the trial environment and run exactly one live batch.
 
 ```bash
-cd "$INFLOW_LAB_REPO"
+cd "$INFLOW_LAB_DIR"
 
 export REGENGINE_REMOTE_BASE_URL='https://<inflow-lab-url>'
 export REGENGINE_REMOTE_USERNAME='<basic-auth-username>'
@@ -131,13 +126,13 @@ export REGENGINE_WEBHOOK_HMAC_SECRET='<same-secret-as-staging>'
 python3 scripts/live_trial.py --confirm-live
 ```
 
-Expected success output (printed by `main` in `scripts/live_trial.py`):
+Expected success output (from `scripts/live_trial.py:57-67`):
 
 ```text
 Live trial completed: base_url=..., demo_tenant=..., mock_posted=1, live_posted=1, live_failed=0, live_delivery_status=posted
 ```
 
-Expected response/metadata shape (from `LiveIngestResult` and `_delivery_metadata` in `app/regengine_client.py`):
+Expected response/metadata shape (from `app/regengine_client.py:29-33` and `app/regengine_client.py:112-118`):
 
 ```json
 {
@@ -159,9 +154,12 @@ Expected response/metadata shape (from `LiveIngestResult` and `_delivery_metadat
 }
 ```
 
-`response` keys should align with RegEngine's `IngestResponse` (`services/ingestion/app/webhook_models.py` in the RegEngine repo).
+`response` keys should align with RegEngine `IngestResponse` (`services/ingestion/app/webhook_models.py:253-262`).
 
-Validate stored event metadata from the simulator API — the `StoredEventRecord` fields in `app/schemas/domain.py`, served by `list_events` in `app/routers/events.py`:
+Validate stored event metadata from the simulator API. The feed is
+`list_events` in `app/routers/events.py` (`GET /api/events`), serving
+`StoredEventRecord` objects assembled by
+`SimulationController._deliver_payload` in `app/controller.py`:
 
 ```bash
 curl -fsS -u "$REGENGINE_REMOTE_USERNAME:$REGENGINE_REMOTE_PASSWORD" \
@@ -341,7 +339,7 @@ Simulator-side symptom:
 - Trial fails, but failure is not signature-specific.
 
 RegEngine-side symptom:
-- 401 with `Invalid or missing API key` (the webhook ingest route in RegEngine's `services/ingestion/app/webhook_router_v2.py`).
+- 401 with `Invalid or missing API key` (`services/ingestion/app/webhook_router_v2.py:118-122`).
 
 Likely root cause:
 - Invalid `X-RegEngine-API-Key`, wrong tenant, or unrelated auth/subscription failure.

@@ -4,7 +4,6 @@ import base64
 import os
 import shutil
 import sys
-from functools import partial
 from pathlib import Path
 from typing import Any
 
@@ -13,20 +12,12 @@ from fastapi.testclient import TestClient
 REPO_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(REPO_ROOT))
 
-# Must follow the sys.path insert above: this script is run directly
-# (`python scripts/smoke_regression.py`), so the repo root is not on sys.path
-# until that line puts it there. Deliberate, not an ordering slip (#137).
+# Imported after the sys.path bootstrap above so
+# `python scripts/smoke_regression.py` works from a clean checkout; hence the
+# E402 waivers.
 from app.main import app  # noqa: E402
-
-# The app resolves its data root from REGENGINE_DATA_DIR at import time
-# (app.tenancy.DATA_ROOT), so this script must ask tenancy where a tenant
-# lives rather than assume the default ./data. Hardcoding it made the
-# persist_path assertion below fail on a literal string mismatch, and made
-# the cleanup rmtree miss -- leaving release-smoke tenants behind in
-# whatever store the operator's shell actually pointed at (#108).
-# Same reason as the import above (#137).
 from app.tenancy import tenant_dir, tenant_events_path  # noqa: E402
-from scripts import _smoke_common  # noqa: E402
+from scripts import _smoke_common as smoke  # noqa: E402
 
 
 TENANTS = ["release-smoke-main", "release-smoke-other"]
@@ -84,6 +75,11 @@ def run_smoke(client: TestClient) -> None:
 
     status = assert_json(client.get("/api/simulate/status", headers=main_headers), 200)
     assert_equal(status["stats"]["total_records"], 13, "fixture status total")
+    # Derived from app.tenancy rather than written out, because the app
+    # resolves the data root from REGENGINE_DATA_DIR at import time. A literal
+    # made this assertion fail -- on a cosmetic path string, saying nothing
+    # about correctness -- for any operator whose shell exports that variable,
+    # which DEPLOYMENT_PROFILES.md tells them to do.
     assert_equal(
         status["config"]["persist_path"],
         str(tenant_events_path(TENANTS[0])),
@@ -183,23 +179,48 @@ def request_headers(tenant_id: str) -> dict[str, str]:
 
 
 def cleanup_smoke_tenants() -> None:
+    """Remove the smoke tenants from the data root the app actually used.
+
+    Hardcoding ``data/`` deleted the wrong directory whenever
+    REGENGINE_DATA_DIR pointed elsewhere, leaving release-smoke-main and
+    release-smoke-other in the shared demo's persistent store, where
+    ``known_tenant_ids()`` then surfaced them in /api/operator/tenants forever.
+    """
     for tenant_id in TENANTS:
         shutil.rmtree(tenant_dir(tenant_id), ignore_errors=True)
 
 
-# _smoke_common holds the one implementation of this harness, shared with
-# the other smoke scripts (#139). It takes the failure type first so each
-# script keeps its own exception class; bind it once rather than at every
-# call site.
-assert_status = partial(_smoke_common.assert_status, SmokeFailure)
-assert_equal = partial(_smoke_common.assert_equal, SmokeFailure)
-assert_in = partial(_smoke_common.assert_in, SmokeFailure)
-
-
 def assert_json(response, expected_status: int) -> dict[str, Any]:
-    return _smoke_common.response_json(
-        SmokeFailure, response, "response", expected_status=expected_status
+    assert_status(response, expected_status)
+    return smoke.response_json(response, response.request.url.path, failure=SmokeFailure)
+
+
+def assert_status(response, expected_status: int) -> None:
+    smoke.assert_status(
+        response,
+        expected_status,
+        f"{response.request.method} {response.request.url.path}",
+        failure=SmokeFailure,
+        redact=redact,
     )
+
+
+def redact(value: str) -> str:
+    """Scrub anything credential-shaped in the environment out of a body.
+
+    The release smoke runs in-process against a TestClient, so an echoed 500
+    body can carry whatever REGENGINE_BASIC_AUTH_PASSWORD (or any other
+    credential env var) is set to on the operator's machine.
+    """
+    return smoke.redact_secrets(value, sorted(smoke.secret_values()))
+
+
+def assert_equal(actual: Any, expected: Any, label: str) -> None:
+    smoke.assert_equal(actual, expected, label, failure=SmokeFailure)
+
+
+def assert_in(member: Any, container: Any, label: str) -> None:
+    smoke.assert_in(member, container, label, failure=SmokeFailure)
 
 
 if __name__ == "__main__":

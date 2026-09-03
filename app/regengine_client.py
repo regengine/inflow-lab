@@ -1,44 +1,26 @@
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import hmac
+import ipaddress
 import json
 import os
+import socket
 import uuid
 from dataclasses import dataclass
 from typing import Any
 from urllib.parse import urlparse
-from urllib.request import getproxies
 
 import httpx
 
 from .contract import INFLOW_CONTRACT_VERSION
 from .schemas.ingestion import IngestPayload
-from .schemas.simulation import SimulationConfig, resolve_egress_endpoint_async
-# Same masking convention store.py persists with and controller.py logs
-# with -- see _extract_error_body below (#138).
-from .store import mask_secret_in_payload, mask_secret_in_string
+from .schemas.simulation import SimulationConfig
 
 
-# THE single source of truth for the live RegEngine ingest URL (#155).
-# The literal belongs here and nowhere else: the console used to keep its
-# own copy in app/static/app.js and substitute it into every config it
-# submitted, so this constant was unreachable from the UI and changing it
-# alone would have left the operator console posting live traffic at the
-# stale URL. The console now reads the value off
-# /api/integration/status.default_endpoint and sends a null endpoint when
-# its field is blank, which is what makes every fallback below apply.
 DEFAULT_LIVE_INGEST_ENDPOINT = "https://www.regengine.co/api/v1/webhooks/ingest"
 DEFAULT_LIVE_TIMEOUT_SECONDS = 30.0
-
-# Cap on how much of a failed live ingest's response body (#138) is kept
-# in the raised error / delivery_metadata. RegEngine's real validation
-# errors are compact per-event JSON, comfortably under this; the cap is
-# for the pathological case -- an HTML error page from a misconfigured
-# proxy, or an oversized body some other layer streams back -- so one bad
-# response can't bloat the stored event record or the console log without
-# limit.
-_MAX_ERROR_BODY_CHARS = 4000
 
 # Env var used to share an HMAC secret with the RegEngine ingest service.
 # When set, every live ingest request is signed with HMAC-SHA256 over the
@@ -48,6 +30,453 @@ _MAX_ERROR_BODY_CHARS = 4000
 # pre-signing migration ramp on both sides.
 # Bandit B105 false positive: this is an env var key, not a secret literal.
 WEBHOOK_HMAC_SECRET_ENV = "REGENGINE_WEBHOOK_HMAC_SECRET"  # nosec B105
+
+# --- Egress restriction (SSRF / credential-exfiltration guard) -------------
+#
+# Delivery endpoints are caller-supplied (POST /api/integration/test, and the
+# inline `delivery` block accepted by the CSV-import, replay and demo-fixture
+# routes). Every outbound call carries the RegEngine API key and tenant id in
+# request headers, so an unrestricted endpoint is both an SSRF pivot and a
+# credential-exfiltration channel. Both outbound paths -- ingest() and
+# check_connection() -- validate the endpoint before sending anything.
+#
+# Validation alone is not enough, because validating a *name* and then handing
+# that same name to httpx means the name is resolved twice, independently. A
+# hostile zone with a short TTL answers public for the guard's lookup and
+# loopback for httpx's, and the credentials follow the second answer (#207).
+# So the guard resolves once and returns the address it approved, and the
+# client dials *that address* -- see PinnedEndpoint and _PinnedAddressTransport
+# below. There is no second resolution to poison.
+#
+# Optional strict allowlist: comma-separated hosts. A leading dot matches
+# subdomains (".regengine.co" allows "www.regengine.co"). When unset, any
+# public host is allowed but private/loopback/link-local destinations are not.
+ALLOWED_DELIVERY_HOSTS_ENV = "REGENGINE_ALLOWED_DELIVERY_HOSTS"
+# Escape hatch for developers pointing the simulator at a RegEngine stack
+# running on localhost (see scripts/customer_journey.py). Off by default.
+ALLOW_PRIVATE_DELIVERY_ENV = "REGENGINE_ALLOW_PRIVATE_DELIVERY_HOSTS"
+# DNS resolution of non-literal hosts can be disabled in sealed environments.
+DELIVERY_DNS_GUARD_ENV = "REGENGINE_DELIVERY_DNS_GUARD"
+# Opt back in to cleartext (`http://`) delivery to a public host. Off by
+# default: every live delivery and probe carries the API key in an
+# `Authorization` header, and over `http` that header crosses the network in
+# the clear. `REGENGINE_ALLOW_PRIVATE_DELIVERY_HOSTS` already implies it, so a
+# local stack on `http://localhost:8000` needs nothing new.
+ALLOW_CLEARTEXT_DELIVERY_ENV = "REGENGINE_ALLOW_CLEARTEXT_DELIVERY"
+
+_TRUTHY = frozenset({"1", "true", "yes", "on"})
+_BLOCKED_HOSTNAMES = frozenset(
+    {
+        "localhost",
+        "ip6-localhost",
+        "ip6-loopback",
+        "metadata",
+        "metadata.google.internal",
+        "instance-data",
+    }
+)
+_BLOCKED_HOST_SUFFIXES = (".localhost", ".internal", ".local")
+BLOCKED_ENDPOINT_VERDICT = "blocked_endpoint"
+
+
+class BlockedDeliveryEndpointError(ValueError):
+    """Raised when a delivery endpoint is not an allowed egress destination."""
+
+
+@dataclass(frozen=True, slots=True)
+class PinnedEndpoint:
+    """The one address the guard approved, plus the name it approved it for.
+
+    `hostname` is the endpoint's original hostname and stays authoritative for
+    everything name-shaped: the `Host` header, TLS SNI and therefore
+    certificate verification. `address` is the literal the socket is opened to.
+    """
+
+    hostname: str
+    address: str
+
+
+def _env_flag(name: str) -> bool:
+    return os.getenv(name, "").strip().lower() in _TRUTHY
+
+
+def _allowed_delivery_hosts() -> list[str]:
+    raw = os.getenv(ALLOWED_DELIVERY_HOSTS_ENV, "")
+    return [item.strip().lower() for item in raw.split(",") if item.strip()]
+
+
+def _host_matches_allowlist(host: str, allowlist: list[str]) -> bool:
+    for entry in allowlist:
+        if entry.startswith("."):
+            if host == entry[1:] or host.endswith(entry):
+                return True
+        elif host == entry:
+            return True
+    return False
+
+
+def _is_blocked_address(address: str) -> bool:
+    try:
+        ip = ipaddress.ip_address(address)
+    except ValueError:
+        return False
+    if ip.is_loopback or ip.is_private or ip.is_link_local or ip.is_reserved:
+        return True
+    return ip.is_multicast or ip.is_unspecified
+
+
+def _resolved_addresses(host: str) -> list[str]:
+    """Best-effort blocking DNS resolution, for synchronous callers.
+
+    A host that does not resolve cannot be reached, so an unresolvable name is
+    not a bypass -- it is left to fail as an ordinary connection error rather
+    than being reported as a blocked endpoint.
+    """
+    try:
+        infos = socket.getaddrinfo(host, None, type=socket.SOCK_STREAM)
+    except (OSError, UnicodeError):
+        return []
+    return [info[4][0] for info in infos]
+
+
+async def _aresolved_addresses(host: str) -> list[str]:
+    """`_resolved_addresses` without blocking the event loop.
+
+    `socket.getaddrinfo` blocks for the full resolver timeout, and the guard
+    runs on every live delivery and every connection test, so doing it inline
+    in an `async def` stalls every other request in the process behind a slow
+    or unresponsive resolver. The loop's own `getaddrinfo` runs the same call
+    in its executor and yields meanwhile; failures degrade exactly as above.
+    """
+    loop = asyncio.get_running_loop()
+    try:
+        infos = await loop.getaddrinfo(host, None, type=socket.SOCK_STREAM)
+    except (OSError, UnicodeError):
+        return []
+    return [str(info[4][0]) for info in infos]
+
+
+def _static_endpoint_checks(endpoint: str) -> str | None:
+    """Every check that needs no resolver, cheapest first.
+
+    Returns the hostname still awaiting DNS validation, or None when the
+    endpoint is already fully checked (IP literal, opt-out in force, DNS guard
+    disabled). Raises BlockedDeliveryEndpointError for a refused endpoint.
+    """
+    parsed = urlparse(endpoint)
+    if parsed.scheme not in {"http", "https"}:
+        raise BlockedDeliveryEndpointError(
+            "Delivery endpoint must be an http(s) URL."
+        )
+    host = (parsed.hostname or "").strip().lower().rstrip(".")
+    if not host:
+        raise BlockedDeliveryEndpointError("Delivery endpoint must include a host.")
+
+    allowlist = _allowed_delivery_hosts()
+    if allowlist and not _host_matches_allowlist(host, allowlist):
+        raise BlockedDeliveryEndpointError(
+            f"Delivery endpoint host {host!r} is not in {ALLOWED_DELIVERY_HOSTS_ENV}."
+        )
+
+    if _env_flag(ALLOW_PRIVATE_DELIVERY_ENV):
+        # Local-development opt-out: the operator has deliberately pointed the
+        # simulator at a private stack (localhost, the built-in mock, a LAN
+        # host). Nothing is resolved and nothing is pinned -- there is no
+        # address the guard would refuse, so pinning would only make this path
+        # behave differently from a plain httpx call.
+        return None
+
+    if host in _BLOCKED_HOSTNAMES or host.endswith(_BLOCKED_HOST_SUFFIXES):
+        raise BlockedDeliveryEndpointError(
+            f"Delivery endpoint host {host!r} resolves to a local/internal "
+            "destination. Set "
+            f"{ALLOW_PRIVATE_DELIVERY_ENV}=1 only for a trusted local stack."
+        )
+
+    literal = host.strip("[]")
+    if _is_blocked_address(literal):
+        raise BlockedDeliveryEndpointError(
+            f"Delivery endpoint address {literal} is loopback/private/link-local "
+            "and is not an allowed destination. Set "
+            f"{ALLOW_PRIVATE_DELIVERY_ENV}=1 only for a trusted local stack."
+        )
+    if parsed.scheme == "http" and not _env_flag(ALLOW_CLEARTEXT_DELIVERY_ENV):
+        # Every check that names a *specific* unsafe destination has run and
+        # passed, so this is an ordinary public host and the only thing wrong
+        # with it is the scheme. Ordered last of the static checks deliberately:
+        # a metadata or loopback endpoint that also happens to be cleartext
+        # should be reported as the local/internal destination it is, because
+        # that is the finding the operator has to act on.
+        #
+        # Refused before any credential header is built and before the name is
+        # resolved -- over `http` the API key crosses the network in the clear.
+        raise BlockedDeliveryEndpointError(
+            f"Delivery endpoint {endpoint!r} is cleartext http. The API key "
+            "would be sent unencrypted. Use https, or set "
+            f"{ALLOW_CLEARTEXT_DELIVERY_ENV}=1 for a trusted network."
+        )
+
+    try:
+        ipaddress.ip_address(literal)
+    except ValueError:
+        pass
+    else:
+        # Literal address already checked, and the URL already carries it:
+        # there is no name for a resolver to answer differently later.
+        return None
+
+    if os.getenv(DELIVERY_DNS_GUARD_ENV, "1").strip().lower() not in _TRUTHY:
+        return None
+    return host
+
+
+def _pin_from_addresses(host: str, addresses: list[str]) -> PinnedEndpoint | None:
+    """Check every answer for `host` and return the one address to dial."""
+    for address in addresses:
+        if _is_blocked_address(address):
+            raise BlockedDeliveryEndpointError(
+                f"Delivery endpoint host {host!r} resolves to {address}, which is "
+                "loopback/private/link-local and is not an allowed destination."
+            )
+    if not addresses:
+        # Nothing resolved here, so there is nothing to pin and the dial falls
+        # back to httpx's own lookup. Stating the residual case plainly rather
+        # than implying it is closed: a zone that fails this lookup and answers
+        # loopback for httpx's would still slip past. Refusing instead would
+        # turn every transient resolver failure into a "blocked endpoint"
+        # verdict for an endpoint that is not blocked, and would refuse names
+        # this process cannot resolve but the runtime can (split-horizon DNS, a
+        # container resolver). Operators who need that case closed set
+        # REGENGINE_ALLOWED_DELIVERY_HOSTS, which gates on the name and never
+        # depends on a resolver answering.
+        return None
+    # Every answer was checked; dial the first one. That is the address an
+    # unpinned connect would have tried first anyway -- getaddrinfo returns
+    # them in the platform's RFC 6724 preference order. The trade-off is that a
+    # pinned dial does not fall through to the remaining answers if the first
+    # is unreachable; a delivery endpoint whose primary address is down now
+    # surfaces as a connection error instead of silently failing over.
+    return PinnedEndpoint(hostname=host, address=addresses[0])
+
+
+def assert_delivery_endpoint_allowed(endpoint: str) -> PinnedEndpoint | None:
+    """Reject endpoints that are not permitted egress destinations.
+
+    Raises BlockedDeliveryEndpointError (a ValueError) before any request is
+    built, so no credential header is ever constructed for a blocked host.
+
+    Synchronous entry point, for callers that are not already on an event loop.
+    Coroutines must use `resolve_delivery_endpoint` instead: this one resolves
+    with a blocking `socket.getaddrinfo`.
+
+    Returns the single address this call resolved and approved, so the caller
+    can dial that address instead of re-resolving the name (#207). Returns None
+    when there is nothing to pin -- the host is already an IP literal, DNS
+    checking is switched off, the private-host opt-out is in force, or the name
+    did not resolve here. A None return is never a verdict of "unsafe": the
+    endpoint has passed every check that applies to it.
+    """
+    host = _static_endpoint_checks(endpoint)
+    if host is None:
+        return None
+    return _pin_from_addresses(host, _resolved_addresses(host))
+
+
+async def resolve_delivery_endpoint(endpoint: str) -> PinnedEndpoint | None:
+    """`assert_delivery_endpoint_allowed` for coroutines.
+
+    Identical checks and identical verdicts; the resolver call is awaited
+    instead of blocking the event loop.
+    """
+    host = _static_endpoint_checks(endpoint)
+    if host is None:
+        return None
+    return _pin_from_addresses(host, await _aresolved_addresses(host))
+
+
+# The genuine httpx client class, captured before any test double can replace
+# the module attribute. A pinned dial is expressed through an httpx transport,
+# so it can only be attached to a real httpx client; substituted clients (the
+# in-memory doubles this repo's tests install over `httpx.AsyncClient`) never
+# open a socket, so there is nothing for a pin to protect there.
+_HTTPX_ASYNC_CLIENT = httpx.AsyncClient
+
+
+class _PinnedAddressTransport(httpx.AsyncHTTPTransport):
+    """Dial the address the guard approved, under the original hostname.
+
+    Rewriting the URL host to the literal is what stops httpx from resolving
+    the name a second time. Everything name-shaped is preserved:
+
+    * the `Host` header was already set from the original URL when the request
+      was built (`httpx.Request._prepare`), so the server still sees the name;
+    * `sni_hostname` carries the name into the TLS handshake, and httpx's
+      default SSL context has `check_hostname=True`, so the certificate is
+      verified against the hostname -- never against the pinned literal.
+
+    Only the pinned host is rewritten. A redirect or health probe aimed at any
+    other host goes out untouched.
+    """
+
+    def __init__(self, pin: PinnedEndpoint, **transport_kwargs: Any) -> None:
+        # No transport_kwargs in production: the defaults are exactly what
+        # `httpx.AsyncClient()` would have built, so pinning changes where the
+        # socket goes and nothing about how the connection is made. The
+        # parameter exists so a test can point verification at its own CA.
+        super().__init__(**transport_kwargs)
+        self._pin = pin
+
+    async def handle_async_request(self, request: httpx.Request) -> httpx.Response:
+        host = (request.url.host or "").strip().lower().rstrip(".")
+        if host == self._pin.hostname:
+            request.url = request.url.copy_with(host=self._pin.address)
+            request.extensions = {
+                **request.extensions,
+                "sni_hostname": self._pin.hostname,
+            }
+        return await super().handle_async_request(request)
+
+
+def _environment_proxy_applies(endpoint: str) -> bool:
+    """True when httpx would send this URL through an environment proxy.
+
+    Mirrors httpx's own mount matching rather than guessing, because being
+    wrong either way is costly: a proxied request that we pin would break (see
+    _dial_pin), and an unproxied request that we decline to pin would leave the
+    rebinding gap open.
+    """
+    try:
+        from httpx._utils import URLPattern, get_environment_proxies
+    except ImportError:  # pragma: no cover - httpx internals moved
+        return any(
+            os.getenv(name, "").strip()
+            for name in ("HTTPS_PROXY", "https_proxy", "ALL_PROXY", "all_proxy")
+        )
+    url = httpx.URL(endpoint)
+    mounts = sorted(
+        ((URLPattern(pattern), proxy) for pattern, proxy in get_environment_proxies().items()),
+        key=lambda item: item[0],
+    )
+    for pattern, proxy in mounts:
+        if pattern.matches(url):
+            return proxy is not None
+    return False
+
+
+async def _dial_pin(endpoint: str) -> PinnedEndpoint | None:
+    """Validate `endpoint` and return the address to dial, if any.
+
+    Pinning is suppressed when an environment proxy handles the request. That
+    is not a loophole: with a proxy in play the client never resolves the name
+    at all -- it sends `CONNECT <name>:<port>` and the proxy resolves -- so
+    there is no second local lookup to poison, and the guard's own resolution
+    does not describe the connection either way. Pinning anyway would be
+    actively harmful: httpcore's tunnel connection ignores the `sni_hostname`
+    extension and takes the TLS `server_hostname` from the request origin, so a
+    pinned URL would verify the certificate against the IP and fail, and
+    passing an explicit transport to httpx would disable the proxy mounts
+    (`allow_env_proxies = trust_env and transport is None`) and silently route
+    around the operator's proxy. The residual risk -- a rebinding zone answering
+    the *proxy* -- belongs to the proxy, not to this process.
+    """
+    pin = await resolve_delivery_endpoint(endpoint)
+    if pin is None or _environment_proxy_applies(endpoint):
+        return None
+    return pin
+
+
+def _open_live_client(pin: PinnedEndpoint | None) -> Any:
+    """An httpx client for one live exchange, dialing the pinned address."""
+    timeout = _live_timeout_seconds()
+    client_cls = httpx.AsyncClient
+    if (
+        pin is not None
+        and isinstance(client_cls, type)
+        and issubclass(client_cls, _HTTPX_ASYNC_CLIENT)
+    ):
+        return client_cls(timeout=timeout, transport=_PinnedAddressTransport(pin))
+    return client_cls(timeout=timeout)
+
+
+# RegEngine's IngestEvent declares `input_traceability_lot_codes` as a
+# **top-level** field, and its canonical-event writer populates
+# `kdes["input_lot_codes"]` (the thing transformation lineage rows are built
+# from) only from that top-level field. The simulator's RegEngineEvent carries
+# the value inside the free-form `kdes` dict, where RegEngine's ingest path
+# never looks -- so a transformation used to be accepted while producing zero
+# input->output lineage links. Pydantic ignores the unknown key, so nothing
+# rejected and nothing mapped.
+#
+# Hoisting happens here, at serialization time, rather than on RegEngineEvent:
+# the `kdes` copy stays exactly where it is (this repo's lineage view, EPCIS
+# export, CSV importer and the mock all read it) and the wire body additionally
+# carries the field where RegEngine reads it. Both sides then agree.
+INPUT_LOT_CODES_FIELD = "input_traceability_lot_codes"
+
+
+def _input_lot_codes(kdes: Any) -> list[str] | None:
+    """Input lot codes from an event's KDEs, or None when it declares none.
+
+    Accepts the list form the engine and CSV importer produce and the bare
+    string form a hand-written payload may carry.
+    """
+    if not isinstance(kdes, dict):
+        return None
+    raw = kdes.get(INPUT_LOT_CODES_FIELD)
+    if isinstance(raw, str):
+        raw = [raw]
+    if not isinstance(raw, list):
+        return None
+    codes = [item.strip() for item in raw if isinstance(item, str) and item.strip()]
+    return codes or None
+
+
+def build_wire_body(payload: IngestPayload) -> dict[str, Any]:
+    """Serialize an IngestPayload into the exact dict sent to RegEngine.
+
+    Identical to `payload.model_dump(mode="json")` except that an event whose
+    KDEs declare input lot codes also carries them at the top level, where
+    RegEngine's `IngestEvent` reads them. Events that declare none are left
+    untouched rather than sent an explicit `null`: the field is optional and
+    defaults to None on RegEngine, so omitting it keeps every non-transformation
+    event's wire shape byte-for-byte what it was before.
+    """
+    body = payload.model_dump(mode="json")
+    events = body.get("events")
+    if isinstance(events, list):
+        for event in events:
+            if not isinstance(event, dict):
+                continue
+            codes = _input_lot_codes(event.get("kdes"))
+            if codes is not None:
+                event[INPUT_LOT_CODES_FIELD] = codes
+    return body
+
+
+def _response_error_detail(response: httpx.Response) -> str:
+    """RegEngine's error body as a short string, JSON or not.
+
+    Never raises: a non-JSON body degrades to raw text, and an unreadable body
+    degrades to an empty string.
+    """
+    try:
+        payload = response.json()
+    except Exception:  # noqa: BLE001 - any decode failure falls back to text
+        payload = None
+    if payload is not None:
+        if isinstance(payload, dict):
+            for key in ("detail", "message", "error"):
+                value = payload.get(key)
+                if isinstance(value, str) and value.strip():
+                    return value.strip()[:1000]
+        try:
+            return json.dumps(payload, separators=(",", ":"))[:1000]
+        except (TypeError, ValueError):
+            pass
+    try:
+        return (response.text or "").strip()[:1000]
+    except Exception:  # noqa: BLE001 - body already consumed/undecodable
+        return ""
 
 
 @dataclass(frozen=True, slots=True)
@@ -69,52 +498,45 @@ class ConnectionCheckResult:
 # returns, so the settings page can give recovery guidance instead of a
 # bare status code.
 #
-# #100 -- this maps GET /api/v1/webhooks/recent's status code, NOT
-# POST /api/v1/webhooks/ingest's. The two routes' dependency chains
-# differ: /recent authenticates the caller and checks a read-scope
-# permission, but never touches the tenant's subscription status, the
-# separate webhooks.ingest permission scope, or (when configured) the
-# HMAC request signature -- all three are gates on /ingest alone. A
-# credential that gets HTTP 200 here can still fail an actual ingest
-# with 401 (signature), 402 (subscription) or 403 (wrong scope).
-#
-# The verdict string for HTTP 200 deliberately stays "connected":
-# tests/test_integration_settings.py, tests/test_egress_guard.py and
-# tests/test_client_diagnostics.py all pin it there (as does
-# scripts/customer_journey.py's live smoke check), and none of those
-# files are this change's to edit. So the fix for the false-assurance
-# report below is in the DETAIL text, not the verdict: say plainly what
-# a green read proves and what it does not, instead of implying ingest
-# is safe. A verdict that actually named the gap (e.g. "read_only") was
-# considered and rejected for exactly that reason -- see
-# tests/test_connection_probe.py for the full reasoning, including what
-# a RegEngine-side change would need to add for a verdict-level fix.
+# Scope caveat, deliberately reflected in the wording below: the probe is a
+# GET on /api/v1/webhooks/recent, whose dependency chain is strictly weaker
+# than POST /api/v1/webhooks/ingest. The read route carries neither the
+# ingest route's active-subscription gate, nor its `webhooks.ingest`
+# permission requirement, nor its HMAC signature verification, and it has
+# its own rate-limit budget. A green read therefore proves the key and
+# tenant are valid *for reads* and nothing more -- claiming it certifies
+# ingestion is how a "connected" badge ends up sitting above a run in which
+# every delivery 401s. The HMAC half of that gap is closed separately below
+# by comparing signing posture across the two sides; subscription state and
+# permission scope remain unobservable from this endpoint, so the 200 detail
+# names them as unproven rather than implying otherwise.
 _CONNECTION_VERDICTS: dict[int, tuple[str, str]] = {
     200: (
         "connected",
-        "Authenticated read succeeded: this API key and tenant can read "
-        "RegEngine's webhook surface. This does not confirm that POST "
-        "/api/v1/webhooks/ingest will accept events -- that route gates on "
-        "three things a read-only probe cannot reach: the tenant's "
-        "subscription status, the separate webhooks.ingest permission "
-        "scope (a read-only key passes this probe and then gets HTTP 403 "
-        "on ingest), and -- if RegEngine requires it -- the HMAC request "
-        "signature. If live ingests fail after this reports connected, "
-        "check those three first.",
+        "Authenticated read succeeded: the API key and tenant are valid for reads on this "
+        "RegEngine workspace. This probe reads /api/v1/webhooks/recent, so it does not prove "
+        "ingestion will succeed -- the subscription gate, the webhooks.ingest permission scope "
+        "and the ingest rate limit apply to the write path only. Send a test batch to confirm "
+        "end-to-end delivery.",
     ),
     401: ("unauthorized", "RegEngine rejected the API key (HTTP 401). Check the key value and that it has not expired or been revoked."),
-    # #100: per the issue's route audit, RegEngine's subscription gate
-    # (require_active_subscription) sits on /ingest only, so this probe
-    # returning 402 is not currently expected. Kept rather than deleted:
-    # it is the correct verdict if that ever changes, an unreachable
-    # entry costs nothing, and it is already pinned by
-    # tests/test_client_diagnostics.py and tests/test_integration_settings.py.
-    402: ("subscription_inactive", "The tenant's subscription is not active (HTTP 402). Billing status must be active or trialing before ingestion resumes."),
+    402: (
+        "subscription_inactive",
+        "RegEngine returned HTTP 402 for the read probe: the tenant's subscription is not "
+        "active. Billing status must be active or trialing before ingestion resumes.",
+    ),
     403: ("forbidden", "RegEngine refused the request (HTTP 403). The key may be missing the webhooks.read scope, or the tenant does not match the key."),
     404: ("tenant_mismatch", "RegEngine returned HTTP 404. Webhook reads return 404 when the tenant does not match the API key's tenant."),
-    429: ("rate_limited", "RegEngine is rate limiting this tenant (HTTP 429). Wait for the window shown in Retry-After and try again."),
+    429: (
+        "rate_limited",
+        "RegEngine is rate limiting this tenant's webhook reads (HTTP 429). Wait for the window "
+        "shown in Retry-After and try again. Ingestion is metered separately, so this limit does "
+        "not necessarily apply to delivery.",
+    ),
     503: ("service_unavailable", "RegEngine is up but a required backing service is unavailable (HTTP 503). Try again shortly."),
 }
+
+SIGNATURE_MISMATCH_VERDICT = "signature_mismatch"
 
 
 class LiveRegEngineDeliveryError(RuntimeError):
@@ -135,17 +557,9 @@ class LiveRegEngineClient:
         tenant_id = config.delivery.tenant_id
         if not api_key or not tenant_id:
             raise ValueError("Live delivery requires both api_key and tenant_id")
-        # SSRF/credential-exfiltration guard — see resolve_egress_endpoint's
-        # docstring. Checked here, immediately before the request, so it sees
-        # the endpoint every caller path actually ends up using. The address
-        # it validated comes back, and _pinned_dial below aims the POST at
-        # THAT address instead of letting httpx resolve the hostname a second
-        # time on its own -- the second lookup a hostile zone answered with
-        # 127.0.0.1 to bypass this guard entirely (#207). None means there is
-        # nothing to pin, and the request is dialed by hostname as before.
-        # Awaited rather than called: the guard's getaddrinfo() is blocking,
-        # and this is an async def on the event loop (#209).
-        pinned_address = await resolve_egress_endpoint_async(config.delivery.endpoint)
+        # Validate before any credential header is built, and keep the address
+        # that validation approved so the dial cannot land anywhere else.
+        pin = await _dial_pin(endpoint)
 
         idempotency_key = idempotency_key or uuid.uuid4().hex
         # Serialize the body exactly once so the bytes we sign are the same
@@ -153,12 +567,15 @@ class LiveRegEngineClient:
         # to httpx, it would re-serialize and any whitespace/key-order drift
         # between our HMAC input and the wire body would cause RegEngine's
         # signature check to 401 on every request.
-        # allow_nan=False (#98): bare NaN/Infinity tokens are not RFC 8259,
-        # and this body is both HMAC-signed and PUT on the live wire. Fail
-        # here rather than sign and ship something RegEngine's own strict
-        # JSON parser will reject (or worse, silently coerce).
+        #
+        # `allow_nan=False` is not cosmetic: json.dumps defaults to emitting
+        # the bare tokens NaN/Infinity/-Infinity, which are not JSON. RegEngine's
+        # parser rejects them, so a non-finite quantity would be signed, sent,
+        # and only then fail -- burning the idempotency key and reporting as a
+        # remote error. Failing here raises ValueError before any credential
+        # header or signature exists (#98).
         body_bytes = json.dumps(
-            payload.model_dump(mode="json"),
+            build_wire_body(payload),
             separators=(",", ":"),
             sort_keys=True,
             allow_nan=False,
@@ -179,12 +596,9 @@ class LiveRegEngineClient:
         }
         if signature_header is not None:
             headers["X-Webhook-Signature"] = signature_header
-        dial_url, dial_headers, dial_kwargs = _pinned_dial(endpoint, headers, pinned_address)
         try:
-            async with httpx.AsyncClient(timeout=_live_timeout_seconds()) as client:
-                response = await client.post(
-                    dial_url, headers=dial_headers, content=body_bytes, **dial_kwargs
-                )
+            async with _open_live_client(pin) as client:
+                response = await client.post(endpoint, headers=headers, content=body_bytes)
         except httpx.HTTPError as exc:
             raise LiveRegEngineDeliveryError(str(exc), metadata) from exc
 
@@ -192,77 +606,57 @@ class LiveRegEngineClient:
         try:
             response.raise_for_status()
         except httpx.HTTPStatusError as exc:
-            # #138: str(exc) alone is only httpx's generic status-line text
-            # (e.g. "Client error '402 Payment Required' for url ...") --
-            # RegEngine's actual per-event rejection reason lives in the
-            # response body, which used to be discarded here. Attach it
-            # (masked and bounded -- see _extract_error_body) to both the
-            # raised message and the metadata so the console and the
-            # stored delivery record show *why*, not just the status code.
-            error_body = _extract_error_body(exc.response, api_key)
-            message = f"{exc} | RegEngine response: {error_body}" if error_body else str(exc)
-            raise LiveRegEngineDeliveryError(message, metadata | {"error_body": error_body}) from exc
+            # Keep RegEngine's own explanation (subscription status, rate-limit
+            # window, key scope) instead of httpx's bare status-line text.
+            detail = _response_error_detail(exc.response)
+            if detail:
+                metadata = metadata | {"error_body": detail}
+            message = f"{exc}: {detail}" if detail else str(exc)
+            raise LiveRegEngineDeliveryError(message, metadata) from exc
         return LiveIngestResult(response=response.json(), metadata=metadata)
 
     async def check_connection(self, config: SimulationConfig) -> ConnectionCheckResult:
         """Probe RegEngine with the configured credentials without ingesting.
 
         Uses GET /api/v1/webhooks/recent?limit=1 — the cheapest authenticated
-        read on the webhook surface — and maps the response to a failure
-        vocabulary keyed by HTTP status (bad key, wrong tenant, rate limit).
-
-        #100: this is deliberately a read, never a write -- posting a
-        synthetic event into a customer's production RegEngine to "test"
-        the connection is not acceptable for a button labelled Test
-        connection. The tradeoff that buys is real: /recent's dependency
-        chain is weaker than /ingest's, so this cannot observe the
-        tenant's subscription status, the webhooks.ingest permission scope,
-        or (when configured) the HMAC signature requirement -- three gates
-        that live only on the write path and can each independently fail
-        an ingest a passing probe here said nothing about. See
-        _CONNECTION_VERDICTS' comment and tests/test_connection_probe.py
-        for how the HTTP-200 case is worded to reflect that gap instead of
-        implying ingest is safe.
+        read on the webhook surface — and maps the response to the same
+        failure vocabulary a live integrator sees (bad key, wrong tenant,
+        lapsed subscription, rate limit).
         """
         endpoint = str(config.delivery.endpoint) if config.delivery.endpoint else DEFAULT_LIVE_INGEST_ENDPOINT
         api_key = config.delivery.api_key
         tenant_id = config.delivery.tenant_id
         parsed = urlparse(endpoint)
         host = parsed.netloc
+        try:
+            pin = await _dial_pin(endpoint)
+        except BlockedDeliveryEndpointError as exc:
+            # Refuse before credentials are placed in any header.
+            return ConnectionCheckResult(
+                verdict=BLOCKED_ENDPOINT_VERDICT,
+                detail=str(exc),
+                endpoint_host=host,
+            )
         if not api_key or not tenant_id:
             return ConnectionCheckResult(
                 verdict="not_configured",
                 detail="Both an API key and a tenant id are required before testing the connection.",
                 endpoint_host=host,
             )
-        # SSRF/credential-exfiltration guard — see resolve_egress_endpoint's
-        # docstring. Checked immediately before the probe goes out. As in
-        # ingest() above, the validated address is pinned for the dial, so
-        # the address checked IS the address connected to and the hostname is
-        # resolved exactly once (#207). Both requests this method makes -- the
-        # /recent probe and the /health contract read -- go through the same
-        # pin, so neither of them re-resolves. The caller (the /test route)
-        # turns a raised EgressBlockedError into a clean 4xx rather than
-        # letting it become an unhandled 500. Awaited for the same reason as
-        # ingest()'s call above: blocking getaddrinfo() must not run on the
-        # event loop (#209).
-        pinned_address = await resolve_egress_endpoint_async(config.delivery.endpoint)
 
         probe_url = f"{parsed.scheme}://{parsed.netloc}/api/v1/webhooks/recent"
         headers = {
             "X-RegEngine-API-Key": api_key,
             "X-Tenant-ID": tenant_id,
         }
-        dial_url, dial_headers, dial_kwargs = _pinned_dial(probe_url, headers, pinned_address)
         try:
-            async with httpx.AsyncClient(timeout=_live_timeout_seconds()) as client:
+            async with _open_live_client(pin) as client:
                 response = await client.get(
-                    dial_url,
-                    headers=dial_headers,
+                    probe_url,
+                    headers=headers,
                     params={"tenant_id": tenant_id, "limit": 1},
-                    **dial_kwargs,
                 )
-                remote_contract = await _fetch_remote_contract_version(client, parsed, pinned_address)
+                remote_health = await _fetch_remote_health(client, parsed)
         except httpx.HTTPError as exc:
             return ConnectionCheckResult(
                 verdict="unreachable",
@@ -274,8 +668,19 @@ class LiveRegEngineClient:
             response.status_code,
             ("error", f"Unexpected HTTP {response.status_code} from RegEngine."),
         )
-        if verdict == "connected":
-            detail = f"{detail} {_local_signing_posture()}"
+        # The read probe cannot see the ingest route's signature check, so
+        # compare signing posture across the two sides instead. This is the one
+        # ingest-only gate that is observable without writing, and the one most
+        # likely to be half-configured in a shared demo.
+        signature_detail = _signature_posture_detail(_remote_hmac_configured(remote_health))
+        if verdict == "connected" and signature_detail is not None:
+            return ConnectionCheckResult(
+                verdict=SIGNATURE_MISMATCH_VERDICT,
+                detail=signature_detail,
+                status_code=response.status_code,
+                endpoint_host=host,
+            )
+        remote_contract = _remote_contract_version(remote_health)
         if verdict == "connected" and remote_contract is not None and remote_contract != INFLOW_CONTRACT_VERSION:
             verdict = "contract_mismatch"
             detail = (
@@ -292,224 +697,76 @@ class LiveRegEngineClient:
         )
 
 
-def _local_signing_posture() -> str:
-    """State THIS side's HMAC posture as fact, in the connected detail (#100).
+async def _fetch_remote_health(client: httpx.AsyncClient, parsed) -> dict[str, Any] | None:
+    """Best-effort read of RegEngine's /health document.
 
-    Of the three ingest-only gates a read probe cannot see, one half is not
-    a mystery at all: whether this simulator will sign its requests is
-    decided entirely by REGENGINE_WEBHOOK_HMAC_SECRET, right here. Saying
-    "unsigned, and if RegEngine requires signatures they will 401" is
-    strictly more actionable than listing the signature as a generic
-    unknown alongside two genuine ones.
-
-    It is deliberately NOT the verdict-level fix #100 asks for. That needs
-    RegEngine's OWN posture -- an HMAC-configured flag on its /health, or a
-    preflight endpoint carrying /ingest's gates -- and neither exists in
-    the contract surface this repo has evidence for. Guessing a field name
-    RegEngine has not agreed to publish would be inventing the very
-    assurance #100 is about; the seam for wiring it up when it does exist
-    is _fetch_remote_contract_version's handshake plus this function.
+    Returns None when the health endpoint is unreachable or non-JSON (some
+    deployments serve the frontend at /health). Every skew check built on it
+    engages only when the remote actually advertises the field it needs, so an
+    older RegEngine simply yields no extra verdict.
     """
-    if os.getenv(WEBHOOK_HMAC_SECRET_ENV, "").strip():
-        return (
-            f"On the signature specifically, this side is known: {WEBHOOK_HMAC_SECRET_ENV} is "
-            "set here, so ingests will be signed -- they will still 401 if RegEngine's "
-            "WEBHOOK_HMAC_SECRET differs from this one."
-        )
-    return (
-        f"On the signature specifically, this side is known: {WEBHOOK_HMAC_SECRET_ENV} is NOT "
-        "set here, so every ingest from this simulator will be UNSIGNED. If RegEngine has "
-        "WEBHOOK_HMAC_SECRET set, all of them will 401 no matter how green this probe is."
-    )
-
-
-async def _fetch_remote_contract_version(
-    client: httpx.AsyncClient, parsed, pinned_address: str | None = None
-) -> str | None:
-    """Best-effort read of RegEngine's advertised inflow contract version.
-
-    Returns None when the health endpoint is unreachable, non-JSON (some
-    deployments serve the frontend at /health), or predates the version
-    field — skew detection only engages when both sides advertise.
-
-    Takes the caller's already-validated *pinned_address* so this second
-    request reuses the one lookup check_connection made rather than
-    resolving the host again on its own (#207).
-    """
-    health_url, health_headers, health_kwargs = _pinned_dial(
-        f"{parsed.scheme}://{parsed.netloc}/health", {}, pinned_address
-    )
     try:
-        health = await client.get(health_url, headers=health_headers, **health_kwargs)
+        health = await client.get(f"{parsed.scheme}://{parsed.netloc}/health")
         payload = health.json()
     except (httpx.HTTPError, ValueError):
         return None
-    if not isinstance(payload, dict):
+    return payload if isinstance(payload, dict) else None
+
+
+def _remote_contract_version(health: dict[str, Any] | None) -> str | None:
+    """RegEngine's advertised inflow contract version, when it advertises one."""
+    if health is None:
         return None
-    value = payload.get("inflow_contract_version")
+    value = health.get("inflow_contract_version")
     return str(value) if value is not None else None
 
 
-def _extract_error_body(response: httpx.Response, api_key: str | None) -> str:
-    """Best-effort, masked, bounded rendering of RegEngine's error body.
+# Key names RegEngine's /health may use for its `webhook_hmac_configured()`
+# posture flag. Only a real boolean (or its string spelling) counts -- a
+# missing or unrecognized value leaves signing posture unknown, and unknown
+# never produces a verdict.
+_REMOTE_HMAC_KEYS = ("webhook_hmac_configured", "hmac_configured")
 
-    RegEngine's real validation failures come back as JSON carrying
-    per-event rejection reasons (see the webhook contract this pins
-    against) -- that detail is what an operator actually needs to fix a
-    failed live delivery, and #138 is exactly that it used to be thrown
-    away in favor of httpx's generic status-line text.
 
-    Two hard constraints this enforces before the text goes anywhere:
-    - Masked. RegEngine's body can echo request details back inside free
-      text (e.g. an "invalid key <value>" detail message), so this cannot
-      rely on store.py's _scrub_secrets alone -- that only redacts a
-      secret sitting in a field literally named api_key/authorization/etc
-      at persistence time, not one embedded in prose anywhere else. This
-      uses the same mask_secret_in_payload/mask_secret_in_string store.py
-      and controller.py already mask with, which strip the configured key
-      by value, wherever it appears, before this ever leaves the client.
-    - Bounded. A non-JSON error body (an HTML error page from a
-      misconfigured proxy, for instance) could be arbitrarily large;
-      _MAX_ERROR_BODY_CHARS caps what is kept so a pathological response
-      can't bloat the raised message or the stored delivery record.
+def _remote_hmac_configured(health: dict[str, Any] | None) -> bool | None:
+    if health is None:
+        return None
+    for key in _REMOTE_HMAC_KEYS:
+        value = health.get(key)
+        if isinstance(value, bool):
+            return value
+        if isinstance(value, str):
+            normalized = value.strip().lower()
+            if normalized in _TRUTHY:
+                return True
+            if normalized in {"0", "false", "no", "off"}:
+                return False
+    return None
 
-    Never raises: a body that is not JSON and cannot be decoded as text
-    degrades to a placeholder rather than masking the original
-    HTTPStatusError behind a secondary exception.
+
+def _signature_posture_detail(remote_hmac_configured: bool | None) -> str | None:
+    """Explain a webhook-signing mismatch between the two sides, if any.
+
+    Returns None when the posture matches or when RegEngine does not advertise
+    its posture at all — the probe never invents a failure it cannot see.
     """
-    try:
-        parsed: Any = response.json()
-    except ValueError:
-        parsed = None
-
-    if parsed is not None:
-        text = json.dumps(mask_secret_in_payload(parsed, api_key), sort_keys=True)
-    else:
-        try:
-            text = mask_secret_in_string(response.text, api_key) or ""
-        except Exception:
-            return "<error body unavailable>"
-
-    if len(text) > _MAX_ERROR_BODY_CHARS:
-        omitted = len(text) - _MAX_ERROR_BODY_CHARS
-        text = f"{text[:_MAX_ERROR_BODY_CHARS]}... [truncated, {omitted} more chars]"
-    return text
-
-
-def _proxy_is_configured(url: httpx.URL) -> bool:
-    """Would httpx send *url* through an HTTP proxy?
-
-    This decides whether the connect-time pin (#207) applies, and it must
-    never answer False when httpx would in fact proxy. With a proxy the
-    socket is opened by the proxy, so a pinned IP becomes the CONNECT
-    target -- and httpcore's tunnel connection ignores the sni_hostname
-    extension entirely, verifying the certificate against that tunnel
-    target, i.e. the IP. No ordinary certificate satisfies that, and every
-    obvious "fix" for it ends in weakened verification, which is a worse
-    security outcome than the rebinding gap #207 closes. So: proxied means
-    dial by hostname, exactly as before.
-
-    Answered with httpx's own machinery rather than a hand-rolled NO_PROXY
-    matcher, because it has to agree with httpx exactly. These are the same
-    two pieces ``httpx.AsyncClient(trust_env=True)`` -- the default this
-    module uses -- builds its proxy mounts from, applied in httpx's own
-    order: mounts sorted most-specific-first, first match wins
-    (``Client._init_proxy_map`` and ``Client._transport_for_url``). A test
-    in tests/test_egress_guard.py cross-checks this function against a real
-    client's transport choice, so an httpx release that moves or changes
-    them fails CI loudly instead of silently mis-deciding.
-
-    Note that _pinned_dial asks this about BOTH the original URL and the
-    pinned one, and that the second question is the load-bearing one: httpx
-    chooses a transport from the URL it is handed, so a NO_PROXY entry
-    naming a hostname does not cover the address that hostname resolves to.
-    An environment that exempts ``pypi.org`` from its proxy still sends
-    ``https://151.101.192.223/...`` through it -- verified against a live
-    proxy while building #207 -- which is precisely the tunneled-pin case
-    that must never happen.
-
-    If that import ever disappears the fallback is the coarsest safe
-    answer: any proxy configured for the scheme counts as proxied,
-    NO_PROXY unread. That errs only in the safe direction -- it can skip a
-    pin that would have been fine, never pin a request that then gets
-    tunneled.
-
-    What skipping costs is honest and bounded, and differs by shape:
-
-      * Fully proxied: this process performs no lookup for the connection at
-        all (the proxy resolves), so the two disagreeing lookups a rebinding
-        attack needs do not exist on this side either. The guard's own lookup
-        becomes advisory and what the proxy connects to is the proxy's egress
-        policy to enforce.
-      * Proxied except for a NO_PROXY hostname (the hybrid shape): the
-        request goes direct, so httpx does resolve -- but the pinned URL
-        would be tunneled, so the pin is skipped and #207's gap stays open
-        for that endpoint. This is a real residual limitation, recorded here
-        rather than papered over. Closing it means either exempting the
-        resolved address in NO_PROXY too (which makes both URLs direct and
-        the pin engage), or removing the proxy for that host. Making this
-        code force a direct connection instead would be a deliberate egress
-        policy bypass, which is not the kind of decision a delivery client
-        should be making on its own.
-    """
-    try:
-        from httpx._utils import URLPattern, get_environment_proxies
-    except ImportError:  # pragma: no cover - only on an httpx that moved these
-        proxies = getproxies()
-        return bool(proxies.get(url.scheme.lower()) or proxies.get("all"))
-    mounts = get_environment_proxies()
-    for pattern in sorted(URLPattern(key) for key in mounts):
-        if pattern.matches(url):
-            # A None mount is httpx's spelling of "NO_PROXY covers this".
-            return mounts[pattern.pattern] is not None
-    return False
-
-
-def _pinned_dial(
-    endpoint: str,
-    headers: dict[str, str],
-    pinned_address: str | None,
-) -> tuple[str, dict[str, str], dict[str, Any]]:
-    """Aim one request at *pinned_address* while it still speaks to *endpoint*'s host.
-
-    Returns the ``(url, headers, extra kwargs)`` to hand httpx. With no
-    address to pin -- or with a proxy in the way, see _proxy_is_configured --
-    it returns the caller's own arguments untouched, so the un-pinned path is
-    byte-for-byte the request this client has always sent.
-
-    When it does pin, three things move together and all three matter:
-
-      * The URL's host becomes the validated IP, so httpx opens the socket to
-        that address and never performs a lookup of its own. This is the
-        actual fix for #207: the address the guard checked is the address
-        connected to. Rewriting the host also re-decides httpx's proxy
-        routing, which is why the proxy question is asked of the rewritten
-        URL as well as the original -- see _proxy_is_configured.
-      * ``Host`` is set explicitly to the ORIGINAL netloc -- host plus port
-        when the port is not the scheme default -- which is exactly what
-        httpx auto-populates from an un-pinned URL (``Request._prepare`` uses
-        ``url.netloc``). Sending the bare hostname instead would break any
-        endpoint on a non-default port, and sending the IP would break
-        name-based virtual hosting.
-      * ``sni_hostname`` is the original bare hostname. httpcore passes it to
-        ``start_tls`` as ``server_hostname``, and httpx's default SSL context
-        is ``ssl.create_default_context()`` with ``check_hostname`` on, so
-        that one value drives BOTH the SNI extension and the certificate
-        hostname check. The certificate is therefore verified against the
-        name the operator configured, never against the pinned IP -- nothing
-        here relaxes verification, and there is no code path in this module
-        that sets ``verify=False`` or hands httpx a permissive SSL context.
-    """
-    if not pinned_address:
-        return endpoint, headers, {}
-    url = httpx.URL(endpoint)
-    pinned_url = url.copy_with(host=pinned_address)
-    if _proxy_is_configured(url) or _proxy_is_configured(pinned_url):
-        return endpoint, headers, {}
+    if remote_hmac_configured is None:
+        return None
+    local_configured = bool(os.getenv(WEBHOOK_HMAC_SECRET_ENV, "").strip())
+    if local_configured == remote_hmac_configured:
+        return None
+    if remote_hmac_configured:
+        return (
+            "Credentials are valid for reads, but RegEngine has webhook HMAC signing enabled "
+            f"while {WEBHOOK_HMAC_SECRET_ENV} is unset here. Every live ingest would be sent "
+            "unsigned and rejected with HTTP 401 — the read probe cannot see this because only "
+            "the ingest route verifies signatures. Set the same secret on both sides."
+        )
     return (
-        str(pinned_url),
-        {**headers, "Host": url.netloc.decode("ascii")},
-        {"extensions": {"sni_hostname": url.host}},
+        f"Credentials are valid for reads, but {WEBHOOK_HMAC_SECRET_ENV} is set here while "
+        "RegEngine reports webhook HMAC signing disabled. Ingest still succeeds and RegEngine's "
+        "verifier no-ops, so bodies go unverified — set WEBHOOK_HMAC_SECRET on RegEngine, or "
+        "clear the local secret, so both sides agree."
     )
 
 

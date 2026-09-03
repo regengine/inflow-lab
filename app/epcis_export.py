@@ -17,29 +17,10 @@ _BIZ_STEPS = {
     CTEType.FIRST_LAND_BASED_RECEIVING: "urn:epcglobal:cbv:bizstep:receiving",
     CTEType.SHIPPING: "urn:epcglobal:cbv:bizstep:shipping",
     CTEType.RECEIVING: "urn:epcglobal:cbv:bizstep:receiving",
-    # "transforming" isn't one of GS1 CBV's 41 standard bizStep terms (verified
-    # against GS1's own epcis-context.jsonld, issue #188) -- using the reserved
-    # urn:epcglobal:cbv:bizstep: prefix for a term GS1 never defined would
-    # masquerade as standard CBV, so this is minted under our own namespace.
-    CTEType.TRANSFORMATION: "urn:regengine:bizstep:transformation",
+    # "transforming" is not a CBV bizStep term, so this one is minted under the
+    # repo's own namespace rather than masquerading as a standard CBV value.
+    CTEType.TRANSFORMATION: "urn:regengine:bizstep:transforming",
 }
-
-# The only sourceDestinationType issue #187 asks for -- CBV also defines
-# owning_party/possessing_party, but this app has no ownership/possession
-# model distinct from location, so "location" is the one type it can back
-# with real data.
-#
-# The BARE TOKEN, not the urn:epcglobal:cbv:sdt:location alias. GS1's own
-# epcis-context.jsonld declares sourceList/destinationList `type` as
-# "@type": "@vocab" over exactly three short names -- owning_party,
-# possessing_party, location -- so only the token expands to cbv:SDT-location.
-# The URN is a legitimate sameAs alias of that term, but it is not one of the
-# declared vocabulary entries, so it fails JSON-LD expansion; and the official
-# EPCIS 2.0 JSON Schema's source-dest-type carries a negative lookahead
-# ("^(?!(urn:epcglobal:cbv|https?://ns\.gs1\.org/cbv/))") that rejects this
-# exact prefix outright. Emitting the URN made both documents schema-invalid,
-# which is the opposite of what #187 asked for.
-_SDT_LOCATION = "location"
 
 _DISPOSITIONS = {
     CTEType.HARVESTING: "urn:epcglobal:cbv:disp:active",
@@ -101,31 +82,21 @@ def _render_event(
     event["eventTimeZoneOffset"] = _timezone_offset(record.event.timestamp)
     event["bizStep"] = _BIZ_STEPS[record.event.cte_type]
     event["disposition"] = _DISPOSITIONS[record.event.cte_type]
-    event["readPoint"] = _location_reference(
-        record.event.location_name, location_gln, record.event.location_gln
-    )
-    event["bizLocation"] = _location_reference(
-        record.event.location_name, location_gln, record.event.location_gln
-    )
-
-    # readPoint/bizLocation only ever describe *this* event's own location.
-    # CBV's mechanism for "who this lot moved from/to" in a handoff is
-    # sourceList/destinationList, not a second bizLocation -- without these,
-    # the ship-to and previous-source KDEs were only ever visible inside the
-    # free-form regengine:kdes extension (issue #187).
-    source_list = _source_list(record)
-    if source_list:
-        event["sourceList"] = source_list
-    destination_list = _destination_list(record)
-    if destination_list:
-        event["destinationList"] = destination_list
-
+    event["readPoint"] = _location_reference(record.event.location_name, location_gln)
+    event["bizLocation"] = _location_reference(record.event.location_name, location_gln)
     event["regengine:sequenceNo"] = record.sequence_no
     event["regengine:cteType"] = record.event.cte_type.value
     event["regengine:traceabilityLotCode"] = record.event.traceability_lot_code
     event["regengine:productDescription"] = record.event.product_description
     event["regengine:parentLotCodes"] = _input_lot_codes(record)
     event["regengine:kdes"] = record.event.kdes
+
+    source_list = _source_list(record, location_gln)
+    if source_list:
+        event["sourceList"] = source_list
+    destination_list = _destination_list(record, location_gln)
+    if destination_list:
+        event["destinationList"] = destination_list
 
     transactions = _biz_transactions(record)
     if transactions:
@@ -150,9 +121,7 @@ def _render_object_event(
                 product_description=event.product_description,
             )
         ],
-        "regengine:location": _location_reference(
-            event.location_name, location_gln, event.location_gln
-        ),
+        "regengine:location": _location_reference(event.location_name, location_gln),
     }
 
 
@@ -167,11 +136,15 @@ def _render_transformation_event(
         if batch_number
         else f"urn:regengine:transformation:{record.record_id}"
     )
+    input_details = _input_lot_details(record)
     return {
         "type": "TransformationEvent",
         "transformationID": transformation_id,
         "inputQuantityList": [
-            _input_quantity_element(record, lot_code)
+            _quantity_element(
+                lot_code=lot_code,
+                **input_details.get(lot_code, {}),
+            )
             for lot_code in _input_lot_codes(record)
         ],
         "outputQuantityList": [
@@ -182,9 +155,7 @@ def _render_transformation_event(
                 product_description=event.product_description,
             )
         ],
-        "regengine:location": _location_reference(
-            event.location_name, location_gln, event.location_gln
-        ),
+        "regengine:location": _location_reference(event.location_name, location_gln),
     }
 
 
@@ -224,47 +195,56 @@ def _quantity_element(
     return element
 
 
-def _input_quantity_element(record: StoredEventRecord, lot_code: str) -> dict[str, Any]:
-    """quantity/uom for one transformation input lot, read if it was ever recorded.
+def _input_lot_details(record: StoredEventRecord) -> dict[str, dict[str, Any]]:
+    """Per-input-lot quantity/unit/product, keyed by traceability lot code.
 
-    EPCIS's QuantityElement schema requires `quantity` alongside `epcClass`
-    (issue #159), but as of this fix nothing upstream of this module
-    actually captures a *per-input* quantity for transformation events:
-    industry_adapters.transformation_kdes (which builds
-    input_traceability_lot_codes) only ever computes an aggregate
-    yield_ratio across all inputs, so engine.py's per-lot
-    Lot.quantity/.unit_of_measure never reaches event.kdes for any
-    engine-generated or bundled demo-fixture transformation today --
-    verified directly against both files, and independently documented by
-    cte_rules.py's TRANSFORMATION_INPUT_LINKAGE_KDES comment (issue #189).
-    Fabricating a number here would be worse than omitting it for a
-    regulatory export, so this reads an "input_lot_quantities" KDE
-    (lot_code -> {"quantity": ..., "unit_of_measure": ...}) if one is
-    present -- keyed by lot code rather than positionally paired with
-    input_traceability_lot_codes, since _input_lot_codes() above merges
-    lot codes from three different sources that don't share one common
-    order -- and otherwise leaves quantity/uom out, exactly as before.
-    A hand-crafted or CSV-imported event's free-form kdes JSON can already
-    populate this key today; making industry_adapters.transformation_kdes
-    do the same for engine-generated events is the upstream change that
-    would make this non-empty for the simulator's own data (see this
-    project's issue #159 for the full writeup of that gap).
+    EPCIS ``QuantityElement`` requires ``quantity`` alongside ``epcClass``, so
+    the exporter surfaces whatever the transformation KDEs recorded per input
+    lot. ``input_quantities`` is the structured form (a list of
+    ``{lot_code, quantity, unit_of_measure}`` entries, or a
+    ``{lot_code: quantity}`` mapping); ``input_products`` is read positionally
+    against ``input_traceability_lot_codes``.
     """
-    per_lot = record.event.kdes.get("input_lot_quantities")
-    quantity: float | None = None
-    unit_of_measure: str | None = None
-    if isinstance(per_lot, dict):
-        entry = per_lot.get(lot_code)
-        if isinstance(entry, dict):
-            raw_quantity = entry.get("quantity")
-            # bool is a subclass of int in Python -- exclude it explicitly
-            # so a stray True/False can't be coerced into a fake quantity.
-            if isinstance(raw_quantity, (int, float)) and not isinstance(raw_quantity, bool):
-                quantity = float(raw_quantity)
-            raw_uom = entry.get("unit_of_measure")
-            if isinstance(raw_uom, str) and raw_uom:
-                unit_of_measure = raw_uom
-    return _quantity_element(lot_code=lot_code, quantity=quantity, unit_of_measure=unit_of_measure)
+    details: dict[str, dict[str, Any]] = {}
+
+    lot_codes = record.event.kdes.get("input_traceability_lot_codes")
+    products = record.event.kdes.get("input_products")
+    if isinstance(lot_codes, list) and isinstance(products, list):
+        for lot_code, product in zip(lot_codes, products):
+            if isinstance(lot_code, str) and isinstance(product, str) and product:
+                details.setdefault(lot_code, {})["product_description"] = product
+
+    quantities = record.event.kdes.get("input_quantities")
+    entries: list[Any] = []
+    if isinstance(quantities, dict):
+        entries = [
+            {"lot_code": lot_code, "quantity": quantity}
+            for lot_code, quantity in quantities.items()
+        ]
+    elif isinstance(quantities, list):
+        entries = list(quantities)
+
+    default_uom = record.event.kdes.get("input_unit_of_measure")
+    for entry in entries:
+        if not isinstance(entry, dict):
+            continue
+        lot_code = entry.get("lot_code") or entry.get("traceability_lot_code")
+        if not isinstance(lot_code, str) or not lot_code:
+            continue
+        detail = details.setdefault(lot_code, {})
+        quantity = entry.get("quantity")
+        if isinstance(quantity, (int, float)) and not isinstance(quantity, bool):
+            detail["quantity"] = float(quantity)
+        unit_of_measure = (
+            entry.get("unit_of_measure") or entry.get("uom") or default_uom
+        )
+        if isinstance(unit_of_measure, str) and unit_of_measure:
+            detail["unit_of_measure"] = unit_of_measure
+        product = entry.get("product_description")
+        if isinstance(product, str) and product:
+            detail["product_description"] = product
+
+    return details
 
 
 def _input_lot_codes(record: StoredEventRecord) -> list[str]:
@@ -277,42 +257,99 @@ def _input_lot_codes(record: StoredEventRecord) -> list[str]:
     if isinstance(source_lot_code, str) and source_lot_code not in lot_codes:
         lot_codes.append(source_lot_code)
 
-    # The kdes copy first, then the top-level field. Reading only the kdes
-    # copy meant an event that carried the value where the contract says to
-    # carry it -- top-level -- rendered an empty inputQuantityList, losing the
-    # input-to-output lineage link that is the entire point of a
-    # transformation CTE.
     input_lot_codes = record.event.kdes.get("input_traceability_lot_codes", [])
     if isinstance(input_lot_codes, list):
         for lot_code in input_lot_codes:
             if isinstance(lot_code, str) and lot_code not in lot_codes:
                 lot_codes.append(lot_code)
 
-    for lot_code in record.event.input_traceability_lot_codes or []:
-        if isinstance(lot_code, str) and lot_code not in lot_codes:
-            lot_codes.append(lot_code)
-
     return lot_codes
 
 
-def _source_list(record: StoredEventRecord) -> list[dict[str, str]]:
-    """Receiving's immediate previous source, in CBV's sourceList shape."""
-    if record.event.cte_type != CTEType.RECEIVING:
-        return []
-    previous_source = record.event.kdes.get("immediate_previous_source")
-    if not isinstance(previous_source, str) or not previous_source:
-        return []
-    return [{"type": _SDT_LOCATION, "source": _location_id(previous_source)}]
+_SDT_LOCATION = "urn:epcglobal:cbv:sdt:location"
+_SDT_OWNING_PARTY = "urn:epcglobal:cbv:sdt:owning_party"
+_SDT_POSSESSING_PARTY = "urn:epcglobal:cbv:sdt:possessing_party"
+
+_SOURCE_LOCATION_KDES = {
+    CTEType.SHIPPING: ("ship_from_location",),
+    CTEType.RECEIVING: ("immediate_previous_source", "ship_from_location"),
+}
+
+_DESTINATION_LOCATION_KDES = {
+    CTEType.SHIPPING: ("ship_to_location", "immediate_subsequent_recipient"),
+    CTEType.RECEIVING: ("receiving_location",),
+}
 
 
-def _destination_list(record: StoredEventRecord) -> list[dict[str, str]]:
-    """Shipping's immediate subsequent recipient, in CBV's destinationList shape."""
-    if record.event.cte_type != CTEType.SHIPPING:
+def _kde_location(record: StoredEventRecord, keys: tuple[str, ...]) -> str | None:
+    for key in keys:
+        value = record.event.kdes.get(key)
+        if isinstance(value, str) and value.strip():
+            return value
+    return None
+
+
+def _sdt_elements(
+    location_name: str,
+    field: str,
+    location_gln: Callable[[str], str],
+) -> list[dict[str, str]]:
+    """CBV source/destination elements for a lot handoff between two parties."""
+    identifier = f"urn:regengine:location:{quote(location_name, safe='')}"
+    party_identifier = _party_identifier(location_name, location_gln)
+    elements = [
+        {
+            "type": _SDT_LOCATION,
+            field: identifier,
+            "regengine:locationName": location_name,
+        }
+    ]
+    for sdt_type in (_SDT_OWNING_PARTY, _SDT_POSSESSING_PARTY):
+        elements.append(
+            {
+                "type": sdt_type,
+                field: party_identifier,
+                "regengine:locationName": location_name,
+            }
+        )
+    return elements
+
+
+def _party_identifier(location_name: str, location_gln: Callable[[str], str]) -> str:
+    gln = location_gln(location_name)
+    if gln:
+        return f"urn:epc:id:sgln:{gln}"
+    return f"urn:regengine:party:{quote(location_name, safe='')}"
+
+
+def _source_list(
+    record: StoredEventRecord,
+    location_gln: Callable[[str], str],
+) -> list[dict[str, str]]:
+    keys = _SOURCE_LOCATION_KDES.get(record.event.cte_type)
+    if not keys:
         return []
-    ship_to = record.event.kdes.get("ship_to_location")
-    if not isinstance(ship_to, str) or not ship_to:
+    location_name = _kde_location(record, keys)
+    if record.event.cte_type == CTEType.SHIPPING and location_name is None:
+        location_name = record.event.location_name
+    if not location_name:
         return []
-    return [{"type": _SDT_LOCATION, "destination": _location_id(ship_to)}]
+    return _sdt_elements(location_name, "source", location_gln)
+
+
+def _destination_list(
+    record: StoredEventRecord,
+    location_gln: Callable[[str], str],
+) -> list[dict[str, str]]:
+    keys = _DESTINATION_LOCATION_KDES.get(record.event.cte_type)
+    if not keys:
+        return []
+    location_name = _kde_location(record, keys)
+    if record.event.cte_type == CTEType.RECEIVING and location_name is None:
+        location_name = record.event.location_name
+    if not location_name:
+        return []
+    return _sdt_elements(location_name, "destination", location_gln)
 
 
 def _biz_transactions(record: StoredEventRecord) -> list[dict[str, str]]:
@@ -337,27 +374,15 @@ def _lot_identifier(lot_code: str) -> str:
     return f"urn:regengine:lot:{quote(lot_code, safe='')}"
 
 
-def _location_reference(
-    location_name: str,
-    location_gln: Callable[[str], str],
-    event_gln: str | None = None,
-) -> dict[str, str]:
-    # Registry lookup first, then the event's own GLN (#162). csv_importer
-    # threads a GLN column into RegEngineEvent.location_gln, but this only ever
-    # consulted the engine's static name->GLN registry -- which an imported
-    # location is not in -- so a supplied GLN never reached the EPCIS document.
-    gln = location_gln(location_name) or event_gln or ""
+def _location_reference(location_name: str, location_gln: Callable[[str], str]) -> dict[str, str]:
+    gln = location_gln(location_name)
     reference = {
-        "id": _location_id(location_name),
+        "id": f"urn:regengine:location:{quote(location_name, safe='')}",
         "regengine:locationName": location_name,
     }
     if gln:
         reference["regengine:gln"] = gln
     return reference
-
-
-def _location_id(location_name: str) -> str:
-    return f"urn:regengine:location:{quote(location_name, safe='')}"
 
 
 def _reference_type_identifier(reference_type: str) -> str:

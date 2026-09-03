@@ -9,14 +9,10 @@ from fastapi.responses import StreamingResponse
 
 from .. import tenancy
 from ..auth import TenantContext
-from ..controller import (
-    SimulationController,
-    config_with_stored_delivery_secrets,
-    request_with_stored_delivery_secrets,
-)
+from ..controller import SimulationController
 from ..dependencies import get_active_controller, get_tenant_context
 from ..schemas.ingestion import ReplayRequest, ReplayResponse
-from ..schemas.simulation import ResetResponse, SimulationConfig, StartRequest, StatusResponse, StepResponse
+from ..schemas.simulation import ResetRequest, ResetResponse, StartRequest, StatusResponse, StepResponse
 
 
 router = APIRouter(prefix="/api/simulate", tags=["Simulation"])
@@ -26,7 +22,7 @@ router = APIRouter(prefix="/api/simulate", tags=["Simulation"])
 async def simulate_status(
     active_controller: SimulationController = Depends(get_active_controller),
 ) -> StatusResponse:
-    status = await active_controller.status()
+    status = active_controller.status()
     return StatusResponse.model_validate(status)
 
 
@@ -38,7 +34,7 @@ async def simulate_stream(
     active_controller: SimulationController = Depends(get_active_controller),
 ) -> StreamingResponse:
     async def event_generator():
-        snapshot = await active_controller.snapshot(event_limit=limit)
+        snapshot = active_controller.snapshot(event_limit=limit)
         last_revision = snapshot["revision"]
         yield sse_message("snapshot", snapshot)
         if once:
@@ -53,7 +49,7 @@ async def simulate_stream(
                 yield ": keep-alive\n\n"
                 continue
 
-            snapshot = await active_controller.snapshot(event_limit=limit)
+            snapshot = active_controller.snapshot(event_limit=limit)
             last_revision = snapshot["revision"]
             yield sse_message("snapshot", snapshot)
 
@@ -73,11 +69,8 @@ async def simulate_start(
     context: TenantContext = Depends(get_tenant_context),
     active_controller: SimulationController = Depends(get_active_controller),
 ) -> StatusResponse:
-    # #148: the console's form cannot round-trip the API key (status() masks
-    # it), so an omitted credential here means "unchanged", not "clear it".
-    config = config_with_stored_delivery_secrets(active_controller, start_request.config)
-    await active_controller.start(tenancy.scope_config(context, config))
-    return StatusResponse.model_validate(await active_controller.status())
+    await active_controller.start(tenancy.scope_config(context, start_request.config))
+    return StatusResponse.model_validate(active_controller.status())
 
 
 @router.post("/stop", response_model=StatusResponse)
@@ -85,21 +78,17 @@ async def simulate_stop(
     active_controller: SimulationController = Depends(get_active_controller),
 ) -> StatusResponse:
     await active_controller.stop()
-    return StatusResponse.model_validate(await active_controller.status())
+    return StatusResponse.model_validate(active_controller.status())
 
 
 @router.post("/reset", response_model=ResetResponse)
 async def simulate_reset(
-    config: SimulationConfig | None = None,
+    reset_request: ResetRequest | None = None,
     context: TenantContext = Depends(get_tenant_context),
     active_controller: SimulationController = Depends(get_active_controller),
 ) -> ResetResponse:
-    scoped = (
-        tenancy.scope_config(context, config_with_stored_delivery_secrets(active_controller, config))
-        if config
-        else None
-    )
-    await active_controller.reset(scoped)
+    config = reset_request.config if reset_request else None
+    await active_controller.reset(tenancy.scope_config(context, config) if config else None)
     return ResetResponse(status="reset")
 
 
@@ -117,8 +106,7 @@ async def simulate_replay(
     context: TenantContext = Depends(get_tenant_context),
     active_controller: SimulationController = Depends(get_active_controller),
 ) -> ReplayResponse:
-    merged = request_with_stored_delivery_secrets(active_controller, replay_request)
-    return await active_controller.replay(tenancy.scope_replay_request(context, merged))
+    return await active_controller.replay(tenancy.scope_replay_request(context, replay_request))
 
 
 def sse_message(event_name: str, payload: dict[str, Any]) -> str:

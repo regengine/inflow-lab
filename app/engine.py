@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import random
 import os
+from collections import deque
+from copy import deepcopy
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 from itertools import count
@@ -20,45 +22,39 @@ from .scenarios import (
 
 
 DEFAULT_MAX_FUTURE_HOURS = 20
+# How far behind wall-clock time the simulated clock starts. The simulated
+# clock advances far faster than real time (tens of minutes per event), so the
+# starting offset is what determines how many events can be generated before
+# the clock reaches the live-webhook future ceiling and has to stop drifting.
+DEFAULT_HISTORY_HOURS = 336  # 14 simulated days of runway
+# Smallest step `_advance_time` will ever take. Once the simulated clock has
+# saturated its window it can no longer move in realistic increments, but it
+# must still move: two CTEs for the same lot must never share an instant.
+MIN_TIME_ADVANCE = timedelta(microseconds=200)
 
-# GS1 company prefix every identifier this simulator mints is built on --
-# SGTINs, SSCCs, and (in app/scenarios.py) location GLNs. Not a real
-# assignment: this is a simulator, and the prefix only has to be
-# structurally valid and consistent across the identifiers one run emits.
-GS1_COMPANY_PREFIX = "8500000"
-
-# An SSCC is exactly 18 digits: 17 of payload (extension digit + company
-# prefix + serial reference) closed by a mod-10 check digit.
-SSCC_PAYLOAD_DIGITS = 17
+#: GS1 company prefix used for every synthetic SSCC this lab mints.
+SSCC_COMPANY_PREFIX = "8500000"
 
 
 def gs1_check_digit(digits: str) -> int:
-    """Standard GS1 mod-10 check digit for *digits* (SSCC, GTIN, GLN...).
-
-    Weights alternate 3, 1, 3, 1 ... reading right to left from the digit
-    that will sit immediately left of the check digit.
-    """
+    """GS1 mod-10 check digit for a run of digits (SSCC, GTIN, GLN, ...)."""
     total = 0
     for index, digit in enumerate(reversed(digits), start=1):
         total += int(digit) * (3 if index % 2 else 1)
     return (10 - (total % 10)) % 10
 
 
-def make_sscc(payload: str) -> str:
-    """Close a 17-digit SSCC payload with its check digit, making 18.
+def sscc_from_base(base: str) -> str:
+    """Complete a 17-digit SSCC base into the full 18-digit SSCC.
 
-    Module-level rather than a method so anything that has to *write* an
-    SSCC uses this one construction -- the engine's generated shipments
-    and app/demo_fixtures.py's hand-authored ones alike (#209). A
-    GS1-128 "(00)" reference that is not 18 digits with a valid check
-    digit is precisely the malformed identifier this simulator exists to
-    help people notice, so it must not ship inside the demo data.
+    GS1 Application Identifier ``(00)`` promises exactly 18 digits, so anything
+    that writes an ``(00)`` reference — the engine or a hand-written fixture —
+    must come through here rather than pasting a human-readable label after the
+    AI.
     """
-    if len(payload) != SSCC_PAYLOAD_DIGITS or not payload.isdigit():
-        raise ValueError(
-            f"an SSCC payload must be exactly {SSCC_PAYLOAD_DIGITS} digits, got {payload!r}"
-        )
-    return f"{payload}{gs1_check_digit(payload)}"
+    if len(base) != 17 or not base.isdigit():
+        raise ValueError(f"SSCC base must be 17 digits, got {base!r}")
+    return f"{base}{gs1_check_digit(base)}"
 
 
 @dataclass(slots=True)
@@ -119,7 +115,8 @@ class LegitFlowEngine:
         self.rng = random.Random(seed if seed is not None else self._initial_seed)  # nosec B311
         self._lot_counter = count(1)
         self._ref_counter = count(1)
-        self._time_cursor = datetime.now(UTC) - timedelta(hours=12)
+        self._time_cursor = datetime.now(UTC) - timedelta(hours=_history_hours())
+        self._pending_events: deque[tuple[RegEngineEvent, list[str]]] = deque()
         self.scale = OperationScale(scale or self._initial_scale)
         self.quantity_multiplier = SCALE_QUANTITY_MULTIPLIER[self.scale]
         self.scenario = scale_scenario(get_scenario(scenario or self._initial_scenario), self.scale)
@@ -144,11 +141,6 @@ class LegitFlowEngine:
         self.dc_inventory: list[Lot] = []
         self.retail_inventory: list[Lot] = []
         self.in_transit: list[Shipment] = []
-        # Events minted alongside another action's return value but not yet
-        # handed back to a caller -- currently just rework lots' own CTE
-        # records (#97). next_event() drains this before choosing a new
-        # action; see _transform.
-        self._pending_events: list[tuple[RegEngineEvent, list[str]]] = []
 
         self.location_index = {loc.name: loc for loc in self.all_locations}
 
@@ -157,24 +149,29 @@ class LegitFlowEngine:
         return [*self.farms, *self.coolers, *self.packers, *self.processors, *self.dcs, *self.retailers]
 
     def next_event(self) -> tuple[RegEngineEvent, list[str]]:
-        if self._pending_events:
-            # #97: flush any CTE record queued by an earlier action (e.g. a
-            # rework lot's own transformation-output event, see _transform)
-            # before choosing a new one. This never touches self.rng, so it
-            # cannot reorder or add an RNG draw relative to the unqueued
-            # path.
-            return self._pending_events.pop(0)
+        """Return the next `(event, parent_lot_codes)` pair.
+
+        Some actions (notably transformation) legitimately produce more than
+        one CTE — one per new output lot. Those extra events are queued here
+        and handed out by subsequent calls so every generated lot gets a
+        record of its own without changing this method's single-event API.
+        """
+        if not self._pending_events:
+            self._pending_events.extend(self._generate_events())
+        return self._pending_events.popleft()
+
+    def _generate_events(self) -> list[tuple[RegEngineEvent, list[str]]]:
         action = self._choose_action()
         if action == "harvest":
-            return self._harvest()
+            return [self._harvest()]
         if action == "cool":
-            return self._cool()
+            return [self._cool()]
         if action == "initial_pack":
-            return self._initial_pack()
+            return [self._initial_pack()]
         if action == "ship":
-            return self._ship()
+            return [self._ship()]
         if action == "receive":
-            return self._receive()
+            return [self._receive()]
         if action == "transform":
             return self._transform()
         raise RuntimeError(f"Unhandled action: {action}")
@@ -223,13 +220,7 @@ class LegitFlowEngine:
             quantity_high * self.quantity_multiplier,
         )
         timestamp = self._advance_time(15, 90)
-        # #164: source CTE type comes from the adapter, which is the single
-        # owner of it. self.adapter is derived from self.scenario.industry_type
-        # (see __init__), so adapter and scenario can never be paired
-        # inconsistently -- which is exactly what a second copy of this value
-        # on ScenarioPreset made possible.
-        source_cte_type = self.adapter.source_cte_type
-        reference_prefix = "LAND" if source_cte_type == CTEType.FIRST_LAND_BASED_RECEIVING else "HAR"
+        reference_prefix = "LAND" if self.scenario.source_cte_type == CTEType.FIRST_LAND_BASED_RECEIVING else "HAR"
         reference_number = self._reference(reference_prefix)
         next_location = self._default_next_location()
 
@@ -257,7 +248,7 @@ class LegitFlowEngine:
         self.harvested.append(lot)
 
         event = RegEngineEvent(
-            cte_type=source_cte_type,
+            cte_type=self.scenario.source_cte_type,
             traceability_lot_code=lot.lot_code,
             product_description=lot.product_description,
             quantity=lot.quantity,
@@ -444,7 +435,7 @@ class LegitFlowEngine:
         )
         return event, lot.parents or [lot.lot_code]
 
-    def _transform(self) -> tuple[RegEngineEvent, list[str]]:
+    def _transform(self) -> list[tuple[RegEngineEvent, list[str]]]:
         sample_size = min(len(self.processor_inventory), self.rng.choice(self.scenario.transform_input_choices))
         inputs = self.rng.sample(self.processor_inventory, k=sample_size)
         self.processor_inventory = [lot for lot in self.processor_inventory if lot not in inputs]
@@ -484,8 +475,6 @@ class LegitFlowEngine:
             outputs.append(output_lot)
             self.transformed.append(output_lot)
 
-        input_lot_codes = [lot.lot_code for lot in inputs]
-
         if rework_qty > 0:
             rework_lot = Lot(
                 lot_code=self._make_lot_code(prefix="TLC"),
@@ -504,7 +493,7 @@ class LegitFlowEngine:
             rework_lots.append(rework_lot)
             self.processor_inventory.append(rework_lot)
 
-        kdes = self.adapter.transformation_kdes(
+        batch_kdes = self.adapter.transformation_kdes(
             engine=self,
             inputs=inputs,
             outputs=outputs,
@@ -516,62 +505,49 @@ class LegitFlowEngine:
             total_input_qty=total_input_qty,
             total_output_qty=gross_output_qty,
         )
+        input_lot_codes = [lot.lot_code for lot in inputs]
+        if rework_lots:
+            # A rework lot is real output mass from this batch (`yield_ratio`
+            # already counts it) and now carries a CTE of its own, so it belongs
+            # in the batch's declared output set. `rework_traceability_lot_codes`
+            # still marks which of those outputs are rework rather than sellable.
+            batch_kdes["output_traceability_lot_codes"] = [
+                *batch_kdes.get("output_traceability_lot_codes", []),
+                *(lot.lot_code for lot in rework_lots),
+            ]
 
-        event = RegEngineEvent(
-            cte_type=CTEType.TRANSFORMATION,
-            traceability_lot_code=outputs[0].lot_code,
-            product_description=outputs[0].product_description,
-            quantity=outputs[0].quantity,
-            unit_of_measure=outputs[0].unit_of_measure,
-            location_name=processor.name,
-            location_gln=self._location_gln_or_none(processor.name),
-            timestamp=timestamp,
-            # #91: RegEngine's live ingest reads transformation input-lot
-            # linkage only from this top-level field, never from
-            # kdes["input_traceability_lot_codes"] (which stays populated
-            # below for local lineage/exports/mock validation). Sourced
-            # straight from `inputs` rather than read back out of `kdes`,
-            # so it can never drift from what this transformation actually
-            # consumed even if an industry adapter's kdes shape changes.
-            input_traceability_lot_codes=input_lot_codes,
-            kdes=kdes,
-        )
-
-        for output_lot in outputs[1:]:
-            # #115: _transform can mint 2-3 output lots
-            # (_transform_output_count), appends every one of them to
-            # self.transformed, and used to build exactly ONE CTE record --
-            # keyed to outputs[0]. The other output lots were named only
-            # inside this event's kdes["output_traceability_lot_codes"]
-            # array, never as the traceability_lot_code of a record of their
-            # own. EventStore.lineage() links a record to its parents via
-            # parent_lot_codes, source_traceability_lot_code and
-            # input_traceability_lot_codes -- never via
-            # output_traceability_lot_codes -- so lineage() for outputs[1]
-            # or outputs[2] returned nothing at all until that lot shipped,
-            # and _ship() then set the shipment's parent_lot_codes to the
-            # *pre-transformation* inputs (lot.parents). The first stored
-            # record for that lot code was therefore a SHIPPING event
-            # appearing to link straight back to the input lots, skipping
-            # the transformation that created it -- wrong in store.lineage()
-            # and in every per-lot export built on it.
-            #
-            # Emitted through the same _pending_events queue #97 added for
-            # rework lots, and deliberately so: queuing rather than
-            # returning a second event keeps next_event()'s
-            # (event, parent_lot_codes) return type intact, costs no
-            # self.rng draw, and so cannot reorder or shift any later seeded
-            # value. Same non-collapsing timestamp idiom too (#119).
-            output_timestamp = self._time_cursor + timedelta(microseconds=1)
-            self._time_cursor = output_timestamp
-            # Batch-level KDEs are shared with outputs[0] -- same inputs,
-            # same batch record, same yield -- and are correct for every
-            # output of this transformation. Only the two source-reference
-            # KDEs are per-lot: transformation_kdes keys them to outputs[0].
-            output_kdes = dict(kdes)
-            output_kdes["tlc_source_reference"] = output_lot.tlc_source_reference
-            output_kdes["traceability_lot_code_source_reference"] = output_lot.tlc_source_reference
-            output_event = RegEngineEvent(
+        # One TRANSFORMATION record per output lot: every new traceability lot
+        # code needs its own CTE, otherwise outputs[1:] first appear in the
+        # store as a SHIPPING event that looks like it came straight from the
+        # pre-transformation inputs.
+        #
+        # Rework lots get a record for exactly the same reason. A rework lot is
+        # minted here and pushed back into `processor_inventory`, where a later
+        # `_transform` can sample it as an input -- at which point it appears in
+        # that event's `input_traceability_lot_codes`. Without a CTE of its own
+        # it has no record to anchor to, so `EventStore.lineage_edges` drops the
+        # edge and the rendered graph shows fewer inputs than the payload
+        # declares. It is also real mass produced by this batch (`yield_ratio`
+        # already counts it), so emitting it keeps the mass balance honest.
+        results: list[tuple[RegEngineEvent, list[str]]] = []
+        emitted: list[tuple[Lot, bool]] = [(lot, False) for lot in outputs]
+        emitted.extend((lot, True) for lot in rework_lots)
+        for output_lot, is_rework in emitted:
+            kdes = deepcopy(batch_kdes)
+            kdes["output_traceability_lot_code"] = output_lot.lot_code
+            kdes["output_lot_count"] = len(emitted)
+            kdes["tlc_source_reference"] = output_lot.tlc_source_reference
+            kdes["traceability_lot_code_source_reference"] = output_lot.tlc_source_reference
+            if is_rework:
+                # Additive markers only: the required transformation KDEs still
+                # come from the shared batch record, so the wire contract is
+                # unchanged and the batch stays identifiable across siblings.
+                kdes["rework_output"] = True
+                kdes["rework_hold_reference"] = self._reference_document(
+                    output_lot.current_reference_type,
+                    output_lot.current_reference_number,
+                )
+            event = RegEngineEvent(
                 cte_type=CTEType.TRANSFORMATION,
                 traceability_lot_code=output_lot.lot_code,
                 product_description=output_lot.product_description,
@@ -579,62 +555,11 @@ class LegitFlowEngine:
                 unit_of_measure=output_lot.unit_of_measure,
                 location_name=processor.name,
                 location_gln=self._location_gln_or_none(processor.name),
-                timestamp=output_timestamp,
-                input_traceability_lot_codes=input_lot_codes,
-                kdes=output_kdes,
+                timestamp=timestamp,
+                kdes=kdes,
             )
-            self._pending_events.append((output_event, input_lot_codes))
-
-        for rework_lot in rework_lots:
-            # #97: a rework lot enters processor_inventory and can later be
-            # sampled as another transformation's input (see the `inputs`
-            # sampling at the top of this method), where it appears in
-            # parent_lot_codes and input_traceability_lot_codes -- but
-            # without a CTE record of its own, EventStore.lineage_edges
-            # (app/store.py) silently drops that edge, since it only keeps
-            # edges whose source lot code has a record of its own. Emit the
-            # rework lot's own record here, at creation time: another
-            # transformation-output event for the same batch/inputs/
-            # location/reference, differing only in the identity fields
-            # (lot code, description, quantity, its own reference/source
-            # tags) that distinguish it from `outputs[0]`.
-            #
-            # Queued rather than returned as a second event from this call
-            # so next_event()'s (event, parent_lot_codes) return type never
-            # changes, and drained (see next_event()) before any new action
-            # is chosen -- so it costs no extra `self.rng` draw and cannot
-            # reorder or shift any later seeded value. The timestamp is
-            # nudged forward by the smallest representable step, the same
-            # non-collapsing idiom `_advance_time` uses at the live-window
-            # ceiling (#119), rather than reusing `timestamp` outright,
-            # since two events sharing one timestamp is exactly what that
-            # fix exists to prevent.
-            rework_timestamp = self._time_cursor + timedelta(microseconds=1)
-            self._time_cursor = rework_timestamp
-            rework_kdes = dict(kdes)
-            rework_kdes["tlc_source_reference"] = rework_lot.tlc_source_reference
-            rework_kdes["traceability_lot_code_source_reference"] = rework_lot.tlc_source_reference
-            rework_kdes["reference_document"] = self._reference_document(
-                rework_lot.current_reference_type,
-                rework_lot.current_reference_number,
-            )
-            rework_kdes["reference_document_type"] = rework_lot.current_reference_type
-            rework_kdes["reference_document_number"] = rework_lot.current_reference_number
-            rework_event = RegEngineEvent(
-                cte_type=CTEType.TRANSFORMATION,
-                traceability_lot_code=rework_lot.lot_code,
-                product_description=rework_lot.product_description,
-                quantity=rework_lot.quantity,
-                unit_of_measure=rework_lot.unit_of_measure,
-                location_name=processor.name,
-                location_gln=self._location_gln_or_none(processor.name),
-                timestamp=rework_timestamp,
-                input_traceability_lot_codes=input_lot_codes,
-                kdes=rework_kdes,
-            )
-            self._pending_events.append((rework_event, input_lot_codes))
-
-        return event, input_lot_codes
+            results.append((event, list(input_lot_codes)))
+        return results
 
     def location_gln(self, location_name: str) -> str:
         location = self.location_index.get(location_name)
@@ -666,17 +591,17 @@ class LegitFlowEngine:
         return reference_number or reference_type or ""
 
     def _advance_time(self, min_minutes: int, max_minutes: int) -> datetime:
-        candidate = self._time_cursor + timedelta(minutes=self.rng.randint(min_minutes, max_minutes))
+        # Draw the step unconditionally so the RNG stream stays deterministic
+        # regardless of how close the cursor is to the live-window ceiling.
+        step = timedelta(minutes=self.rng.randint(min_minutes, max_minutes))
         live_window_ceiling = datetime.now(UTC) + timedelta(hours=_max_future_hours())
-        if candidate > live_window_ceiling:
-            # Once the simulated clock has caught up to the live cap,
-            # clamping straight to `live_window_ceiling` would repeat that
-            # same instant for every event generated within one wall-clock
-            # tick. Ride the ceiling forward as it creeps ahead of real
-            # time, and when it hasn't moved yet, nudge the cursor by the
-            # smallest representable step so ordering never collapses.
-            candidate = live_window_ceiling if live_window_ceiling > self._time_cursor else self._time_cursor + timedelta(microseconds=1)
-        self._time_cursor = candidate
+        if self._time_cursor + step > live_window_ceiling:
+            # Cap the *delta* to whatever headroom is left instead of clamping
+            # the cursor onto the ceiling, which collapsed every later event
+            # onto the same instant. The cursor still always moves forward.
+            headroom = live_window_ceiling - self._time_cursor
+            step = headroom if headroom > MIN_TIME_ADVANCE else MIN_TIME_ADVANCE
+        self._time_cursor += step
         return self._time_cursor
 
     def _quantity(self, low: float, high: float) -> float:
@@ -728,22 +653,21 @@ class LegitFlowEngine:
 
     def _make_sgtin(self) -> str:
         serial = next(self._lot_counter)
-        company_prefix = GS1_COMPANY_PREFIX
+        company_prefix = "8500000"
         item_reference = f"{10000 + (serial % 89999):05d}"
         serial_component = f"{self._time_cursor.strftime('%y%m%d')}{serial:06d}"
         return f"urn:epc:id:sgtin:{company_prefix}.{item_reference}.{serial_component}"
 
     def _make_sscc(self) -> str:
-        serial = next(self._ref_counter)
-        # SSCC payload is extension digit (1) + company prefix (7) +
-        # day-of-year (3) + serial reference, summing to exactly 17 digits
-        # ahead of the check digit. Wrap the serial into the 6 digits that
-        # leaves rather than building an 18-character string and slicing it
-        # — slicing silently dropped the serial's last digit and made
-        # distinct lots collide on the same SSCC.
-        serial_component = f"{serial % 1_000_000:06d}"
-        payload = f"0{GS1_COMPANY_PREFIX}{self._time_cursor.strftime('%j')}{serial_component}"
-        return make_sscc(payload)
+        # An SSCC is 18 digits: a 17-digit base plus a GS1 check digit.
+        # extension (1) + company prefix (7) + day-of-year (3) + serial (6) = 17,
+        # so the serial must be kept to six digits rather than truncated after
+        # the fact — truncating a 7-digit serial collapsed every run of ten
+        # consecutive references onto the same SSCC.
+        serial = next(self._ref_counter) % 1_000_000
+        return sscc_from_base(
+            f"0{SSCC_COMPANY_PREFIX}{self._time_cursor.strftime('%j')}{serial:06d}"
+        )
 
     def _gs1_check_digit(self, digits: str) -> int:
         return gs1_check_digit(digits)
@@ -762,3 +686,11 @@ def _max_future_hours() -> int:
         return int(os.getenv("REGENGINE_SIM_MAX_FUTURE_HOURS", str(DEFAULT_MAX_FUTURE_HOURS)))
     except ValueError:
         return DEFAULT_MAX_FUTURE_HOURS
+
+
+def _history_hours() -> int:
+    try:
+        hours = int(os.getenv("REGENGINE_SIM_HISTORY_HOURS", str(DEFAULT_HISTORY_HOURS)))
+    except ValueError:
+        return DEFAULT_HISTORY_HOURS
+    return hours if hours > 0 else DEFAULT_HISTORY_HOURS

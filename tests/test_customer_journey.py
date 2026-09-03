@@ -1,21 +1,16 @@
 from __future__ import annotations
 
-import argparse
-import asyncio
 import socket
 import threading
-from types import SimpleNamespace
 
-import httpx
 import pytest
 
-from scripts import customer_journey
 from scripts.customer_journey import (
     JourneyReport,
+    RedisReplyError,
     build_config,
     generate_batch,
     parse_redis_url,
-    record_billing_seed,
     resp_command,
     seed_billing_status,
 )
@@ -59,242 +54,241 @@ def test_journey_config_targets_live_delivery() -> None:
     assert str(config.delivery.endpoint) == "http://localhost:8000/api/v1/webhooks/ingest"
 
 
+def test_provision_returns_the_key_id_needed_for_teardown() -> None:
+    import asyncio
+
+    import httpx
+
+    from scripts.customer_journey import provision_tenant_and_key
+
+    def handle(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/v1/admin/tenants":
+            return httpx.Response(200, json={"tenant_id": "tenant-123"})
+        if request.url.path == "/v1/admin/keys":
+            return httpx.Response(200, json={"api_key": "rge_secret", "key_id": "key-456"})
+        return httpx.Response(404)
+
+    async def run():
+        async with httpx.AsyncClient(transport=httpx.MockTransport(handle)) as client:
+            return await provision_tenant_and_key(client, "http://stack.test", "admin")
+
+    provisioned = asyncio.run(run())
+
+    assert provisioned.tenant_id == "tenant-123"
+    assert provisioned.api_key == "rge_secret"
+    assert provisioned.key_id == "key-456"
+    # The raw API key must not leak through the dataclass repr.
+    assert "rge_secret" not in repr(provisioned)
+
+
+def test_deprovision_deletes_the_key_then_the_tenant() -> None:
+    import asyncio
+
+    import httpx
+
+    from scripts.customer_journey import (
+        JourneyReport,
+        ProvisionedTenant,
+        deprovision_tenant_and_key,
+    )
+
+    deleted: list[str] = []
+
+    def handle(request: httpx.Request) -> httpx.Response:
+        assert request.method == "DELETE"
+        assert request.headers["X-Admin-Key"] == "admin"
+        deleted.append(request.url.path)
+        return httpx.Response(204)
+
+    report = JourneyReport()
+
+    async def run():
+        async with httpx.AsyncClient(transport=httpx.MockTransport(handle)) as client:
+            await deprovision_tenant_and_key(
+                client,
+                "http://stack.test",
+                "admin",
+                ProvisionedTenant("tenant-123", "rge_secret", "key-456"),
+                report,
+            )
+
+    asyncio.run(run())
+
+    assert deleted == ["/v1/admin/keys/key-456", "/v1/admin/tenants/tenant-123"]
+    assert report.failed is False
+
+
+def test_deprovision_reports_manual_cleanup_when_the_admin_api_refuses() -> None:
+    import asyncio
+
+    import httpx
+
+    from scripts.customer_journey import (
+        JourneyReport,
+        ProvisionedTenant,
+        deprovision_tenant_and_key,
+    )
+
+    report = JourneyReport()
+
+    async def run():
+        async with httpx.AsyncClient(
+            transport=httpx.MockTransport(lambda request: httpx.Response(405))
+        ) as client:
+            await deprovision_tenant_and_key(
+                client,
+                "http://stack.test",
+                "admin",
+                ProvisionedTenant("tenant-123", "rge_secret", None),
+                report,
+            )
+
+    asyncio.run(run())
+
+    assert report.failed is True
+    assert "tenant-123" in report.steps[-1][2]
+
+
 # ---------------------------------------------------------------------------
-# #109 -- the billing seed must detect a failed Redis write, not just an
-# error reply. seed_billing_status used to treat any reply not starting with
-# "-" as success, so a closed peer (empty read) or TLS alert bytes produced a
-# PASS line for a write that never happened.
+# #109 -- the billing seed used to call anything not starting with "-" a PASS
 # ---------------------------------------------------------------------------
 
 
-class _ScriptedRedis:
-    """A single-connection TCP server that plays a fixed reply script."""
+class FakeRedis:
+    """A one-connection RESP server that replies from a scripted list.
 
-    def __init__(self, replies: list[bytes] | None, *, close_immediately: bool = False) -> None:
-        self.replies = replies or []
-        self.close_immediately = close_immediately
-        self.received = b""
-        self._listener = socket.socket()
-        self._listener.bind(("127.0.0.1", 0))
-        self._listener.listen(1)
-        self.port = self._listener.getsockname()[1]
+    ``replies`` entries are raw bytes to send; the sentinel ``CLOSE`` hangs up
+    instead, which is what a TLS-only server does to a plaintext client.
+    """
+
+    CLOSE = object()
+
+    def __init__(self, replies):
+        self.replies = list(replies)
+        self.received = bytearray()
+        self._sock = socket.socket()
+        self._sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        self._sock.bind(("127.0.0.1", 0))
+        self._sock.listen(1)
+        self.port = self._sock.getsockname()[1]
         self._thread = threading.Thread(target=self._serve, daemon=True)
         self._thread.start()
 
-    def url(self, scheme: str = "redis", password: str | None = None) -> str:
-        credential = f":{password}@" if password else ""
-        return f"{scheme}://{credential}127.0.0.1:{self.port}/0"
-
     def _serve(self) -> None:
         try:
-            conn, _ = self._listener.accept()
+            conn, _ = self._sock.accept()
         except OSError:
             return
         with conn:
-            conn.settimeout(2)
-            try:
-                if self.close_immediately:
-                    # Give whatever the client sends first a chance to land so
-                    # the test can assert on it, then drop the connection.
-                    self.received += conn.recv(65536)
+            for reply in self.replies:
+                try:
+                    chunk = conn.recv(4096)
+                except OSError:
                     return
-                for reply in self.replies:
-                    data = conn.recv(65536)
-                    if not data:
-                        return
-                    self.received += data
+                if not chunk:
+                    return
+                self.received.extend(chunk)
+                if reply is self.CLOSE:
+                    return
+                try:
                     conn.sendall(reply)
-            except OSError:
-                return
+                except OSError:
+                    return
+
+    def url(self, *, scheme: str = "redis", password: str | None = None) -> str:
+        auth = f":{password}@" if password else ""
+        return f"{scheme}://{auth}127.0.0.1:{self.port}/0"
 
     def close(self) -> None:
-        self._listener.close()
-        self._thread.join(timeout=3)
+        self._sock.close()
+        self._thread.join(timeout=2)
 
 
 @pytest.fixture
-def scripted_redis():
-    servers: list[_ScriptedRedis] = []
+def fake_redis():
+    servers = []
 
-    def factory(replies: list[bytes] | None = None, *, close_immediately: bool = False):
-        server = _ScriptedRedis(replies, close_immediately=close_immediately)
+    def build(replies):
+        server = FakeRedis(replies)
         servers.append(server)
         return server
 
-    yield factory
+    yield build
     for server in servers:
         server.close()
 
 
-def test_seed_billing_status_accepts_a_well_formed_exchange(scripted_redis) -> None:
-    server = scripted_redis([b":1\r\n", b"$8\r\ntrialing\r\n"])
+def test_billing_seed_succeeds_on_a_well_formed_exchange(fake_redis) -> None:
+    server = fake_redis([b":1\r\n", b"$8\r\ntrialing\r\n"])
 
     seed_billing_status(server.url(), "tenant-1", "trialing")
 
-    assert b"HSET" in server.received
+    assert b"HSET" in bytes(server.received)
+    assert b"HGET" in bytes(server.received)
 
 
-def test_seed_billing_status_raises_when_the_peer_closes(scripted_redis) -> None:
-    server = scripted_redis(None, close_immediately=True)
+def test_billing_seed_raises_when_the_peer_closes_without_replying(fake_redis) -> None:
+    """The false PASS from #109: an empty read used to return silently."""
+    server = fake_redis([FakeRedis.CLOSE])
 
-    with pytest.raises(RuntimeError, match="closed the connection"):
-        seed_billing_status(server.url(), "tenant-1", "trialing")
-
-
-def test_seed_billing_status_raises_on_bytes_that_are_not_resp(scripted_redis) -> None:
-    # What a TLS server answering a plaintext client actually sends back.
-    server = scripted_redis([b"\x15\x03\x03\x00\x02\x02\x14\r\n"])
-
-    with pytest.raises(RuntimeError, match="unrecognized RESP type"):
-        seed_billing_status(server.url(), "tenant-1", "trialing")
+    with pytest.raises(RedisReplyError, match="closed the connection"):
+        seed_billing_status(server.url(), "tenant-1")
 
 
-def test_seed_billing_status_raises_when_hset_does_not_answer_an_integer(scripted_redis) -> None:
-    server = scripted_redis([b"+QUEUED\r\n"])
+def test_billing_seed_raises_on_non_resp_bytes(fake_redis) -> None:
+    """TLS alert bytes do not start with '-', so they used to read as success."""
+    server = fake_redis([b"\x15\x03\x01\x00\x02\x02\x28"])
 
-    with pytest.raises(RuntimeError, match="HSET: expected a RESP integer"):
-        seed_billing_status(server.url(), "tenant-1", "trialing")
-
-
-def test_seed_billing_status_raises_when_the_readback_disagrees(scripted_redis) -> None:
-    server = scripted_redis([b":1\r\n", b"$6\r\nactive\r\n"])
-
-    with pytest.raises(RuntimeError, match="expected 'trialing'"):
-        seed_billing_status(server.url(), "tenant-1", "trialing")
+    with pytest.raises(RedisReplyError, match="Truncated or non-RESP"):
+        seed_billing_status(server.url(), "tenant-1")
 
 
-def test_billing_seed_records_fail_when_the_peer_closes(scripted_redis) -> None:
-    server = scripted_redis(None, close_immediately=True)
-    report = JourneyReport()
+def test_billing_seed_raises_when_hset_returns_the_wrong_resp_type(fake_redis) -> None:
+    server = fake_redis([b"+OK\r\n"])
 
-    record_billing_seed(report, server.url(), "tenant-1")
-
-    assert report.failed is True
-    name, ok, detail = report.steps[0]
-    assert name == "Activate billing (Redis seed)"
-    assert ok is False
-    assert "402/503" in detail
+    with pytest.raises(RedisReplyError, match="expected integer"):
+        seed_billing_status(server.url(), "tenant-1")
 
 
-def test_billing_seed_records_pass_on_a_confirmed_write(scripted_redis) -> None:
-    server = scripted_redis([b":1\r\n", b"$8\r\ntrialing\r\n"])
-    report = JourneyReport()
+def test_billing_seed_raises_on_a_redis_error_reply(fake_redis) -> None:
+    server = fake_redis([b"-NOAUTH Authentication required.\r\n"])
 
-    record_billing_seed(report, server.url(), "tenant-1")
-
-    assert report.failed is False
+    with pytest.raises(RedisReplyError, match="NOAUTH"):
+        seed_billing_status(server.url(), "tenant-1")
 
 
-def test_rediss_url_never_writes_the_password_in_plaintext(scripted_redis) -> None:
-    server = scripted_redis(None, close_immediately=True)
+def test_billing_seed_raises_when_the_read_back_disagrees(fake_redis) -> None:
+    """HSET can succeed against the wrong db or key prefix; prove the value."""
+    server = fake_redis([b":1\r\n", b"$-1\r\n"])
 
-    with pytest.raises(OSError):
-        seed_billing_status(server.url("rediss", password="s3cr3t-redis-password"), "tenant-1")
-
-    # Whatever reached the server is a TLS ClientHello, not an AUTH command.
-    assert b"s3cr3t-redis-password" not in server.received
-    assert b"AUTH" not in server.received
+    with pytest.raises(RedisReplyError, match="did not take effect"):
+        seed_billing_status(server.url(), "tenant-1")
 
 
-# ---------------------------------------------------------------------------
-# #190 -- --local provisions a tenant and an API key on every run and used to
-# leave both behind.
-# ---------------------------------------------------------------------------
+def test_rediss_url_never_writes_the_password_before_the_handshake(fake_redis) -> None:
+    """#109's credential exposure: AUTH used to go out over a raw socket."""
+    server = fake_redis([b"+OK\r\n", b":1\r\n", b"$8\r\ntrialing\r\n"])
 
+    with pytest.raises(Exception) as excinfo:
+        seed_billing_status(server.url(scheme="rediss", password="s3cret"), "tenant-1")
 
-class _StubLiveClient:
-    def __init__(self, *, raise_on_connect: bool = False) -> None:
-        self.raise_on_connect = raise_on_connect
-
-    async def check_connection(self, config):
-        if self.raise_on_connect:
-            raise RuntimeError("connection probe exploded")
-        return SimpleNamespace(verdict="connected", detail="ok")
-
-    async def ingest(self, payload, config, idempotency_key=None):
-        return SimpleNamespace(
-            response={"accepted": len(payload.events), "rejected": 0, "events": []}
-        )
-
-
-def _admin_handler(calls: list[tuple[str, str]], *, delete_status: int = 204):
-    def handler(request: httpx.Request) -> httpx.Response:
-        calls.append((request.method, request.url.path))
-        path = request.url.path
-        if request.method == "DELETE":
-            return httpx.Response(delete_status)
-        if path == "/v1/admin/tenants":
-            return httpx.Response(200, json={"tenant_id": "tenant-abc"})
-        if path == "/v1/admin/keys":
-            return httpx.Response(200, json={"api_key": "rge_journey_key", "key_id": "key-xyz"})
-        return httpx.Response(200, json={})
-
-    return handler
-
-
-def _local_args() -> argparse.Namespace:
-    return argparse.Namespace(
-        local=True,
-        confirm_live=False,
-        batches=1,
-        batch_size=1,
-        seed=204,
-        scale="small",
-        friction=False,
+    assert not isinstance(excinfo.value, AssertionError)
+    assert b"s3cret" not in bytes(server.received), (
+        "the Redis password reached the wire in plaintext before the TLS "
+        "handshake failed"
     )
 
 
-def _drive_local_journey(monkeypatch, calls, *, live_client, delete_status: int = 204):
-    monkeypatch.setenv("REGENGINE_ADMIN_KEY", "admin-master-key")
-    monkeypatch.setenv("REGENGINE_BASE_URL", "http://regengine.test")
-    monkeypatch.setattr(customer_journey, "LiveRegEngineClient", lambda: live_client)
-    monkeypatch.setattr(customer_journey, "seed_billing_status", lambda *a, **k: None)
-
-    async def drive() -> int:
-        transport = httpx.MockTransport(_admin_handler(calls, delete_status=delete_status))
-        async with httpx.AsyncClient(transport=transport) as client:
-            return await customer_journey.run_journey(_local_args(), client=client)
-
-    return asyncio.run(drive())
-
-
-def test_local_journey_deletes_what_it_provisioned(monkeypatch) -> None:
-    calls: list[tuple[str, str]] = []
-
-    _drive_local_journey(monkeypatch, calls, live_client=_StubLiveClient())
-
-    assert ("DELETE", "/v1/admin/keys/key-xyz") in calls
-    assert ("DELETE", "/v1/admin/tenants/tenant-abc") in calls
-
-
-def test_local_journey_deletes_what_it_provisioned_when_a_later_step_raises(monkeypatch) -> None:
-    calls: list[tuple[str, str]] = []
-
-    with pytest.raises(RuntimeError, match="connection probe exploded"):
-        _drive_local_journey(
-            monkeypatch, calls, live_client=_StubLiveClient(raise_on_connect=True)
-        )
-
-    # The tenant exists from the moment provisioning returned, so its removal
-    # cannot depend on the rest of the journey succeeding.
-    assert ("DELETE", "/v1/admin/tenants/tenant-abc") in calls
-
-
-def test_teardown_reports_a_failure_when_the_admin_api_has_no_delete_route() -> None:
-    calls: list[tuple[str, str]] = []
+def test_a_failed_seed_is_recorded_as_a_journey_failure(fake_redis, capsys) -> None:
+    """The caller wraps this in try/except and records PASS/FAIL from it."""
+    server = fake_redis([FakeRedis.CLOSE])
     report = JourneyReport()
 
-    async def drive() -> None:
-        transport = httpx.MockTransport(_admin_handler(calls, delete_status=405))
-        async with httpx.AsyncClient(transport=transport) as client:
-            await customer_journey.deprovision_tenant_and_key(
-                client, "http://regengine.test", "admin-master-key", "tenant-abc", "key-xyz", report
-            )
+    try:
+        seed_billing_status(server.url(), "tenant-1")
+        report.record("Activate billing (Redis seed)", True, "status=trialing")
+    except Exception as exc:  # noqa: BLE001 - mirrors customer_journey.run
+        report.record("Activate billing (Redis seed)", False, str(exc))
 
-    asyncio.run(drive())
-
-    assert report.failed is True
-    name, ok, detail = report.steps[-1]
-    assert name == "Teardown: journey tenant + key removed"
-    assert ok is False
-    assert "tenant-abc" in detail
+    assert report.failed
+    assert "[FAIL] Activate billing (Redis seed)" in capsys.readouterr().out

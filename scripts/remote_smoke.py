@@ -2,12 +2,10 @@ from __future__ import annotations
 
 import os
 import sys
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
-from functools import partial
 from pathlib import Path
 from typing import Any
-from urllib.parse import urlparse
 
 import httpx
 
@@ -15,41 +13,24 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
-# Must follow the sys.path insert above: this script is run directly
-# (`python scripts/remote_smoke.py`), so the repo root is not on sys.path
-# until that line puts it there. Deliberate, not an ordering slip (#137).
+# Imported after the sys.path bootstrap above so `python scripts/remote_smoke.py`
+# works from a clean checkout; hence the E402 waivers.
 from app.build_info import APP_VERSION  # noqa: E402
-from scripts import _smoke_common  # noqa: E402
-from scripts._smoke_common import origin_from_url, secret_values  # noqa: E402
+from scripts import _smoke_common as smoke  # noqa: E402
 
 
 DEFAULT_TENANT = "remote-smoke"
+# Hosts remote smoke is allowed to send the shared-demo Basic Auth secrets to.
+# A leading dot matches subdomains. `demo.example.com` is the RFC 2606 reserved
+# documentation domain used by the docs and the offline test transport; it is
+# not routable, so it cannot receive credentials.
+DEFAULT_ALLOWED_BASE_HOSTS = (
+    "regengine-inflow-lab-gh-production.up.railway.app",
+    "demo.example.com",
+)
+ALLOWED_HOSTS_ENV = "REGENGINE_REMOTE_ALLOWED_HOSTS"
 DEFAULT_UNTRUSTED_ORIGIN = "https://untrusted.example"
 FRESH_CUT_OUTPUT_LOT = "TLC-DEMO-FC-OUT-001"
-
-# #124: the remote-smoke workflows take `base_url` as a free-text
-# workflow_dispatch input and hand it to this script in the same env block
-# that carries the live shared-demo REGENGINE_REMOTE_USERNAME/PASSWORD.
-# Without a host restriction, anyone who can dispatch the workflow could
-# point it at a server they control and collect those credentials from the
-# Basic Auth header of the first authenticated request -- no PR, no review.
-# So the destination host is allowlisted here, in code, and checked before
-# a config carrying the secrets is ever constructed.
-DEFAULT_ALLOWED_HOSTS = ("regengine-inflow-lab-gh-production.up.railway.app",)
-
-# Loopback is always permitted: `browser_smoke.py` spawns its own uvicorn on
-# 127.0.0.1 for local runs, and a developer pointing either script at their
-# own instance is not an exfiltration path.
-LOOPBACK_HOSTS = frozenset({"127.0.0.1", "::1", "localhost"})
-
-# Escape hatch for a legitimately different deployment (a fork, a staging
-# host). Deliberately an environment variable and NOT a workflow input:
-# a dispatcher can only set the inputs a workflow declares, so this cannot
-# be reached from the dispatch form that motivates the allowlist -- setting
-# it requires editing a workflow, which takes a reviewed commit. Replaces
-# the defaults rather than extending them, so the permitted set is always
-# exactly what the operator wrote.
-ALLOWED_HOSTS_ENV_VAR = "REGENGINE_REMOTE_ALLOWED_HOSTS"
 
 
 class RemoteSmokeFailure(AssertionError):
@@ -103,8 +84,8 @@ def main() -> int:
     return 0
 
 
-def config_from_env(environ: dict[str, str] | None = None) -> RemoteSmokeConfig:
-    environ = environ or os.environ
+def config_from_env(environ: Mapping[str, str] | None = None) -> RemoteSmokeConfig:
+    env: Mapping[str, str] = environ if environ else os.environ
     missing = [
         name
         for name in (
@@ -112,27 +93,28 @@ def config_from_env(environ: dict[str, str] | None = None) -> RemoteSmokeConfig:
             "REGENGINE_REMOTE_USERNAME",
             "REGENGINE_REMOTE_PASSWORD",
         )
-        if not environ.get(name)
+        if not env.get(name)
     ]
     if missing:
         raise RemoteSmokeFailure(
             "Missing required environment variables: " + ", ".join(missing)
         )
 
-    base_url = normalize_base_url(environ["REGENGINE_REMOTE_BASE_URL"])
-    # Before the config -- and therefore the username/password -- exists.
-    assert_base_url_allowed(base_url, environ)
+    base_url = normalize_base_url(
+        env["REGENGINE_REMOTE_BASE_URL"],
+        allowed_hosts=allowed_base_hosts(env),
+    )
     return RemoteSmokeConfig(
         base_url=base_url,
-        username=environ["REGENGINE_REMOTE_USERNAME"],
-        password=environ["REGENGINE_REMOTE_PASSWORD"],
-        tenant=environ.get("REGENGINE_REMOTE_TENANT") or DEFAULT_TENANT,
-        cors_origin=normalize_optional_origin(environ.get("REGENGINE_REMOTE_CORS_ORIGIN")),
+        username=env["REGENGINE_REMOTE_USERNAME"],
+        password=env["REGENGINE_REMOTE_PASSWORD"],
+        tenant=env.get("REGENGINE_REMOTE_TENANT") or DEFAULT_TENANT,
+        cors_origin=normalize_optional_origin(env.get("REGENGINE_REMOTE_CORS_ORIGIN")),
         untrusted_origin=normalize_optional_origin(
-            environ.get("REGENGINE_REMOTE_UNTRUSTED_ORIGIN")
+            env.get("REGENGINE_REMOTE_UNTRUSTED_ORIGIN")
         )
         or DEFAULT_UNTRUSTED_ORIGIN,
-        expected_build_sha=environ.get("REGENGINE_EXPECTED_BUILD_SHA") or None,
+        expected_build_sha=env.get("REGENGINE_EXPECTED_BUILD_SHA") or None,
     )
 
 
@@ -303,8 +285,9 @@ def request_json(
         json=json,
         params=params,
     )
-    return _smoke_common.response_json(
-        RemoteSmokeFailure, response, path, redact=config.redact
+    assert_status(config, response, 200, path)
+    return smoke.response_json(
+        response, path, failure=RemoteSmokeFailure, redact=config.redact
     )
 
 
@@ -321,14 +304,14 @@ def request(
 ) -> httpx.Response:
     request_headers = {"X-RegEngine-Tenant": config.tenant}
     request_headers.update(headers or {})
-    auth = httpx.BasicAuth(config.username, config.password) if authenticated else None
-    return client.request(
+    return smoke.request(
+        client,
         method,
         path,
         headers=request_headers,
         json=json,
         params=params,
-        auth=auth,
+        auth=httpx.BasicAuth(config.username, config.password) if authenticated else None,
     )
 
 
@@ -346,22 +329,18 @@ def health_response_header(
     )
 
 
-# The shared harness in _smoke_common takes the failure type as its first
-# argument so every script can keep its own exception class. These bind
-# this script's class once instead of at each of the call sites below.
-assert_equal = partial(_smoke_common.assert_equal, RemoteSmokeFailure)
-assert_in = partial(_smoke_common.assert_in, RemoteSmokeFailure)
-assert_build_sha = partial(_smoke_common.assert_build_sha, RemoteSmokeFailure)
-
-
 def assert_status(
     config: RemoteSmokeConfig,
     response: httpx.Response,
     expected_status: int,
     label: str,
 ) -> None:
-    _smoke_common.assert_status(
-        RemoteSmokeFailure, response, expected_status, label, redact=config.redact
+    smoke.assert_status(
+        response,
+        expected_status,
+        label,
+        failure=RemoteSmokeFailure,
+        redact=config.redact,
     )
 
 
@@ -372,87 +351,78 @@ def assert_header(
     expected_value: str,
     label: str,
 ) -> None:
-    _smoke_common.assert_header(
-        RemoteSmokeFailure,
+    smoke.assert_header(
         response,
         header_name,
         expected_value,
         label,
+        failure=RemoteSmokeFailure,
         redact=config.redact,
     )
 
 
+def assert_equal(actual: Any, expected: Any, label: str) -> None:
+    smoke.assert_equal(actual, expected, label, failure=RemoteSmokeFailure)
+
+
+def assert_in(member: Any, container: Any, label: str) -> None:
+    smoke.assert_in(member, container, label, failure=RemoteSmokeFailure)
+
+
 def assert_build_info(config: RemoteSmokeConfig, build: Any) -> dict[str, Any]:
-    return _smoke_common.assert_build_info(RemoteSmokeFailure, build, APP_VERSION)
+    return smoke.assert_build_info(build, APP_VERSION, failure=RemoteSmokeFailure)
 
 
-def normalize_base_url(value: str) -> str:
-    return _smoke_common.normalize_base_url(
-        RemoteSmokeFailure,
+def assert_build_sha(actual: Any, expected: str, label: str) -> None:
+    smoke.assert_build_sha(actual, expected, label, failure=RemoteSmokeFailure)
+
+
+def allowed_base_hosts(environ: Mapping[str, str] | None = None) -> tuple[str, ...]:
+    """Hosts remote smoke may send the shared-demo Basic Auth secrets to.
+
+    The workflow_dispatch `base_url` input is free text, so without this the
+    dispatcher could point the run at a host they control and collect the live
+    REGENGINE_REMOTE_USERNAME/PASSWORD out of the Basic Auth header. Override
+    with REGENGINE_REMOTE_ALLOWED_HOSTS (comma separated, a leading dot matches
+    subdomains) -- an env var, so it cannot be set from a dispatch input.
+    """
+    return smoke.allowed_hosts_from_env(
+        ALLOWED_HOSTS_ENV, DEFAULT_ALLOWED_BASE_HOSTS, environ
+    )
+
+
+def normalize_base_url(value: str, allowed_hosts: Sequence[str] | None = None) -> str:
+    return smoke.normalize_base_url(
         value,
-        message=(
+        allowed_hosts=allowed_hosts if allowed_hosts is not None else allowed_base_hosts(),
+        failure=RemoteSmokeFailure,
+        scheme_error=(
             "REGENGINE_REMOTE_BASE_URL must be an HTTP(S) URL such as "
+            "https://demo.example.com"
+        ),
+        host_error=lambda host, hosts: (
+            f"REGENGINE_REMOTE_BASE_URL host {host!r} is not allowed. Remote smoke "
+            "attaches the shared-demo Basic Auth credentials to every "
+            "authenticated request, so it only runs against "
+            f"{', '.join(hosts)}. Set {ALLOWED_HOSTS_ENV} to extend the allowlist."
+        ),
+    )
+
+
+def normalize_optional_origin(value: str | None) -> str | None:
+    return smoke.normalize_optional_origin(
+        value,
+        failure=RemoteSmokeFailure,
+        error=(
+            "Remote smoke CORS origins must be HTTP(S) origins such as "
             "https://demo.example.com"
         ),
     )
 
 
-def allowed_smoke_hosts(environ: Mapping[str, str] | None = None) -> tuple[str, ...]:
-    """The hosts a smoke script may send real credentials to (#124)."""
-    env = os.environ if environ is None else environ
-    configured = (env.get(ALLOWED_HOSTS_ENV_VAR) or "").replace(",", " ").split()
-    if configured:
-        return tuple(host.lower() for host in configured)
-    return DEFAULT_ALLOWED_HOSTS
-
-
-def assert_base_url_allowed(
-    base_url: str,
-    environ: Mapping[str, str] | None = None,
-) -> str:
-    """Fail closed unless ``base_url`` names an allowlisted host (#124).
-
-    Compares ``parsed.hostname`` rather than ``parsed.netloc``: hostname is
-    lowercased and strips both the port and any ``user:pass@`` userinfo
-    prefix, so it is the host the client will actually dial. Matching on the
-    raw netloc would let ``https://allowed.host@attacker.example/`` read as
-    allowlisted while every request went to ``attacker.example``.
-
-    Plaintext HTTP is refused for non-loopback hosts as well. Basic Auth puts
-    the shared-demo password in a base64 header on the wire, so an ``http://``
-    downgrade to even an allowlisted host hands it to anyone on the path.
-    """
-    parsed = urlparse(base_url)
-    host = (parsed.hostname or "").lower()
-    if host in LOOPBACK_HOSTS:
-        return base_url
-
-    allowed = allowed_smoke_hosts(environ)
-    if host not in allowed:
-        raise RemoteSmokeFailure(
-            f"Refusing to send credentials to {host or base_url!r}: not an "
-            f"allowlisted remote-smoke host. Allowed: {', '.join(allowed)}. "
-            f"Set {ALLOWED_HOSTS_ENV_VAR} to target a different deployment."
-        )
-    if parsed.scheme != "https":
-        raise RemoteSmokeFailure(
-            f"Refusing to send credentials to {base_url!r} over plaintext HTTP: "
-            "Basic Auth would be exposed on the wire. Use https://."
-        )
-    return base_url
-
-
-def normalize_optional_origin(value: str | None) -> str | None:
-    if not value or not value.strip():
-        return None
-    origin = value.strip().rstrip("/")
-    parsed = urlparse(origin)
-    if parsed.scheme not in _smoke_common.HTTP_SCHEMES or not parsed.netloc:
-        raise RemoteSmokeFailure(
-            "Remote smoke CORS origins must be HTTP(S) origins such as "
-            "https://demo.example.com"
-        )
-    return f"{parsed.scheme}://{parsed.netloc}"
+origin_from_url = smoke.origin_from_url
+secret_values = smoke.secret_values
+_sha_prefix_match = smoke.sha_prefix_match
 
 
 if __name__ == "__main__":

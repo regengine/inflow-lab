@@ -5,7 +5,7 @@
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
     <title>Meridian Fresh Ops — Plant Operations Console</title>
     <link rel="icon" href="data:," />
-    <link rel="stylesheet" href="/static/styles.css?v=6" />
+    <link rel="stylesheet" href="/static/styles.css?v=11" />
   </head>
   <body>
     <main class="page">
@@ -72,7 +72,7 @@
           <button class="button secondary guide-tour-btn" id="tourBtn" type="button">Take the tour</button>
         </header>
         <ol class="guide-steps">
-          <li data-guide-step="setup" data-guide-target=".compact-panel" data-state="current" role="button" aria-current="step" tabindex="0">
+          <li data-guide-step="setup" data-guide-target=".compact-panel" data-state="current" role="button" tabindex="0" aria-current="step">
             <span class="guide-num">1</span>
             <strong>Set up the line</strong>
             <small>Pick an operation type and line profile — or just keep the defaults.</small>
@@ -106,7 +106,8 @@
           <h2>Watch the line, trace lots through the plant, and keep compliance records current.</h2>
         </div>
         <div class="quick-trace">
-          <input id="lotLookup" aria-label="Traceability Lot Code" placeholder="Traceability Lot Code" />
+          <label class="sr-only" for="lotLookup">Traceability Lot Code</label>
+          <input id="lotLookup" placeholder="Traceability Lot Code" />
           <button class="button secondary" type="button" onclick="document.getElementById('lineageBtn').click()">Trace lot</button>
         </div>
       </section>
@@ -175,7 +176,7 @@
               <span class="status-pill" id="runStatePill">Idle</span>
             </div>
             <p class="panel-help"><strong>Start line</strong> records events continuously; <strong>Record next batch</strong> (up top) does one batch at a time. <strong>Clear shift</strong> wipes this workspace's records so you can start fresh.</p>
-            <p class="note status-message" id="statusMessage" role="status" aria-live="polite">Ready.</p>
+            <p class="note status-message" id="statusMessage" role="status" aria-live="polite" aria-atomic="true">Ready.</p>
             <div class="action-row">
               <button class="button" id="startBtn" type="button">Start line</button>
               <button class="button secondary" id="stopBtn" type="button">Pause line</button>
@@ -211,8 +212,6 @@
               </label>
               <label class="wide-field">
                 Ingest endpoint
-                <!-- The placeholder is filled from /api/integration/status.default_endpoint
-                     by app.js (#155); the live ingest URL is not repeated here. -->
                 <input id="endpoint" name="endpoint" />
               </label>
               <label class="wide-field">
@@ -349,7 +348,7 @@
               <button class="button secondary" id="retryFailedBtn" type="button">Retry failed</button>
             </div>
             <p class="panel-help">Delivery health at a glance. <strong>Retry failed</strong> is always safe — retries reuse each record's original idempotency key, so nothing is ever ingested twice.</p>
-            <div id="deliverySummary" class="delivery-summary"></div>
+            <div id="deliverySummary" class="delivery-summary" role="status" aria-live="polite"></div>
           </section>
 
           <section class="panel evidence-panel">
@@ -381,6 +380,7 @@
                 <input id="exportEndDate" name="exportEndDate" type="date" />
               </label>
             </div>
+            <p class="export-hint" id="exportLotHint" hidden></p>
             <p class="note" id="exportPresetDescription">Full FDA-request export for the selected date range. EPCIS uses the same lot and date filters.</p>
           </section>
 
@@ -413,7 +413,7 @@
 
           <nav class="resource-links" aria-label="Resources">
             <a href="/docs" target="_blank" rel="noreferrer">Open API docs</a>
-            <a href="/api/mock/regengine/export/fda-request" target="_blank" rel="noreferrer">Download FDA export</a>
+            <a id="navExportLink" href="/api/mock/regengine/export/fda-request" target="_blank" rel="noreferrer">Download FDA export</a>
           </nav>
         </aside>
       </div>
@@ -451,6 +451,6 @@
       </div>
     </div>
 
-    <script src="/static/app.js?v=6" defer></script>
+    <script type="module" src="/static/app.js?v=11"></script>
   </body>
 </html>

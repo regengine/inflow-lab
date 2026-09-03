@@ -41,7 +41,7 @@ async def list_saved_scenarios(
     return ScenarioSaveListResponse(
         saves=[
             ScenarioSaveSummary.model_validate(summary)
-            for summary in active_controller.list_scenario_saves().saves
+            for summary in (await active_controller.list_scenario_saves()).saves
         ]
     )
 

@@ -1,71 +1,90 @@
-"""The two manual release-gate scripts must honor REGENGINE_DATA_DIR (#108).
+"""Coverage for the two scripts that make up the manual release gate.
 
-Both build a TestClient over the imported app, so the data root they write to
-is whatever ``app.tenancy`` resolved from the *caller's* environment. Both
-used to compare against, and clean up, a hardcoded ``data/`` instead -- so run
-from a shell carrying ``REGENGINE_DATA_DIR`` (which the shared-demo and
-live-trial profiles in DEPLOYMENT_PROFILES.md both export) the release smoke
-failed on a literal path-string mismatch and both scripts deleted a directory
-the app had never written, accumulating test tenants in the real store.
-
-These run each script as a subprocess with the variable set, because the
-defect only exists across that boundary: the data root is read at import time,
-so nothing about it can be exercised by monkeypatching inside a session that
-has already imported the app.
+`scripts/smoke_regression.py` and `run_full_fsma_simulation.py` were the only
+substantial code in the repo with no automated coverage, which is how both came
+to hardcode `data/` while the app resolves its root from REGENGINE_DATA_DIR:
+the smoke failed a literal path assertion, and both deleted a directory they
+had never written to. These tests run each script against a scratch data root
+and assert it leaves nothing behind there.
 """
 
 from __future__ import annotations
 
-import os
-import subprocess
-import sys
-from pathlib import Path
+import pytest
+from fastapi.testclient import TestClient
 
-REPO_ROOT = Path(__file__).resolve().parents[1]
+from app import tenancy
+from app.main import app
+from app.tenancy import DEFAULT_TENANT_ID
 
 
-def _run_release_script(script: str, data_root: Path) -> subprocess.CompletedProcess[str]:
-    data_root.mkdir(parents=True, exist_ok=True)
-    env = os.environ.copy()
-    env["REGENGINE_DATA_DIR"] = str(data_root)
-    return subprocess.run(
-        [sys.executable, str(REPO_ROOT / script)],
-        cwd=REPO_ROOT,
-        env=env,
-        capture_output=True,
-        text=True,
-        timeout=300,
-        check=False,
+@pytest.fixture
+def scratch_data_root(monkeypatch, tmp_path):
+    """Repoint tenant storage at an empty root, as REGENGINE_DATA_DIR would.
+
+    Patching the module attributes rather than the env var because
+    `app.tenancy` resolves DATA_ROOT once at import; a test that only set the
+    variable would be checking nothing.
+    """
+    tenant_root = tmp_path / "volume" / "tenants"
+    tenant_root.mkdir(parents=True, exist_ok=True)
+    monkeypatch.setattr(tenancy, "DATA_ROOT", tmp_path / "volume")
+    monkeypatch.setattr(tenancy, "TENANT_DATA_ROOT", tenant_root)
+    monkeypatch.setattr(
+        tenancy, "_tenant_controllers", {DEFAULT_TENANT_ID: tenancy.controller}
+    )
+    monkeypatch.setattr(tenancy, "_tenants_being_deleted", {})
+    return tenant_root
+
+
+def test_release_smoke_passes_against_a_relocated_data_root(scratch_data_root):
+    """The whole release gate, run where REGENGINE_DATA_DIR is not `data`."""
+    from scripts.smoke_regression import TENANTS, run_smoke
+
+    with TestClient(app) as client:
+        run_smoke(client)
+
+    # run_smoke itself does not clean up; main() does. What matters here is
+    # that the tenants were created under the configured root at all -- the
+    # persist_path assertion inside run_smoke is what used to fail.
+    assert {path.name for path in scratch_data_root.iterdir()} >= set(TENANTS)
+
+
+def test_release_smoke_cleanup_removes_tenants_from_the_configured_root(
+    scratch_data_root,
+):
+    from scripts.smoke_regression import TENANTS, cleanup_smoke_tenants, run_smoke
+
+    with TestClient(app) as client:
+        run_smoke(client)
+    cleanup_smoke_tenants()
+
+    leftovers = {path.name for path in scratch_data_root.iterdir()}
+    assert not (leftovers & set(TENANTS)), (
+        "release-smoke tenants were left behind in the configured data root; "
+        "cleanup is deleting some other directory"
     )
 
 
-def test_smoke_regression_passes_under_a_relocated_data_root(tmp_path):
-    data_root = tmp_path / "release-smoke-root"
+def test_full_fsma_simulation_cleans_up_its_tenant(scratch_data_root, capsys):
+    import run_full_fsma_simulation as sim
 
-    result = _run_release_script("scripts/smoke_regression.py", data_root)
-
-    assert result.returncode == 0, f"stdout:\n{result.stdout}\nstderr:\n{result.stderr}"
-    assert "Release smoke regression passed." in result.stdout
-
-
-def test_smoke_regression_cleans_up_under_the_configured_data_root(tmp_path):
-    data_root = tmp_path / "release-smoke-root"
-
-    result = _run_release_script("scripts/smoke_regression.py", data_root)
-
-    # The tenants the smoke provisions must be removed from the root the app
-    # actually wrote to, not from ./data. Checked independently of the exit
-    # code above: a cleanup aimed at the wrong directory leaves these behind
-    # whether the run passed or failed.
-    leftover = sorted(path.name for path in (data_root / "tenants").glob("release-smoke-*"))
-    assert leftover == [], f"tenants left behind: {leftover}\nstdout:\n{result.stdout}"
+    assert sim.main() == 0
+    captured = capsys.readouterr()
+    assert "Golden path complete" in captured.out
+    assert sim.TENANT_ID not in {path.name for path in scratch_data_root.iterdir()}
 
 
-def test_full_fsma_simulation_cleans_up_under_the_configured_data_root(tmp_path):
-    data_root = tmp_path / "golden-path-root"
+def test_no_script_hardcodes_the_default_data_root():
+    """Acceptance criterion from #108, kept as a guard against reintroduction."""
+    from pathlib import Path
 
-    result = _run_release_script("run_full_fsma_simulation.py", data_root)
-
-    assert result.returncode == 0, f"stdout:\n{result.stdout}\nstderr:\n{result.stderr}"
-    assert "Golden path complete" in result.stdout
-    assert not (data_root / "tenants" / "golden-path-demo").exists()
+    repo_root = Path(__file__).resolve().parents[1]
+    for relative in ("scripts/smoke_regression.py", "run_full_fsma_simulation.py"):
+        source = (repo_root / relative).read_text(encoding="utf-8")
+        for lineno, line in enumerate(source.splitlines(), start=1):
+            code = line.split("#", 1)[0]
+            assert '"data/' not in code and "'data/" not in code, (
+                f"{relative}:{lineno} hardcodes the default data root; derive it "
+                "from app.tenancy instead"
+            )

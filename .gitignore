@@ -14,3 +14,4 @@ uvicorn.out.log
 uvicorn.err.log
 output/playwright/
 data/pytest-tmp/
+data/pytest-tmp-*/

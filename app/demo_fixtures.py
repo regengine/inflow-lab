@@ -1,46 +1,72 @@
+"""Canned demo fixtures, rebased onto the live replay window.
+
+The event *bodies* below are authored against a fixed calendar starting at
+:data:`FIXTURE_BASE_DATE` — that keeps the diff readable and the lineage
+story (harvest 08:00, cool 09:10, pack 11:30, ship 14:00, receive 19:15)
+legible at a glance. What ships is those same events shifted forward by a
+whole number of days so the oldest fixture event lands the same distance
+behind wall-clock time as a live engine run starts
+(``REGENGINE_SIM_HISTORY_HOURS``, default 336h = 14 days; see
+``app/engine.LegitFlowEngine.reset``). A fixture run therefore has the same
+shape as a live run, and every event stays inside RegEngine's
+``WEBHOOK_MAX_EVENT_AGE_DAYS=90`` replay window (issue #102).
+
+The shift is a whole number of days, which keeps two properties the fixtures
+depend on:
+
+* relative spacing and ordering between events are preserved exactly, and
+  each event keeps its authored time of day (harvest still happens at 08:00);
+* date-only KDEs (``harvest_date``, ``ship_date``, ...) shift by the same
+  number of days as their event timestamp, so they never drift apart across a
+  midnight boundary. ``tests/test_fixture_audit.py`` asserts every fixture
+  still scores 100 with zero warnings.
+
+The shift is computed once at import, so fixtures are deterministic for the
+life of the process rather than moving under a running server.
+"""
+
 from __future__ import annotations
 
 import re
 from dataclasses import dataclass
-from datetime import UTC, datetime, timedelta
-from typing import Any
+from datetime import UTC, date, datetime, timedelta
 
-from .engine import GS1_COMPANY_PREFIX, make_sscc
+from .engine import SSCC_COMPANY_PREFIX, _history_hours, sscc_from_base
 from .schemas.domain import CTEType, DemoFixtureId, RegEngineEvent
 from .scenarios import ScenarioId
 
+#: The calendar the fixture bodies below are authored against. The oldest
+#: fixture event is ``FIXTURE_BASE_DATE`` at 08:00Z; everything else is
+#: relative to it.
+FIXTURE_BASE_DATE = date(2026, 2, 5)
 
-def _demo_sscc(serial: int) -> str:
-    """An 18-digit SSCC for one demo shipment's bill of lading (#209).
+_DATE_ONLY = re.compile(r"^\d{4}-\d{2}-\d{2}$")
 
-    The shipping/receiving KDEs below advertise their reference as
-    ``GS1-128 (00)...``. AI (00) *is* the SSCC application identifier, so
-    whatever follows it has to be a real SSCC -- 18 digits closed by a
-    GS1 mod-10 check digit -- and these used to carry human-readable
-    document numbers instead. Cosmetic in a simulator, and exactly the
-    class of malformed identifier this simulator exists to help people
-    notice, which is why the shipped demo data should not be the thing
-    modelling it.
 
-    Built with the engine's own construction (``app.engine.make_sscc``,
-    the same helper ``LegitFlowEngine._make_sscc`` uses for generated GS1
-    shipments) so fixtures and generated runs agree on the rules. The 9
-    digits of serial reference are fixed rather than date-derived like
-    the engine's, because the golden export tests render these fixtures
-    byte-for-byte and must stay reproducible.
+#: Hard ceiling on how far back the oldest fixture event may be placed. The
+#: engine's history offset is configurable, and a large
+#: ``REGENGINE_SIM_HISTORY_HOURS`` would otherwise push canned playback back
+#: out of RegEngine's 90-day replay window — the exact failure this rebase
+#: exists to end. 60 days keeps a month of headroom under the live floor.
+MAX_FIXTURE_AGE_DAYS = 60
+
+
+def fixture_time_shift(now: datetime | None = None) -> timedelta:
+    """Whole-day shift that lands the oldest fixture event on the live window.
+
+    Mirrors the engine's own starting offset (``REGENGINE_SIM_HISTORY_HOURS``)
+    so canned playback and a live simulation occupy the same slice of time,
+    clamped at :data:`MAX_FIXTURE_AGE_DAYS` so an unusual history setting can
+    never age the fixtures out of the replay window.
     """
-    return make_sscc(f"0{GS1_COMPANY_PREFIX}{serial:09d}")
+    moment = now or datetime.now(UTC)
+    age = min(timedelta(hours=_history_hours()), timedelta(days=MAX_FIXTURE_AGE_DAYS))
+    start = moment - age
+    return timedelta(days=(start.date() - FIXTURE_BASE_DATE).days)
 
 
-# One SSCC per bill of lading. A shipping event and the receiving event
-# that answers it deliberately share one, exactly as the human-readable
-# references they replace did -- that shared reference is what ties the
-# two ends of a shipment together.
-_SSCC_LEAFY_GREENS_BOL = _demo_sscc(1)
-_SSCC_FRESH_CUT_INBOUND_BOL_A = _demo_sscc(2)
-_SSCC_FRESH_CUT_INBOUND_BOL_B = _demo_sscc(3)
-_SSCC_FRESH_CUT_OUTBOUND_BOL = _demo_sscc(4)
-_SSCC_RETAIL_BOL = _demo_sscc(5)
+#: Resolved once at import so a fixture's timestamps never change mid-process.
+FIXTURE_TIME_SHIFT: timedelta = fixture_time_shift()
 
 
 @dataclass(frozen=True, slots=True)
@@ -67,8 +93,53 @@ class DemoFixture:
         return lot_codes
 
 
+#: Serial numbers behind each fixture pallet reference. GS1 Application
+#: Identifier ``(00)`` promises exactly 18 digits, so the human-readable
+#: ``BOL-DEMO-*`` label cannot live inside the ``(00)`` field — it stays on the
+#: ``reference_document_number`` KDE next to it, and the SSCC is minted here.
+#: Serials are fixed rather than derived so a fixture reference is stable
+#: across runs and two different bills of lading can never collide.
+FIXTURE_SSCC_SERIALS: dict[str, int] = {
+    "BOL-DEMO-LG-001": 100001,
+    "BOL-DEMO-FC-001": 100002,
+    "BOL-DEMO-FC-002": 100003,
+    "BOL-DEMO-FC-OUT-001": 100004,
+    "BOL-DEMO-RT-001": 100005,
+}
+
+#: Prefix every GS1-128 SSCC reference document carries.
+SSCC_REFERENCE_PREFIX = "GS1-128 (00)"
+
+
+def fixture_sscc(reference_number: str) -> str:
+    """Valid 18-digit SSCC for a fixture's bill-of-lading reference number."""
+    serial = FIXTURE_SSCC_SERIALS[reference_number]
+    return sscc_from_base(f"0{SSCC_COMPANY_PREFIX}{serial:09d}")
+
+
+def sscc_reference_document(reference_number: str) -> str:
+    """``GS1-128 (00)`` reference document carrying a real SSCC, not a label."""
+    return f"{SSCC_REFERENCE_PREFIX}{fixture_sscc(reference_number)}"
+
+
 def dt(value: str) -> datetime:
-    return datetime.fromisoformat(value.replace("Z", "+00:00")).astimezone(UTC)
+    """Parse an authored timestamp and shift it onto the live replay window."""
+    parsed = datetime.fromisoformat(value.replace("Z", "+00:00")).astimezone(UTC)
+    return parsed + FIXTURE_TIME_SHIFT
+
+
+def shift_kdes(kdes: dict) -> dict:
+    """Shift date-only KDE values by the same whole-day offset as timestamps."""
+    shift_days = FIXTURE_TIME_SHIFT.days
+    if not shift_days:
+        return kdes
+    shifted = {}
+    for key, value in kdes.items():
+        if isinstance(value, str) and _DATE_ONLY.match(value):
+            shifted[key] = (date.fromisoformat(value) + timedelta(days=shift_days)).isoformat()
+        else:
+            shifted[key] = value
+    return shifted
 
 
 def event(
@@ -89,7 +160,7 @@ def event(
         unit_of_measure=unit_of_measure,
         location_name=location_name,
         timestamp=dt(timestamp),
-        kdes=kdes,
+        kdes=shift_kdes(kdes),
     )
 
 
@@ -113,14 +184,14 @@ DEMO_FIXTURES: dict[DemoFixtureId, DemoFixture] = {
                         "harvest_date": "2026-02-05",
                         "farm_location": "Valley Fresh Farms",
                         "field_name": "Field-7",
+                        "field_gps_coordinates": "36.6777,-121.6555",
+                        "plu_code": "4640",
                         "immediate_subsequent_recipient": "Salinas Cooling Hub",
                         "reference_document": "GS1 Harvest Log HAR-DEMO-LG-001",
                         "reference_document_type": "Harvest Log",
                         "reference_document_number": "HAR-DEMO-LG-001",
                         "tlc_source_reference": "SRC-DEMO-LG-001",
                         "traceability_lot_code_source_reference": "SRC-DEMO-LG-001",
-                        "field_gps_coordinates": "36.6777,-121.6555",
-                        "plu_code": "4640",
                     },
                 )
             ),
@@ -161,19 +232,19 @@ DEMO_FIXTURES: dict[DemoFixtureId, DemoFixture] = {
                         "source_traceability_lot_code": "TLC-DEMO-LG-HARVEST-001",
                         "farm_location": "Valley Fresh Farms",
                         "harvester_business_name": "Valley Fresh Farms",
-                        "reference_document": "GS1 Packout Record PACK-DEMO-LG-001",
-                        "reference_document_type": "Packout Record",
-                        "reference_document_number": "PACK-DEMO-LG-001",
-                        "tlc_source_reference": "SRC-DEMO-LG-PACK-001",
-                        "traceability_lot_code_source_reference": "SRC-DEMO-LG-PACK-001",
                         "field_gps_coordinates": "36.6777,-121.6555",
                         "plu_code": "4640",
                         "packaging_hierarchy": ["bulk_bin", "individual_clamshell", "master_case"],
                         "packaging_conversion": {
                             "bulk_bin_count": 1,
-                            "clamshell_count": 1050,
-                            "master_case_count": 87,
+                            "clamshell_count": 1188,
+                            "master_case_count": 99,
                         },
+                        "reference_document": "GS1 Packout Record PACK-DEMO-LG-001",
+                        "reference_document_type": "Packout Record",
+                        "reference_document_number": "PACK-DEMO-LG-001",
+                        "tlc_source_reference": "SRC-DEMO-LG-PACK-001",
+                        "traceability_lot_code_source_reference": "SRC-DEMO-LG-PACK-001",
                     },
                 ),
                 parent_lot_codes=("TLC-DEMO-LG-HARVEST-001",),
@@ -192,9 +263,9 @@ DEMO_FIXTURES: dict[DemoFixtureId, DemoFixture] = {
                         "ship_from_location": "FreshPack Central",
                         "ship_to_location": "Distribution Center #4",
                         "carrier": "ColdRoute Freight",
-                        "reference_document": f"GS1-128 (00){_SSCC_LEAFY_GREENS_BOL}",
+                        "reference_document": sscc_reference_document("BOL-DEMO-LG-001"),
                         "reference_document_type": "Bill of Lading",
-                        "reference_document_number": _SSCC_LEAFY_GREENS_BOL,
+                        "reference_document_number": "BOL-DEMO-LG-001",
                         "tlc_source_reference": "SRC-DEMO-LG-PACK-001",
                         "traceability_lot_code_source_reference": "SRC-DEMO-LG-PACK-001",
                     },
@@ -214,9 +285,9 @@ DEMO_FIXTURES: dict[DemoFixtureId, DemoFixture] = {
                         "receiving_location": "Distribution Center #4",
                         "ship_from_location": "FreshPack Central",
                         "immediate_previous_source": "FreshPack Central",
-                        "reference_document": f"GS1-128 (00){_SSCC_LEAFY_GREENS_BOL}",
+                        "reference_document": sscc_reference_document("BOL-DEMO-LG-001"),
                         "reference_document_type": "Bill of Lading",
-                        "reference_document_number": _SSCC_LEAFY_GREENS_BOL,
+                        "reference_document_number": "BOL-DEMO-LG-001",
                         "tlc_source_reference": "SRC-DEMO-LG-PACK-001",
                         "traceability_lot_code_source_reference": "SRC-DEMO-LG-PACK-001",
                     },
@@ -243,14 +314,14 @@ DEMO_FIXTURES: dict[DemoFixtureId, DemoFixture] = {
                         "harvest_date": "2026-02-06",
                         "farm_location": "Valley Fresh Farms",
                         "field_name": "Field-3",
+                        "field_gps_coordinates": "36.6777,-121.6555",
+                        "plu_code": "4640",
                         "immediate_subsequent_recipient": "Salinas Cooling Hub",
                         "reference_document": "GS1 Harvest Log HAR-DEMO-FC-001",
                         "reference_document_type": "Harvest Log",
                         "reference_document_number": "HAR-DEMO-FC-001",
                         "tlc_source_reference": "SRC-DEMO-FC-001",
                         "traceability_lot_code_source_reference": "SRC-DEMO-FC-001",
-                        "field_gps_coordinates": "36.6777,-121.6555",
-                        "plu_code": "4640",
                     },
                 )
             ),
@@ -267,14 +338,14 @@ DEMO_FIXTURES: dict[DemoFixtureId, DemoFixture] = {
                         "harvest_date": "2026-02-06",
                         "farm_location": "Coastal Leaf Farm",
                         "field_name": "Field-11",
+                        "field_gps_coordinates": "36.6039,-121.8947",
+                        "plu_code": "4090",
                         "immediate_subsequent_recipient": "Coastal Cold Chain",
                         "reference_document": "GS1 Harvest Log HAR-DEMO-FC-002",
                         "reference_document_type": "Harvest Log",
                         "reference_document_number": "HAR-DEMO-FC-002",
                         "tlc_source_reference": "SRC-DEMO-FC-002",
                         "traceability_lot_code_source_reference": "SRC-DEMO-FC-002",
-                        "field_gps_coordinates": "36.6039,-121.8947",
-                        "plu_code": "4090",
                     },
                 )
             ),
@@ -336,19 +407,19 @@ DEMO_FIXTURES: dict[DemoFixtureId, DemoFixture] = {
                         "source_traceability_lot_code": "TLC-DEMO-FC-HARVEST-001",
                         "farm_location": "Valley Fresh Farms",
                         "harvester_business_name": "Valley Fresh Farms",
-                        "reference_document": "GS1 Packout Record PACK-DEMO-FC-001",
-                        "reference_document_type": "Packout Record",
-                        "reference_document_number": "PACK-DEMO-FC-001",
-                        "tlc_source_reference": "SRC-DEMO-FC-PACK-001",
-                        "traceability_lot_code_source_reference": "SRC-DEMO-FC-PACK-001",
                         "field_gps_coordinates": "36.6777,-121.6555",
                         "plu_code": "4640",
                         "packaging_hierarchy": ["bulk_bin", "individual_clamshell", "master_case"],
                         "packaging_conversion": {
                             "bulk_bin_count": 1,
-                            "clamshell_count": 750,
-                            "master_case_count": 62,
+                            "clamshell_count": 864,
+                            "master_case_count": 72,
                         },
+                        "reference_document": "GS1 Packout Record PACK-DEMO-FC-001",
+                        "reference_document_type": "Packout Record",
+                        "reference_document_number": "PACK-DEMO-FC-001",
+                        "tlc_source_reference": "SRC-DEMO-FC-PACK-001",
+                        "traceability_lot_code_source_reference": "SRC-DEMO-FC-PACK-001",
                     },
                 ),
                 parent_lot_codes=("TLC-DEMO-FC-HARVEST-001",),
@@ -369,19 +440,19 @@ DEMO_FIXTURES: dict[DemoFixtureId, DemoFixture] = {
                         "source_traceability_lot_code": "TLC-DEMO-FC-HARVEST-002",
                         "farm_location": "Coastal Leaf Farm",
                         "harvester_business_name": "Coastal Leaf Farm",
-                        "reference_document": "GS1 Packout Record PACK-DEMO-FC-002",
-                        "reference_document_type": "Packout Record",
-                        "reference_document_number": "PACK-DEMO-FC-002",
-                        "tlc_source_reference": "SRC-DEMO-FC-PACK-002",
-                        "traceability_lot_code_source_reference": "SRC-DEMO-FC-PACK-002",
                         "field_gps_coordinates": "36.6039,-121.8947",
                         "plu_code": "4090",
                         "packaging_hierarchy": ["bulk_bin", "individual_clamshell", "master_case"],
                         "packaging_conversion": {
                             "bulk_bin_count": 1,
-                            "clamshell_count": 650,
-                            "master_case_count": 54,
+                            "clamshell_count": 744,
+                            "master_case_count": 62,
                         },
+                        "reference_document": "GS1 Packout Record PACK-DEMO-FC-002",
+                        "reference_document_type": "Packout Record",
+                        "reference_document_number": "PACK-DEMO-FC-002",
+                        "tlc_source_reference": "SRC-DEMO-FC-PACK-002",
+                        "traceability_lot_code_source_reference": "SRC-DEMO-FC-PACK-002",
                     },
                 ),
                 parent_lot_codes=("TLC-DEMO-FC-HARVEST-002",),
@@ -400,9 +471,9 @@ DEMO_FIXTURES: dict[DemoFixtureId, DemoFixture] = {
                         "ship_from_location": "Processor Intake Packout",
                         "ship_to_location": "ReadyFresh Processing Plant",
                         "carrier": "PrepLine Logistics",
-                        "reference_document": f"GS1-128 (00){_SSCC_FRESH_CUT_INBOUND_BOL_A}",
+                        "reference_document": sscc_reference_document("BOL-DEMO-FC-001"),
                         "reference_document_type": "Bill of Lading",
-                        "reference_document_number": _SSCC_FRESH_CUT_INBOUND_BOL_A,
+                        "reference_document_number": "BOL-DEMO-FC-001",
                         "tlc_source_reference": "SRC-DEMO-FC-PACK-001",
                         "traceability_lot_code_source_reference": "SRC-DEMO-FC-PACK-001",
                     },
@@ -422,9 +493,9 @@ DEMO_FIXTURES: dict[DemoFixtureId, DemoFixture] = {
                         "ship_from_location": "Processor Intake Packout",
                         "ship_to_location": "ReadyFresh Processing Plant",
                         "carrier": "PrepLine Logistics",
-                        "reference_document": f"GS1-128 (00){_SSCC_FRESH_CUT_INBOUND_BOL_B}",
+                        "reference_document": sscc_reference_document("BOL-DEMO-FC-002"),
                         "reference_document_type": "Bill of Lading",
-                        "reference_document_number": _SSCC_FRESH_CUT_INBOUND_BOL_B,
+                        "reference_document_number": "BOL-DEMO-FC-002",
                         "tlc_source_reference": "SRC-DEMO-FC-PACK-002",
                         "traceability_lot_code_source_reference": "SRC-DEMO-FC-PACK-002",
                     },
@@ -444,9 +515,9 @@ DEMO_FIXTURES: dict[DemoFixtureId, DemoFixture] = {
                         "receiving_location": "ReadyFresh Processing Plant",
                         "ship_from_location": "Processor Intake Packout",
                         "immediate_previous_source": "Processor Intake Packout",
-                        "reference_document": f"GS1-128 (00){_SSCC_FRESH_CUT_INBOUND_BOL_A}",
+                        "reference_document": sscc_reference_document("BOL-DEMO-FC-001"),
                         "reference_document_type": "Bill of Lading",
-                        "reference_document_number": _SSCC_FRESH_CUT_INBOUND_BOL_A,
+                        "reference_document_number": "BOL-DEMO-FC-001",
                         "tlc_source_reference": "SRC-DEMO-FC-PACK-001",
                         "traceability_lot_code_source_reference": "SRC-DEMO-FC-PACK-001",
                     },
@@ -466,9 +537,9 @@ DEMO_FIXTURES: dict[DemoFixtureId, DemoFixture] = {
                         "receiving_location": "ReadyFresh Processing Plant",
                         "ship_from_location": "Processor Intake Packout",
                         "immediate_previous_source": "Processor Intake Packout",
-                        "reference_document": f"GS1-128 (00){_SSCC_FRESH_CUT_INBOUND_BOL_B}",
+                        "reference_document": sscc_reference_document("BOL-DEMO-FC-002"),
                         "reference_document_type": "Bill of Lading",
-                        "reference_document_number": _SSCC_FRESH_CUT_INBOUND_BOL_B,
+                        "reference_document_number": "BOL-DEMO-FC-002",
                         "tlc_source_reference": "SRC-DEMO-FC-PACK-002",
                         "traceability_lot_code_source_reference": "SRC-DEMO-FC-PACK-002",
                     },
@@ -495,10 +566,11 @@ DEMO_FIXTURES: dict[DemoFixtureId, DemoFixture] = {
                         "reference_document_type": "Batch Record",
                         "reference_document_number": "BATCH-DEMO-FC-001",
                         "yield_ratio": 0.802,
-                        "tlc_source_reference": "SRC-DEMO-FC-OUT-001",
-                        "traceability_lot_code_source_reference": "SRC-DEMO-FC-OUT-001",
                         "packaging_hierarchy": ["bulk_bin", "individual_clamshell", "master_case"],
                         "lineage_pattern": "commingled_packout",
+                        "plu_code": "4640",
+                        "tlc_source_reference": "SRC-DEMO-FC-OUT-001",
+                        "traceability_lot_code_source_reference": "SRC-DEMO-FC-OUT-001",
                     },
                 ),
                 parent_lot_codes=("TLC-DEMO-FC-PACK-001", "TLC-DEMO-FC-PACK-002"),
@@ -517,9 +589,9 @@ DEMO_FIXTURES: dict[DemoFixtureId, DemoFixture] = {
                         "ship_from_location": "ReadyFresh Processing Plant",
                         "ship_to_location": "Foodservice DC #12",
                         "carrier": "ColdRoute Freight",
-                        "reference_document": f"GS1-128 (00){_SSCC_FRESH_CUT_OUTBOUND_BOL}",
+                        "reference_document": sscc_reference_document("BOL-DEMO-FC-OUT-001"),
                         "reference_document_type": "Bill of Lading",
-                        "reference_document_number": _SSCC_FRESH_CUT_OUTBOUND_BOL,
+                        "reference_document_number": "BOL-DEMO-FC-OUT-001",
                         "tlc_source_reference": "SRC-DEMO-FC-OUT-001",
                         "traceability_lot_code_source_reference": "SRC-DEMO-FC-OUT-001",
                     },
@@ -539,9 +611,9 @@ DEMO_FIXTURES: dict[DemoFixtureId, DemoFixture] = {
                         "receiving_location": "Foodservice DC #12",
                         "ship_from_location": "ReadyFresh Processing Plant",
                         "immediate_previous_source": "ReadyFresh Processing Plant",
-                        "reference_document": f"GS1-128 (00){_SSCC_FRESH_CUT_OUTBOUND_BOL}",
+                        "reference_document": sscc_reference_document("BOL-DEMO-FC-OUT-001"),
                         "reference_document_type": "Bill of Lading",
-                        "reference_document_number": _SSCC_FRESH_CUT_OUTBOUND_BOL,
+                        "reference_document_number": "BOL-DEMO-FC-OUT-001",
                         "tlc_source_reference": "SRC-DEMO-FC-OUT-001",
                         "traceability_lot_code_source_reference": "SRC-DEMO-FC-OUT-001",
                     },
@@ -568,14 +640,14 @@ DEMO_FIXTURES: dict[DemoFixtureId, DemoFixture] = {
                         "harvest_date": "2026-02-08",
                         "farm_location": "SunCoast Produce Ranch",
                         "field_name": "Field-2",
+                        "field_gps_coordinates": "34.1231,-119.1802",
+                        "plu_code": "4090",
                         "immediate_subsequent_recipient": "Retail Cold Dock West",
                         "reference_document": "GS1 Harvest Log HAR-DEMO-RT-001",
                         "reference_document_type": "Harvest Log",
                         "reference_document_number": "HAR-DEMO-RT-001",
                         "tlc_source_reference": "SRC-DEMO-RT-001",
                         "traceability_lot_code_source_reference": "SRC-DEMO-RT-001",
-                        "field_gps_coordinates": "34.1231,-119.1802",
-                        "plu_code": "4090",
                     },
                 )
             ),
@@ -616,19 +688,19 @@ DEMO_FIXTURES: dict[DemoFixtureId, DemoFixture] = {
                         "source_traceability_lot_code": "TLC-DEMO-RT-HARVEST-001",
                         "farm_location": "SunCoast Produce Ranch",
                         "harvester_business_name": "SunCoast Produce Ranch",
-                        "reference_document": "GS1 Packout Record PACK-DEMO-RT-001",
-                        "reference_document_type": "Packout Record",
-                        "reference_document_number": "PACK-DEMO-RT-001",
-                        "tlc_source_reference": "SRC-DEMO-RT-PACK-001",
-                        "traceability_lot_code_source_reference": "SRC-DEMO-RT-PACK-001",
                         "field_gps_coordinates": "34.1231,-119.1802",
                         "plu_code": "4090",
                         "packaging_hierarchy": ["bulk_bin", "individual_clamshell", "master_case"],
                         "packaging_conversion": {
                             "bulk_bin_count": 1,
-                            "clamshell_count": 600,
-                            "master_case_count": 50,
+                            "clamshell_count": 684,
+                            "master_case_count": 57,
                         },
+                        "reference_document": "GS1 Packout Record PACK-DEMO-RT-001",
+                        "reference_document_type": "Packout Record",
+                        "reference_document_number": "PACK-DEMO-RT-001",
+                        "tlc_source_reference": "SRC-DEMO-RT-PACK-001",
+                        "traceability_lot_code_source_reference": "SRC-DEMO-RT-PACK-001",
                     },
                 ),
                 parent_lot_codes=("TLC-DEMO-RT-HARVEST-001",),
@@ -647,9 +719,9 @@ DEMO_FIXTURES: dict[DemoFixtureId, DemoFixture] = {
                         "ship_from_location": "Retail Ready Packout",
                         "ship_to_location": "Retail DC West",
                         "carrier": "StoreLane Logistics",
-                        "reference_document": f"GS1-128 (00){_SSCC_RETAIL_BOL}",
+                        "reference_document": sscc_reference_document("BOL-DEMO-RT-001"),
                         "reference_document_type": "Bill of Lading",
-                        "reference_document_number": _SSCC_RETAIL_BOL,
+                        "reference_document_number": "BOL-DEMO-RT-001",
                         "tlc_source_reference": "SRC-DEMO-RT-PACK-001",
                         "traceability_lot_code_source_reference": "SRC-DEMO-RT-PACK-001",
                     },
@@ -669,9 +741,9 @@ DEMO_FIXTURES: dict[DemoFixtureId, DemoFixture] = {
                         "receiving_location": "Retail DC West",
                         "ship_from_location": "Retail Ready Packout",
                         "immediate_previous_source": "Retail Ready Packout",
-                        "reference_document": f"GS1-128 (00){_SSCC_RETAIL_BOL}",
+                        "reference_document": sscc_reference_document("BOL-DEMO-RT-001"),
                         "reference_document_type": "Bill of Lading",
-                        "reference_document_number": _SSCC_RETAIL_BOL,
+                        "reference_document_number": "BOL-DEMO-RT-001",
                         "tlc_source_reference": "SRC-DEMO-RT-PACK-001",
                         "traceability_lot_code_source_reference": "SRC-DEMO-RT-PACK-001",
                     },
@@ -726,113 +798,8 @@ DEMO_FIXTURES: dict[DemoFixtureId, DemoFixture] = {
 }
 
 
-# ---------------------------------------------------------------------------
-# Load-time rebasing (#199)
-#
-# The literals above are the fixtures' canonical *shape*: which events happen,
-# in what order, and how far apart. They are deliberately fixed dates, because
-# the export conformance tests render golden FDA/EPCIS output straight from
-# DEMO_FIXTURES and need it byte-reproducible.
-#
-# What must not be fixed is how old those events are when they are *loaded*.
-# RegEngine enforces a 90-day event-age replay window on ingest, so a literal
-# 2026-02-05 harvest was 202 days old by the time #199 was filed and live
-# ingest would have rejected the entire Load Demo Fixture flow -- the one
-# workflow the fixtures exist to make reliable. The mock accepted them
-# happily, which is exactly the mock-versus-live drift this repository exists
-# to catch, and the gap widened by one day every day.
-#
-# So get_demo_fixture() returns a copy shifted onto today. The shift is a
-# whole number of days, computed once across *all* fixtures from a single
-# anchor, which is what preserves the lineage narrative: every event keeps its
-# time of day, its spacing from its neighbours, and its ordering relative to
-# events in the other fixtures.
-# ---------------------------------------------------------------------------
-
-# How far before "now" the newest fixture event should land. Non-zero so no
-# fixture event is ever in the future (the mock and live both reject events
-# beyond a small future ceiling), and small enough that the whole ~4-day span
-# sits far inside the 90-day window.
-FIXTURE_RECENCY_DAYS = 2
-
-# Matches a bare calendar date and nothing else. Fixture KDEs carry dates as
-# exact "YYYY-MM-DD" strings (harvest_date, cooling_date, pack_date,
-# ship_date, receive_date, transformation_date, landing_date ...) which have
-# to move with the event timestamp they describe, or the record starts
-# contradicting itself. Anchored on both ends so a reference number or lot
-# code that merely contains digits is never touched.
-_BARE_DATE = re.compile(r"\d{4}-\d{2}-\d{2}\Z")
-
-
-def _latest_fixture_timestamp() -> datetime:
-    return max(
-        fixture_event.event.timestamp
-        for fixture in DEMO_FIXTURES.values()
-        for fixture_event in fixture.events
-    )
-
-
-def demo_fixture_shift(now: datetime | None = None) -> timedelta:
-    """Whole-day offset that moves the fixture set onto the current date.
-
-    Derived from the newest event across every fixture, not per fixture, so
-    the three fixtures keep their positions relative to each other as well as
-    internally. Whole days only: that preserves each event's time of day and
-    lets the bare-date KDEs shift by simple date arithmetic.
-    """
-    now = now or datetime.now(UTC)
-    target = now.date() - timedelta(days=FIXTURE_RECENCY_DAYS)
-    return timedelta(days=(target - _latest_fixture_timestamp().date()).days)
-
-
-def _shift_kde_value(value: Any, shift: timedelta) -> Any:
-    if isinstance(value, str) and _BARE_DATE.fullmatch(value):
-        return (datetime.fromisoformat(value).date() + shift).isoformat()
-    if isinstance(value, dict):
-        return {key: _shift_kde_value(item, shift) for key, item in value.items()}
-    if isinstance(value, list):
-        return [_shift_kde_value(item, shift) for item in value]
-    return value
-
-
-def rebase_demo_fixture(fixture: DemoFixture, shift: timedelta) -> DemoFixture:
-    """Return ``fixture`` with every timestamp and bare-date KDE moved by ``shift``."""
-    if not shift:
-        return fixture
-    return DemoFixture(
-        id=fixture.id,
-        label=fixture.label,
-        description=fixture.description,
-        scenario=fixture.scenario,
-        events=tuple(
-            DemoFixtureEvent(
-                fixture_event.event.model_copy(
-                    update={
-                        "timestamp": fixture_event.event.timestamp + shift,
-                        "kdes": _shift_kde_value(fixture_event.event.kdes, shift),
-                    }
-                ),
-                fixture_event.parent_lot_codes,
-            )
-            for fixture_event in fixture.events
-        ),
-    )
-
-
-def get_demo_fixture(
-    fixture_id: DemoFixtureId | str,
-    now: datetime | None = None,
-) -> DemoFixture:
-    """The fixture as it should be *loaded*: rebased onto the current date.
-
-    Every caller that delivers or persists fixture events goes through here
-    (``SimulationController.load_demo_fixture``), so the events that reach
-    live ingest are always inside the replay window no matter when the repo
-    is run. ``DEMO_FIXTURES`` still holds the fixed-date originals for the
-    golden export tests.
-    """
-    fixture = DEMO_FIXTURES[DemoFixtureId(fixture_id)]
-    return rebase_demo_fixture(fixture, demo_fixture_shift(now))
+def get_demo_fixture(fixture_id: DemoFixtureId | str) -> DemoFixture:
+    return DEMO_FIXTURES[DemoFixtureId(fixture_id)]
 
 
 def list_demo_fixture_summaries() -> list[dict[str, object]]:

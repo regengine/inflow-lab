@@ -8,7 +8,7 @@ from fastapi import Request
 from fastapi.responses import JSONResponse
 
 from .auth import TenantContext, tenant_context_from_request
-from .cors import resolve_cors_origins_cached
+from .cors import cors_origins_for_app
 from .dependencies import get_tenant_context
 from .tenancy import active_controller_for_context
 
@@ -77,14 +77,7 @@ def _reject_untrusted_unsafe_origin(request: Request, context: TenantContext) ->
     if request_origin is None:
         return None
 
-    # resolve_cors_origins_cached(), never the strict cors_origins_from_env()
-    # (#200): this runs on every authenticated state-changing request, so a
-    # single malformed REGENGINE_CORS_ORIGINS entry raising here would 500 the
-    # request rather than merely dropping that one bad origin. #178 fixed the
-    # equivalent crash in create_app(); this is the same variable on the
-    # request path, and the Dockerfile now forces auth on, which is what makes
-    # this branch reachable in every container deployment.
-    if request_origin in resolve_cors_origins_cached():
+    if request_origin in cors_origins_for_app():
         return None
 
     return JSONResponse(
