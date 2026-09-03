@@ -491,3 +491,29 @@ def test_inline_delivery_on_an_ingestion_route_never_reaches_the_metadata_addres
     assert SpyAsyncClient.calls == []
     assert "inline-key" not in response.text
     assert response.status_code < 500, response.text
+
+
+def test_name_based_blocklist_rejects_localhost() -> None:
+    """Name-based blocklist backstops the address check when DNS fails."""
+    from app.schemas.simulation import EgressBlockedError, validate_egress_endpoint
+    from pydantic import HttpUrl
+
+    for hostname in ("localhost", "metadata.google.internal", "evil.localhost", "internal.local"):
+        url = HttpUrl(f"https://{hostname}/api/v1/webhooks/ingest")
+        try:
+            validate_egress_endpoint(url)
+            raise AssertionError(f"{hostname} should have been blocked")
+        except EgressBlockedError:
+            pass
+
+
+def test_name_based_blocklist_allows_private_endpoints_escape_hatch(
+    monkeypatch: Any,
+) -> None:
+    """REGENGINE_ALLOW_PRIVATE_ENDPOINTS=1 bypasses the name blocklist."""
+    from app.schemas.simulation import validate_egress_endpoint
+    from pydantic import HttpUrl
+
+    monkeypatch.setenv("REGENGINE_ALLOW_PRIVATE_ENDPOINTS", "1")
+    url = HttpUrl("http://localhost:8000/api/v1/webhooks/ingest")
+    validate_egress_endpoint(url)

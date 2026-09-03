@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 from collections import Counter, deque
 from pathlib import Path
 from threading import RLock
@@ -279,11 +280,14 @@ class EventStore:
             with tmp_path.open("w", encoding="utf-8") as handle:
                 for record in records_oldest_first:
                     handle.write(_serialize_record(record) + "\n")
+                handle.flush()
+                os.fsync(handle.fileno())
             tmp_path.replace(self.persist_path)
         except OSError:
             # Re-raised, never swallowed: callers order their in-memory
             # commit around this and depend on the failure propagating.
             logger.exception("event store rewrite failed for %s", self.persist_path)
+            tmp_path.unlink(missing_ok=True)
             raise
 
     def add_many(self, records: Iterable[StoredEventRecord]) -> list[StoredEventRecord]:

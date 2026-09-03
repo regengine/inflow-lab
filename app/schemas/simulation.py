@@ -25,6 +25,21 @@ _TRUSTED_REGENGINE_HOST = "www.regengine.co"
 # environment, since it disables the SSRF guard entirely.
 PRIVATE_ENDPOINTS_ENV = "REGENGINE_ALLOW_PRIVATE_ENDPOINTS"
 
+_BLOCKED_HOSTNAMES = frozenset({
+    "localhost",
+    "ip6-localhost",
+    "ip6-loopback",
+    "metadata",
+    "metadata.google.internal",
+    "instance-data",
+})
+
+_BLOCKED_HOST_SUFFIXES = (
+    ".localhost",
+    ".internal",
+    ".local",
+)
+
 
 class EgressBlockedError(ValueError):
     """A delivery endpoint failed the egress guard (see validate_egress_endpoint).
@@ -116,6 +131,12 @@ def validate_egress_endpoint(url: HttpUrl | None) -> None:
         raise EgressBlockedError("Delivery endpoint is missing a host.")
     if host == _TRUSTED_REGENGINE_HOST:
         return
+    if host in _BLOCKED_HOSTNAMES or any(host.endswith(s) for s in _BLOCKED_HOST_SUFFIXES):
+        raise EgressBlockedError(
+            f"Delivery endpoint host {host!r} is blocked by name. "
+            f"Set {PRIVATE_ENDPOINTS_ENV}=1 to allow this for local "
+            "development."
+        )
     addresses = _resolved_addresses(host)
     if not addresses:
         # A host that does not resolve cannot be dialed, so it is not an SSRF

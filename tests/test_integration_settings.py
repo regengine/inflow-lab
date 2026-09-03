@@ -318,3 +318,21 @@ def test_integration_test_explains_credential_stripping_on_origin_change() -> No
     assert "differs" in data["detail"], (
         "Detail should explain the endpoint changed, not give a generic 'credentials required' message"
     )
+
+
+def test_integration_configure_rejects_extra_fields() -> None:
+    """extra='forbid' catches misspelled fields (#217)."""
+    response = client.post(
+        "/api/integration/configure",
+        json={"modee": "mock"},
+    )
+    assert response.status_code == 422
+
+
+def test_integration_test_rejects_extra_fields() -> None:
+    """extra='forbid' catches misspelled fields (#217)."""
+    response = client.post(
+        "/api/integration/test",
+        json={"endpont": "https://example.com/api"},
+    )
+    assert response.status_code == 422

@@ -51,7 +51,14 @@ async def delete_operator_tenant(
         if tenant_controller is not None:
             await tenant_controller.shutdown()
 
-        shutil.rmtree(tenant_dir, ignore_errors=True)
+        resolved = tenant_dir.resolve()
+        expected_root = tenancy.TENANT_DATA_ROOT.resolve()
+        if not str(resolved).startswith(str(expected_root) + "/"):
+            raise HTTPException(
+                status_code=400,
+                detail=f"Tenant directory escapes the data root: {resolved}",
+            )
+        shutil.rmtree(resolved, ignore_errors=True)
     finally:
         tenancy.finish_tenant_delete(normalized_tenant)
 
