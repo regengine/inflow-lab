@@ -59,12 +59,15 @@ async def integration_test(
         }.items()
         if value is not None
     }
+    credentials_stripped = False
     if request.endpoint is not None:
         req_parsed = urlparse(str(request.endpoint))
         request_origin = f"{req_parsed.scheme}://{(req_parsed.hostname or '').lower()}"
         if request_origin != _delivery_origin(config):
             updates.setdefault("api_key", None)
             updates.setdefault("tenant_id", None)
+            if "api_key" not in {k for k, v in updates.items() if v is not None}:
+                credentials_stripped = True
         updates.setdefault("api_key", None)
         updates.setdefault("tenant_id", None)
     delivery = config.delivery.model_copy(update=updates, deep=True)
@@ -77,6 +80,17 @@ async def integration_test(
                 "Delivery is in mock mode: events go to the built-in RegEngine "
                 "stand-in, no credentials required. Enter live credentials to "
                 "test a real connection."
+            ),
+            mode=config.delivery.mode,
+        )
+
+    if credentials_stripped and not delivery.api_key and not delivery.tenant_id:
+        return ConnectionTestResponse(
+            verdict="not_configured",
+            detail=(
+                "The test endpoint differs from the configured delivery endpoint, "
+                "so stored credentials were not forwarded. Provide api_key and "
+                "tenant_id for the new endpoint."
             ),
             mode=config.delivery.mode,
         )

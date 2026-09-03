@@ -697,6 +697,7 @@ function pendingAuditModel(summary) {
     passed: 0,
     total: 0,
     missing: 0,
+    pending: true,
     detail: summary
       ? `${summary.label} needs a simulator status refresh before audit scoring can be shown.`
       : 'Run the simulator to load backend audit scoring.',
@@ -731,6 +732,7 @@ function renderReadinessBanner(summary, events, status = state.status) {
 
 function recordWarnings(record, summary, status = state.status) {
   const audit = backendAudit(status, summary);
+  if (!audit) return null;
   const warningPayload = audit?.warnings_by_record?.[record.record_id];
   if (Array.isArray(warningPayload) && warningPayload.length) {
     return warningPayload
@@ -770,9 +772,9 @@ function renderScenarioWorkbench(status = state.status, events = state.events) {
         <p>${escapeHtml(summary.description)}</p>
         <p class="note">${escapeHtml(scenarioNarrative(summary))}</p>
       </div>
-      <div class="scenario-alert${warningCount ? ' has-warning' : ''}">
+      <div class="scenario-alert${warningCount ? ' has-warning' : ''}${readiness.pending ? ' is-pending' : ''}">
         <span>Audit readiness</span>
-        <strong>${warningCount ? `${warningCount} signal(s) still missing` : 'Signals visible'}</strong>
+        <strong>${readiness.pending ? 'Audit pending' : warningCount ? `${warningCount} signal(s) still missing` : readiness.total > 0 ? 'Signals visible' : 'No checks evaluated'}</strong>
         <small>${escapeHtml(summary.reference_format)} references, ${escapeHtml(sourceCte)} source flow</small>
       </div>
     </div>
@@ -1077,8 +1079,10 @@ function renderEvents(events) {
     .map((record) => {
       const event = record.event;
       const warnings = recordWarnings(record, summary);
+      const auditNotEvaluated = warnings === null;
+      const hasWarning = !auditNotEvaluated && warnings.length > 0;
       return `
-        <tr class="${warnings.length ? 'has-audit-warning' : ''}">
+        <tr class="${hasWarning ? 'has-audit-warning' : auditNotEvaluated ? 'audit-not-evaluated' : ''}">
           <td>${record.sequence_no}</td>
           <td><span class="pill">${escapeHtml(event.cte_type)}</span></td>
           <td><button class="link-button" data-lot="${escapeHtml(event.traceability_lot_code)}">${escapeHtml(event.traceability_lot_code)}</button></td>
@@ -1088,7 +1092,7 @@ function renderEvents(events) {
           <td>${escapeHtml(record.destination_mode)}</td>
           <td>
             ${escapeHtml(record.delivery_attempts || 0)}
-            ${warnings.length ? `<small class="status-warning">${escapeHtml(warnings[0])}</small>` : ''}
+            ${hasWarning ? `<small class="status-warning">${escapeHtml(warnings[0])}</small>` : auditNotEvaluated ? '<small class="status-muted">not evaluated</small>' : ''}
           </td>
           <td>
             <span class="status-pill" data-tone="${deliveryTone(record.delivery_status)}">${escapeHtml(record.delivery_status)}</span>
@@ -1189,12 +1193,14 @@ function renderLineage(payload, traceabilityLotCode) {
     .map((record) => {
       const event = record.event;
       const warnings = recordWarnings(record, scenarioSummary);
+      const auditNotEvaluated = warnings === null;
+      const hasWarning = !auditNotEvaluated && warnings.length > 0;
       const kdes = Object.entries(event.kdes || {})
         .slice(0, 6)
         .map(([key, value]) => `<li><strong>${escapeHtml(key)}:</strong> ${escapeHtml(formatKdeValue(value))}</li>`)
         .join('');
       return `
-        <article class="lineage-card${warnings.length ? ' has-audit-warning' : ''}">
+        <article class="lineage-card${hasWarning ? ' has-audit-warning' : auditNotEvaluated ? ' audit-not-evaluated' : ''}">
           <header>
             <h3>${escapeHtml(cteLabel(event.cte_type))}</h3>
             <span>${formatDateTime(event.timestamp)}</span>
@@ -1202,7 +1208,7 @@ function renderLineage(payload, traceabilityLotCode) {
           <p><strong>Lot:</strong> ${escapeHtml(event.traceability_lot_code)}</p>
           <p><strong>Product:</strong> ${escapeHtml(event.product_description)}</p>
           <p><strong>Location:</strong> ${escapeHtml(event.location_name)}</p>
-          ${warnings.length ? `<p class="lineage-warning">${escapeHtml(warnings.join(' • '))}</p>` : ''}
+          ${hasWarning ? `<p class="lineage-warning">${escapeHtml(warnings.join(' • '))}</p>` : auditNotEvaluated ? '<p class="lineage-muted">Audit not evaluated for this scenario</p>' : ''}
           <ul>${kdes}</ul>
         </article>
       `;
