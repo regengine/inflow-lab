@@ -6,11 +6,25 @@ from typing import Any, Literal
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 from .domain import CSVImportType, CTEType, DestinationMode, RegEngineEvent
-from .simulation import DeliveryConfig
+from .simulation import STRICT_REQUEST, DeliveryConfig
 
 
 class IngestPayload(BaseModel):
+    # Deliberately NOT strict: this is the mock stand-in for RegEngine's own
+    # webhook receiver, and a receiver that 422s on an additive field a
+    # newer producer sends would misrepresent live behaviour.
     source: str = "codex-simulator"
+    # NOT max_length=500, deliberately -- see tests/test_schema_bounds.py.
+    # RegEngine's own WebhookPayload does bound `events` at 1-500, and this
+    # model is the request body for the mock's /api/mock/regengine/ingest
+    # route, so a pydantic constraint here would be rejected by FastAPI as a
+    # RequestValidationError whose `detail` is a list of error dicts. The mock
+    # instead enforces the cap in MockRegEngineService.ingest so it can return
+    # RegEngine's own wording ("events accepts at most 500 items per batch")
+    # as a plain string detail, which tests/test_mock_parity.py pins. Adding
+    # the constraint here changes that response body and breaks the pin.
+    # Producers are already bounded: every bulk send goes through
+    # `delivery.chunk_events`, which chunks at MAX_BATCH_EVENTS (#103).
     events: list[RegEngineEvent]
 
 
@@ -86,11 +100,25 @@ class ReplayResponse(BaseModel):
     error: str | None = None
 
 
+# Upper bound on a single CSV import body, in characters.
+#
+# `parse_csv_import` is CPU-bound and runs synchronously on the app's single
+# event loop, so an unbounded `csv_text` makes the worst-case stall unbounded
+# too: one oversized import blocks every other request in the process. The
+# limit is enforced by pydantic, which means it rejects with a 422 before the
+# parser ever sees the body.
+#
+# 4 MiB of characters is roughly 25k-40k typical CTE rows -- far above any
+# real demo or design-partner import, and far below a body that would stall
+# the loop noticeably.
+MAX_CSV_IMPORT_CHARS = 4 * 1024 * 1024
+
+
 class CSVImportRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     import_type: CSVImportType
-    csv_text: str
+    csv_text: str = Field(max_length=MAX_CSV_IMPORT_CHARS)
     source: str | None = None
     delivery: DeliveryConfig | None = None
 

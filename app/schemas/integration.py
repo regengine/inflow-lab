@@ -2,8 +2,9 @@ from __future__ import annotations
 
 from pydantic import BaseModel, ConfigDict, Field, HttpUrl
 
+from ..regengine_client import DEFAULT_LIVE_INGEST_ENDPOINT
 from .domain import DestinationMode
-from .simulation import MockFrictionCode
+from .simulation import STRICT_REQUEST, MockFrictionCode
 
 
 class IntegrationStatusResponse(BaseModel):
@@ -12,6 +13,12 @@ class IntegrationStatusResponse(BaseModel):
     mode: DestinationMode
     endpoint: str
     endpoint_host: str
+    # The endpoint live mode falls back to when none is configured. Served
+    # so the console can show and use the backend's own default instead of
+    # keeping a second copy of the URL in JavaScript: changing
+    # `regengine_client.DEFAULT_LIVE_INGEST_ENDPOINT` changes what every
+    # client sees, with no frontend edit.
+    default_endpoint: str = DEFAULT_LIVE_INGEST_ENDPOINT
     api_key_configured: bool
     tenant_configured: bool
     hmac_configured: bool
@@ -40,6 +47,14 @@ class ConnectionTestRequest(BaseModel):
     endpoint: HttpUrl | None = None
     api_key: str | None = None
     tenant_id: str | None = None
+
+
+# Verdict for a test whose endpoint is not the configured one, where the
+# stored credentials were therefore deliberately not sent. Distinct from
+# `not_configured`, which means no credentials exist to send at all: the two
+# call for opposite operator actions (supply this endpoint's own credentials
+# vs. configure any credentials), so they must not share a verdict.
+CREDENTIALS_WITHHELD_VERDICT = "credentials_withheld"
 
 
 class ConnectionTestResponse(BaseModel):

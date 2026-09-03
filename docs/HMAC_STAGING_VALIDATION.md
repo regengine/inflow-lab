@@ -1,11 +1,24 @@
 # HMAC Staging Validation Runbook
 
-Validate end-to-end HMAC signing between Inflow Lab (`regengine_codex_workspace`) and a RegEngine staging deployment before enabling production enforcement.
+Validate end-to-end HMAC signing between Inflow Lab and a RegEngine staging deployment before enabling production enforcement.
 
-Source references used in this runbook:
-- Inflow Lab signing path: `app/regengine_client.py:17-119`
-- Inflow Lab trial runner: `scripts/live_trial.py:57-67`, `scripts/live_trial.py:216-249`, `scripts/live_trial.py:304-314`
-- Inflow Lab stored delivery metadata: `app/models.py:102-116`, `app/main.py:474-479`
+The commands below use two environment variables so the runbook works from a
+checkout at any path. Set them once before you start:
+
+```bash
+export INFLOW_LAB_DIR="$(git rev-parse --show-toplevel)"   # run from an inflow-lab checkout
+export REGENGINE_DIR="<path to your RegEngine checkout>"
+```
+
+Source references used in this runbook. Symbol names rather than line numbers
+wherever possible: the previous `app/models.py:102-116` / `app/main.py:474-479`
+anchors both rotted through ordinary refactors (the module was deleted, and
+`app/main.py` is 74 lines long), which cost a reader the verification step at
+exactly the point this runbook asks for one.
+
+- Inflow Lab signing path: `app/regengine_client.py` (`_build_signature_header`, `assert_delivery_endpoint_allowed`)
+- Inflow Lab trial runner: `scripts/live_trial.py`
+- Inflow Lab stored delivery metadata: `StoredEventRecord` in `app/schemas/domain.py`, written by `app/controller.py`
 - RegEngine ingest response model: `services/ingestion/app/webhook_models.py:253-262`
 - RegEngine API key rejection text: `services/ingestion/app/webhook_router_v2.py:106-122`
 - RegEngine signature utility log/event names: `services/shared/webhook_security.py:248-259`
@@ -16,20 +29,21 @@ Run all checks before touching secrets.
 
 ```bash
 # Repo 1: Inflow Lab simulator must be on main with PR #43 merged.
-git -C ~/Documents/GitHub/regengine_codex_workspace checkout main
-git -C ~/Documents/GitHub/regengine_codex_workspace pull
-git -C ~/Documents/GitHub/regengine_codex_workspace merge-base --is-ancestor eefde6a HEAD && echo "PR #43 is in history"
+git -C "$INFLOW_LAB_DIR" checkout main
+git -C "$INFLOW_LAB_DIR" pull
+git -C "$INFLOW_LAB_DIR" merge-base --is-ancestor eefde6a HEAD && echo "PR #43 is in history"
 
 # Repo 2: RegEngine should be on main at current HEAD.
-git -C ~/Documents/GitHub/RegEngine checkout main
-git -C ~/Documents/GitHub/RegEngine rev-parse --short HEAD
+git -C "$REGENGINE_DIR" checkout main
+git -C "$REGENGINE_DIR" rev-parse --short HEAD
 
-# Staging health check (must return 2xx).
+# Staging health check (must return 2xx; Inflow Lab's own /api/healthz answers
+# 503 when its event store is unwritable, so a non-2xx here is a real fault).
 export REGEN_STAGING_BASE_URL="https://<staging-url>"
 curl -fsS "$REGEN_STAGING_BASE_URL/api/healthz" >/dev/null && echo "staging healthz ok"
 
 # Simulator local test baseline.
-cd ~/Documents/GitHub/regengine_codex_workspace
+cd "$INFLOW_LAB_DIR"
 uv run pytest
 ```
 
@@ -37,7 +51,7 @@ Expected pre-flight outcomes:
 - `git merge-base --is-ancestor eefde6a HEAD` exits 0 and prints `PR #43 is in history`.
 - RegEngine repo is on `main` and at current HEAD.
 - `curl` to `/api/healthz` returns 2xx.
-- `uv run pytest` returns `87 passed`.
+- `uv run pytest` passes with no failures.
 
 Operational prerequisites (manual, no SQL shortcuts):
 - Staging tenant exists.
@@ -95,7 +109,7 @@ Required interpretation:
 Configure the trial environment and run exactly one live batch.
 
 ```bash
-cd ~/Documents/GitHub/regengine_codex_workspace
+cd "$INFLOW_LAB_DIR"
 
 export REGENGINE_REMOTE_BASE_URL='https://<inflow-lab-url>'
 export REGENGINE_REMOTE_USERNAME='<basic-auth-username>'
@@ -142,7 +156,10 @@ Expected response/metadata shape (from `app/regengine_client.py:29-33` and `app/
 
 `response` keys should align with RegEngine `IngestResponse` (`services/ingestion/app/webhook_models.py:253-262`).
 
-Validate stored event metadata from the simulator API (`app/main.py:474-479`):
+Validate stored event metadata from the simulator API. The feed is
+`list_events` in `app/routers/events.py` (`GET /api/events`), serving
+`StoredEventRecord` objects assembled by
+`SimulationController._deliver_payload` in `app/controller.py`:
 
 ```bash
 curl -fsS -u "$REGENGINE_REMOTE_USERNAME:$REGENGINE_REMOTE_PASSWORD" \

@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import random
 import os
+from collections import deque
+from copy import deepcopy
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 from itertools import count
@@ -20,6 +22,39 @@ from .scenarios import (
 
 
 DEFAULT_MAX_FUTURE_HOURS = 20
+# How far behind wall-clock time the simulated clock starts. The simulated
+# clock advances far faster than real time (tens of minutes per event), so the
+# starting offset is what determines how many events can be generated before
+# the clock reaches the live-webhook future ceiling and has to stop drifting.
+DEFAULT_HISTORY_HOURS = 336  # 14 simulated days of runway
+# Smallest step `_advance_time` will ever take. Once the simulated clock has
+# saturated its window it can no longer move in realistic increments, but it
+# must still move: two CTEs for the same lot must never share an instant.
+MIN_TIME_ADVANCE = timedelta(microseconds=200)
+
+#: GS1 company prefix used for every synthetic SSCC this lab mints.
+SSCC_COMPANY_PREFIX = "8500000"
+
+
+def gs1_check_digit(digits: str) -> int:
+    """GS1 mod-10 check digit for a run of digits (SSCC, GTIN, GLN, ...)."""
+    total = 0
+    for index, digit in enumerate(reversed(digits), start=1):
+        total += int(digit) * (3 if index % 2 else 1)
+    return (10 - (total % 10)) % 10
+
+
+def sscc_from_base(base: str) -> str:
+    """Complete a 17-digit SSCC base into the full 18-digit SSCC.
+
+    GS1 Application Identifier ``(00)`` promises exactly 18 digits, so anything
+    that writes an ``(00)`` reference — the engine or a hand-written fixture —
+    must come through here rather than pasting a human-readable label after the
+    AI.
+    """
+    if len(base) != 17 or not base.isdigit():
+        raise ValueError(f"SSCC base must be 17 digits, got {base!r}")
+    return f"{base}{gs1_check_digit(base)}"
 
 
 @dataclass(slots=True)
@@ -80,7 +115,8 @@ class LegitFlowEngine:
         self.rng = random.Random(seed if seed is not None else self._initial_seed)  # nosec B311
         self._lot_counter = count(1)
         self._ref_counter = count(1)
-        self._time_cursor = datetime.now(UTC) - timedelta(hours=12)
+        self._time_cursor = datetime.now(UTC) - timedelta(hours=_history_hours())
+        self._pending_events: deque[tuple[RegEngineEvent, list[str]]] = deque()
         self.scale = OperationScale(scale or self._initial_scale)
         self.quantity_multiplier = SCALE_QUANTITY_MULTIPLIER[self.scale]
         self.scenario = scale_scenario(get_scenario(scenario or self._initial_scenario), self.scale)
@@ -113,17 +149,29 @@ class LegitFlowEngine:
         return [*self.farms, *self.coolers, *self.packers, *self.processors, *self.dcs, *self.retailers]
 
     def next_event(self) -> tuple[RegEngineEvent, list[str]]:
+        """Return the next `(event, parent_lot_codes)` pair.
+
+        Some actions (notably transformation) legitimately produce more than
+        one CTE — one per new output lot. Those extra events are queued here
+        and handed out by subsequent calls so every generated lot gets a
+        record of its own without changing this method's single-event API.
+        """
+        if not self._pending_events:
+            self._pending_events.extend(self._generate_events())
+        return self._pending_events.popleft()
+
+    def _generate_events(self) -> list[tuple[RegEngineEvent, list[str]]]:
         action = self._choose_action()
         if action == "harvest":
-            return self._harvest()
+            return [self._harvest()]
         if action == "cool":
-            return self._cool()
+            return [self._cool()]
         if action == "initial_pack":
-            return self._initial_pack()
+            return [self._initial_pack()]
         if action == "ship":
-            return self._ship()
+            return [self._ship()]
         if action == "receive":
-            return self._receive()
+            return [self._receive()]
         if action == "transform":
             return self._transform()
         raise RuntimeError(f"Unhandled action: {action}")
@@ -387,7 +435,7 @@ class LegitFlowEngine:
         )
         return event, lot.parents or [lot.lot_code]
 
-    def _transform(self) -> tuple[RegEngineEvent, list[str]]:
+    def _transform(self) -> list[tuple[RegEngineEvent, list[str]]]:
         sample_size = min(len(self.processor_inventory), self.rng.choice(self.scenario.transform_input_choices))
         inputs = self.rng.sample(self.processor_inventory, k=sample_size)
         self.processor_inventory = [lot for lot in self.processor_inventory if lot not in inputs]
@@ -445,29 +493,73 @@ class LegitFlowEngine:
             rework_lots.append(rework_lot)
             self.processor_inventory.append(rework_lot)
 
-        event = RegEngineEvent(
-            cte_type=CTEType.TRANSFORMATION,
-            traceability_lot_code=outputs[0].lot_code,
-            product_description=outputs[0].product_description,
-            quantity=outputs[0].quantity,
-            unit_of_measure=outputs[0].unit_of_measure,
-            location_name=processor.name,
-            location_gln=self._location_gln_or_none(processor.name),
+        batch_kdes = self.adapter.transformation_kdes(
+            engine=self,
+            inputs=inputs,
+            outputs=outputs,
+            rework_lots=rework_lots,
+            processor=processor,
             timestamp=timestamp,
-            kdes=self.adapter.transformation_kdes(
-                engine=self,
-                inputs=inputs,
-                outputs=outputs,
-                rework_lots=rework_lots,
-                processor=processor,
-                timestamp=timestamp,
-                reference_type=outputs[0].current_reference_type or "Batch Record",
-                reference_number=reference_number,
-                total_input_qty=total_input_qty,
-                total_output_qty=gross_output_qty,
-            ),
+            reference_type=outputs[0].current_reference_type or "Batch Record",
+            reference_number=reference_number,
+            total_input_qty=total_input_qty,
+            total_output_qty=gross_output_qty,
         )
-        return event, [lot.lot_code for lot in inputs]
+        input_lot_codes = [lot.lot_code for lot in inputs]
+        if rework_lots:
+            # A rework lot is real output mass from this batch (`yield_ratio`
+            # already counts it) and now carries a CTE of its own, so it belongs
+            # in the batch's declared output set. `rework_traceability_lot_codes`
+            # still marks which of those outputs are rework rather than sellable.
+            batch_kdes["output_traceability_lot_codes"] = [
+                *batch_kdes.get("output_traceability_lot_codes", []),
+                *(lot.lot_code for lot in rework_lots),
+            ]
+
+        # One TRANSFORMATION record per output lot: every new traceability lot
+        # code needs its own CTE, otherwise outputs[1:] first appear in the
+        # store as a SHIPPING event that looks like it came straight from the
+        # pre-transformation inputs.
+        #
+        # Rework lots get a record for exactly the same reason. A rework lot is
+        # minted here and pushed back into `processor_inventory`, where a later
+        # `_transform` can sample it as an input -- at which point it appears in
+        # that event's `input_traceability_lot_codes`. Without a CTE of its own
+        # it has no record to anchor to, so `EventStore.lineage_edges` drops the
+        # edge and the rendered graph shows fewer inputs than the payload
+        # declares. It is also real mass produced by this batch (`yield_ratio`
+        # already counts it), so emitting it keeps the mass balance honest.
+        results: list[tuple[RegEngineEvent, list[str]]] = []
+        emitted: list[tuple[Lot, bool]] = [(lot, False) for lot in outputs]
+        emitted.extend((lot, True) for lot in rework_lots)
+        for output_lot, is_rework in emitted:
+            kdes = deepcopy(batch_kdes)
+            kdes["output_traceability_lot_code"] = output_lot.lot_code
+            kdes["output_lot_count"] = len(emitted)
+            kdes["tlc_source_reference"] = output_lot.tlc_source_reference
+            kdes["traceability_lot_code_source_reference"] = output_lot.tlc_source_reference
+            if is_rework:
+                # Additive markers only: the required transformation KDEs still
+                # come from the shared batch record, so the wire contract is
+                # unchanged and the batch stays identifiable across siblings.
+                kdes["rework_output"] = True
+                kdes["rework_hold_reference"] = self._reference_document(
+                    output_lot.current_reference_type,
+                    output_lot.current_reference_number,
+                )
+            event = RegEngineEvent(
+                cte_type=CTEType.TRANSFORMATION,
+                traceability_lot_code=output_lot.lot_code,
+                product_description=output_lot.product_description,
+                quantity=output_lot.quantity,
+                unit_of_measure=output_lot.unit_of_measure,
+                location_name=processor.name,
+                location_gln=self._location_gln_or_none(processor.name),
+                timestamp=timestamp,
+                kdes=kdes,
+            )
+            results.append((event, list(input_lot_codes)))
+        return results
 
     def location_gln(self, location_name: str) -> str:
         location = self.location_index.get(location_name)
@@ -499,10 +591,17 @@ class LegitFlowEngine:
         return reference_number or reference_type or ""
 
     def _advance_time(self, min_minutes: int, max_minutes: int) -> datetime:
-        self._time_cursor += timedelta(minutes=self.rng.randint(min_minutes, max_minutes))
+        # Draw the step unconditionally so the RNG stream stays deterministic
+        # regardless of how close the cursor is to the live-window ceiling.
+        step = timedelta(minutes=self.rng.randint(min_minutes, max_minutes))
         live_window_ceiling = datetime.now(UTC) + timedelta(hours=_max_future_hours())
-        if self._time_cursor > live_window_ceiling:
-            self._time_cursor = live_window_ceiling
+        if self._time_cursor + step > live_window_ceiling:
+            # Cap the *delta* to whatever headroom is left instead of clamping
+            # the cursor onto the ceiling, which collapsed every later event
+            # onto the same instant. The cursor still always moves forward.
+            headroom = live_window_ceiling - self._time_cursor
+            step = headroom if headroom > MIN_TIME_ADVANCE else MIN_TIME_ADVANCE
+        self._time_cursor += step
         return self._time_cursor
 
     def _quantity(self, low: float, high: float) -> float:
@@ -560,16 +659,18 @@ class LegitFlowEngine:
         return f"urn:epc:id:sgtin:{company_prefix}.{item_reference}.{serial_component}"
 
     def _make_sscc(self) -> str:
-        company_prefix = "8500000"
-        serial = next(self._ref_counter)
-        base = f"0{company_prefix}{self._time_cursor.strftime('%j')}{serial:07d}"[:17]
-        return f"{base}{self._gs1_check_digit(base)}"
+        # An SSCC is 18 digits: a 17-digit base plus a GS1 check digit.
+        # extension (1) + company prefix (7) + day-of-year (3) + serial (6) = 17,
+        # so the serial must be kept to six digits rather than truncated after
+        # the fact — truncating a 7-digit serial collapsed every run of ten
+        # consecutive references onto the same SSCC.
+        serial = next(self._ref_counter) % 1_000_000
+        return sscc_from_base(
+            f"0{SSCC_COMPANY_PREFIX}{self._time_cursor.strftime('%j')}{serial:06d}"
+        )
 
     def _gs1_check_digit(self, digits: str) -> int:
-        total = 0
-        for index, digit in enumerate(reversed(digits), start=1):
-            total += int(digit) * (3 if index % 2 else 1)
-        return (10 - (total % 10)) % 10
+        return gs1_check_digit(digits)
 
     def _gps_coordinate(self) -> str:
         lat = round(self.rng.uniform(32.0, 39.5), 4)
@@ -585,3 +686,11 @@ def _max_future_hours() -> int:
         return int(os.getenv("REGENGINE_SIM_MAX_FUTURE_HOURS", str(DEFAULT_MAX_FUTURE_HOURS)))
     except ValueError:
         return DEFAULT_MAX_FUTURE_HOURS
+
+
+def _history_hours() -> int:
+    try:
+        hours = int(os.getenv("REGENGINE_SIM_HISTORY_HOURS", str(DEFAULT_HISTORY_HOURS)))
+    except ValueError:
+        return DEFAULT_HISTORY_HOURS
+    return hours if hours > 0 else DEFAULT_HISTORY_HOURS

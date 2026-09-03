@@ -41,7 +41,7 @@ async def delete_operator_tenant(
     _: None = Depends(require_operator_auth),
 ) -> TenantOperationResponse:
     normalized_tenant = tenancy.operator_tenant_id(tenant_id)
-    tenant_dir = tenancy.tenant_dir(normalized_tenant)
+    tenant_dir = tenancy.assert_deletable_tenant_dir(tenancy.tenant_dir(normalized_tenant))
     removed_data = tenant_dir.exists()
 
     tenant_controller = tenancy.pop_tenant_controller(normalized_tenant)

@@ -4,6 +4,7 @@ import httpx
 import pytest
 
 from app.build_info import APP_VERSION
+from app.tenancy import tenant_events_path
 from scripts.remote_smoke import (
     DEFAULT_TENANT,
     FRESH_CUT_OUTPUT_LOT,
@@ -161,7 +162,7 @@ class FakeRemoteServer:
                     },
                     "status": {
                         "config": {
-                            "persist_path": "data/tenants/remote-smoke/events.jsonl",
+                            "persist_path": str(tenant_events_path(DEFAULT_TENANT)),
                             "delivery": {"mode": "mock"},
                         }
                     },

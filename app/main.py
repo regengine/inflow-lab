@@ -10,13 +10,18 @@ from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
 
 from . import tenancy
-from .auth import basic_auth_config_from_env
+from .auth import basic_auth_config_from_env, enforce_auth_requirement
 from .auth_middleware import auth_and_tenant_middleware
 from .build_info import APP_VERSION
-from .cors import cors_origins_from_env
+from .cors import cors_origins_for_app, cors_origins_from_env  # noqa: F401  (re-exported for tests)
 from .exceptions import handle_value_error
 from .routers import events, health, ingestion, integration, mock_regengine, operator, scenarios, simulation
-from .tenancy import controller, scenario_saves
+
+# Not used by this module: routers resolve a per-tenant controller through
+# `dependencies.get_active_controller`, never these module-level singletons.
+# They stay as an explicit re-export because the test-suite imports them
+# from `app.main` — marked so nobody reads them as live wiring here.
+from .tenancy import controller, scenario_saves  # noqa: F401  (re-exported for tests)
 
 
 static_dir = Path(__file__).parent / "static"
@@ -26,6 +31,7 @@ logger = logging.getLogger("inflow_lab")
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    enforce_auth_requirement()
     if not basic_auth_config_from_env().enabled:
         logger.warning(
             "inflow-lab is starting WITHOUT authentication (REGENGINE_BASIC_AUTH_USERNAME/"
@@ -46,7 +52,7 @@ def create_app() -> FastAPI:
     )
     fastapi_app.add_middleware(
         CORSMiddleware,
-        allow_origins=cors_origins_from_env(),
+        allow_origins=cors_origins_for_app(),
         allow_credentials=True,
         allow_methods=["*"],
         allow_headers=["*"],

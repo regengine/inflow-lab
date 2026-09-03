@@ -1,0 +1,29 @@
+# Every `uses:` in .github/workflows is pinned to a full commit SHA (a mutable
+# tag would let a retagged or compromised upstream release silently change what
+# runs with this repo's write-scoped tokens). Pins only stay safe if something
+# refreshes them, so Dependabot owns that here: it opens a PR bumping the SHA
+# and the `# vX.Y.Z` comment together whenever an action publishes a release.
+version: 2
+updates:
+  - package-ecosystem: github-actions
+    directory: "/"
+    schedule:
+      interval: weekly
+      day: monday
+    open-pull-requests-limit: 5
+    commit-message:
+      prefix: "ci"
+    labels:
+      - dependencies
+      - ci
+    groups:
+      # The first-party actions move together and are low risk; one PR a week
+      # for the lot keeps the queue readable.
+      actions-official:
+        patterns:
+          - "actions/*"
+
+  # uv.lock is the source of truth for the Python dependency set (CI installs
+  # with `uv sync --frozen`), and Dependabot cannot update it. pip-audit in
+  # ci.yml is what flags vulnerable Python packages; the fix is
+  # `uv lock --upgrade-package <name>`.

@@ -1,9 +1,12 @@
 from __future__ import annotations
 
+import logging
 from datetime import UTC, datetime
 
 from fastapi import APIRouter, Depends
+from fastapi.responses import JSONResponse
 
+from .. import tenancy
 from ..auth import TenantContext
 from ..build_info import current_build_info
 from ..contract import INFLOW_CONTRACT_VERSION
@@ -11,6 +14,8 @@ from ..controller import SimulationController
 from ..dependencies import get_active_controller, get_tenant_context
 from ..schemas.health import HealthResponse, HealthzResponse
 
+
+logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/api", tags=["Health"])
 

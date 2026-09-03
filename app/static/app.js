@@ -1732,7 +1732,8 @@ ids.resetBtn.addEventListener('click', () => {
     return;
   }
   disarmReset();
-  runWithBusy(ids.resetBtn, resetState);
+  // Not bound through bindAsyncClick, so it needs the shared reporter here.
+  runWithBusy(ids.resetBtn, resetState).catch(reportActionError);
 });
 
 // The setup grid is a <form>; without this, pressing Enter in a text field
@@ -1742,18 +1743,19 @@ document.getElementById('config-form').addEventListener('submit', (event) => eve
 ids.lotLookup.addEventListener('keydown', (event) => {
   if (event.key === 'Enter') {
     event.preventDefault();
-    runWithBusy(ids.lineageBtn, lookupLineage);
+    runWithBusy(ids.lineageBtn, lookupLineage).catch(reportActionError);
   }
 });
 
 document.getElementById('nextActionGo')?.addEventListener('click', goToNextAction);
-for (const link of [ids.exportDownloadLink, ids.epcisDownloadLink]) {
-  link?.addEventListener('click', () => {
-    if (!state.events.length) {
-      return;
-    }
-    journey.exported = true;
-    renderGuide();
+for (const [link, label] of [
+  [ids.exportDownloadLink, 'Compliance export'],
+  [ids.epcisDownloadLink, 'EPCIS JSON'],
+  [ids.navExportLink, 'Compliance export'],
+]) {
+  link?.addEventListener('click', (event) => {
+    event.preventDefault();
+    downloadExport(link, label);
   });
 }
 document.querySelectorAll('#guideRail [data-guide-target]').forEach((step) => {
@@ -1776,7 +1778,7 @@ welcomeEls.tour.addEventListener('click', () => {
 });
 welcomeEls.sample.addEventListener('click', () => {
   hideWelcome();
-  runWithBusy(ids.loadFixtureBtn, loadSelectedDemoFixture);
+  runWithBusy(ids.loadFixtureBtn, loadSelectedDemoFixture).catch(reportActionError);
   flashPanel('.run-panel');
 });
 welcomeEls.skip.addEventListener('click', hideWelcome);
@@ -1807,24 +1809,15 @@ ids.scenario.addEventListener('change', () => {
   renderEvents(state.events);
 });
 
-loadScenarios().catch((error) => {
-  setStatus(error.message, 'error', 5000);
-});
-loadScenarioSaves().catch((error) => {
-  setStatus(error.message, 'error', 5000);
-});
-loadDemoFixtures().catch((error) => {
-  setStatus(error.message, 'error', 5000);
-});
-loadExportPresets().catch((error) => {
-  setStatus(error.message, 'error', 5000);
-});
-loadIntegrationStatus().catch((error) => {
-  setStatus(error.message, 'error', 5000);
-});
+loadScenarios().catch(reportActionError);
+loadScenarioSaves().catch(reportActionError);
+loadDemoFixtures().catch(reportActionError);
+loadExportPresets().catch(reportActionError);
+loadIntegrationStatus().catch(reportActionError);
 connectLiveUpdates();
-refresh().catch((error) => {
-  setStatus(error.message, 'error', 5000);
-  startFallbackPolling();
+refresh().then((ok) => {
+  if (!ok) {
+    startFallbackPolling();
+  }
 });
 maybeShowWelcome();

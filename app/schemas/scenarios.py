@@ -7,7 +7,7 @@ from pydantic import BaseModel, ConfigDict, Field
 
 from ..scenarios import ScenarioId
 from .domain import DemoFixtureId, DestinationMode, StoredEventRecord
-from .simulation import DeliveryConfig, SimulationConfig
+from .simulation import STRICT_REQUEST, DeliveryConfig, SimulationConfig
 
 
 class ScenarioSummary(BaseModel):

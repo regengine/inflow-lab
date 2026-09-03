@@ -1,18 +1,20 @@
+"""Core simulation API: step, status, SSE, the mock ingest endpoint and
+run-loop lifecycle.
+
+The rest of this file was split by theme into ``test_api_*.py`` modules
+(see #132); the tests themselves were moved verbatim.
+"""
+
+from datetime import UTC, datetime, timedelta
+
 import asyncio
 import base64
-import csv
-import io
 import json
-import logging
 
-import pytest
 from fastapi.testclient import TestClient
 
-from app.build_info import BRANCH_ENV_VARS, COMMIT_SHA_ENV_VARS, DEPLOYMENT_ID_ENV_VARS
-from app.cors import DEFAULT_CORS_ORIGINS
-from app.main import app, controller, cors_origins_from_env, scenario_saves
+from app.main import app, controller
 from app.schemas.simulation import SimulationConfig
-from app.regengine_client import LiveIngestResult, LiveRegEngineDeliveryError
 from app.scenarios import ScenarioId, get_scenario
 
 
@@ -815,6 +817,11 @@ def test_stop_interrupts_long_interval_sleep(tmp_path):
     assert asyncio.run(start_and_stop()) is False
 
 
+# Built relative to "now": the mock enforces RegEngine's 90-day replay window
+# by default, so a pinned calendar timestamp is rejected once it goes stale.
+RECENT_MOMENT = (datetime.now(UTC) - timedelta(days=1)).replace(microsecond=0)
+
+
 def test_mock_ingest_endpoint_returns_hashes():
     payload = {
         "source": "test-suite",
@@ -826,9 +833,9 @@ def test_mock_ingest_endpoint_returns_hashes():
                 "quantity": 500,
                 "unit_of_measure": "cases",
                 "location_name": "Distribution Center #4",
-                "timestamp": "2026-02-05T08:30:00Z",
+                "timestamp": RECENT_MOMENT.isoformat().replace("+00:00", "Z"),
                 "kdes": {
-                    "receive_date": "2026-02-05",
+                    "receive_date": RECENT_MOMENT.date().isoformat(),
                     "receiving_location": "Distribution Center #4",
                     "ship_from_location": "Valley Fresh Farms",
                     "immediate_previous_source": "Valley Fresh Farms",
