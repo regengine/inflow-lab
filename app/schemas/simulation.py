@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from typing import Any, Literal
 
-from pydantic import BaseModel, ConfigDict, Field, HttpUrl, field_validator
+from pydantic import BaseModel, ConfigDict, Field, HttpUrl, field_validator, model_validator
 
 from ..scenarios import ScenarioId
 from .domain import DestinationMode, OperationScale
@@ -80,12 +80,6 @@ class StartRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     config: SimulationConfig
-
-
-class ResetRequest(BaseModel):
-    model_config = ConfigDict(extra="forbid")
-
-    config: SimulationConfig | None = None
 
 
 class StepRequest(BaseModel):

@@ -12,6 +12,7 @@ import base64
 import json
 
 from fastapi.testclient import TestClient
+import pytest
 
 from app.main import app, controller
 from app.schemas.simulation import SimulationConfig
