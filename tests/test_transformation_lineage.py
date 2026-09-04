@@ -83,22 +83,38 @@ def _rework_lot_count(engine: LegitFlowEngine, count: int) -> int:
 
 def _run_past_first_rework(
     engine: LegitFlowEngine, attempts: int = 250
-) -> list[tuple[RegEngineEvent, list[str]]]:
+) -> tuple[
+    list[tuple[RegEngineEvent, list[str]]],
+    tuple[RegEngineEvent, list[str]],
+    tuple[RegEngineEvent, list[str]],
+]:
     """Drive ``engine`` until a transformation reporting a rework lot has
-    been observed, then one call further to also capture that rework lot's
-    own queued CTE record. The two are always adjacent in that order (see
-    app/engine.py::_transform / next_event): the primary event is always
-    returned synchronously from the very call that performs the
-    transformation, and its rework twin is always the very next
-    ``next_event()`` call after that, ahead of any freshly chosen action.
+    been observed, then keep going until that rework lot's own queued CTE
+    record appears. Returns ``(collected, primary, rework)``.
+
+    The primary event is still returned synchronously from the very call
+    that performs the transformation. Its rework twin used to be the very
+    next ``next_event()`` call, and this helper relied on that adjacency --
+    but #115 now queues one record per *additional transformation output
+    lot* on the same _pending_events queue, ahead of the rework one, so
+    between 0 and 2 output records can sit in between. The rework record is
+    located by lot code instead, which is what the callers actually mean and
+    is independent of how many siblings the batch produced.
     """
     collected: list[tuple[RegEngineEvent, list[str]]] = []
+    primary: tuple[RegEngineEvent, list[str]] | None = None
     for _ in range(attempts):
         collected.append(engine.next_event())
         event, _ = collected[-1]
-        if event.cte_type == CTEType.TRANSFORMATION and event.kdes.get("rework_traceability_lot_codes"):
-            collected.append(engine.next_event())
-            return collected
+        if event.cte_type != CTEType.TRANSFORMATION:
+            continue
+        if not event.kdes.get("rework_traceability_lot_codes"):
+            continue
+        if primary is None:
+            primary = collected[-1]
+            continue
+        if event.traceability_lot_code in primary[0].kdes["rework_traceability_lot_codes"]:
+            return collected, primary, collected[-1]
     raise AssertionError(f"Expected a transformation with a rework lot within {attempts} calls")
 
 
@@ -239,10 +255,7 @@ def test_rework_event_timestamp_never_collides_with_or_precedes_its_primary():
     events may share a timestamp, and the rework lot's own record must
     still land strictly after the transformation that minted it."""
     engine = LegitFlowEngine(seed=SEED, scenario=TRANSFORM_SCENARIO)
-    collected = _run_past_first_rework(engine)
-
-    primary_event, _ = collected[-2]
-    rework_event, _ = collected[-1]
+    collected, (primary_event, _), (rework_event, _) = _run_past_first_rework(engine)
 
     assert primary_event.cte_type == CTEType.TRANSFORMATION
     assert rework_event.cte_type == CTEType.TRANSFORMATION
@@ -263,9 +276,9 @@ def test_rework_event_timestamp_never_collides_with_or_precedes_its_primary():
 
 def test_rework_lot_gets_its_own_transformation_record():
     engine = LegitFlowEngine(seed=SEED, scenario=TRANSFORM_SCENARIO)
-    collected = _run_past_first_rework(engine)
-    primary_event, primary_parents = collected[-2]
-    rework_event, rework_parents = collected[-1]
+    _, (primary_event, primary_parents), (rework_event, rework_parents) = _run_past_first_rework(
+        engine
+    )
 
     assert rework_event.traceability_lot_code in primary_event.kdes["rework_traceability_lot_codes"]
     assert rework_event.cte_type == CTEType.TRANSFORMATION

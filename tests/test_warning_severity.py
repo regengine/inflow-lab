@@ -12,8 +12,6 @@ passes.
 
 from __future__ import annotations
 
-import pytest
-
 from datetime import UTC, datetime
 
 from app.audit import summarize_scenario_audit
@@ -49,7 +47,6 @@ def _bare_harvest_event() -> RegEngineEvent:
     )
 
 
-@pytest.mark.xfail(strict=True, reason="reverted by PR #225's HEAD-side conflict resolution; re-landing tracked in #232")
 def test_missing_required_kdes_are_marked_required() -> None:
     warnings = validate_event_kdes(_bare_harvest_event())
     by_field = {warning.field: warning for warning in warnings}
@@ -59,7 +56,6 @@ def test_missing_required_kdes_are_marked_required() -> None:
             assert by_field[field].severity == "required", field
 
 
-@pytest.mark.xfail(strict=True, reason="reverted by PR #225's HEAD-side conflict resolution; re-landing tracked in #232")
 def test_missing_recommended_kdes_are_marked_recommended() -> None:
     warnings = validate_event_kdes(_bare_harvest_event())
     by_field = {warning.field: warning for warning in warnings}
@@ -69,13 +65,11 @@ def test_missing_recommended_kdes_are_marked_recommended() -> None:
         assert by_field[field].severity == "recommended", field
 
 
-@pytest.mark.xfail(strict=True, reason="reverted by PR #225's HEAD-side conflict resolution; re-landing tracked in #232")
 def test_severity_defaults_to_recommended() -> None:
     """An advisory warning must never be promoted to a blocker by accident."""
     assert CTEValidationWarning(field="x", message="y").severity == "recommended"
 
 
-@pytest.mark.xfail(strict=True, reason="reverted by PR #225's HEAD-side conflict resolution; re-landing tracked in #232")
 def test_required_warnings_sort_ahead_of_recommended_ones() -> None:
     severities = [warning.severity for warning in validate_event_kdes(_bare_harvest_event())]
 
@@ -89,7 +83,6 @@ def test_required_warnings_sort_ahead_of_recommended_ones() -> None:
     assert audit_severities == sorted(audit_severities, key=lambda value: value != "required")
 
 
-@pytest.mark.xfail(strict=True, reason="reverted by PR #225's HEAD-side conflict resolution; re-landing tracked in #232")
 def test_dedupe_keeps_one_copy_and_still_orders_required_first() -> None:
     recommended = CTEValidationWarning(field="a", message="a", severity="recommended")
     required = CTEValidationWarning(field="b", message="b", severity="required")
@@ -105,7 +98,6 @@ def test_warning_messages_are_unchanged_by_the_severity_field() -> None:
     assert messages["field_name"] == "Missing recommended harvesting KDE: field_name"
 
 
-@pytest.mark.xfail(strict=True, reason="reverted by PR #225's HEAD-side conflict resolution; re-landing tracked in #232")
 def test_audit_summary_serialises_severity_and_counts_it_separately() -> None:
     scenario = get_scenario(ScenarioId.LEAFY_GREENS_SUPPLIER)
     record = StoredEventRecord(payload_source="severity-test", event=_bare_harvest_event())
@@ -124,7 +116,6 @@ def test_audit_summary_serialises_severity_and_counts_it_separately() -> None:
     )
 
 
-@pytest.mark.xfail(strict=True, reason="reverted by PR #225's HEAD-side conflict resolution; re-landing tracked in #232")
 def test_a_clean_event_reports_no_required_gaps() -> None:
     """The counts must be able to say "nothing would fail live ingest"."""
     scenario = get_scenario(ScenarioId.LEAFY_GREENS_SUPPLIER)
@@ -138,3 +129,31 @@ def test_a_clean_event_reports_no_required_gaps() -> None:
 
     assert summary["required_warning_count"] == 0
     assert summary["records_with_required_warnings"] == 0
+
+
+def test_a_required_gap_suppresses_the_same_field_s_advisory() -> None:
+    """The dedupe pass must not let a field's advisory outrank its required gap.
+
+    A consumer that reads the first warning for a field -- which is what the
+    shift log does, one row per warning -- would otherwise report
+    "recommended" for something the required tier already flagged.
+
+    Asserted directly on `dedupe_warnings` rather than through a scenario,
+    deliberately. The two tiers are assembled independently and one field can
+    already be named by both (`seafood_first_receiver` does it with
+    `vessel_identifier`), but today both of those entries are "recommended",
+    so no rule table currently produces the required/recommended clash this
+    guards. Promoting any `EventRequirement` to "required" makes it live, and
+    that is precisely the edit that would otherwise remove this behaviour
+    without a single test noticing.
+    """
+    required = CTEValidationWarning(field="lot", message="required gap", severity="required")
+    advisory = CTEValidationWarning(field="lot", message="advisory nudge", severity="recommended")
+    other = CTEValidationWarning(field="other", message="unrelated", severity="recommended")
+
+    deduped = dedupe_warnings([advisory, required, other])
+
+    assert deduped == [required, other], deduped
+    # The advisory for a DIFFERENT field is untouched -- this suppresses one
+    # field's lower tier, not every recommended warning in the list.
+    assert other in deduped

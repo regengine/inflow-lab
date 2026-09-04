@@ -65,7 +65,6 @@ def _transformation_events(records: list[StoredEventRecord]) -> list[StoredEvent
 
 
 @pytest.mark.parametrize("scenario", SCENARIOS)
-@pytest.mark.xfail(strict=True, reason="reverted by PR #225's HEAD-side conflict resolution; re-landing tracked in #232")
 def test_transformation_kdes_emit_one_quantity_entry_per_input_lot(scenario: str) -> None:
     records, _ = _transformation_runs(scenario=scenario)
     transformations = _transformation_events(records)
@@ -91,7 +90,6 @@ def test_transformation_kdes_emit_one_quantity_entry_per_input_lot(scenario: str
         assert len(entries) == kdes["commingled_input_lot_count"]
 
 
-@pytest.mark.xfail(strict=True, reason="reverted by PR #225's HEAD-side conflict resolution; re-landing tracked in #232")
 def test_input_quantities_are_true_to_the_simulated_mass_balance() -> None:
     """The recorded per-input quantities must reconcile with `yield_ratio`.
 
@@ -133,7 +131,6 @@ def test_input_quantities_are_true_to_the_simulated_mass_balance() -> None:
     assert checked, "no complete transformation batch to reconcile"
 
 
-@pytest.mark.xfail(strict=True, reason="reverted by PR #225's HEAD-side conflict resolution; re-landing tracked in #232")
 def test_every_input_quantity_lot_code_is_a_real_upstream_lot() -> None:
     """The quantities are lifted off real input Lots, not invented."""
     records, _ = _transformation_runs()
@@ -154,7 +151,6 @@ def test_every_input_quantity_lot_code_is_a_real_upstream_lot() -> None:
 
 
 @pytest.mark.parametrize("industry", INDUSTRIES)
-@pytest.mark.xfail(strict=True, reason="reverted by PR #225's HEAD-side conflict resolution; re-landing tracked in #232")
 def test_every_adapter_emits_input_quantities(industry: str) -> None:
     """Subclass adapters extend the base dict, so none may drop the new key."""
     adapter = get_industry_adapter(industry)
@@ -198,7 +194,6 @@ def test_every_adapter_emits_input_quantities(industry: str) -> None:
     ]
 
 
-@pytest.mark.xfail(strict=True, reason="reverted by PR #225's HEAD-side conflict resolution; re-landing tracked in #232")
 def test_seeded_runs_stay_deterministic() -> None:
     """The new KDE must not consume RNG draws."""
     first, _ = _transformation_runs()
@@ -219,7 +214,6 @@ def test_seeded_runs_stay_deterministic() -> None:
 # --- #159: the EPCIS export end-to-end ------------------------------------
 
 
-@pytest.mark.xfail(strict=True, reason="reverted by PR #225's HEAD-side conflict resolution; re-landing tracked in #232")
 def test_epcis_input_quantity_list_entries_carry_quantities() -> None:
     records, _ = _transformation_runs()
     document = render_epcis_document(records, source="kde-test", location_gln=_gln)
@@ -240,7 +234,6 @@ def test_epcis_input_quantity_list_entries_carry_quantities() -> None:
             assert element["uom"]
 
 
-@pytest.mark.xfail(strict=True, reason="reverted by PR #225's HEAD-side conflict resolution; re-landing tracked in #232")
 def test_epcis_input_quantities_match_the_source_lots_per_lot() -> None:
     """Quantity correctness per input lot, not merely quantity presence."""
     records, _ = _transformation_runs()
@@ -269,7 +262,6 @@ def test_epcis_input_quantities_match_the_source_lots_per_lot() -> None:
 
 
 @pytest.mark.parametrize("scenario", SCENARIOS)
-@pytest.mark.xfail(strict=True, reason="reverted by PR #225's HEAD-side conflict resolution; re-landing tracked in #232")
 def test_epcis_input_quantities_land_for_every_scenario(scenario: str) -> None:
     records, _ = _transformation_runs(scenario=scenario)
     document = render_epcis_document(records, source="kde-test", location_gln=_gln)

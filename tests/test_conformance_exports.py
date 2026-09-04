@@ -328,7 +328,6 @@ def _transformation_record(input_quantities: Any = None) -> StoredEventRecord:
     )
 
 
-@pytest.mark.xfail(strict=True, reason="reverted by PR #225's HEAD-side conflict resolution; re-landing tracked in #232")
 def test_transformation_inputs_carry_per_lot_quantity_when_kdes_record_it() -> None:
     record = _transformation_record(
         [
@@ -348,7 +347,6 @@ def test_transformation_inputs_carry_per_lot_quantity_when_kdes_record_it() -> N
     assert all("quantity" in element for element in event["inputQuantityList"])
 
 
-@pytest.mark.xfail(strict=True, reason="reverted by PR #225's HEAD-side conflict resolution; re-landing tracked in #232")
 def test_transformation_inputs_accept_lot_to_quantity_mapping() -> None:
     record = _transformation_record({"TLC-IN-1": 80, "TLC-IN-2": 45.5})
     (event,) = _render([record])

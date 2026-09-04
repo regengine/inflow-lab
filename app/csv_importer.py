@@ -279,7 +279,12 @@ def _build_event(
         return None, [], errors, []
 
     warnings = [
-        CSVImportWarning(row=row_number, field=warning.field, message=warning.message)
+        CSVImportWarning(
+            row=row_number,
+            field=warning.field,
+            message=warning.message,
+            severity=warning.severity,
+        )
         for warning in validate_event_kdes(event)
     ]
     return event, parent_lot_codes, [], warnings
