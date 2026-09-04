@@ -539,3 +539,91 @@ def test_userinfo_rejection_precedes_address_check() -> None:
 
     with pytest.raises(EgressBlockedError, match="userinfo"):
         validate_egress_endpoint(HttpUrl("https://user:pass@www.regengine.co/api/v1/webhooks/ingest"))
+
+
+# ---------------------------------------------------------------------------
+# Cleartext delivery -- the API key rides in a request header, so http:// to a
+# public host hands the credential to anything on the path.
+# ---------------------------------------------------------------------------
+
+
+def test_cleartext_to_a_public_host_is_refused(monkeypatch: Any) -> None:
+    monkeypatch.setattr(
+        simulation_schemas,
+        "_resolved_addresses",
+        lambda host: [ipaddress.ip_address("8.8.8.8")],
+    )
+    with pytest.raises(EgressBlockedError, match="cleartext"):
+        validate_egress_endpoint(HttpUrl("http://partner.example.net/webhooks/ingest"))
+
+
+def test_https_to_the_same_public_host_is_allowed(monkeypatch: Any) -> None:
+    monkeypatch.setattr(
+        simulation_schemas,
+        "_resolved_addresses",
+        lambda host: [ipaddress.ip_address("8.8.8.8")],
+    )
+    validate_egress_endpoint(HttpUrl("https://partner.example.net/webhooks/ingest"))
+
+
+def test_cleartext_is_refused_before_the_host_is_ever_resolved(monkeypatch: Any) -> None:
+    """The scheme check must not depend on the resolver.
+
+    A deployment with no DNS must still refuse to put the API key on the wire
+    in the clear, rather than falling through to the unresolvable-host branch
+    that deliberately allows the request to proceed.
+    """
+
+    def _boom(host: str) -> list[Any]:
+        raise AssertionError(f"the scheme check resolved {host!r}")
+
+    monkeypatch.setattr(simulation_schemas, "_resolved_addresses", _boom)
+    with pytest.raises(EgressBlockedError, match="cleartext"):
+        validate_egress_endpoint(HttpUrl("http://partner.example.net/webhooks/ingest"))
+
+
+def test_cleartext_escape_hatch_relaxes_the_scheme_only(monkeypatch: Any) -> None:
+    monkeypatch.setenv(simulation_schemas.ALLOW_CLEARTEXT_DELIVERY_ENV, "1")
+    monkeypatch.setattr(
+        simulation_schemas,
+        "_resolved_addresses",
+        lambda host: [ipaddress.ip_address("8.8.8.8")],
+    )
+    # Scheme relaxed...
+    validate_egress_endpoint(HttpUrl("http://partner.example.net/webhooks/ingest"))
+    # ...but a private or metadata destination is still refused.
+    with pytest.raises(EgressBlockedError):
+        validate_egress_endpoint(HttpUrl("http://169.254.169.254/latest/meta-data/"))
+    with pytest.raises(EgressBlockedError):
+        validate_egress_endpoint(HttpUrl("http://localhost:8000/webhooks/ingest"))
+
+
+def test_the_private_endpoints_hatch_implies_the_cleartext_one(monkeypatch: Any) -> None:
+    # The local-mock workflow is http://localhost and must need no new flag.
+    monkeypatch.delenv(simulation_schemas.ALLOW_CLEARTEXT_DELIVERY_ENV, raising=False)
+    monkeypatch.setenv(PRIVATE_ENDPOINTS_ENV, "1")
+    validate_egress_endpoint(HttpUrl("http://localhost:8000/webhooks/ingest"))
+
+
+@pytest.mark.parametrize(
+    ("endpoint", "expected"),
+    [
+        ("http://169.254.169.254/latest/meta-data/", "cloud-metadata"),
+        ("http://127.0.0.1:9000/webhooks/ingest", "loopback"),
+        ("http://10.0.5.5/webhooks/ingest", "loopback"),
+    ],
+)
+def test_a_local_destination_is_reported_as_local_even_when_it_is_also_cleartext(
+    endpoint: str, expected: str
+) -> None:
+    """Ordering matters more than it looks.
+
+    These URLs fail two checks at once. The operator has to act on the
+    destination, not the scheme -- being told "use https" about a link-local
+    metadata address would send them to fix the wrong thing. An address
+    literal is classified with no resolver, so this ordering costs no DNS.
+    """
+    with pytest.raises(EgressBlockedError) as excinfo:
+        validate_egress_endpoint(HttpUrl(endpoint))
+    assert expected in str(excinfo.value)
+    assert "cleartext" not in str(excinfo.value)

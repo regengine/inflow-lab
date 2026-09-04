@@ -25,6 +25,12 @@ _TRUSTED_REGENGINE_HOST = "www.regengine.co"
 # environment, since it disables the SSRF guard entirely.
 PRIVATE_ENDPOINTS_ENV = "REGENGINE_ALLOW_PRIVATE_ENDPOINTS"
 
+# Relaxes the scheme check only, for a trusted network where TLS terminates
+# elsewhere. Private, loopback and metadata destinations stay refused, and
+# PRIVATE_ENDPOINTS_ENV already implies this -- the local-mock workflow runs
+# over http://localhost and needs nothing new.
+ALLOW_CLEARTEXT_DELIVERY_ENV = "REGENGINE_ALLOW_CLEARTEXT_DELIVERY"
+
 _BLOCKED_HOSTNAMES = frozenset({
     "localhost",
     "ip6-localhost",
@@ -51,8 +57,18 @@ class EgressBlockedError(ValueError):
     """
 
 
+def _env_flag(name: str) -> bool:
+    return os.getenv(name, "").strip().lower() in {"1", "true", "yes", "on"}
+
+
 def _private_endpoints_allowed() -> bool:
-    return os.getenv(PRIVATE_ENDPOINTS_ENV, "").strip().lower() in {"1", "true", "yes", "on"}
+    return _env_flag(PRIVATE_ENDPOINTS_ENV)
+
+
+def _cleartext_delivery_allowed() -> bool:
+    # PRIVATE_ENDPOINTS_ENV implies this: that hatch exists for
+    # http://localhost and the built-in mock, which are cleartext by nature.
+    return _env_flag(ALLOW_CLEARTEXT_DELIVERY_ENV) or _private_endpoints_allowed()
 
 
 def _resolved_addresses(host: str) -> list[ipaddress.IPv4Address | ipaddress.IPv6Address]:
@@ -91,6 +107,27 @@ def _is_unsafe_address(address: ipaddress.IPv4Address | ipaddress.IPv6Address) -
     # address inside a technically-"routable" v6 one — unwrap and re-check.
     mapped = getattr(address, "ipv4_mapped", None)
     return mapped is not None and _is_unsafe_address(mapped)
+
+
+def _as_ip_address(host: str) -> ipaddress.IPv4Address | ipaddress.IPv6Address | None:
+    """The host as an IP address if it is already a literal, else None.
+
+    Purely syntactic -- never touches the resolver -- so it is safe to call
+    ahead of checks that are deliberately resolver-free.
+    """
+    try:
+        return ipaddress.ip_address(host)
+    except ValueError:
+        return None
+
+
+def _unsafe_address_message(host: str) -> str:
+    return (
+        f"Delivery endpoint host {host!r} resolves to a loopback, private, "
+        "link-local, or cloud-metadata address, which is blocked to prevent "
+        f"SSRF. Set {PRIVATE_ENDPOINTS_ENV}=1 to allow this for local "
+        "development."
+    )
 
 
 async def async_validate_egress_endpoint(url: HttpUrl | None) -> None:
@@ -134,14 +171,37 @@ def validate_egress_endpoint(url: HttpUrl | None) -> None:
     host = (url.host or "").strip("[]").lower()
     if not host:
         raise EgressBlockedError("Delivery endpoint is missing a host.")
-    if host == _TRUSTED_REGENGINE_HOST:
-        return
+    # Name checks run before the trusted-host short-circuit and before the
+    # scheme check, so a metadata or loopback destination is always reported
+    # as the local/internal address it is -- that is the finding an operator
+    # has to act on, even when the endpoint is also cleartext.
     if host in _BLOCKED_HOSTNAMES or any(host.endswith(s) for s in _BLOCKED_HOST_SUFFIXES):
         raise EgressBlockedError(
             f"Delivery endpoint host {host!r} is blocked by name. "
             f"Set {PRIVATE_ENDPOINTS_ENV}=1 to allow this for local "
             "development."
         )
+    # An address literal can be classified with no resolver at all, so the
+    # local/internal verdict is reached before the scheme check even for a
+    # cleartext metadata URL like http://169.254.169.254/. Names still wait
+    # for the resolution below, so the scheme check stays resolver-free.
+    literal = _as_ip_address(host)
+    if literal is not None and _is_unsafe_address(literal):
+        raise EgressBlockedError(_unsafe_address_message(host))
+    if url.scheme == "http" and not _cleartext_delivery_allowed():
+        # Every live delivery and every connection probe carries the RegEngine
+        # API key in a request header. Over http that header crosses the
+        # network in the clear, so an endpoint that is otherwise a perfectly
+        # ordinary public host still hands the credential to anything on the
+        # path. Refused here -- before the name is resolved and before any
+        # credential header is built -- rather than at the socket.
+        raise EgressBlockedError(
+            f"Delivery endpoint {url.scheme}://{host} is cleartext, and the RegEngine "
+            "API key would cross the network unencrypted in a request header. Use "
+            f"https, or set {ALLOW_CLEARTEXT_DELIVERY_ENV}=1 for a trusted network."
+        )
+    if host == _TRUSTED_REGENGINE_HOST:
+        return
     addresses = _resolved_addresses(host)
     if not addresses:
         # A host that does not resolve cannot be dialed, so it is not an SSRF
@@ -151,12 +211,7 @@ def validate_egress_endpoint(url: HttpUrl | None) -> None:
         # as hostile and fail all live delivery closed at once.
         return
     if any(_is_unsafe_address(address) for address in addresses):
-        raise EgressBlockedError(
-            f"Delivery endpoint host {host!r} resolves to a loopback, private, "
-            "link-local, or cloud-metadata address, which is blocked to prevent "
-            f"SSRF. Set {PRIVATE_ENDPOINTS_ENV}=1 to allow this for local "
-            "development."
-        )
+        raise EgressBlockedError(_unsafe_address_message(host))
 
 
 class DeliveryConfig(BaseModel):

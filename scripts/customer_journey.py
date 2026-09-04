@@ -53,7 +53,11 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from app.engine import LegitFlowEngine  # noqa: E402
 from app.regengine_client import LiveRegEngineClient, LiveRegEngineDeliveryError  # noqa: E402
 from app.schemas.ingestion import IngestPayload  # noqa: E402
-from app.schemas.simulation import DeliveryConfig, SimulationConfig  # noqa: E402
+from app.schemas.simulation import (  # noqa: E402
+    PRIVATE_ENDPOINTS_ENV,
+    DeliveryConfig,
+    SimulationConfig,
+)
 from app.scenarios import ScenarioId  # noqa: E402
 
 
@@ -317,6 +321,14 @@ async def run_journey(args: argparse.Namespace) -> int:
             print("REGENGINE_ADMIN_KEY is required for --local (the stack's ADMIN_MASTER_KEY).")
             return 2
         batches, batch_size = args.batches, args.batch_size
+        # --local points delivery at http://localhost:8000 by design, which the
+        # egress guard refuses by name and by scheme -- correctly, since that is
+        # exactly the shape an SSRF probe takes. This is the one caller that is
+        # legitimately local, so it opts itself in rather than asking every
+        # developer to remember an env var the docs did not mention. Scoped to
+        # this branch: --confirm-live above never reaches it, so a deployed run
+        # keeps the full guard.
+        os.environ.setdefault(PRIVATE_ENDPOINTS_ENV, "1")
 
     async with httpx.AsyncClient(timeout=30.0) as client:
         # 1. Reach RegEngine.
