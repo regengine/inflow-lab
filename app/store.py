@@ -77,6 +77,36 @@ def mask_secret_in_payload(value: Any, secret: str | None = None) -> Any:
     return value
 
 
+def _describe_parse_failure(exc: Exception) -> str:
+    """Describe why a line failed to parse, WITHOUT quoting the line.
+
+    Both this module's log line and ``CorruptRecordLine.error`` promise not
+    to carry the offending content: a line that failed to parse *as* a
+    record never went through ``_scrub_secrets``, so it can still hold a
+    plaintext ``api_key``. ``str(ValidationError)`` breaks that promise --
+    pydantic renders ``input_value=...`` into its message, so a corrupt line
+    carrying a live key put that key straight into the log.
+
+    ``errors(include_input=False)`` drops exactly that field and keeps what
+    is actually diagnostic: the failure type, the field location, and the
+    message. ``include_url=False`` trims the docs link, which adds nothing
+    to a log. A non-pydantic ValueError (nothing raises one here today, but
+    the caller catches the base class) has no structured form, so it falls
+    back to ``str`` -- those messages are ours, not echoes of the input.
+    """
+    errors = getattr(exc, "errors", None)
+    if not callable(errors):
+        return str(exc)
+    try:
+        rendered = errors(include_url=False, include_input=False)
+    except TypeError:  # pragma: no cover - only on a pydantic without the kwargs
+        return f"{type(exc).__name__}: unparseable record line"
+    return "; ".join(
+        f"{'.'.join(str(part) for part in item.get('loc', ())) or '<record>'}: {item.get('msg', '')}"
+        for item in rendered
+    )
+
+
 class CorruptRecordLine(NamedTuple):
     """One JSONL line ``read_persisted_records`` could not parse and skipped.
 
@@ -218,7 +248,27 @@ class EventStore:
 
         with self._lock:
             if path.exists():
-                with path.open("r", encoding="utf-8") as handle:
+                # Opened in BINARY mode, deliberately (#93). A text-mode
+                # handle decodes as it iterates, so a run of invalid UTF-8
+                # bytes anywhere in the file raises UnicodeDecodeError out
+                # of the `for` statement itself -- outside the try below,
+                # and therefore past every skip-and-log guard here. That is
+                # the same whole-read abort this method exists to prevent,
+                # just triggered by byte corruption instead of a syntax
+                # error: torn writes, a truncated volume restore, or a file
+                # written by something that was not this app. Because
+                # app/tenancy.py builds the default store at import time,
+                # that abort also stopped the app starting at all on a
+                # corrupt volume.
+                #
+                # Reading bytes and letting model_validate_json do the
+                # decoding moves that failure inside the try, where it
+                # arrives as a pydantic ValidationError (a ValueError) and
+                # is skipped and logged exactly like any other unparseable
+                # line. Iterating a binary handle still splits on b"\n",
+                # which is precisely what _serialize_record writes, so
+                # line numbering is unchanged.
+                with path.open("rb") as handle:
                     for line_number, line in enumerate(handle, start=1):
                         if not line.strip():
                             continue
@@ -229,15 +279,20 @@ class EventStore:
                             # line itself is never logged: it failed to
                             # parse *as* a record, so it could still carry a
                             # secret-named KDE the model never got a chance
-                            # to scrub.
+                            # to scrub. Rendered by _describe_parse_failure
+                            # rather than str(exc), because pydantic puts
+                            # the rejected input INTO its message -- which
+                            # made that promise false for as long as it has
+                            # been written here.
+                            detail = _describe_parse_failure(exc)
                             logger.error(
                                 "skipping unreadable event record at %s:%d (%s)",
                                 path,
                                 line_number,
-                                exc,
+                                detail,
                             )
                             corrupt_lines.append(
-                                CorruptRecordLine(path=str(path), line_number=line_number, error=str(exc))
+                                CorruptRecordLine(path=str(path), line_number=line_number, error=detail)
                             )
             # Overwritten every call, including empty, so this always
             # reflects *this* read rather than stale state left by a
@@ -371,7 +426,41 @@ class EventStore:
                     self._counter = next_sequence_no
                     self._records.appendleft(record)
                     stored.append(record)
+                if stored:
+                    self._fsync_appended(handle)
         return stored
+
+    def _fsync_appended(self, handle: Any) -> None:
+        """Force this batch's appended bytes to stable storage (#93).
+
+        ``flush()`` in the loop above only pushes the bytes out of Python's
+        buffer into the OS page cache. That is enough to make a write error
+        surface synchronously and enough to survive the process dying, but
+        not enough to survive the machine losing power -- so an
+        acknowledged append could still be missing after a hard restart.
+        ``update_many``/``replace_all`` get their durability from the tmp +
+        ``os.replace`` swap in ``_write_records``; the append path had no
+        equivalent, which is the durability half of #93.
+
+        A tmp + rename would give the same guarantee here only by
+        rewriting the entire log on every append -- turning an O(1) append
+        into O(total records), on the hot path every step() takes. #93
+        names ``fsync`` as the alternative for exactly this reason.
+
+        One fsync per *batch*, not per record: the per-record ``flush()``
+        already supplies the error detection and the write-then-commit
+        ordering the loop depends on, and an fsync per record would make a
+        multi-thousand-row CSV import pay a disk round-trip per row.
+
+        Skipped for anything that is not a regular file: the persist path
+        can legitimately point at a character device (the durability tests
+        use /dev/full to force ENOSPC), which has no durable state to
+        flush. Same constraint ``_truncate_torn_tail`` and
+        ``_resync_counter_from_disk`` already carry, for the same reason.
+        """
+        if not self.persist_path.is_file():
+            return
+        os.fsync(handle.fileno())
 
     def update_many(self, records: Iterable[StoredEventRecord]) -> list[StoredEventRecord]:
         self._refuse_if_retired()
