@@ -1345,3 +1345,134 @@ def test_over_real_tls_a_certificate_for_the_pinned_ip_is_rejected(
     message = str(exc_info.value)
     assert "CERTIFICATE_VERIFY_FAILED" in message or "certificate verify failed" in message, message
     assert servers.received == []
+
+
+# ---------------------------------------------------------------------------
+# #209/#210: the /api/integration/test credential guard compares the full ORIGIN
+# ---------------------------------------------------------------------------
+
+
+def test_restating_the_stored_endpoint_verbatim_still_uses_stored_credentials(
+    monkeypatch: Any,
+) -> None:
+    """The ordinary Test-connection case, which main had broken.
+
+    The two ``updates.setdefault(..., None)`` calls that blank the stored
+    credentials had drifted OUTSIDE the origin-mismatch branch, so *any*
+    request carrying an endpoint lost them -- including one naming the very
+    endpoint the credentials were stored for. The console's settings form
+    posts the endpoint alongside the probe, so pressing Test connection with
+    a correctly configured live integration answered "Both an API key and a
+    tenant id are required": a condition that had not failed, about
+    credentials that were sitting right there.
+
+    Withholding must key on the origin actually differing, and nothing else.
+    """
+    SpyAsyncClient.calls = []
+    SpyAsyncClient.status_code = 200
+    monkeypatch.setattr("app.regengine_client.httpx.AsyncClient", SpyAsyncClient)
+    monkeypatch.setattr(
+        simulation_schemas, "_resolved_addresses", lambda host: [ipaddress.ip_address("8.8.8.8")]
+    )
+    client.post(
+        "/api/integration/configure",
+        json={
+            "mode": "live",
+            "endpoint": "https://www.regengine.co/api/v1/webhooks/ingest",
+            "api_key": "rge_live_super_secret_key",
+            "tenant_id": "11111111-1111-1111-1111-111111111111",
+        },
+    )
+
+    response = client.post(
+        "/api/integration/test",
+        json={"endpoint": "https://www.regengine.co/api/v1/webhooks/ingest"},
+    )
+
+    assert response.json()["verdict"] == "connected", response.text
+    assert SpyAsyncClient.calls, "the stored origin should still be probed"
+    assert SpyAsyncClient.calls[0]["headers"]["X-RegEngine-API-Key"] == "rge_live_super_secret_key"
+
+
+def test_a_scheme_downgrade_to_the_stored_host_withholds_the_credentials(
+    monkeypatch: Any,
+) -> None:
+    """Same host, same port, different scheme -- the case host-only comparison
+    could not see (#209). A key issued for a TLS endpoint must not be handed to
+    a cleartext probe of the same name."""
+    SpyAsyncClient.calls = []
+    monkeypatch.setattr("app.regengine_client.httpx.AsyncClient", SpyAsyncClient)
+    monkeypatch.setattr(
+        simulation_schemas, "_resolved_addresses", lambda host: [ipaddress.ip_address("8.8.8.8")]
+    )
+    client.post(
+        "/api/integration/configure",
+        json={
+            "mode": "live",
+            "endpoint": "https://www.regengine.co/api/v1/webhooks/ingest",
+            "api_key": "rge_live_super_secret_key",
+            "tenant_id": "11111111-1111-1111-1111-111111111111",
+        },
+    )
+
+    response = client.post(
+        "/api/integration/test",
+        json={"endpoint": "http://www.regengine.co/api/v1/webhooks/ingest"},
+    )
+
+    assert response.status_code == 200
+    assert "rge_live_super_secret_key" not in response.text
+    assert SpyAsyncClient.calls == [], "a key issued for https was sent over http"
+
+
+def test_a_different_port_on_the_stored_host_withholds_the_credentials(
+    monkeypatch: Any,
+) -> None:
+    """The other half of #209: ``https://host:8443`` reaches whatever else is
+    listening on that host, which is not the service the credential was
+    issued for. Comparing scheme and host but not port let it inherit the
+    stored key."""
+    SpyAsyncClient.calls = []
+    monkeypatch.setattr("app.regengine_client.httpx.AsyncClient", SpyAsyncClient)
+    monkeypatch.setattr(
+        simulation_schemas, "_resolved_addresses", lambda host: [ipaddress.ip_address("8.8.8.8")]
+    )
+    client.post(
+        "/api/integration/configure",
+        json={
+            "mode": "live",
+            "endpoint": "https://www.regengine.co/api/v1/webhooks/ingest",
+            "api_key": "rge_live_super_secret_key",
+            "tenant_id": "11111111-1111-1111-1111-111111111111",
+        },
+    )
+
+    response = client.post(
+        "/api/integration/test",
+        json={"endpoint": "https://www.regengine.co:8443/api/v1/webhooks/ingest"},
+    )
+
+    assert response.status_code == 200
+    assert "rge_live_super_secret_key" not in response.text
+    assert SpyAsyncClient.calls == []
+
+
+def test_origin_treats_an_implicit_and_explicit_default_port_as_the_same_place() -> None:
+    # Adding the port to the comparison must not make two spellings of the
+    # same endpoint look like different origins.
+    from app.routers.integration import _origin
+
+    assert _origin("https://www.regengine.co/x") == _origin("https://www.regengine.co:443/x")
+    assert _origin("http://example.test/x") == _origin("http://example.test:80/x")
+    assert _origin("https://example.test/x") != _origin("https://example.test:8443/x")
+    # The scheme has to be compared in its own right, not inferred from the
+    # default port. https://host and http://host already differ on 443 vs 80,
+    # so only a pair sharing an EXPLICIT port isolates the scheme -- and that
+    # pair is the real cleartext downgrade: same wire address, TLS on one side
+    # and not the other.
+    assert _origin("https://example.test/x") != _origin("http://example.test/x")
+    assert _origin("https://example.test:8443/x") != _origin("http://example.test:8443/x")
+    # Already-closed cases that must stay closed: a trailing dot and a
+    # different host are still different origins.
+    assert _origin("https://example.test/x") != _origin("https://example.test./x")
+    assert _origin("https://example.test/x") != _origin("https://other.test/x")
