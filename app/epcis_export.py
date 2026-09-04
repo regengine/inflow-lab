@@ -27,8 +27,21 @@ _BIZ_STEPS = {
 # The only sourceDestinationType issue #187 asks for -- CBV also defines
 # owning_party/possessing_party, but this app has no ownership/possession
 # model distinct from location, so "location" is the one type it can back
-# with real data.
-_SDT_LOCATION = "urn:epcglobal:cbv:sdt:location"
+# with real data. Emitting the other two would be asserting an ownership or
+# possession handoff the simulator does not model.
+#
+# The BARE TOKEN, not the urn:epcglobal:cbv:sdt:location alias. GS1's own
+# epcis-context.jsonld declares sourceList/destinationList `type` as
+# "@type": "@vocab" over exactly three short names -- owning_party,
+# possessing_party, location -- so only the token expands to cbv:SDT-location.
+# The URN is a legitimate sameAs alias of that term, but it is not one of the
+# declared vocabulary entries, so it fails JSON-LD expansion; and the official
+# EPCIS 2.0 JSON Schema's source-dest-type carries a negative lookahead
+# ("^(?!(urn:epcglobal:cbv|https?://ns\.gs1\.org/cbv/))") that rejects this
+# exact prefix outright. Emitting the URN made every shipping and receiving
+# document schema-invalid, which is the opposite of what #187 asked for.
+# Both facts re-verified against the published context and schema.
+_SDT_LOCATION = "location"
 
 _DISPOSITIONS = {
     CTEType.HARVESTING: "urn:epcglobal:cbv:disp:active",
@@ -150,11 +163,12 @@ def _render_transformation_event(
         if batch_number
         else f"urn:regengine:transformation:{record.record_id}"
     )
+    input_lot_details = _input_lot_details(record)
     return {
         "type": "TransformationEvent",
         "transformationID": transformation_id,
         "inputQuantityList": [
-            _input_quantity_element(record, lot_code)
+            _input_quantity_element(record, lot_code, input_lot_details)
             for lot_code in _input_lot_codes(record)
         ],
         "outputQuantityList": [
@@ -205,47 +219,99 @@ def _quantity_element(
     return element
 
 
-def _input_quantity_element(record: StoredEventRecord, lot_code: str) -> dict[str, Any]:
-    """quantity/uom for one transformation input lot, read if it was ever recorded.
+def _input_lot_details(record: StoredEventRecord) -> dict[str, dict[str, Any]]:
+    """Per-input-lot quantity/unit/product for one transformation, by lot code.
 
-    EPCIS's QuantityElement schema requires `quantity` alongside `epcClass`
-    (issue #159), but as of this fix nothing upstream of this module
-    actually captures a *per-input* quantity for transformation events:
-    industry_adapters.transformation_kdes (which builds
-    input_traceability_lot_codes) only ever computes an aggregate
-    yield_ratio across all inputs, so engine.py's per-lot
-    Lot.quantity/.unit_of_measure never reaches event.kdes for any
-    engine-generated or bundled demo-fixture transformation today --
-    verified directly against both files, and independently documented by
-    cte_rules.py's TRANSFORMATION_INPUT_LINKAGE_KDES comment (issue #189).
-    Fabricating a number here would be worse than omitting it for a
-    regulatory export, so this reads an "input_lot_quantities" KDE
-    (lot_code -> {"quantity": ..., "unit_of_measure": ...}) if one is
-    present -- keyed by lot code rather than positionally paired with
-    input_traceability_lot_codes, since _input_lot_codes() above merges
-    lot codes from three different sources that don't share one common
-    order -- and otherwise leaves quantity/uom out, exactly as before.
-    A hand-crafted or CSV-imported event's free-form kdes JSON can already
-    populate this key today; making industry_adapters.transformation_kdes
-    do the same for engine-generated events is the upstream change that
-    would make this non-empty for the simulator's own data (see this
-    project's issue #159 for the full writeup of that gap).
+    EPCIS ``QuantityElement`` requires ``quantity`` alongside ``epcClass``
+    (#159), so the exporter surfaces whatever the transformation KDEs recorded
+    per input lot -- and nothing more. Fabricating a number, or splitting an
+    aggregate evenly across lots, would be worse than omitting it in a
+    regulatory export, so a lot with no recorded quantity renders without one.
+
+    Keyed by lot code rather than paired positionally with
+    ``input_traceability_lot_codes``, because ``_input_lot_codes`` below merges
+    lot codes from three sources that share no common order.
+
+    Two KDE shapes are read, because two different producers write them:
+
+      * ``input_quantities`` -- what ``industry_adapters.transformation_kdes``
+        emits for every engine-generated transformation: a list of
+        ``{lot_code, quantity, unit_of_measure}``. A ``{lot_code: quantity}``
+        mapping is accepted too, since that is the other natural spelling.
+      * ``input_lot_quantities`` -- ``{lot_code: {quantity, unit_of_measure}}``,
+        the shape a hand-authored or CSV-imported event's free-form kdes JSON
+        uses. Applied second, so an explicitly authored per-lot mapping wins
+        over a generated one if an event somehow carries both.
+
+    ``input_products`` is read positionally against
+    ``input_traceability_lot_codes``, which is the only order it has.
     """
+    details: dict[str, dict[str, Any]] = {}
+
+    lot_codes = record.event.kdes.get("input_traceability_lot_codes")
+    products = record.event.kdes.get("input_products")
+    if isinstance(lot_codes, list) and isinstance(products, list):
+        for lot_code, product in zip(lot_codes, products):
+            if isinstance(lot_code, str) and isinstance(product, str) and product:
+                details.setdefault(lot_code, {})["product_description"] = product
+
+    default_uom = record.event.kdes.get("input_unit_of_measure")
+
+    quantities = record.event.kdes.get("input_quantities")
+    entries: list[Any] = []
+    if isinstance(quantities, dict):
+        entries = [
+            {"lot_code": lot_code, "quantity": quantity}
+            for lot_code, quantity in quantities.items()
+        ]
+    elif isinstance(quantities, list):
+        entries = list(quantities)
+
     per_lot = record.event.kdes.get("input_lot_quantities")
-    quantity: float | None = None
-    unit_of_measure: str | None = None
     if isinstance(per_lot, dict):
-        entry = per_lot.get(lot_code)
-        if isinstance(entry, dict):
-            raw_quantity = entry.get("quantity")
-            # bool is a subclass of int in Python -- exclude it explicitly
-            # so a stray True/False can't be coerced into a fake quantity.
-            if isinstance(raw_quantity, (int, float)) and not isinstance(raw_quantity, bool):
-                quantity = float(raw_quantity)
-            raw_uom = entry.get("unit_of_measure")
-            if isinstance(raw_uom, str) and raw_uom:
-                unit_of_measure = raw_uom
-    return _quantity_element(lot_code=lot_code, quantity=quantity, unit_of_measure=unit_of_measure)
+        entries += [
+            {"lot_code": lot_code, **entry}
+            for lot_code, entry in per_lot.items()
+            if isinstance(entry, dict)
+        ]
+
+    for entry in entries:
+        if not isinstance(entry, dict):
+            continue
+        lot_code = entry.get("lot_code") or entry.get("traceability_lot_code")
+        if not isinstance(lot_code, str) or not lot_code:
+            continue
+        detail = details.setdefault(lot_code, {})
+        quantity = entry.get("quantity")
+        # bool is a subclass of int in Python -- exclude it explicitly so a
+        # stray True/False cannot be coerced into a fake quantity of 1 or 0.
+        if isinstance(quantity, (int, float)) and not isinstance(quantity, bool):
+            detail["quantity"] = float(quantity)
+        unit_of_measure = entry.get("unit_of_measure") or entry.get("uom") or default_uom
+        if isinstance(unit_of_measure, str) and unit_of_measure:
+            detail["unit_of_measure"] = unit_of_measure
+        product = entry.get("product_description")
+        if isinstance(product, str) and product:
+            detail["product_description"] = product
+
+    return details
+
+
+def _input_quantity_element(
+    record: StoredEventRecord, lot_code: str, details: dict[str, dict[str, Any]] | None = None
+) -> dict[str, Any]:
+    """One ``inputQuantityList`` entry, carrying a quantity only if one was recorded."""
+    detail = (_input_lot_details(record) if details is None else details).get(lot_code, {})
+    return _quantity_element(
+        lot_code=lot_code,
+        quantity=detail.get("quantity"),
+        unit_of_measure=detail.get("unit_of_measure"),
+        # _input_lot_details already reads input_products positionally against
+        # input_traceability_lot_codes; passing it on is what puts each input
+        # lot's own product description in the document rather than leaving a
+        # consumer to guess which of the batch's inputs an epcClass refers to.
+        product_description=detail.get("product_description"),
+    )
 
 
 def _input_lot_codes(record: StoredEventRecord) -> list[str]:

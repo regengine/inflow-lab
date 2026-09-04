@@ -200,11 +200,26 @@ def _linked_location_description(event: RegEngineEvent) -> str:
     the immediate previous source -- both already live in event.kdes, so a
     Shipping- or Receiving-only export no longer silently drops half of the
     required location pair just because its paired leg isn't in the batch.
+
+    Read through the same short/long aliasing `_tlc_source_reference` below
+    uses, and for the same reason: "immediate subsequent recipient" and
+    "immediate previous source" are FDA's own KDE names, so a hand-crafted or
+    CSV-imported event is as likely to carry those as the short keys the
+    engine writes. Without the fallback such a row exported an empty cell for
+    a location it had actually supplied.
     """
     if event.cte_type == CTEType.SHIPPING:
-        return event.kdes.get("ship_to_location") or ""
+        return (
+            event.kdes.get("ship_to_location")
+            or event.kdes.get("immediate_subsequent_recipient")
+            or ""
+        )
     if event.cte_type == CTEType.RECEIVING:
-        return event.kdes.get("immediate_previous_source") or ""
+        return (
+            event.kdes.get("immediate_previous_source")
+            or event.kdes.get("immediate_previous_source_location")
+            or ""
+        )
     return ""
 
 

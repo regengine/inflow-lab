@@ -122,7 +122,7 @@ def test_shipping_event_carries_destination_list_for_ship_to_location() -> None:
 
     assert shipping_event["destinationList"] == [
         {
-            "type": "urn:epcglobal:cbv:sdt:location",
+            "type": "location",
             "destination": "urn:regengine:location:Distribution%20Center%20%234",
         }
     ]
@@ -137,7 +137,7 @@ def test_receiving_event_carries_source_list_for_previous_source() -> None:
 
     assert receiving_event["sourceList"] == [
         {
-            "type": "urn:epcglobal:cbv:sdt:location",
+            "type": "location",
             "source": "urn:regengine:location:FreshPack%20Central",
         }
     ]

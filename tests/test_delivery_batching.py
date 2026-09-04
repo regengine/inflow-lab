@@ -34,7 +34,6 @@ only files this workstream owns.
 from __future__ import annotations
 
 import asyncio
-from datetime import UTC, datetime
 
 import app.controller as controller_module
 from app.main import controller
@@ -49,9 +48,10 @@ from app.schemas.domain import (
 )
 from app.schemas.ingestion import CSVImportRequest, DeliveryRetryRequest, IngestPayload, ReplayRequest
 from app.schemas.simulation import DeliveryConfig, SimulationConfig
+from tests.support.timestamps import recent_event_timestamp
 
 
-_BASE_TIME = datetime(2026, 3, 1, 8, 0, tzinfo=UTC)
+_BASE_TIME = recent_event_timestamp()
 _VALID_KDES = {"harvest_date": "2026-03-01", "reference_document": "Harvest Log HL-BATCHING-DEFAULT"}
 
 

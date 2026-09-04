@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import asyncio
-from datetime import UTC, datetime, timedelta
+from datetime import timedelta
 from typing import Any
 
 import pytest
@@ -10,6 +10,12 @@ from fastapi.testclient import TestClient
 from app.main import app, controller
 from app.schemas.domain import CTEType, DestinationMode, RegEngineEvent, StoredEventRecord
 from app.schemas.simulation import SimulationConfig
+from tests.support.timestamps import recent_event_timestamp
+
+# The mock enforces the 90-day replay window by default, so a request body
+# posted by these tests needs a timestamp inside it -- see
+# tests/support/timestamps.py for why a literal cannot serve.
+RECENT_TIMESTAMP_JSON = recent_event_timestamp().isoformat().replace("+00:00", "Z")
 
 
 # Regression tests for #143 (reject unknown/misplaced request body fields),
@@ -20,7 +26,7 @@ from app.schemas.simulation import SimulationConfig
 
 client = TestClient(app)
 
-_BASE_TIME = datetime(2026, 3, 1, 8, 0, tzinfo=UTC)
+_BASE_TIME = recent_event_timestamp()
 
 
 def setup_function() -> None:
@@ -87,7 +93,7 @@ def _make_stored_record(
                         "quantity": 100,
                         "unit_of_measure": "cases",
                         "location_name": "Valley Fresh Farms",
-                        "timestamp": "2026-03-01T08:00:00Z",
+                        "timestamp": RECENT_TIMESTAMP_JSON,
                         "kdes": {},
                     }
                 ],
@@ -158,7 +164,7 @@ def test_ingest_with_well_formed_body_still_succeeds() -> None:
                     "quantity": 100,
                     "unit_of_measure": "cases",
                     "location_name": "Valley Fresh Farms",
-                    "timestamp": "2026-03-01T08:00:00Z",
+                    "timestamp": RECENT_TIMESTAMP_JSON,
                     "kdes": {"harvest_date": "2026-03-01", "reference_document": "Harvest Log HL-ROBUST-001"},
                 }
             ],
@@ -342,15 +348,29 @@ def test_events_endpoint_limit_still_refuses_past_its_existing_maximum() -> None
     assert response.status_code == 422
 
 
-def test_wrapped_reset_body_is_rejected_instead_of_silently_ignored() -> None:
-    """#143's headline repro: /api/simulate/reset validates the raw body as
-    SimulationConfig, so a caller who wrapped it the way /start expects used
-    to get a 200 and an unchanged scenario. It must be a 422."""
+def test_wrapped_reset_body_is_applied_instead_of_silently_ignored() -> None:
+    """#143's headline repro: /api/simulate/reset validated the raw body as
+    SimulationConfig, so a caller who wrapped it the way /start expects got a
+    200 and an unchanged scenario -- the override discarded in silence.
+
+    This asserted a 422 while the fix was mid-flight. #143's closing change
+    went further and made the wrapped shape *canonical*: /reset accepts both
+    it and the legacy bare-config form, and the two are unambiguous because
+    SimulationConfig has no `config` field and both forbid unknown keys. So
+    the silent discard is still closed -- the override is now honoured rather
+    than refused, which is the better answer for two endpoints that sit side
+    by side and take the same settings.
+
+    The property this test exists for is unchanged and is what it checks: a
+    wrapped body never leaves the scenario at its default. A typo, or a field
+    alongside `config`, is still a 422 -- see tests/test_request_strictness.py.
+    """
     response = client.post(
         "/api/simulate/reset",
         json={"config": {"scenario": "dairy_continuous_flow"}},
     )
-    assert response.status_code == 422
+    assert response.status_code == 200, response.text
+    assert client.get("/api/simulate/status").json()["config"]["scenario"] == "dairy_continuous_flow"
 
 
 def test_unknown_key_inside_inline_delivery_block_is_rejected() -> None:

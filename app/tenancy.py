@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import logging
 import os
 from pathlib import Path
@@ -71,6 +72,7 @@ controller = SimulationController(
     scenario_saves=scenario_saves,
     mock_service=mock_service,
     live_client=LiveRegEngineClient(),
+    tenant_id=DEFAULT_TENANT_ID,
 )
 
 _tenant_controllers: dict[str, SimulationController] = {DEFAULT_TENANT_ID: controller}
@@ -91,8 +93,30 @@ _tenants_being_deleted: set[str] = set()
 
 
 async def shutdown_tenant_controllers() -> None:
-    for tenant_controller in set(_tenant_controllers.values()):
-        await tenant_controller.shutdown()
+    """Stop every tenant's run loop, concurrently and without giving up on one.
+
+    Awaiting these serially made container shutdown pay the sum of every
+    tenant's stop latency, and a platform's shutdown grace period is a fixed
+    budget for all of them together (#208). `return_exceptions=True` so one
+    wedged or already-broken tenant cannot stop the others from shutting down
+    cleanly; each `shutdown()` is separately bounded and cancels its own run
+    loop past the cap.
+    """
+    with _tenant_lock:
+        tenant_controllers = list(set(_tenant_controllers.values()))
+    if not tenant_controllers:
+        return
+    outcomes = await asyncio.gather(
+        *(tenant_controller.shutdown() for tenant_controller in tenant_controllers),
+        return_exceptions=True,
+    )
+    for tenant_controller, outcome in zip(tenant_controllers, outcomes):
+        if isinstance(outcome, BaseException):
+            logger.warning(
+                "tenant controller shutdown failed: tenant=%s (%s)",
+                tenant_controller.tenant_id,
+                outcome,
+            )
 
 
 def active_controller_for_context(context: TenantContext) -> SimulationController:
@@ -149,7 +173,18 @@ def pop_tenant_controller(tenant_id: str) -> SimulationController | None:
     """
     with _tenant_lock:
         _tenants_being_deleted.add(tenant_id)
-        return _tenant_controllers.pop(tenant_id, None)
+        popped = _tenant_controllers.pop(tenant_id, None)
+    if popped is not None:
+        # Removing the controller from the registry only stops the NEXT
+        # request resolving it. A request that resolved it before the delete
+        # started still holds this object, and every EventStore write path
+        # mkdirs its own parent -- so that write would recreate the tenant
+        # directory after the rmtree. Retiring the store makes it fail loudly
+        # instead (#175). Done outside the registry lock: retire() takes the
+        # store's own lock, and holding both at once here would be the only
+        # place in the codebase that orders them.
+        popped.store.retire()
+    return popped
 
 
 def finish_tenant_delete(tenant_id: str) -> None:
@@ -190,6 +225,12 @@ def known_tenant_ids() -> list[str]:
         tenant_ids.update(
             tenant_id for tenant_id in _tenant_controllers if tenant_id != DEFAULT_TENANT_ID
         )
+        # Snapshotted under the same lock the registry is read under, so the
+        # two can never disagree about a tenant's state. Subtracted at the
+        # end: a directory whose pending rmtree has not reached it yet is
+        # still on disk, and reporting it as a live tenant is what made a
+        # deleted tenant reappear in the operator listing (#175).
+        being_deleted = set(_tenants_being_deleted)
 
     if TENANT_DATA_ROOT.exists():
         for path in TENANT_DATA_ROOT.iterdir():
@@ -198,7 +239,7 @@ def known_tenant_ids() -> list[str]:
                     tenant_ids.add(normalize_tenant_id(path.name))
                 except ValueError:
                     continue
-    return sorted(tenant_ids)
+    return sorted(tenant_ids - being_deleted)
 
 
 def tenant_summary(tenant_id: str) -> dict[str, Any]:
@@ -325,18 +366,48 @@ def _count_scenario_saves(path: Path) -> int:
     return sum(1 for candidate in path.glob("*.json") if candidate.is_file())
 
 
+def assert_within_tenant_root(path: Path) -> Path:
+    """Refuse to operate on a path that is not strictly inside the tenant root.
+
+    Resolves symlinks first, so a tenant directory symlinked elsewhere fails
+    here rather than at the point something recursive runs against it. The
+    root itself is refused too -- deleting one tenant must never be able to
+    take out every tenant.
+
+    The delete path is safe as written today: `operator_tenant_id` applies a
+    strict regex and a URL segment cannot contain a slash. But a recursive
+    delete should not rest on an upstream validator staying strict, and a
+    symlink is not something that validator can see at all.
+    """
+    resolved_root = TENANT_DATA_ROOT.resolve()
+    resolved = path.resolve()
+    if resolved == resolved_root or not resolved.is_relative_to(resolved_root):
+        raise HTTPException(status_code=400, detail="Refusing to operate outside the tenant root")
+    return resolved
+
+
 def _create_tenant_controller(tenant_id: str) -> SimulationController:
-    # Tenant id only -- never the caller's credentials, which the auth layer
-    # has already discarded by this point.
-    logger.info("creating tenant controller for %s", tenant_id)
     persist_path = tenant_events_path(tenant_id)
-    tenant_engine = LegitFlowEngine(seed=204)
-    tenant_store = EventStore(persist_path=str(persist_path))
-    tenant_saves = ScenarioSaveStore(save_dir=str(tenant_saves_path(tenant_id)))
+    try:
+        tenant_engine = LegitFlowEngine(seed=204)
+        tenant_store = EventStore(persist_path=str(persist_path))
+        tenant_saves = ScenarioSaveStore(save_dir=str(tenant_saves_path(tenant_id)))
+    except Exception as exc:
+        # Provisioning creates directories on disk, so it can fail for reasons
+        # that have nothing to do with the request that triggered it. Without
+        # this the only trace was the 500 the caller got.
+        logger.error("Tenant provisioning failed: tenant=%s error=%s", tenant_id, exc)
+        raise
+    # Logged AFTER it succeeds, and tenant id only -- never the caller's
+    # credentials, which the auth layer has already discarded by this point.
+    # Tenants are minted lazily on first use, so this line is the only record
+    # that a new one came into existence and started consuming disk.
+    logger.info("Provisioned tenant controller: tenant=%s path=%s", tenant_id, persist_path)
     return SimulationController(
         engine=tenant_engine,
         store=tenant_store,
         scenario_saves=tenant_saves,
         mock_service=MockRegEngineService(store=tenant_store),
         live_client=LiveRegEngineClient(),
+        tenant_id=tenant_id,
     )

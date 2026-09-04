@@ -12,6 +12,12 @@ from ..build_info import current_build_info
 from ..contract import INFLOW_CONTRACT_VERSION
 from ..controller import SimulationController
 from ..dependencies import get_active_controller, get_tenant_context
+from ..schemas.health import (
+    HealthResponse,
+    HealthUnavailableResponse,
+    HealthzResponse,
+    HealthzUnavailableResponse,
+)
 from ..store import EventStore
 
 
@@ -56,6 +62,12 @@ def _store_write_error(store: EventStore) -> str | None:
     EOF, which would turn a health check into a hang rather than a fast,
     correct "unhealthy".
     """
+    if store.retired:
+        # Short-circuit before the mkdir below. Probing a deleted tenant would
+        # otherwise recreate its directory tree and put the tenant back in the
+        # operator listing -- the health check itself resurrecting what the
+        # delete just removed (#175).
+        return "tenant deleted; event store retired"
     try:
         store.persist_path.parent.mkdir(parents=True, exist_ok=True)
         with store.persist_path.open("a", encoding="utf-8") as handle:
@@ -66,7 +78,17 @@ def _store_write_error(store: EventStore) -> str | None:
     return None
 
 
-@router.get("/health", response_model=None)
+# response_model stays None because the handler returns dict | JSONResponse,
+# but each status code declares its own concrete model (#146) -- otherwise
+# the union collapsed the documented schema to {}.
+@router.get(
+    "/health",
+    response_model=None,
+    responses={
+        200: {"model": HealthResponse},
+        503: {"model": HealthUnavailableResponse},
+    },
+)
 async def health(
     context: TenantContext = Depends(get_tenant_context),
     active_controller: SimulationController = Depends(get_active_controller),
@@ -108,7 +130,14 @@ async def health(
     }
 
 
-@router.get("/healthz", response_model=None)
+@router.get(
+    "/healthz",
+    response_model=None,
+    responses={
+        200: {"model": HealthzResponse},
+        503: {"model": HealthzUnavailableResponse},
+    },
+)
 async def healthz(
     active_controller: SimulationController = Depends(get_active_controller),
 ) -> dict[str, Any] | JSONResponse:

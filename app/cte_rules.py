@@ -1,16 +1,44 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, Literal
 
 from .scenarios import ScenarioPreset
 from .schemas.domain import CTEType, RegEngineEvent, StoredEventRecord
 
 
+# How much weight a warning carries. "required" means FDA's CTE/KDE
+# reference makes the field unconditional for that CTE; "recommended" means
+# it is advisory -- industry practice, scenario realism, or a KDE the
+# contract lists as optional.
+WarningSeverity = Literal["required", "recommended"]
+
+#: Sort key: required warnings come first wherever a list is rendered, so the
+#: gaps that would fail live ingest are what an operator reads first.
+SEVERITY_ORDER: dict[str, int] = {"required": 0, "recommended": 1}
+
+
 @dataclass(frozen=True, slots=True)
 class CTEValidationWarning:
+    """One validation finding for one event field.
+
+    ``severity`` is a real field rather than something a consumer infers by
+    string-matching "Missing expected" against "Missing recommended" (#189).
+    Before it existed, #189's promotion of transformation input-lot linkage
+    to required tier was only a change to message text: no consumer in app/
+    told the two apart, so a required-tier gap and an advisory nudge reached
+    the CSV import panel, the audit summary and the console rendered
+    identically. Message strings are presentation; this is the datum a
+    consumer keys off.
+
+    Defaults to "recommended" so a construction site that has not thought
+    about severity fails in the harmless direction -- understating a nudge,
+    never overstating a gap as mandatory.
+    """
+
     field: str
     message: str
+    severity: WarningSeverity = "recommended"
 
 
 @dataclass(frozen=True, slots=True)
@@ -258,6 +286,7 @@ def validate_event_kdes(event: RegEngineEvent) -> list[CTEValidationWarning]:
                 CTEValidationWarning(
                     field=field,
                     message=f"Missing expected {event.cte_type.value} KDE: {field}",
+                    severity="required",
                 )
             )
 
@@ -268,6 +297,7 @@ def validate_event_kdes(event: RegEngineEvent) -> list[CTEValidationWarning]:
                     CTEValidationWarning(
                         field=field,
                         message=f"Missing expected {event.cte_type.value} KDE: {field}",
+                        severity="required",
                     )
                 )
 
@@ -277,6 +307,7 @@ def validate_event_kdes(event: RegEngineEvent) -> list[CTEValidationWarning]:
                 CTEValidationWarning(
                     field=field,
                     message=f"Missing recommended {event.cte_type.value} KDE: {field}",
+                    severity="recommended",
                 )
             )
 
@@ -286,11 +317,16 @@ def validate_event_kdes(event: RegEngineEvent) -> list[CTEValidationWarning]:
             warnings.append(
                 CTEValidationWarning(
                     field="input_traceability_lot_codes",
+                    # Required tier for the same reason its absence is: this
+                    # is the input-lot linkage FDA makes unconditional, and a
+                    # malformed value satisfies the requirement no better
+                    # than a missing one.
                     message="Transformation input_traceability_lot_codes should be a non-empty list of lot codes",
+                    severity="required",
                 )
             )
 
-    return warnings
+    return sort_warnings(warnings)
 
 
 def audit_warnings_for_event(event: RegEngineEvent, scenario: ScenarioPreset) -> list[CTEValidationWarning]:
@@ -370,6 +406,25 @@ def merged_event_values(event: RegEngineEvent) -> dict[str, Any]:
 
 
 def dedupe_warnings(warnings: list[CTEValidationWarning]) -> list[CTEValidationWarning]:
+    """Drop repeats, and never let a field's advisory outrank its required gap.
+
+    The severity-aware pass exists because the two tiers are assembled
+    independently -- per-CTE KDE tables in ``validate_event_kdes``, then
+    industry/scenario ``EventRequirement``s -- and one field can already be
+    named by both (``seafood_first_receiver`` does it today with
+    ``vessel_identifier``). Keeping both entries would let a consumer that
+    reads the first warning for a field report "recommended" for something
+    the required tier already flagged, which is the understatement #189 is
+    about: app/static/app.js shows exactly one warning per row in the shift
+    log.
+
+    Today's overlap happens to be same-tier, because ``EventRequirement``
+    warnings all take the default "recommended" severity -- so this pass is
+    a no-op on the current rule tables and is kept as a guard, not a live
+    correction. Promoting any scenario requirement to "required" (the
+    natural next edit here) makes it live immediately, which is exactly when
+    a missing guard would be hardest to notice.
+    """
     seen: set[tuple[str, str]] = set()
     deduped: list[CTEValidationWarning] = []
     for warning in warnings:
@@ -378,7 +433,27 @@ def dedupe_warnings(warnings: list[CTEValidationWarning]) -> list[CTEValidationW
             continue
         seen.add(key)
         deduped.append(warning)
-    return deduped
+
+    required_fields = {
+        warning.field for warning in deduped if warning.severity == "required"
+    }
+    return sort_warnings(
+        [
+            warning
+            for warning in deduped
+            if warning.severity == "required" or warning.field not in required_fields
+        ]
+    )
+
+
+def sort_warnings(warnings: list[CTEValidationWarning]) -> list[CTEValidationWarning]:
+    """Required-severity warnings first, otherwise stable in discovery order.
+
+    ``sorted`` is stable, so this only lifts the required tier -- the order
+    within each tier stays exactly the order the rules produced it in, which
+    is what the message-string tests pin.
+    """
+    return sorted(warnings, key=lambda warning: SEVERITY_ORDER.get(warning.severity, 1))
 
 
 def _evaluate_check(records: list[StoredEventRecord], definition: AuditCheckDefinition) -> bool:

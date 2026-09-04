@@ -689,19 +689,34 @@ function scenarioNarrative(summary) {
   return 'This flow should prove field-level origin, packout packaging changes, and downstream traceability through transformation and shipment.';
 }
 
-function pendingAuditModel(summary) {
+// The stand-in used when backendAudit() has nothing to report. `missing: 0`
+// is literally true -- nothing was evaluated, so nothing is missing -- but it
+// is NOT the same fact as "the backend scored this profile and found no gaps".
+// `pending: true` is what callers branch on so a not-computed audit can never
+// render as a passing one (#193).
+//
+// `mismatched` separates the two ways an audit can be absent, which need
+// different copy: nothing has run yet, versus something ran but scored a
+// DIFFERENT profile than the one on screen. The second is the more misleading
+// state, because a score does exist -- it just is not this profile's.
+function pendingAuditModel(summary, status = state.status) {
+  const scoredScenario = status?.config?.scenario || null;
+  const mismatched = Boolean(scoredScenario && summary && scoredScenario !== summary.id);
   return {
     checks: [],
     score: 0,
     tone: 'watch',
-    label: 'Awaiting simulator audit',
+    label: mismatched ? 'Not scored for this profile' : 'Awaiting simulator audit',
     passed: 0,
     total: 0,
     missing: 0,
     pending: true,
-    detail: summary
-      ? `${summary.label} needs a simulator status refresh before audit scoring can be shown.`
-      : 'Run the simulator to load backend audit scoring.',
+    mismatched,
+    detail: mismatched
+      ? `Showing ${summary.label}, but the backend last scored ${scenarioLabel(scoredScenario)}. Start the line on this profile to score it.`
+      : summary
+        ? `${summary.label} needs a simulator status refresh before audit scoring can be shown.`
+        : 'Run the simulator to load backend audit scoring.',
   };
 }
 
@@ -710,7 +725,7 @@ function renderReadinessBanner(summary, events, status = state.status) {
     ids.readinessBanner.innerHTML = '<p class="note">Readiness scoring will appear once scenario metadata loads.</p>';
     return;
   }
-  const readiness = backendAudit(status, summary) || pendingAuditModel(summary);
+  const readiness = backendAudit(status, summary) || pendingAuditModel(summary, status);
   ids.readinessBanner.innerHTML = `
     <div class="readiness-banner-shell" data-tone="${escapeHtml(readiness.tone)}">
       <div class="readiness-score">
@@ -731,16 +746,26 @@ function renderReadinessBanner(summary, events, status = state.status) {
   `;
 }
 
-function recordWarnings(record, summary, status = state.status) {
+// Returns both the warnings AND whether an audit ran at all. These are
+// different facts -- a row nothing evaluated is not a row the backend cleared
+// (#193) -- and they used to be carried as null-or-array, which every caller
+// had to remember to unpack in that order. An explicit `evaluated` flag makes
+// the distinction impossible to drop by accident.
+function recordAudit(record, summary, status = state.status) {
   const audit = backendAudit(status, summary);
-  if (!audit) return null;
-  const warningPayload = audit?.warnings_by_record?.[record.record_id];
-  if (Array.isArray(warningPayload) && warningPayload.length) {
-    return warningPayload
-      .map((warning) => warning.message)
-      .filter((message) => typeof message === 'string' && message);
+  if (!audit) {
+    return { evaluated: false, messages: [] };
   }
-  return [];
+  const warningPayload = audit.warnings_by_record?.[record.record_id];
+  if (Array.isArray(warningPayload) && warningPayload.length) {
+    return {
+      evaluated: true,
+      messages: warningPayload
+        .map((warning) => warning.message)
+        .filter((message) => typeof message === 'string' && message),
+    };
+  }
+  return { evaluated: true, messages: [] };
 }
 
 function renderScenarioWorkbench(status = state.status, events = state.events) {
@@ -749,7 +774,7 @@ function renderScenarioWorkbench(status = state.status, events = state.events) {
     ids.scenarioWorkbench.innerHTML = '<p class="note">Scenario metadata will appear here once presets load.</p>';
     return;
   }
-  const readiness = backendAudit(status, summary) || pendingAuditModel(summary);
+  const readiness = backendAudit(status, summary) || pendingAuditModel(summary, status);
   const checks = readiness.checks;
   const sourceCte = sourceCteForScenario(summary);
   const eventCount = (events || []).length;
@@ -775,7 +800,7 @@ function renderScenarioWorkbench(status = state.status, events = state.events) {
       </div>
       <div class="scenario-alert${warningCount ? ' has-warning' : ''}${readiness.pending ? ' is-pending' : ''}">
         <span>Audit readiness</span>
-        <strong>${readiness.pending ? 'Audit pending' : warningCount ? `${warningCount} signal(s) still missing` : readiness.total > 0 ? 'Signals visible' : 'No checks evaluated'}</strong>
+        <strong>${escapeHtml(readiness.pending ? (readiness.mismatched ? `Not scored for ${summary.label}` : 'Audit not evaluated yet') : warningCount ? `${warningCount} signal(s) still missing` : readiness.total > 0 ? 'Signals visible' : 'No checks evaluated')}</strong>
         <small>${escapeHtml(summary.reference_format)} references, ${escapeHtml(sourceCte)} source flow</small>
       </div>
     </div>
@@ -1079,9 +1104,9 @@ function renderEvents(events) {
   ids.eventsBody.innerHTML = events
     .map((record) => {
       const event = record.event;
-      const warnings = recordWarnings(record, summary);
-      const auditNotEvaluated = warnings === null;
-      const hasWarning = !auditNotEvaluated && warnings.length > 0;
+      const audit = recordAudit(record, summary);
+      const auditNotEvaluated = !audit.evaluated;
+      const hasWarning = audit.messages.length > 0;
       return `
         <tr class="${hasWarning ? 'has-audit-warning' : auditNotEvaluated ? 'audit-not-evaluated' : ''}">
           <td>${record.sequence_no}</td>
@@ -1093,7 +1118,7 @@ function renderEvents(events) {
           <td>${escapeHtml(record.destination_mode)}</td>
           <td>
             ${escapeHtml(record.delivery_attempts || 0)}
-            ${hasWarning ? `<small class="status-warning">${escapeHtml(warnings[0])}</small>` : auditNotEvaluated ? '<small class="status-muted">not evaluated</small>' : ''}
+            ${hasWarning ? `<small class="status-warning">${escapeHtml(audit.messages[0])}</small>` : auditNotEvaluated ? '<small class="status-muted">Audit not evaluated</small>' : ''}
           </td>
           <td>
             <span class="status-pill" data-tone="${escapeHtml(deliveryTone(record.delivery_status))}">${escapeHtml(record.delivery_status)}</span>
@@ -1193,9 +1218,9 @@ function renderLineage(payload, traceabilityLotCode) {
   const timelineMarkup = records
     .map((record) => {
       const event = record.event;
-      const warnings = recordWarnings(record, scenarioSummary);
-      const auditNotEvaluated = warnings === null;
-      const hasWarning = !auditNotEvaluated && warnings.length > 0;
+      const audit = recordAudit(record, scenarioSummary);
+      const auditNotEvaluated = !audit.evaluated;
+      const hasWarning = audit.messages.length > 0;
       const kdes = Object.entries(event.kdes || {})
         .slice(0, 6)
         .map(([key, value]) => `<li><strong>${escapeHtml(key)}:</strong> ${escapeHtml(formatKdeValue(value))}</li>`)
@@ -1209,7 +1234,7 @@ function renderLineage(payload, traceabilityLotCode) {
           <p><strong>Lot:</strong> ${escapeHtml(event.traceability_lot_code)}</p>
           <p><strong>Product:</strong> ${escapeHtml(event.product_description)}</p>
           <p><strong>Location:</strong> ${escapeHtml(event.location_name)}</p>
-          ${hasWarning ? `<p class="lineage-warning">${escapeHtml(warnings.join(' • '))}</p>` : auditNotEvaluated ? '<p class="lineage-muted">Audit not evaluated for this scenario</p>' : ''}
+          ${hasWarning ? `<p class="lineage-warning">${escapeHtml(audit.messages.join(' • '))}</p>` : auditNotEvaluated ? '<p class="lineage-muted">Audit not evaluated for this scenario</p>' : ''}
           <ul>${kdes}</ul>
         </article>
       `;

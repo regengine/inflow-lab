@@ -492,6 +492,54 @@ class LegitFlowEngine:
             kdes=kdes,
         )
 
+        for output_lot in outputs[1:]:
+            # #115: _transform can mint 2-3 output lots
+            # (_transform_output_count), appends every one of them to
+            # self.transformed, and used to build exactly ONE CTE record --
+            # keyed to outputs[0]. The other output lots were named only
+            # inside this event's kdes["output_traceability_lot_codes"]
+            # array, never as the traceability_lot_code of a record of their
+            # own. EventStore.lineage() links a record to its parents via
+            # parent_lot_codes, source_traceability_lot_code and
+            # input_traceability_lot_codes -- never via
+            # output_traceability_lot_codes -- so lineage() for outputs[1]
+            # or outputs[2] returned nothing at all until that lot shipped,
+            # and _ship() then set the shipment's parent_lot_codes to the
+            # *pre-transformation* inputs (lot.parents). The first stored
+            # record for that lot code was therefore a SHIPPING event
+            # appearing to link straight back to the input lots, skipping
+            # the transformation that created it -- wrong in store.lineage()
+            # and in every per-lot export built on it.
+            #
+            # Emitted through the same _pending_events queue #97 added for
+            # rework lots, and deliberately so: queuing rather than
+            # returning a second event keeps next_event()'s
+            # (event, parent_lot_codes) return type intact, costs no
+            # self.rng draw, and so cannot reorder or shift any later seeded
+            # value. Same non-collapsing timestamp idiom too (#119).
+            output_timestamp = self._time_cursor + timedelta(microseconds=1)
+            self._time_cursor = output_timestamp
+            # Batch-level KDEs are shared with outputs[0] -- same inputs,
+            # same batch record, same yield -- and are correct for every
+            # output of this transformation. Only the two source-reference
+            # KDEs are per-lot: transformation_kdes keys them to outputs[0].
+            output_kdes = dict(kdes)
+            output_kdes["tlc_source_reference"] = output_lot.tlc_source_reference
+            output_kdes["traceability_lot_code_source_reference"] = output_lot.tlc_source_reference
+            output_event = RegEngineEvent(
+                cte_type=CTEType.TRANSFORMATION,
+                traceability_lot_code=output_lot.lot_code,
+                product_description=output_lot.product_description,
+                quantity=output_lot.quantity,
+                unit_of_measure=output_lot.unit_of_measure,
+                location_name=processor.name,
+                location_gln=self._location_gln_or_none(processor.name),
+                timestamp=output_timestamp,
+                input_traceability_lot_codes=input_lot_codes,
+                kdes=output_kdes,
+            )
+            self._pending_events.append((output_event, input_lot_codes))
+
         for rework_lot in rework_lots:
             # #97: a rework lot enters processor_inventory and can later be
             # sampled as another transformation's input (see the `inputs`

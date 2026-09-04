@@ -55,6 +55,10 @@ class ProbeAsyncClient:
         *,
         headers: dict[str, str] | None = None,
         params: dict[str, Any] | None = None,
+        # extensions: the live client attaches {"sni_hostname": ...} when it
+        # pins the validated address for the dial (#207). Accepted and
+        # ignored here so this fake keeps working on either path.
+        extensions: dict[str, Any] | None = None,
     ) -> FakeProbeResponse:
         if url.endswith("/health"):
             return FakeProbeResponse(200, ProbeAsyncClient.health_payload)
@@ -287,7 +291,11 @@ def test_integration_test_strips_credentials_on_scheme_downgrade() -> None:
     assert response.status_code == 200
     data = response.json()
     assert data["verdict"] == "not_configured"
-    assert "differs" in data["detail"]
+    # The detail must show the downgrade was SEEN -- both origins named, and
+    # the two spellings distinguished. Asserted on the substance rather than
+    # on one word of the wording, which is free to improve.
+    assert "https://regengine.example.com:443" in data["detail"], data["detail"]
+    assert "http://regengine.example.com:80" in data["detail"], data["detail"]
 
 
 def test_integration_test_explains_credential_stripping_on_origin_change() -> None:
@@ -315,8 +323,18 @@ def test_integration_test_explains_credential_stripping_on_origin_change() -> No
     assert response.status_code == 200
     data = response.json()
     assert data["verdict"] == "not_configured"
-    assert "differs" in data["detail"], (
-        "Detail should explain the endpoint changed, not give a generic 'credentials required' message"
+    # #210.3 is about the DETAIL naming what actually happened. The generic
+    # "Both an API key and a tenant id are required" is the wording it exists
+    # to replace: it names a condition that did not fail and sends the
+    # operator off to re-enter credentials that were already correct.
+    assert "Both an API key and a tenant id are required" not in data["detail"], (
+        "Detail gives the generic 'credentials required' message, which is false here"
+    )
+    assert "https://regengine.example.com:443" in data["detail"], (
+        "Detail should name the origin the stored credentials belong to"
+    )
+    assert "https://other-host.example.com:443" in data["detail"], (
+        "Detail should name the origin this test targeted instead"
     )
 
 

@@ -93,7 +93,6 @@ def _harvest_event_payload(timestamp: datetime, lot: str) -> dict:
     }
 
 
-@pytest.mark.xfail(strict=True, reason="reverted by PR #225's HEAD-side conflict resolution; re-landing tracked in #232")
 def test_a_row_older_than_the_window_is_warned_about_before_delivery() -> None:
     parsed = parse_csv_import(
         CSVImportType.SCHEDULED_EVENTS,
@@ -126,7 +125,6 @@ def test_a_row_inside_the_window_is_not_warned_about() -> None:
     assert _replay_warnings(parsed) == []
 
 
-@pytest.mark.xfail(strict=True, reason="reverted by PR #225's HEAD-side conflict resolution; re-landing tracked in #232")
 def test_the_window_boundary_matches_the_mock_service_exactly() -> None:
     """Exactly MAX_EVENT_AGE_DAYS old is inside the window, not outside it
     -- the same inclusive convention _handler_level_errors uses. An importer
@@ -148,7 +146,6 @@ def test_the_window_boundary_matches_the_mock_service_exactly() -> None:
     assert len(_replay_warnings(just_past)) == 1
 
 
-@pytest.mark.xfail(strict=True, reason="reverted by PR #225's HEAD-side conflict resolution; re-landing tracked in #232")
 def test_the_warning_and_the_delivery_rejection_now_agree_on_a_stale_row() -> None:
     """The divergence #209 closed, pinned from the API caller's side.
 
@@ -207,7 +204,6 @@ def test_seed_lot_rows_without_a_timestamp_are_never_stale() -> None:
 
 
 @pytest.mark.parametrize("service", [tenancy.mock_service])
-@pytest.mark.xfail(strict=True, reason="reverted by PR #225's HEAD-side conflict resolution; re-landing tracked in #232")
 def test_the_deployed_mock_now_enforces_the_window_by_default(service) -> None:
     """The inverted pin (#209). Its predecessor asserted ``is False`` and
     said in its own docstring that when #199 re-timed the fixtures and the
@@ -223,7 +219,6 @@ def test_the_deployed_mock_now_enforces_the_window_by_default(service) -> None:
     assert service._enforce_event_age_window is True
 
 
-@pytest.mark.xfail(strict=True, reason="reverted by PR #225's HEAD-side conflict resolution; re-landing tracked in #232")
 def test_a_freshly_created_tenant_controller_enforces_the_window_too() -> None:
     """The second construction site (#209).
 
@@ -242,7 +237,6 @@ def test_a_freshly_created_tenant_controller_enforces_the_window_too() -> None:
         tenancy.finish_tenant_delete(tenant_id)
 
 
-@pytest.mark.xfail(strict=True, reason="reverted by PR #225's HEAD-side conflict resolution; re-landing tracked in #232")
 def test_a_stale_event_is_rejected_through_the_production_ingest_route() -> None:
     """End-to-end proof, through the route rather than the flag.
 

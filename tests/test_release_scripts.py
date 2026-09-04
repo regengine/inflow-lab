@@ -37,7 +37,6 @@ def scratch_data_root(monkeypatch, tmp_path):
     return tenant_root
 
 
-@pytest.mark.xfail(strict=True, reason="reverted by PR #225's HEAD-side conflict resolution; re-landing tracked in #232")
 def test_release_smoke_passes_against_a_relocated_data_root(scratch_data_root):
     """The whole release gate, run where REGENGINE_DATA_DIR is not `data`."""
     from scripts.smoke_regression import TENANTS, run_smoke
@@ -51,7 +50,6 @@ def test_release_smoke_passes_against_a_relocated_data_root(scratch_data_root):
     assert {path.name for path in scratch_data_root.iterdir()} >= set(TENANTS)
 
 
-@pytest.mark.xfail(strict=True, reason="reverted by PR #225's HEAD-side conflict resolution; re-landing tracked in #232")
 def test_release_smoke_cleanup_removes_tenants_from_the_configured_root(
     scratch_data_root,
 ):
@@ -68,7 +66,6 @@ def test_release_smoke_cleanup_removes_tenants_from_the_configured_root(
     )
 
 
-@pytest.mark.xfail(strict=True, reason="reverted by PR #225's HEAD-side conflict resolution; re-landing tracked in #232")
 def test_full_fsma_simulation_cleans_up_its_tenant(scratch_data_root, capsys):
     import run_full_fsma_simulation as sim
 
@@ -78,7 +75,6 @@ def test_full_fsma_simulation_cleans_up_its_tenant(scratch_data_root, capsys):
     assert sim.TENANT_ID not in {path.name for path in scratch_data_root.iterdir()}
 
 
-@pytest.mark.xfail(strict=True, reason="reverted by PR #225's HEAD-side conflict resolution; re-landing tracked in #232")
 def test_no_script_hardcodes_the_default_data_root():
     """Acceptance criterion from #108, kept as a guard against reintroduction."""
     from pathlib import Path

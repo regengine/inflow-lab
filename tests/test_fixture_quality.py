@@ -25,13 +25,14 @@ made to match what those already-correct modules expect, not the reverse.
 from __future__ import annotations
 
 from collections import defaultdict
+from datetime import UTC, datetime
 
 import pytest
 
 from app.audit import summarize_scenario_audit
-from app.demo_fixtures import DEMO_FIXTURES, DemoFixture
+from app.demo_fixtures import DEMO_FIXTURES, DemoFixture, get_demo_fixture
 from app.engine import LegitFlowEngine
-from app.mock_service import validate_event_like_regengine
+from app.mock_service import MAX_EVENT_AGE_DAYS, validate_event_like_regengine
 from app.scenarios import SCENARIO_PRESETS, ScenarioId, ScenarioPreset, _gln, get_scenario
 from app.schemas.domain import StoredEventRecord
 
@@ -251,3 +252,103 @@ def test_copacker_nut_butter_no_longer_collides_with_dairy_or_seafood() -> None:
     assert not _non_farm_glns(copacker) & _non_farm_glns(seafood), (
         "copacker cooler/packer/processor/dc/retailer GLNs still collide with seafood's"
     )
+
+
+# ---------------------------------------------------------------------------
+# #199 -- load-time rebasing keeps the fixtures inside the replay window
+#         without deforming the walkthrough they exist to tell
+# ---------------------------------------------------------------------------
+
+
+def test_loaded_fixtures_land_inside_the_replay_window() -> None:
+    """The point of rebasing: Load Demo Fixture must not post stale events.
+
+    RegEngine rejects anything older than MAX_EVENT_AGE_DAYS, and the mock now
+    enforces the same floor by default, so a fixture frozen at its authored
+    date would fail the one walkthrough the fixtures exist to make reliable --
+    and would fail a day harder every day.
+    """
+    now = datetime.now(UTC)
+    for fixture_id in DEMO_FIXTURES:
+        for fixture_event in get_demo_fixture(fixture_id).events:
+            age = (now - fixture_event.event.timestamp).days
+            assert 0 <= age < MAX_EVENT_AGE_DAYS, (
+                f"{fixture_id.value} event {fixture_event.event.traceability_lot_code} "
+                f"is {age} days old; the window is {MAX_EVENT_AGE_DAYS} days and "
+                "nothing may be in the future either"
+            )
+
+
+def test_rebasing_preserves_spacing_time_of_day_and_cross_fixture_order() -> None:
+    """A shift, not a rewrite. The fixtures are a lineage narrative: harvest
+    then cool then pack, hours apart, in a fixed order across all three. A
+    per-event or per-fixture adjustment would land them in the window while
+    destroying the story, so the offset is one whole number of days applied
+    to the whole set.
+    """
+    for fixture_id, original in DEMO_FIXTURES.items():
+        rebased = get_demo_fixture(fixture_id)
+        authored = [event.event.timestamp for event in original.events]
+        loaded = [event.event.timestamp for event in rebased.events]
+
+        assert [
+            loaded[i + 1] - loaded[i] for i in range(len(loaded) - 1)
+        ] == [authored[i + 1] - authored[i] for i in range(len(authored) - 1)], (
+            f"{fixture_id.value}: rebasing changed the spacing between events"
+        )
+        assert [stamp.timetz() for stamp in loaded] == [stamp.timetz() for stamp in authored], (
+            f"{fixture_id.value}: rebasing moved events to a different time of day"
+        )
+
+    def earliest(getter):
+        return [
+            fixture_id.value
+            for fixture_id, _ in sorted(
+                (
+                    (fixture_id, min(event.event.timestamp for event in getter(fixture_id).events))
+                    for fixture_id in DEMO_FIXTURES
+                ),
+                key=lambda pair: pair[1],
+            )
+        ]
+
+    assert earliest(lambda fixture_id: DEMO_FIXTURES[fixture_id]) == earliest(get_demo_fixture), (
+        "rebasing reordered the fixtures relative to each other"
+    )
+
+
+def test_bare_date_kdes_move_with_the_event_they_describe() -> None:
+    """A shifted timestamp and a frozen date KDE is a self-contradicting record.
+
+    harvest_date, cooling_date, pack_date, ship_date, receive_date,
+    transformation_date and landing_date all restate their event's own day. If
+    the timestamp moves and they do not, the exported row says the lot was
+    harvested on one date and the event happened on another -- and both the
+    FDA CSV and the validators read those KDEs, so the contradiction is
+    visible to exactly the audience the fixtures are for.
+
+    Asserted against the event's OWN day rather than a fixed expected value,
+    so it holds whenever the suite runs.
+    """
+    date_kdes = {
+        "harvest_date",
+        "cooling_date",
+        "pack_date",
+        "packing_date",
+        "ship_date",
+        "receive_date",
+        "transformation_date",
+        "landing_date",
+    }
+    checked = 0
+    for fixture_id in DEMO_FIXTURES:
+        for fixture_event in get_demo_fixture(fixture_id).events:
+            event_day = fixture_event.event.timestamp.date().isoformat()
+            for key, value in fixture_event.event.kdes.items():
+                if key in date_kdes and isinstance(value, str):
+                    checked += 1
+                    assert value == event_day, (
+                        f"{fixture_id.value}: {key}={value!r} but the event is on "
+                        f"{event_day} -- the KDE did not move with its timestamp"
+                    )
+    assert checked, "no bare-date KDEs were found to check"

@@ -21,11 +21,48 @@ from ..schemas.simulation import EgressBlockedError, SimulationConfig
 router = APIRouter(prefix="/api/integration", tags=["RegEngine Integration"])
 
 
-def _delivery_origin(config: SimulationConfig) -> str:
-    """Origin (scheme + host) the stored config would deliver to right now."""
-    endpoint = str(config.delivery.endpoint) if config.delivery.endpoint else DEFAULT_LIVE_INGEST_ENDPOINT
+# Ports a scheme reaches when the URL does not spell one out, so
+# "https://host" and "https://host:443" compare equal while "https://host"
+# and "https://host:8443" do not.
+_DEFAULT_SCHEME_PORTS = {"http": 80, "https": 443}
+
+
+def _origin(endpoint: str) -> str:
+    """scheme://host:port for *endpoint* -- the identity a credential is issued for.
+
+    Compared instead of the bare hostname (#209). Host-only comparison
+    treated ``http://www.regengine.co`` as the same destination as
+    ``https://www.regengine.co``, so a caller could hand the probe a
+    downgraded URL and the stored API key -- issued for a TLS endpoint --
+    would ride along over cleartext to anyone on the path. Scheme and port
+    are part of what a credential was scoped to, so they are part of the
+    comparison.
+
+    Deliberately NOT normalized beyond the default-port case: a trailing
+    dot ("www.regengine.co.") stays distinct from the bare host, and
+    userinfo is already dropped by urlparse().hostname. Both of those are
+    closed today and folding them together here would reopen them.
+    """
     parsed = urlparse(endpoint)
-    return f"{parsed.scheme}://{(parsed.hostname or '').lower()}"
+    scheme = (parsed.scheme or "").lower()
+    host = (parsed.hostname or "").lower()
+    try:
+        port = parsed.port
+    except ValueError:
+        # An unparseable port is not a port we can prove matches, so give it
+        # a value nothing else can equal rather than falling back to the
+        # scheme default and calling it a match.
+        return f"{scheme}://{host}:<invalid>"
+    if port is None:
+        port = _DEFAULT_SCHEME_PORTS.get(scheme)
+    return f"{scheme}://{host}:{port}"
+
+
+def _delivery_origin(config: SimulationConfig) -> str:
+    """Origin the stored config would actually deliver to right now (falls
+    back to the documented default when no endpoint is configured)."""
+    endpoint = str(config.delivery.endpoint) if config.delivery.endpoint else DEFAULT_LIVE_INGEST_ENDPOINT
+    return _origin(endpoint)
 
 
 @router.get("/status", response_model=IntegrationStatusResponse)
@@ -59,17 +96,26 @@ async def integration_test(
         }.items()
         if value is not None
     }
-    credentials_stripped = False
-    if request.endpoint is not None:
-        req_parsed = urlparse(str(request.endpoint))
-        request_origin = f"{req_parsed.scheme}://{(req_parsed.hostname or '').lower()}"
-        if request_origin != _delivery_origin(config):
-            updates.setdefault("api_key", None)
-            updates.setdefault("tenant_id", None)
-            if "api_key" not in {k for k, v in updates.items() if v is not None}:
-                credentials_stripped = True
-        updates.setdefault("api_key", None)
-        updates.setdefault("tenant_id", None)
+    stored_origin = _delivery_origin(config)
+    probe_origin = _origin(str(request.endpoint)) if request.endpoint is not None else stored_origin
+    withheld: list[str] = []
+    if probe_origin != stored_origin:
+        # Caller is pointing the probe at a different origin than the stored/
+        # default RegEngine endpoint. Never let the stored api_key/tenant_id
+        # ride along to an origin they were never issued for — the caller must
+        # supply fresh credentials for THIS origin (already captured above if
+        # they did; the setdefault below is then a no-op). Otherwise the
+        # probe runs uncredentialed and reports not_configured instead of
+        # leaking them.
+        #
+        # Which stored credentials that suppressed is recorded, because the
+        # generic "no credentials configured" wording is factually false in
+        # this case and the caller cannot act on it: they DID configure a
+        # key, it just was not this origin's (#210).
+        for field in ("api_key", "tenant_id"):
+            if field not in updates and getattr(config.delivery, field):
+                withheld.append(field)
+            updates.setdefault(field, None)
     delivery = config.delivery.model_copy(update=updates, deep=True)
     if config.delivery.mode == DestinationMode.MOCK and not (
         request.api_key or request.tenant_id or request.endpoint
@@ -84,14 +130,28 @@ async def integration_test(
             mode=config.delivery.mode,
         )
 
-    if credentials_stripped and not delivery.api_key and not delivery.tenant_id:
+    if withheld and not (delivery.api_key and delivery.tenant_id):
+        # #210: check_connection's own not_configured detail -- "Both an API
+        # key and a tenant id are required before testing the connection" --
+        # names a condition that is not the one that failed here. Something
+        # IS configured; it was withheld on purpose because this request
+        # points somewhere else. Reporting the generic reason sent the
+        # operator off to re-enter credentials that were already correct.
+        # The verdict stays not_configured (nothing was probed, and the UI
+        # and this suite both key off it); only the explanation changes.
+        names = " and ".join(
+            {"api_key": "API key", "tenant_id": "tenant id"}[field] for field in withheld
+        )
+        belongs = "belong" if len(withheld) > 1 else "belongs"
         return ConnectionTestResponse(
             verdict="not_configured",
             detail=(
-                "The test endpoint differs from the configured delivery endpoint, "
-                "so stored credentials were not forwarded. Provide api_key and "
-                "tenant_id for the new endpoint."
+                f"Nothing was probed. The stored {names} {belongs} to {stored_origin}, "
+                f"and this test targets {probe_origin}, so it was not reused — a "
+                "credential is never sent to an origin it was not issued for. "
+                "Supply an API key and tenant id for this origin to test it."
             ),
+            endpoint_host=urlparse(str(delivery.endpoint)).netloc if delivery.endpoint else "",
             mode=config.delivery.mode,
         )
 

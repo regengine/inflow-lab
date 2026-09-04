@@ -31,8 +31,7 @@ halves below belong to the same issue.
 
 from __future__ import annotations
 
-import pytest
-
+import json
 import logging
 import os
 from datetime import UTC, datetime, timedelta
@@ -78,7 +77,6 @@ def _seeded_store(tmp_path: Path, lot_codes: list[str]) -> tuple[EventStore, Pat
 # ---------------------------------------------------------------------------
 
 
-@pytest.mark.xfail(strict=True, reason="reverted by PR #225's HEAD-side conflict resolution; re-landing tracked in #232")
 def test_a_line_of_invalid_utf8_bytes_is_skipped_and_the_records_around_it_still_load(tmp_path):
     """The core of this half, in the same shape as the malformed-line test.
 
@@ -101,7 +99,6 @@ def test_a_line_of_invalid_utf8_bytes_is_skipped_and_the_records_around_it_still
     assert reloaded.stats()["total_records"] == 2
 
 
-@pytest.mark.xfail(strict=True, reason="reverted by PR #225's HEAD-side conflict resolution; re-landing tracked in #232")
 def test_a_wholly_undecodable_line_is_skipped_too(tmp_path):
     """Not just a bad string *inside* otherwise-valid JSON: a line that is
     nothing but raw binary -- what a torn write or a truncated volume
@@ -122,7 +119,6 @@ def test_a_wholly_undecodable_line_is_skipped_too(tmp_path):
     ]
 
 
-@pytest.mark.xfail(strict=True, reason="reverted by PR #225's HEAD-side conflict resolution; re-landing tracked in #232")
 def test_invalid_utf8_in_the_final_line_does_not_hide_the_records_before_it(tmp_path):
     """The torn-append shape: bytes landed, then the write died mid-record.
 
@@ -140,7 +136,6 @@ def test_invalid_utf8_in_the_final_line_does_not_hide_the_records_before_it(tmp_
     assert reloaded.last_read_was_complete is False
 
 
-@pytest.mark.xfail(strict=True, reason="reverted by PR #225's HEAD-side conflict resolution; re-landing tracked in #232")
 def test_byte_corruption_is_reported_through_the_same_integrity_signal(tmp_path):
     """Skipping must stay *visible*: a read that dropped undecodable bytes
     reports itself through the same ``last_read_corrupt_lines`` /
@@ -162,7 +157,6 @@ def test_byte_corruption_is_reported_through_the_same_integrity_signal(tmp_path)
     assert store.persist_path == reloaded.persist_path
 
 
-@pytest.mark.xfail(strict=True, reason="reverted by PR #225's HEAD-side conflict resolution; re-landing tracked in #232")
 def test_the_undecodable_bytes_are_never_echoed_into_the_log(tmp_path, caplog):
     """Same rule the malformed-line path already follows: the line failed to
     parse *as a record*, so it could still hold a secret-named KDE the
@@ -183,7 +177,6 @@ def test_the_undecodable_bytes_are_never_echoed_into_the_log(tmp_path, caplog):
     assert not any("super-secret-value" in message for message in messages)
 
 
-@pytest.mark.xfail(strict=True, reason="reverted by PR #225's HEAD-side conflict resolution; re-landing tracked in #232")
 def test_a_store_of_pure_binary_still_constructs_and_serves_an_empty_history(tmp_path):
     """The startup-safety leg of #93, at its worst.
 
@@ -202,7 +195,6 @@ def test_a_store_of_pure_binary_still_constructs_and_serves_an_empty_history(tmp
     assert store.last_read_was_complete is False
 
 
-@pytest.mark.xfail(strict=True, reason="reverted by PR #225's HEAD-side conflict resolution; re-landing tracked in #232")
 def test_a_reconfigure_onto_byte_corrupted_data_does_not_raise(tmp_path):
     """``configure()`` reloads from the new path, so it is the second way a
     corrupt file reaches the read path -- via start()/reset() repointing a
@@ -260,7 +252,6 @@ class FsyncSpy:
         self._real_fsync(fd)
 
 
-@pytest.mark.xfail(strict=True, reason="reverted by PR #225's HEAD-side conflict resolution; re-landing tracked in #232")
 def test_add_many_fsyncs_the_appended_batch_to_stable_storage(tmp_path, monkeypatch):
     """The durability half of #93.
 
@@ -284,7 +275,6 @@ def test_add_many_fsyncs_the_appended_batch_to_stable_storage(tmp_path, monkeypa
     ]
 
 
-@pytest.mark.xfail(strict=True, reason="reverted by PR #225's HEAD-side conflict resolution; re-landing tracked in #232")
 def test_the_batch_is_fsynced_once_not_once_per_record(tmp_path, monkeypatch):
     """Per-record ``flush()`` already covers error detection and the
     write-then-commit ordering ``_append_locked`` depends on; an fsync per
@@ -336,3 +326,54 @@ def test_appending_to_a_character_device_still_skips_the_fsync(tmp_path, monkeyp
         pass  # ENOSPC from the flush is the expected outcome here.
 
     assert spy.fds == [], "fsync must not be attempted on a non-regular persist path"
+
+
+def test_a_corrupt_line_never_puts_its_own_content_in_the_log_or_the_record(tmp_path, caplog) -> None:
+    """The no-content promise this module makes twice must actually hold.
+
+    `read_persisted_records`'s skip-and-log branch and `CorruptRecordLine`'s
+    own docstring both state that the offending line is never carried out of
+    here: it failed to parse *as* a record, so it never went through
+    `_scrub_secrets` and can still hold a plaintext `api_key`.
+
+    `str(ValidationError)` broke that promise, because pydantic renders the
+    rejected input into its own message as `input_value=...`. A JSONL line
+    carrying a live key therefore put that key straight into the log and into
+    `CorruptRecordLine.error`, which is exactly the population the promise
+    exists for.
+
+    Asserted on the ABSENCE OF `input_value` rather than only on the secret
+    string, deliberately. Pydantic truncates that repr with an ellipsis, and
+    where the ellipsis lands depends on the surrounding keys -- so a
+    substring check for the secret can pass while a recognisable fragment of
+    it is still in the log. "The rendering echoes no input at all" is the
+    property that actually holds, and it does not depend on how one payload
+    happens to truncate. The secret checks stay as the concrete case.
+    """
+    secret = "rge_live_MUST_NOT_APPEAR"
+    path = tmp_path / "events.jsonl"
+    # api_key first, so it lands before pydantic's truncation point: with it
+    # last, the ellipsis splits the value and the exact-substring assertion
+    # below would pass on a leak.
+    path.write_text(json.dumps({"api_key": secret, "not": "a record"}) + "\n", encoding="utf-8")
+
+    store = EventStore(persist_path=str(path))
+    with caplog.at_level(logging.ERROR, logger="inflow_lab"):
+        store.read_persisted_records()
+
+    assert store.last_read_corrupt_lines, "the malformed line should have been skipped and recorded"
+    recorded = store.last_read_corrupt_lines[0]
+
+    # The property: nothing from the line is echoed back.
+    assert "input_value" not in recorded.error, recorded.error
+    assert "input_value" not in caplog.text
+    # The concrete case that property exists for.
+    assert secret not in recorded.error, recorded.error
+    assert secret not in caplog.text
+    assert "rge_live" not in recorded.error, recorded.error
+
+    # Still diagnostic: the operator learns where the bad line is and why it
+    # was rejected, just not what was in it.
+    assert recorded.line_number == 1
+    assert str(path) == recorded.path
+    assert recorded.error, "a skipped line must still say why it was skipped"

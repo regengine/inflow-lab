@@ -17,6 +17,14 @@ from .schemas.domain import LineageEdge, LineageNode, StoredEventRecord
 logger = logging.getLogger("inflow_lab")
 
 
+class RetiredStoreError(ValueError):
+    """Raised when a write is attempted through a deleted tenant's store (#175).
+
+    Subclasses ValueError so main.py's app-wide handler turns it into a clean
+    4xx rather than an unhandled 500.
+    """
+
+
 # Sentinel that replaces secrets in scrubbed output. Not a credential.
 MASKED_SECRET = "***MASKED***"  # nosec B105
 SECRET_FIELD_NAMES = {"api_key", "apikey", "x_regengine_api_key", "authorization"}
@@ -69,6 +77,36 @@ def mask_secret_in_payload(value: Any, secret: str | None = None) -> Any:
     return value
 
 
+def _describe_parse_failure(exc: Exception) -> str:
+    """Describe why a line failed to parse, WITHOUT quoting the line.
+
+    Both this module's log line and ``CorruptRecordLine.error`` promise not
+    to carry the offending content: a line that failed to parse *as* a
+    record never went through ``_scrub_secrets``, so it can still hold a
+    plaintext ``api_key``. ``str(ValidationError)`` breaks that promise --
+    pydantic renders ``input_value=...`` into its message, so a corrupt line
+    carrying a live key put that key straight into the log.
+
+    ``errors(include_input=False)`` drops exactly that field and keeps what
+    is actually diagnostic: the failure type, the field location, and the
+    message. ``include_url=False`` trims the docs link, which adds nothing
+    to a log. A non-pydantic ValueError (nothing raises one here today, but
+    the caller catches the base class) has no structured form, so it falls
+    back to ``str`` -- those messages are ours, not echoes of the input.
+    """
+    errors = getattr(exc, "errors", None)
+    if not callable(errors):
+        return str(exc)
+    try:
+        rendered = errors(include_url=False, include_input=False)
+    except TypeError:  # pragma: no cover - only on a pydantic without the kwargs
+        return f"{type(exc).__name__}: unparseable record line"
+    return "; ".join(
+        f"{'.'.join(str(part) for part in item.get('loc', ())) or '<record>'}: {item.get('msg', '')}"
+        for item in rendered
+    )
+
+
 class CorruptRecordLine(NamedTuple):
     """One JSONL line ``read_persisted_records`` could not parse and skipped.
 
@@ -98,6 +136,21 @@ class EventStore:
         # the _load_from_disk() call a few lines down performs the first
         # real read.
         self.last_read_corrupt_lines: list[CorruptRecordLine] = []
+        # Parsed-log cache (#65). `_all_records()` backs stats(), lineage(),
+        # all_between() and status(), and reparsed the entire JSONL through
+        # Pydantic on every one of them -- once per /api/simulate/status poll,
+        # which the console issues on a timer. Keyed on the file's
+        # (mtime_ns, size) rather than on this process's own writes, so a
+        # change made by any path -- another worker, an operator editing the
+        # file, a volume restore -- invalidates it too. Both parts matter:
+        # size alone misses an in-place edit, and mtime alone can miss a write
+        # that lands inside the same filesystem timestamp tick.
+        self._records_cache: list[StoredEventRecord] | None = None
+        self._records_cache_key: tuple[int, int] | None = None
+        # Set by retire() when this store's tenant is deleted; see retire().
+        # Declared here so the attribute always exists, including for the
+        # _load_from_disk() call below, which clears it.
+        self.retired = False
         # threading.RLock, not asyncio.Lock (#136). Two different kinds of
         # caller take it: EventStore.__init__/_load_from_disk and
         # MockRegEngineService.__init__ (mock_service.py, via
@@ -159,6 +212,11 @@ class EventStore:
         self._records = deque(reversed(newest_last), maxlen=self.max_records)
 
     def _load_from_disk(self) -> None:
+        # configure() routes here to repoint the store at a different file.
+        # That is a new backing store, not the retired one, so the retirement
+        # does not carry over -- otherwise a tenant id reused after a delete
+        # would inherit a permanently unwritable store.
+        self.retired = False
         self.persist_path.parent.mkdir(parents=True, exist_ok=True)
         records = self.read_persisted_records(str(self.persist_path))
         counter = max((record.sequence_no for record in records), default=0)
@@ -201,7 +259,27 @@ class EventStore:
 
         with self._lock:
             if path.exists():
-                with path.open("r", encoding="utf-8") as handle:
+                # Opened in BINARY mode, deliberately (#93). A text-mode
+                # handle decodes as it iterates, so a run of invalid UTF-8
+                # bytes anywhere in the file raises UnicodeDecodeError out
+                # of the `for` statement itself -- outside the try below,
+                # and therefore past every skip-and-log guard here. That is
+                # the same whole-read abort this method exists to prevent,
+                # just triggered by byte corruption instead of a syntax
+                # error: torn writes, a truncated volume restore, or a file
+                # written by something that was not this app. Because
+                # app/tenancy.py builds the default store at import time,
+                # that abort also stopped the app starting at all on a
+                # corrupt volume.
+                #
+                # Reading bytes and letting model_validate_json do the
+                # decoding moves that failure inside the try, where it
+                # arrives as a pydantic ValidationError (a ValueError) and
+                # is skipped and logged exactly like any other unparseable
+                # line. Iterating a binary handle still splits on b"\n",
+                # which is precisely what _serialize_record writes, so
+                # line numbering is unchanged.
+                with path.open("rb") as handle:
                     for line_number, line in enumerate(handle, start=1):
                         if not line.strip():
                             continue
@@ -212,15 +290,20 @@ class EventStore:
                             # line itself is never logged: it failed to
                             # parse *as* a record, so it could still carry a
                             # secret-named KDE the model never got a chance
-                            # to scrub.
+                            # to scrub. Rendered by _describe_parse_failure
+                            # rather than str(exc), because pydantic puts
+                            # the rejected input INTO its message -- which
+                            # made that promise false for as long as it has
+                            # been written here.
+                            detail = _describe_parse_failure(exc)
                             logger.error(
                                 "skipping unreadable event record at %s:%d (%s)",
                                 path,
                                 line_number,
-                                exc,
+                                detail,
                             )
                             corrupt_lines.append(
-                                CorruptRecordLine(path=str(path), line_number=line_number, error=str(exc))
+                                CorruptRecordLine(path=str(path), line_number=line_number, error=detail)
                             )
             # Overwritten every call, including empty, so this always
             # reflects *this* read rather than stale state left by a
@@ -290,14 +373,43 @@ class EventStore:
             tmp_path.unlink(missing_ok=True)
             raise
 
+    def retire(self) -> None:
+        """Mark this store dead because its tenant is being deleted (#175).
+
+        A request that resolved its controller *before* the delete started
+        still holds that controller object, and every write path here does
+        ``mkdir(parents=True)`` on its own -- so a write through the popped
+        controller recreated the tenant directory after the rmtree, and
+        ``known_tenant_ids()`` then listed the tenant as present again. That
+        controller was a genuine zombie: the next request for the tenant
+        minted a second EventStore over the same file with an independent
+        ``_counter``, so two live objects handed out the same sequence
+        numbers.
+
+        Retiring makes those in-flight writes fail loudly instead of
+        silently resurrecting the tenant. Reads are deliberately still
+        allowed: a request already holding this object may legitimately
+        finish rendering what it had, and a read cannot recreate anything.
+        """
+        with self._lock:
+            self.retired = True
+
+    def _refuse_if_retired(self) -> None:
+        if self.retired:
+            raise RetiredStoreError(
+                "This tenant has been deleted; its event store is no longer writable. "
+                "Retry the request to work against a freshly created tenant."
+            )
+
     def add_many(self, records: Iterable[StoredEventRecord]) -> list[StoredEventRecord]:
+        self._refuse_if_retired()
         stored: list[StoredEventRecord] = []
         try:
             return self._append_many(records, stored)
         except OSError:
             # Re-raised: the caller must see the failure, and the in-memory
             # rollback below the append depends on it propagating.
-            logger.exception("event store append failed for %s", self.persist_path)
+            logger.exception("EventStore append failed: path=%s", self.persist_path)
             raise
 
     def _append_many(
@@ -325,9 +437,44 @@ class EventStore:
                     self._counter = next_sequence_no
                     self._records.appendleft(record)
                     stored.append(record)
+                if stored:
+                    self._fsync_appended(handle)
         return stored
 
+    def _fsync_appended(self, handle: Any) -> None:
+        """Force this batch's appended bytes to stable storage (#93).
+
+        ``flush()`` in the loop above only pushes the bytes out of Python's
+        buffer into the OS page cache. That is enough to make a write error
+        surface synchronously and enough to survive the process dying, but
+        not enough to survive the machine losing power -- so an
+        acknowledged append could still be missing after a hard restart.
+        ``update_many``/``replace_all`` get their durability from the tmp +
+        ``os.replace`` swap in ``_write_records``; the append path had no
+        equivalent, which is the durability half of #93.
+
+        A tmp + rename would give the same guarantee here only by
+        rewriting the entire log on every append -- turning an O(1) append
+        into O(total records), on the hot path every step() takes. #93
+        names ``fsync`` as the alternative for exactly this reason.
+
+        One fsync per *batch*, not per record: the per-record ``flush()``
+        already supplies the error detection and the write-then-commit
+        ordering the loop depends on, and an fsync per record would make a
+        multi-thousand-row CSV import pay a disk round-trip per row.
+
+        Skipped for anything that is not a regular file: the persist path
+        can legitimately point at a character device (the durability tests
+        use /dev/full to force ENOSPC), which has no durable state to
+        flush. Same constraint ``_truncate_torn_tail`` and
+        ``_resync_counter_from_disk`` already carry, for the same reason.
+        """
+        if not self.persist_path.is_file():
+            return
+        os.fsync(handle.fileno())
+
     def update_many(self, records: Iterable[StoredEventRecord]) -> list[StoredEventRecord]:
+        self._refuse_if_retired()
         replacements = {record.record_id: record for record in records}
         if not replacements:
             return []
@@ -355,6 +502,7 @@ class EventStore:
         return [record for record in updated_records if record.record_id in replacements]
 
     def replace_all(self, records: Iterable[StoredEventRecord]) -> list[StoredEventRecord]:
+        self._refuse_if_retired()
         persisted_records = sorted(list(records), key=lambda record: record.sequence_no)
         with self._lock:
             self._write_records(persisted_records)
@@ -543,9 +691,39 @@ class EventStore:
             filtered.append(record)
         return sorted(filtered, key=lambda record: record.event.timestamp)
 
+    def _cache_key(self) -> tuple[int, int] | None:
+        """(mtime_ns, size) of the log, or None when it cannot be stat'd.
+
+        None means "do not cache": a missing or unreadable path has no
+        identity to key on, and caching under a placeholder would serve a
+        stale answer once the file appeared.
+        """
+        try:
+            stat = self.persist_path.stat()
+        except OSError:
+            return None
+        return (stat.st_mtime_ns, stat.st_size)
+
     def _all_records(self) -> list[StoredEventRecord]:
-        records = self.read_persisted_records()
-        if records:
-            return sorted(records, key=lambda record: record.sequence_no)
         with self._lock:
-            return sorted(self._records, key=lambda record: record.sequence_no)
+            key = self._cache_key()
+            if key is not None and key == self._records_cache_key and self._records_cache is not None:
+                return self._records_cache
+
+            records = self.read_persisted_records()
+            if records:
+                ordered = sorted(records, key=lambda record: record.sequence_no)
+            else:
+                ordered = sorted(self._records, key=lambda record: record.sequence_no)
+
+            # Re-read the key AFTER parsing: if the file changed while this
+            # read was in flight, the pre-read key would cache content that
+            # never matched it, and the next call would serve that stale list
+            # believing it current.
+            if key is not None and key == self._cache_key():
+                self._records_cache = ordered
+                self._records_cache_key = key
+            else:
+                self._records_cache = None
+                self._records_cache_key = None
+            return ordered

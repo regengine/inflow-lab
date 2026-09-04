@@ -35,6 +35,12 @@ from app.schemas.ingestion import IngestPayload
 from app.schemas.simulation import DeliveryConfig, SimulationConfig
 from app.store import EventStore
 
+# One configured logger, not a __name__ logger per module: app/main.py
+# configures "inflow_lab" and app/controller.py, app/store.py, app/tenancy.py,
+# app/mock_service.py and app/routers/health.py all write to it. Named here
+# once so a convention change is a one-line edit rather than a hunt.
+LOGGER_NAME = "inflow_lab"
+
 
 def _controller(tmp_path: Path, tenant_id: str = "test-tenant") -> SimulationController:
     return SimulationController(
@@ -68,7 +74,6 @@ def _record(**kwargs) -> StoredEventRecord:
 # --------------------------------------------------------------------------
 
 
-@pytest.mark.xfail(strict=True, reason="reverted by PR #225's HEAD-side conflict resolution; re-landing tracked in #232")
 def test_a_failed_mock_delivery_is_logged(tmp_path, caplog):
     controller = _controller(tmp_path, tenant_id="acme")
     # `invalid_key` friction makes the mock raise the same way a real 401 would.
@@ -78,7 +83,7 @@ def test_a_failed_mock_delivery_is_logged(tmp_path, caplog):
     )
     payload = IngestPayload(source="test", events=[_record().event])
 
-    with caplog.at_level(logging.ERROR, logger="app.controller"):
+    with caplog.at_level(logging.ERROR, logger=LOGGER_NAME):
         outcome = asyncio.run(
             controller._deliver_payload(payload, config, idempotency_key="idem-123")
         )
@@ -93,7 +98,6 @@ def test_a_failed_mock_delivery_is_logged(tmp_path, caplog):
     assert "idempotency_key=idem-123" in line
 
 
-@pytest.mark.xfail(strict=True, reason="reverted by PR #225's HEAD-side conflict resolution; re-landing tracked in #232")
 def test_a_successful_delivery_logs_nothing(tmp_path, caplog):
     controller = _controller(tmp_path)
     config = SimulationConfig(
@@ -102,18 +106,17 @@ def test_a_successful_delivery_logs_nothing(tmp_path, caplog):
     )
     payload = IngestPayload(source="test", events=[_record().event])
 
-    with caplog.at_level(logging.WARNING, logger="app.controller"):
+    with caplog.at_level(logging.WARNING, logger=LOGGER_NAME):
         outcome = asyncio.run(controller._deliver_payload(payload, config))
 
     assert outcome.delivery_status == "posted"
     assert [r for r in caplog.records if "Delivery failed" in r.message] == []
 
 
-@pytest.mark.xfail(strict=True, reason="reverted by PR #225's HEAD-side conflict resolution; re-landing tracked in #232")
 def test_tenant_provisioning_is_logged(tmp_path, monkeypatch, caplog):
     monkeypatch.setattr(tenancy, "TENANT_DATA_ROOT", tmp_path / "tenants")
 
-    with caplog.at_level(logging.INFO, logger="app.tenancy"):
+    with caplog.at_level(logging.INFO, logger=LOGGER_NAME):
         tenancy._create_tenant_controller("brand-new-tenant")
 
     provisioned = [r for r in caplog.records if "Provisioned tenant controller" in r.message]
@@ -121,28 +124,26 @@ def test_tenant_provisioning_is_logged(tmp_path, monkeypatch, caplog):
     assert "brand-new-tenant" in provisioned[0].getMessage()
 
 
-@pytest.mark.xfail(strict=True, reason="reverted by PR #225's HEAD-side conflict resolution; re-landing tracked in #232")
 def test_a_store_write_failure_is_logged_before_it_propagates(tmp_path, caplog):
     store = EventStore(persist_path=str(tmp_path / "events.jsonl"))
     # A directory where the log file should be: every open(..., "a") fails.
     store.persist_path.unlink(missing_ok=True)
     store.persist_path.mkdir(parents=True)
 
-    with caplog.at_level(logging.ERROR, logger="app.store"):
+    with caplog.at_level(logging.ERROR, logger=LOGGER_NAME):
         with pytest.raises(OSError):
             store.add_many([_record()])
 
     assert [r for r in caplog.records if "EventStore append failed" in r.message]
 
 
-@pytest.mark.xfail(strict=True, reason="reverted by PR #225's HEAD-side conflict resolution; re-landing tracked in #232")
 def test_the_delivery_log_line_does_not_leak_the_api_key(tmp_path, caplog):
     controller = _controller(tmp_path)
     secret = "regengine-live-key-do-not-log"
     controller.config = controller.config.model_copy(
         update={"delivery": DeliveryConfig(mode="mock", api_key=secret)}
     )
-    with caplog.at_level(logging.ERROR, logger="app.controller"):
+    with caplog.at_level(logging.ERROR, logger=LOGGER_NAME):
         controller._log_delivery_failure(
             "mock",
             "idem-1",
@@ -197,7 +198,6 @@ def test_negative_quantities_are_still_written_as_numbers():
 # --------------------------------------------------------------------------
 
 
-@pytest.mark.xfail(strict=True, reason="reverted by PR #225's HEAD-side conflict resolution; re-landing tracked in #232")
 def test_delete_refuses_a_path_outside_the_tenant_root(tmp_path, monkeypatch):
     monkeypatch.setattr(tenancy, "TENANT_DATA_ROOT", tmp_path / "tenants")
     outside = tmp_path / "not-a-tenant"
@@ -209,7 +209,6 @@ def test_delete_refuses_a_path_outside_the_tenant_root(tmp_path, monkeypatch):
     assert "outside the tenant root" in str(excinfo.value.detail)
 
 
-@pytest.mark.xfail(strict=True, reason="reverted by PR #225's HEAD-side conflict resolution; re-landing tracked in #232")
 def test_delete_refuses_the_tenant_root_itself(tmp_path, monkeypatch):
     root = tmp_path / "tenants"
     root.mkdir(parents=True)
@@ -219,7 +218,6 @@ def test_delete_refuses_the_tenant_root_itself(tmp_path, monkeypatch):
         tenancy.assert_within_tenant_root(root)
 
 
-@pytest.mark.xfail(strict=True, reason="reverted by PR #225's HEAD-side conflict resolution; re-landing tracked in #232")
 def test_delete_refuses_a_symlinked_tenant_directory(tmp_path, monkeypatch):
     root = tmp_path / "tenants"
     root.mkdir(parents=True)
@@ -232,7 +230,6 @@ def test_delete_refuses_a_symlinked_tenant_directory(tmp_path, monkeypatch):
         tenancy.assert_within_tenant_root(root / "sneaky")
 
 
-@pytest.mark.xfail(strict=True, reason="reverted by PR #225's HEAD-side conflict resolution; re-landing tracked in #232")
 def test_delete_allows_a_real_tenant_directory(tmp_path, monkeypatch):
     root = tmp_path / "tenants"
     monkeypatch.setattr(tenancy, "TENANT_DATA_ROOT", root)
@@ -242,7 +239,6 @@ def test_delete_allows_a_real_tenant_directory(tmp_path, monkeypatch):
     assert tenancy.assert_within_tenant_root(tenant) == tenant.resolve()
 
 
-@pytest.mark.xfail(strict=True, reason="reverted by PR #225's HEAD-side conflict resolution; re-landing tracked in #232")
 def test_reads_are_served_from_cache_until_the_log_changes(tmp_path):
     store = EventStore(persist_path=str(tmp_path / "events.jsonl"))
     store.add_many([_record(lot_code=f"TLC-{index}") for index in range(50)])

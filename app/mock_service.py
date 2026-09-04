@@ -189,7 +189,7 @@ class MockRegEngineService:
         *,
         idempotency_ttl: timedelta = timedelta(hours=IDEMPOTENCY_TTL_HOURS),
         clock: Callable[[], datetime] = lambda: datetime.now(UTC),
-        enforce_event_age_window: bool = False,
+        enforce_event_age_window: bool = True,
         max_event_age_days: int = MAX_EVENT_AGE_DAYS,
     ) -> None:
         self._chain_hash = _resume_chain_hash(store) if store is not None else ""
@@ -201,22 +201,38 @@ class MockRegEngineService:
         self.idempotency_ttl = idempotency_ttl
         self._clock = clock
         self.max_event_age_days = max_event_age_days
-        # Off by default -- deliberately, not an oversight (#102). Turning
-        # this on unconditionally against the *default* wall-clock `clock`
-        # would reject every one of this repo's own fixed-date fixtures the
-        # instant real time drifts past them by more than
-        # MAX_EVENT_AGE_DAYS: app/demo_fixtures.py's three shipped
-        # DemoFixture entries, and the "2026-02-05"-style timestamp dozens
-        # of existing tests across the suite use as their canonical valid
-        # event, are already >90 days stale as of this writing. That is
-        # exactly the "green demo, failing live post" failure this
-        # simulator exists to avoid -- just inverted (a demo that now fails
-        # on its own bundled data instead of passing data live would
-        # reject). The check itself is fully implemented and correct (see
-        # validate_event_like_regengine's `now` parameter); a caller that
-        # wants it live -- this test suite, or a future caller with a
-        # source of non-stale demo data -- opts in explicitly here and
-        # supplies `clock=` to control what "now" means for it.
+        # ON by default (#209, closing the remaining half of #102). Live
+        # RegEngine applies this floor unconditionally, so a mock whose
+        # default is to skip it accepts batches live 422s outright -- a
+        # historical CSV import or a store replay that passes the demo and
+        # fails the first real post. That is the precise "green demo, failing
+        # live post" divergence this simulator exists to surface, and it was
+        # shipping *inside the simulator itself*.
+        #
+        # The default is what mattered: both production construction sites
+        # (app/tenancy.py) took it, so the check existed but no deployed
+        # caller ever ran it. A faithful mock enforces by default and makes
+        # NOT enforcing the explicit, greppable choice.
+        #
+        # Two things had to land first, and both have:
+        #   * #199 rebases app/demo_fixtures.py's shipped fixtures onto the
+        #     current date at load time, so Load Demo Fixture stays inside the
+        #     window however long after they were written the repo runs.
+        #   * The suite's canonical valid event is computed relative to now
+        #     (tests/support/timestamps.py) instead of a fixed 2026-02-05,
+        #     which is what #102 left outstanding.
+        #
+        # Scope, stated precisely: this BOUNDS replay, it does not close it. A
+        # captured signed request stays replayable for as long as its events
+        # remain inside the window -- what the floor removes is the unbounded
+        # tail, not replay itself. RegEngine's own
+        # _validate_event_timestamp_window says the same. Closing replay
+        # outright needs a signed timestamp plus a nonce on the request, which
+        # neither side has today.
+        #
+        # Pass False to opt out -- for a test whose subject is a deliberately
+        # stale event, or a caller knowingly ingesting historical data. Supply
+        # `clock=` alongside it to control what "now" means.
         self._enforce_event_age_window = enforce_event_age_window
 
     def reset(self) -> None:

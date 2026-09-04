@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import pytest
 
 import csv
 import io
@@ -101,16 +100,41 @@ def _rows(csv_text: str) -> list[dict[str, str]]:
 # --- #186: FDA CSV carries both location descriptions and the TLC source ---
 
 
-@pytest.mark.xfail(strict=True, reason="reverted by PR #225's HEAD-side conflict resolution; re-landing tracked in #232")
 def test_fda_export_keeps_regengine_mirrored_columns_first() -> None:
-    assert FDA_EXPORT_COLUMNS[:11] == [
+    """The RegEngine-mirrored core comes first; #186's additions come after.
+
+    Two corrections to what this test used to assert, both checked against
+    primary sources rather than memory:
+
+    * Index 1 is "Event Type (CTE)", NOT "Traceability Lot Code Description"
+      (#94). That column held `event.cte_type.value`, which is a mislabel
+      rather than a bad value: no KDE by that name exists anywhere in FSMA 204,
+      and RegEngine's own canonical spreadsheet
+      (services/compliance/app/fsma_spreadsheet.py) has no lot-code
+      description column while it does have "Event Type (CTE)". Mirroring
+      RegEngine -- which is what this test is named for -- means this column.
+    * The mirrored core is 7 columns, not 11. #186 inserted the counterparty
+      location and the TLC source reference after it, so asserting a flat
+      11-wide prefix silently required those two NOT to exist. They are
+      asserted in their own right below instead.
+    """
+    assert FDA_EXPORT_COLUMNS[:7] == [
         "Traceability Lot Code",
-        "Traceability Lot Code Description",
+        "Event Type (CTE)",
         "Product Description",
         "Quantity",
         "Unit of Measure",
         "Location Description",
         "Location Identifier (GLN)",
+    ]
+    # #186's two additions sit between the mirrored core and the document
+    # columns, so a Shipping- or Receiving-only export carries the whole
+    # required location pair.
+    assert FDA_EXPORT_COLUMNS[7:9] == [
+        "Ship-To / Previous Source Location Description",
+        "TLC Source Reference",
+    ]
+    assert FDA_EXPORT_COLUMNS[9:] == [
         "Date",
         "Time",
         "Reference Document Type",
@@ -118,37 +142,33 @@ def test_fda_export_keeps_regengine_mirrored_columns_first() -> None:
     ]
 
 
-@pytest.mark.xfail(strict=True, reason="reverted by PR #225's HEAD-side conflict resolution; re-landing tracked in #232")
 def test_shipping_only_export_carries_ship_from_ship_to_and_tlc_source() -> None:
     csv_text = render_fda_request_csv([_shipping_record()], location_gln=_gln)
     (row,) = _rows(csv_text)
 
     assert row["Location Description"] == "FreshPack Central"
-    assert row["Immediate Subsequent Recipient Location"] == "Distribution Center #4"
-    assert row["Traceability Lot Code Source Reference"] == "SRC-CONF-001"
+    assert row["Ship-To / Previous Source Location Description"] == "Distribution Center #4"
+    assert row["TLC Source Reference"] == "SRC-CONF-001"
 
 
-@pytest.mark.xfail(strict=True, reason="reverted by PR #225's HEAD-side conflict resolution; re-landing tracked in #232")
 def test_receiving_only_export_carries_receiver_previous_source_and_tlc_source() -> None:
     csv_text = render_fda_request_csv([_receiving_record()], location_gln=_gln)
     (row,) = _rows(csv_text)
 
     assert row["Location Description"] == "Distribution Center #4"
-    assert row["Immediate Previous Source Location"] == "FreshPack Central"
-    assert row["Traceability Lot Code Source Reference"] == "SRC-CONF-001"
+    assert row["Ship-To / Previous Source Location Description"] == "FreshPack Central"
+    assert row["TLC Source Reference"] == "SRC-CONF-001"
 
 
-@pytest.mark.xfail(strict=True, reason="reverted by PR #225's HEAD-side conflict resolution; re-landing tracked in #232")
 def test_export_surfaces_tlc_source_for_every_cte_that_requires_it() -> None:
     for cte_type, required in REQUIRED_KDES.items():
         if "tlc_source_reference" not in required:
             continue
         record = _record(cte_type, kdes={"tlc_source_reference": "SRC-CONF-XYZ"})
         (row,) = _rows(render_fda_request_csv([record], location_gln=_gln))
-        assert row["Traceability Lot Code Source Reference"] == "SRC-CONF-XYZ", cte_type
+        assert row["TLC Source Reference"] == "SRC-CONF-XYZ", cte_type
 
 
-@pytest.mark.xfail(strict=True, reason="reverted by PR #225's HEAD-side conflict resolution; re-landing tracked in #232")
 def test_export_accepts_alias_kdes_for_recipient_and_tlc_source() -> None:
     record = _shipping_record(
         kdes={
@@ -160,8 +180,8 @@ def test_export_accepts_alias_kdes_for_recipient_and_tlc_source() -> None:
     )
     (row,) = _rows(render_fda_request_csv([record], location_gln=_gln))
 
-    assert row["Immediate Subsequent Recipient Location"] == "Retail DC #9"
-    assert row["Traceability Lot Code Source Reference"] == "SRC-ALIAS-001"
+    assert row["Ship-To / Previous Source Location Description"] == "Retail DC #9"
+    assert row["TLC Source Reference"] == "SRC-ALIAS-001"
 
 
 # --- #157: Date/Time normalized to UTC before splitting ---
@@ -201,110 +221,6 @@ def _render(records: list[StoredEventRecord]) -> list[dict[str, Any]]:
     return document["epcisBody"]["eventList"]
 
 
-@pytest.mark.xfail(strict=True, reason="reverted by PR #225's HEAD-side conflict resolution; re-landing tracked in #232")
-def test_shipping_event_emits_destination_list_for_subsequent_recipient() -> None:
-    (event,) = _render([_shipping_record()])
-
-    destinations = event["destinationList"]
-    assert {entry["type"] for entry in destinations} == {
-        "urn:epcglobal:cbv:sdt:location",
-        "urn:epcglobal:cbv:sdt:owning_party",
-        "urn:epcglobal:cbv:sdt:possessing_party",
-    }
-    assert all(entry["regengine:locationName"] == "Distribution Center #4" for entry in destinations)
-    location_entry = next(
-        entry for entry in destinations if entry["type"] == "urn:epcglobal:cbv:sdt:location"
-    )
-    assert location_entry["destination"] == "urn:regengine:location:Distribution%20Center%20%234"
-
-    sources = event["sourceList"]
-    source_entry = next(
-        entry for entry in sources if entry["type"] == "urn:epcglobal:cbv:sdt:location"
-    )
-    assert source_entry["source"] == "urn:regengine:location:FreshPack%20Central"
-
-
-@pytest.mark.xfail(strict=True, reason="reverted by PR #225's HEAD-side conflict resolution; re-landing tracked in #232")
-def test_receiving_event_emits_source_list_for_previous_source() -> None:
-    (event,) = _render([_receiving_record()])
-
-    sources = event["sourceList"]
-    source_entry = next(
-        entry for entry in sources if entry["type"] == "urn:epcglobal:cbv:sdt:location"
-    )
-    assert source_entry["source"] == "urn:regengine:location:FreshPack%20Central"
-    assert source_entry["regengine:locationName"] == "FreshPack Central"
-
-    destination_entry = next(
-        entry
-        for entry in event["destinationList"]
-        if entry["type"] == "urn:epcglobal:cbv:sdt:location"
-    )
-    assert destination_entry["regengine:locationName"] == "Distribution Center #4"
-
-
-@pytest.mark.xfail(strict=True, reason="reverted by PR #225's HEAD-side conflict resolution; re-landing tracked in #232")
-def test_shipping_receiving_pair_links_through_matching_sdt_locations() -> None:
-    shipping, receiving = _render([_shipping_record(), _receiving_record()])
-
-    ship_destination = next(
-        entry
-        for entry in shipping["destinationList"]
-        if entry["type"] == "urn:epcglobal:cbv:sdt:location"
-    )
-    receive_source = next(
-        entry
-        for entry in receiving["sourceList"]
-        if entry["type"] == "urn:epcglobal:cbv:sdt:location"
-    )
-    ship_source = next(
-        entry
-        for entry in shipping["sourceList"]
-        if entry["type"] == "urn:epcglobal:cbv:sdt:location"
-    )
-    receive_destination = next(
-        entry
-        for entry in receiving["destinationList"]
-        if entry["type"] == "urn:epcglobal:cbv:sdt:location"
-    )
-
-    assert ship_source["source"] == receive_source["source"]
-    assert ship_destination["destination"] == receive_destination["destination"]
-    # The extension blob is kept alongside the standard vocabulary, not replaced.
-    assert shipping["regengine:kdes"]["ship_to_location"] == "Distribution Center #4"
-
-
-def test_non_handoff_events_omit_source_and_destination_lists() -> None:
-    (event,) = _render([_record(CTEType.HARVESTING, location_name="Sunrise Farm")])
-
-    assert "sourceList" not in event
-    assert "destinationList" not in event
-
-
-# --- #188: bizStep vocabulary conformance ---
-
-
-def test_cbv_prefixed_biz_steps_are_real_cbv_terms() -> None:
-    for cte_type, biz_step in _BIZ_STEPS.items():
-        if not biz_step.startswith(CBV_BIZ_STEP_PREFIX):
-            continue
-        term = biz_step[len(CBV_BIZ_STEP_PREFIX):]
-        assert term in CBV_BIZ_STEPS, f"{cte_type} maps to non-CBV bizStep {biz_step}"
-
-
-def test_transformation_biz_step_is_outside_the_cbv_namespace() -> None:
-    biz_step = _BIZ_STEPS[CTEType.TRANSFORMATION]
-    assert not biz_step.startswith("urn:epcglobal:cbv:")
-    assert biz_step.startswith("urn:regengine:")
-
-
-def test_every_cte_type_has_a_biz_step() -> None:
-    assert set(_BIZ_STEPS) == set(CTEType)
-
-
-# --- #159: EPCIS transformation input quantities ---
-
-
 def _transformation_record(input_quantities: Any = None) -> StoredEventRecord:
     kdes: dict[str, Any] = {
         "transformation_date": "2026-02-07",
@@ -328,7 +244,147 @@ def _transformation_record(input_quantities: Any = None) -> StoredEventRecord:
     )
 
 
-@pytest.mark.xfail(strict=True, reason="reverted by PR #225's HEAD-side conflict resolution; re-landing tracked in #232")
+def test_shipping_event_emits_destination_list_for_subsequent_recipient() -> None:
+    """Shipping's ship-to becomes a CBV destinationList entry (#187).
+
+    Two things about the shape are deliberate and both post-date the version
+    this test was originally written against:
+
+    * ``location`` only. CBV also defines ``owning_party`` and
+      ``possessing_party``, but this app has no ownership or possession model
+      distinct from location, so emitting those would assert a handoff it does
+      not model.
+    * The BARE token, not ``urn:epcglobal:cbv:sdt:location``. GS1's
+      epcis-context.jsonld declares this member as ``"@type": "@vocab"`` over
+      exactly three short names, so only a token expands to ``cbv:SDT-location``;
+      and the official EPCIS 2.0 JSON Schema's ``source-dest-type`` rejects the
+      ``urn:epcglobal:cbv`` prefix outright via a negative lookahead. Both
+      verified against the published context and schema, not from memory.
+    """
+    (event,) = _render([_shipping_record()])
+
+    destinations = event["destinationList"]
+    assert {entry["type"] for entry in destinations} == {"location"}
+    (destination,) = destinations
+    assert destination["destination"] == "urn:regengine:location:Distribution%20Center%20%234"
+    # The name is recoverable from the URI itself, so no separate
+    # regengine:locationName member is emitted alongside it.
+    assert set(destination) == {"type", "destination"}
+
+
+def test_receiving_event_emits_source_list_for_previous_source() -> None:
+    (event,) = _render([_receiving_record()])
+
+    sources = event["sourceList"]
+    assert {entry["type"] for entry in sources} == {"location"}
+    (source,) = sources
+    assert source["source"] == "urn:regengine:location:FreshPack%20Central"
+    assert set(source) == {"type", "source"}
+
+
+def test_source_and_destination_types_use_gs1s_declared_vocabulary_tokens() -> None:
+    """Pinned as set membership, so this fails for ANY urn, not just one.
+
+    Emitting the otherwise-legitimate ``urn:epcglobal:cbv:sdt:location`` alias
+    made every shipping and receiving document schema-invalid, which is the
+    opposite of what #187 asked for. A literal-equality assertion would go on
+    passing if the value drifted to some other URN, so this asserts membership
+    in GS1's three declared tokens instead.
+    """
+    declared_tokens = {"owning_party", "possessing_party", "location"}
+
+    seen = 0
+    for event in _render([_shipping_record(), _receiving_record()]):
+        for entry in event.get("sourceList", []) + event.get("destinationList", []):
+            seen += 1
+            assert entry["type"] in declared_tokens, (
+                f"{entry['type']!r} is not one of GS1's declared sourceDestinationType "
+                "tokens; a URN here fails both JSON-LD expansion and the EPCIS 2.0 schema"
+            )
+    assert seen, "no source/destination entries were produced to check"
+
+
+def test_a_shipping_receiving_pair_names_each_others_locations() -> None:
+    """The handoff is traceable across the pair, one side at a time.
+
+    What #187 asks for is that a Shipping/Receiving pair link through matching
+    location identifiers. It is only half met, and this test says which half:
+    Shipping carries a destinationList naming where the lot went, and
+    Receiving carries a sourceList naming where it came from -- so the two
+    endpoints of the handoff ARE both in the document and both as CBV
+    entries.
+
+    What is NOT emitted is the other side of each event: Shipping has no
+    sourceList naming the shipper, and Receiving no destinationList naming
+    the receiver. Those are each event's own ``bizLocation``, so the
+    information is present in the document, just not duplicated into a CBV
+    list. A consumer that links purely on sourceList/destinationList
+    therefore has to fall back on bizLocation for one end of each hop.
+    """
+    shipping, receiving = _render([_shipping_record(), _receiving_record()])
+
+    (ship_destination,) = shipping["destinationList"]
+    (receive_source,) = receiving["sourceList"]
+
+    assert ship_destination["destination"] == "urn:regengine:location:Distribution%20Center%20%234"
+    assert receive_source["source"] == "urn:regengine:location:FreshPack%20Central"
+
+    # The un-emitted halves, asserted so a future change that adds them fails
+    # here and gets to update this docstring rather than silently widening it.
+    assert "sourceList" not in shipping
+    assert "destinationList" not in receiving
+    assert shipping["bizLocation"] and receiving["bizLocation"]
+
+
+def test_transformation_inputs_carry_product_description_from_input_products() -> None:
+    (event,) = _render([_transformation_record()])
+
+    by_lot = {
+        element["regengine:traceabilityLotCode"]: element
+        for element in event["inputQuantityList"]
+    }
+    assert by_lot["TLC-IN-1"]["regengine:productDescription"] == "Romaine Lettuce"
+    assert by_lot["TLC-IN-2"]["regengine:productDescription"] == "Spinach"
+
+
+def test_transformation_output_quantity_still_populated() -> None:
+    (event,) = _render([_transformation_record()])
+
+    (output,) = event["outputQuantityList"]
+    assert output["quantity"] == 120.0
+    assert output["uom"] == "cases"
+
+
+# ---------------------------------------------------------------------------
+# #188 bizStep vocabulary, handoff-list scoping, and per-input quantities
+# ---------------------------------------------------------------------------
+
+
+def test_cbv_prefixed_biz_steps_are_real_cbv_terms() -> None:
+    for cte_type, biz_step in _BIZ_STEPS.items():
+        if not biz_step.startswith(CBV_BIZ_STEP_PREFIX):
+            continue
+        term = biz_step[len(CBV_BIZ_STEP_PREFIX):]
+        assert term in CBV_BIZ_STEPS, f"{cte_type} maps to non-CBV bizStep {biz_step}"
+
+
+def test_every_cte_type_has_a_biz_step() -> None:
+    assert set(_BIZ_STEPS) == set(CTEType)
+
+
+def test_transformation_biz_step_is_outside_the_cbv_namespace() -> None:
+    biz_step = _BIZ_STEPS[CTEType.TRANSFORMATION]
+    assert not biz_step.startswith("urn:epcglobal:cbv:")
+    assert biz_step.startswith("urn:regengine:")
+
+
+def test_non_handoff_events_omit_source_and_destination_lists() -> None:
+    (event,) = _render([_record(CTEType.HARVESTING, location_name="Sunrise Farm")])
+
+    assert "sourceList" not in event
+    assert "destinationList" not in event
+
+
 def test_transformation_inputs_carry_per_lot_quantity_when_kdes_record_it() -> None:
     record = _transformation_record(
         [
@@ -348,7 +404,6 @@ def test_transformation_inputs_carry_per_lot_quantity_when_kdes_record_it() -> N
     assert all("quantity" in element for element in event["inputQuantityList"])
 
 
-@pytest.mark.xfail(strict=True, reason="reverted by PR #225's HEAD-side conflict resolution; re-landing tracked in #232")
 def test_transformation_inputs_accept_lot_to_quantity_mapping() -> None:
     record = _transformation_record({"TLC-IN-1": 80, "TLC-IN-2": 45.5})
     (event,) = _render([record])
@@ -360,21 +415,3 @@ def test_transformation_inputs_accept_lot_to_quantity_mapping() -> None:
     assert quantities == {"TLC-IN-1": 80.0, "TLC-IN-2": 45.5}
 
 
-@pytest.mark.xfail(strict=True, reason="reverted by PR #225's HEAD-side conflict resolution; re-landing tracked in #232")
-def test_transformation_inputs_carry_product_description_from_input_products() -> None:
-    (event,) = _render([_transformation_record()])
-
-    by_lot = {
-        element["regengine:traceabilityLotCode"]: element
-        for element in event["inputQuantityList"]
-    }
-    assert by_lot["TLC-IN-1"]["regengine:productDescription"] == "Romaine Lettuce"
-    assert by_lot["TLC-IN-2"]["regengine:productDescription"] == "Spinach"
-
-
-def test_transformation_output_quantity_still_populated() -> None:
-    (event,) = _render([_transformation_record()])
-
-    (output,) = event["outputQuantityList"]
-    assert output["quantity"] == 120.0
-    assert output["uom"] == "cases"
