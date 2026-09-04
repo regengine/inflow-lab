@@ -93,7 +93,6 @@ def test_a_failed_mock_delivery_is_logged(tmp_path, caplog):
     assert "idempotency_key=idem-123" in line
 
 
-@pytest.mark.xfail(strict=True, reason="reverted by PR #225's HEAD-side conflict resolution; re-landing tracked in #232")
 def test_a_successful_delivery_logs_nothing(tmp_path, caplog):
     controller = _controller(tmp_path)
     config = SimulationConfig(

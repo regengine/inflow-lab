@@ -142,7 +142,6 @@ def test_loading_a_scenario_save_does_not_stall_the_loop(tmp_path):
     assert ticks >= _MIN_EXPECTED_TICKS, f"loop stalled: only {ticks} ticks"
 
 
-@pytest.mark.xfail(strict=True, reason="reverted by PR #225's HEAD-side conflict resolution; re-landing tracked in #232")
 def test_saving_still_holds_the_data_lock_across_the_offload(tmp_path):
     # The offload must not have turned into a hoist. A `reset()` landing between
     # snapshotting the records and writing them would persist a store state that
@@ -162,7 +161,6 @@ def test_saving_still_holds_the_data_lock_across_the_offload(tmp_path):
     assert observed == [True], "the data-plane lock was not held across the save"
 
 
-@pytest.mark.xfail(strict=True, reason="reverted by PR #225's HEAD-side conflict resolution; re-landing tracked in #232")
 def test_a_concurrent_reset_cannot_land_mid_save(tmp_path):
     # The behavioural half of the test above: the save must persist either the
     # pre-reset records or the post-reset ones, never a torn mixture.

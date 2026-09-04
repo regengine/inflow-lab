@@ -163,7 +163,6 @@ def test_a_crashed_run_loop_publishes_a_revision_bump(tmp_path: Path) -> None:
     asyncio.run(scenario())
 
 
-@pytest.mark.xfail(strict=True, reason="reverted by PR #225's HEAD-side conflict resolution; re-landing tracked in #232")
 def test_a_crashed_run_loop_logs_the_failure(tmp_path: Path, caplog: Any) -> None:
     """The traceback belongs in the app's own logger, at crash time."""
 
@@ -182,7 +181,6 @@ def test_a_crashed_run_loop_logs_the_failure(tmp_path: Path, caplog: Any) -> Non
     ), "the store's own error must reach the log, not just a generic message"
 
 
-@pytest.mark.xfail(strict=True, reason="reverted by PR #225's HEAD-side conflict resolution; re-landing tracked in #232")
 def test_stop_clears_a_task_that_died_and_bumps_the_revision(tmp_path: Path) -> None:
     """The #211 headline: stop() used to early-return on a done() task."""
 
@@ -234,7 +232,6 @@ def test_a_crashed_run_loops_exception_is_retrieved(tmp_path: Path) -> None:
     assert not [message for message in unhandled if "never retrieved" in message], unhandled
 
 
-@pytest.mark.xfail(strict=True, reason="reverted by PR #225's HEAD-side conflict resolution; re-landing tracked in #232")
 def test_stop_on_a_crashed_task_never_waits_for_the_data_plane_lock(tmp_path: Path) -> None:
     """Lock ordering, unchanged by #211's fix.
 
@@ -280,7 +277,6 @@ def test_stop_still_stops_a_healthy_run_loop(tmp_path: Path) -> None:
     asyncio.run(scenario())
 
 
-@pytest.mark.xfail(strict=True, reason="reverted by PR #225's HEAD-side conflict resolution; re-landing tracked in #232")
 def test_the_run_loop_publishes_on_a_clean_stop_too(tmp_path: Path) -> None:
     """``_run_loop``'s new ``finally`` runs on every exit, not just crashes.
 
@@ -309,22 +305,7 @@ def test_the_run_loop_publishes_on_a_clean_stop_too(tmp_path: Path) -> None:
     asyncio.run(scenario())
 
 
-@pytest.mark.parametrize(
-    "break_before_start",
-    [
-        True,
-        # The False case calls stop() first and asserts it cleared the dead
-        # task. stop() still early-returns on a done task, so that half stays
-        # xfailed until #211's half of the re-landing lands.
-        pytest.param(
-            False,
-            marks=pytest.mark.xfail(
-                strict=True,
-                reason="reverted by PR #225's HEAD-side conflict resolution; re-landing tracked in #232",
-            ),
-        ),
-    ],
-)
+@pytest.mark.parametrize("break_before_start", [True, False])
 def test_start_is_still_possible_after_a_crash(tmp_path: Path, break_before_start: bool) -> None:
     """A crashed loop must not wedge the controller.
 

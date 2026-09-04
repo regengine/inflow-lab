@@ -94,16 +94,29 @@ class SimulationController:
         scenario_saves: ScenarioSaveStore,
         mock_service: MockRegEngineService,
         live_client: LiveRegEngineClient,
+        tenant_id: str = "default",
     ) -> None:
         self.engine = engine
         self.store = store
         self.scenario_saves = scenario_saves
         self.mock_service = mock_service
         self.live_client = live_client
+        # Identifies this controller in log lines only. One process runs one
+        # controller per tenant, and a failure that names no tenant is not
+        # actionable on a shared deployment (#182).
+        self.tenant_id = tenant_id
         self.config = SimulationConfig(persist_path=str(store.persist_path))
         self._task: asyncio.Task[None] | None = None
         self._stop_event = asyncio.Event()
         self._lock = asyncio.Lock()
+        # Guards the run-loop lifecycle -- `_task` and `_stop_event` -- and
+        # nothing else. Deliberately NOT `self._lock`, the data-plane lock every
+        # delivery path holds: `stop()` must be able to signal and clear a run
+        # loop while a delivery is in flight, and a crashed loop must be
+        # clearable while some other coroutine holds the data plane. Lock order,
+        # where both are taken (only `start()`): `_lifecycle_lock` first, then
+        # `_lock`. Nothing ever takes them the other way round.
+        self._lifecycle_lock = asyncio.Lock()
         self._revision = 0
         self._change_condition = asyncio.Condition()
         self._last_error: str | None = None
@@ -117,7 +130,12 @@ class SimulationController:
         return self._revision
 
     async def start(self, config: SimulationConfig) -> None:
-        async with self._lock:
+        # `_lifecycle_lock` is what makes this mutually exclusive with `stop()`
+        # (#156): both mutate `_task`/`_stop_event`, and stop() no longer takes
+        # the data-plane lock. `_lock` is still taken, inside it, for the config
+        # and engine/store mutations below -- the one place both are held, and
+        # always in this order.
+        async with self._lifecycle_lock, self._lock:
             _validate_live_delivery(config.delivery)
             previous_config = self.config
             if self.running and (
@@ -171,17 +189,17 @@ class SimulationController:
 
     async def stop(self) -> None:
         # #156: the _task/_stop_event mutation below must happen under
-        # self._lock -- the same lock start() uses -- or a concurrent
-        # start() can land in the gap this used to leave open. The old
+        # self._lifecycle_lock -- the same lock start() uses for it -- or a
+        # concurrent start() can land in the gap this used to leave open. The old
         # body read self.running, set self._stop_event, and unconditionally
         # cleared self._task with no lock at all, so a start() landing
         # between "the awaited task finished" and "this coroutine resumed"
         # would install its own task/event and then have both silently
         # discarded by this method's own `self._task = None` -- orphaning
         # a live run loop that nothing could ever reach again.
-        async with self._lock:
+        async with self._lifecycle_lock:
             task = self._task
-            if task is None or task.done():
+            if task is None:
                 return
             # Captured under the same lock as `task`, from the same read of
             # self._task's generation -- start() always assigns
@@ -190,15 +208,21 @@ class SimulationController:
             # on, never a later start()'s fresh replacement.
             stop_event = self._stop_event
             stop_event.set()
-        # await the task OUTSIDE the lock. _run_loop calls self.step(),
-        # which itself does `async with self._lock` -- holding the lock
-        # here while awaiting the loop's own task would deadlock stop()
-        # against itself the instant the loop is mid-step (or about to
-        # start its next one): step() would block forever on a lock stop()
-        # is holding, while stop() blocks forever on a task that can now
-        # never finish stepping.
-        await task
-        async with self._lock:
+        # A task that already finished -- because the run loop crashed (#211),
+        # not because anyone called stop() -- must still be cleared and
+        # published below. `stop()` used to early-return on `task.done()`, so
+        # `self._task` stayed installed forever naming a dead loop, `running`
+        # read False off it, and the SSE revision never moved: every open
+        # console went on rendering a run that no longer existed. Awaiting a
+        # finished task is skipped rather than harmful; the retrieval of its
+        # result happens once, below, after it is out of `self._task`.
+        if not task.done():
+            # await the task OUTSIDE the lock. A fix that instead held
+            # _lifecycle_lock across this await would serialise correctly but
+            # would block a concurrent start() for the whole drain, which
+            # tests/test_stop_start_race.py pins as a behaviour to keep.
+            await task
+        async with self._lifecycle_lock:
             # The other half of #156's fix. While the lock was open across
             # the `await task` above, a concurrent start() could have
             # observed `running is False` (this task had just finished) and
@@ -212,6 +236,14 @@ class SimulationController:
             if self._task is not task:
                 return
             self._task = None
+        # Retrieve the finished task's outcome now that nothing else refers to
+        # it. `_run_loop` swallows its own exceptions (it logs and publishes
+        # instead of propagating), so this is normally a no-op -- but if a
+        # future change ever lets one escape, asyncio would otherwise report it
+        # as "Task exception was never retrieved" at garbage-collection time:
+        # detached from the run, and outside the logger operators watch (#182).
+        if not task.cancelled():
+            task.exception()
         await self._publish_update()
 
     async def shutdown(self, timeout: float = 10.0) -> None:
@@ -976,10 +1008,26 @@ class SimulationController:
                     except asyncio.TimeoutError:
                         continue
         except asyncio.CancelledError:
+            # shutdown() cancels a wedged loop; that is not a run failure, and
+            # publishing here would await inside a cancellation.
             raise
         except Exception as exc:
             self._last_error = f"{type(exc).__name__}: {exc}"
-            logger.exception("run loop crashed")
+            logger.exception(
+                "simulation run loop stopped on an unhandled error: tenant=%s",
+                self.tenant_id,
+            )
+            # The run is over either way -- tell subscribers, so the console
+            # stops showing it as running. Deliberately not re-raised: the
+            # failure is already logged with its traceback and published, and
+            # re-raising would leave an exception on a task that, on the crash
+            # path, nothing is guaranteed to await.
+            await self._publish_update()
+        else:
+            # A clean stop is a state change too: the loop bumps the revision as
+            # it unwinds, before stop()'s own post-await bump. Not a `finally`,
+            # because that branch also runs under cancellation, where awaiting
+            # anything is the wrong thing to do.
             await self._publish_update()
 
     async def _publish_update(self) -> None:

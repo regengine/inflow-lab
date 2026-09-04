@@ -71,6 +71,7 @@ controller = SimulationController(
     scenario_saves=scenario_saves,
     mock_service=mock_service,
     live_client=LiveRegEngineClient(),
+    tenant_id=DEFAULT_TENANT_ID,
 )
 
 _tenant_controllers: dict[str, SimulationController] = {DEFAULT_TENANT_ID: controller}
@@ -356,4 +357,5 @@ def _create_tenant_controller(tenant_id: str) -> SimulationController:
         scenario_saves=tenant_saves,
         mock_service=MockRegEngineService(store=tenant_store),
         live_client=LiveRegEngineClient(),
+        tenant_id=tenant_id,
     )
