@@ -3,7 +3,7 @@ from __future__ import annotations
 import asyncio
 import shutil
 
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends
 
 from .. import tenancy
 from ..dependencies import require_operator_auth
@@ -59,13 +59,12 @@ async def delete_operator_tenant(
         if tenant_controller is not None:
             await tenant_controller.shutdown()
 
-        resolved = tenant_dir.resolve()
-        expected_root = tenancy.TENANT_DATA_ROOT.resolve()
-        if not str(resolved).startswith(str(expected_root) + "/"):
-            raise HTTPException(
-                status_code=400,
-                detail=f"Tenant directory escapes the data root: {resolved}",
-            )
+        # Refuses a path outside the tenant root, and the root itself. Uses
+        # is_relative_to on resolved paths rather than a string prefix, so a
+        # sibling directory whose name merely starts with the root's cannot
+        # slip through -- and a symlinked tenant directory is caught before
+        # the recursive delete runs against wherever it points (#65).
+        resolved = tenancy.assert_within_tenant_root(tenant_dir)
         shutil.rmtree(resolved, ignore_errors=True)
     finally:
         tenancy.finish_tenant_delete(normalized_tenant)

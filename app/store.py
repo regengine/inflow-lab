@@ -136,6 +136,17 @@ class EventStore:
         # the _load_from_disk() call a few lines down performs the first
         # real read.
         self.last_read_corrupt_lines: list[CorruptRecordLine] = []
+        # Parsed-log cache (#65). `_all_records()` backs stats(), lineage(),
+        # all_between() and status(), and reparsed the entire JSONL through
+        # Pydantic on every one of them -- once per /api/simulate/status poll,
+        # which the console issues on a timer. Keyed on the file's
+        # (mtime_ns, size) rather than on this process's own writes, so a
+        # change made by any path -- another worker, an operator editing the
+        # file, a volume restore -- invalidates it too. Both parts matter:
+        # size alone misses an in-place edit, and mtime alone can miss a write
+        # that lands inside the same filesystem timestamp tick.
+        self._records_cache: list[StoredEventRecord] | None = None
+        self._records_cache_key: tuple[int, int] | None = None
         # Set by retire() when this store's tenant is deleted; see retire().
         # Declared here so the attribute always exists, including for the
         # _load_from_disk() call below, which clears it.
@@ -398,7 +409,7 @@ class EventStore:
         except OSError:
             # Re-raised: the caller must see the failure, and the in-memory
             # rollback below the append depends on it propagating.
-            logger.exception("event store append failed for %s", self.persist_path)
+            logger.exception("EventStore append failed: path=%s", self.persist_path)
             raise
 
     def _append_many(
@@ -680,9 +691,39 @@ class EventStore:
             filtered.append(record)
         return sorted(filtered, key=lambda record: record.event.timestamp)
 
+    def _cache_key(self) -> tuple[int, int] | None:
+        """(mtime_ns, size) of the log, or None when it cannot be stat'd.
+
+        None means "do not cache": a missing or unreadable path has no
+        identity to key on, and caching under a placeholder would serve a
+        stale answer once the file appeared.
+        """
+        try:
+            stat = self.persist_path.stat()
+        except OSError:
+            return None
+        return (stat.st_mtime_ns, stat.st_size)
+
     def _all_records(self) -> list[StoredEventRecord]:
-        records = self.read_persisted_records()
-        if records:
-            return sorted(records, key=lambda record: record.sequence_no)
         with self._lock:
-            return sorted(self._records, key=lambda record: record.sequence_no)
+            key = self._cache_key()
+            if key is not None and key == self._records_cache_key and self._records_cache is not None:
+                return self._records_cache
+
+            records = self.read_persisted_records()
+            if records:
+                ordered = sorted(records, key=lambda record: record.sequence_no)
+            else:
+                ordered = sorted(self._records, key=lambda record: record.sequence_no)
+
+            # Re-read the key AFTER parsing: if the file changed while this
+            # read was in flight, the pre-read key would cache content that
+            # never matched it, and the next call would serve that stale list
+            # believing it current.
+            if key is not None and key == self._cache_key():
+                self._records_cache = ordered
+                self._records_cache_key = key
+            else:
+                self._records_cache = None
+                self._records_cache_key = None
+            return ordered

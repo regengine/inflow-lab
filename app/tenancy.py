@@ -366,14 +366,43 @@ def _count_scenario_saves(path: Path) -> int:
     return sum(1 for candidate in path.glob("*.json") if candidate.is_file())
 
 
+def assert_within_tenant_root(path: Path) -> Path:
+    """Refuse to operate on a path that is not strictly inside the tenant root.
+
+    Resolves symlinks first, so a tenant directory symlinked elsewhere fails
+    here rather than at the point something recursive runs against it. The
+    root itself is refused too -- deleting one tenant must never be able to
+    take out every tenant.
+
+    The delete path is safe as written today: `operator_tenant_id` applies a
+    strict regex and a URL segment cannot contain a slash. But a recursive
+    delete should not rest on an upstream validator staying strict, and a
+    symlink is not something that validator can see at all.
+    """
+    resolved_root = TENANT_DATA_ROOT.resolve()
+    resolved = path.resolve()
+    if resolved == resolved_root or not resolved.is_relative_to(resolved_root):
+        raise HTTPException(status_code=400, detail="Refusing to operate outside the tenant root")
+    return resolved
+
+
 def _create_tenant_controller(tenant_id: str) -> SimulationController:
-    # Tenant id only -- never the caller's credentials, which the auth layer
-    # has already discarded by this point.
-    logger.info("creating tenant controller for %s", tenant_id)
     persist_path = tenant_events_path(tenant_id)
-    tenant_engine = LegitFlowEngine(seed=204)
-    tenant_store = EventStore(persist_path=str(persist_path))
-    tenant_saves = ScenarioSaveStore(save_dir=str(tenant_saves_path(tenant_id)))
+    try:
+        tenant_engine = LegitFlowEngine(seed=204)
+        tenant_store = EventStore(persist_path=str(persist_path))
+        tenant_saves = ScenarioSaveStore(save_dir=str(tenant_saves_path(tenant_id)))
+    except Exception as exc:
+        # Provisioning creates directories on disk, so it can fail for reasons
+        # that have nothing to do with the request that triggered it. Without
+        # this the only trace was the 500 the caller got.
+        logger.error("Tenant provisioning failed: tenant=%s error=%s", tenant_id, exc)
+        raise
+    # Logged AFTER it succeeds, and tenant id only -- never the caller's
+    # credentials, which the auth layer has already discarded by this point.
+    # Tenants are minted lazily on first use, so this line is the only record
+    # that a new one came into existence and started consuming disk.
+    logger.info("Provisioned tenant controller: tenant=%s path=%s", tenant_id, persist_path)
     return SimulationController(
         engine=tenant_engine,
         store=tenant_store,

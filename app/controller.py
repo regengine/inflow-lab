@@ -995,6 +995,40 @@ class SimulationController:
     async def _store_configure(self, persist_path: str) -> None:
         await asyncio.to_thread(self.store.configure, persist_path)
 
+    def _log_delivery_failure(
+        self,
+        mode: str,
+        idempotency_key: str | None,
+        payload: IngestPayload,
+        exc: Exception,
+        *,
+        api_key: str | None = None,
+        detail: str = "",
+    ) -> None:
+        """The one place a delivery failure is written to the log (#182).
+
+        Both failure paths funnel through here rather than formatting their own
+        line, for two reasons. The masking is the load-bearing one: the live
+        path masked the API key out of the exception text and the mock path did
+        not, so whether a raised message could leak the credential depended on
+        which destination happened to fail. One choke point makes that
+        structural instead of remembered.
+
+        The other is correlation. `tenant`, `mode` and `idempotency_key` are
+        what let an operator tie this line to the request the caller saw fail;
+        without them the log says a delivery failed but not whose, over which
+        destination, or which attempt.
+        """
+        logger.error(
+            "Delivery failed: tenant=%s mode=%s idempotency_key=%s events=%d %s(%s)",
+            self.tenant_id or "unknown",
+            mode,
+            idempotency_key or "none",
+            len(payload.events),
+            f"{detail} " if detail else "",
+            mask_secret_in_string(str(exc), api_key or self.config.delivery.api_key),
+        )
+
     async def _deliver_payload(
         self,
         payload: IngestPayload,
@@ -1078,11 +1112,13 @@ class SimulationController:
                 metadata=metadata,
             )
         except MockRegEngineHTTPError as exc:
-            logger.error(
-                "mock delivery failed: %s events rejected with HTTP %s (%s)",
-                len(payload.events),
-                exc.status_code,
+            self._log_delivery_failure(
+                config.delivery.mode.value,
+                delivery_idempotency_key,
+                payload,
                 exc,
+                api_key=api_key,
+                detail=f"rejected with HTTP {exc.status_code}",
             )
             return DeliveryOutcome(
                 delivery_status="failed",
@@ -1100,11 +1136,14 @@ class SimulationController:
         except LiveRegEngineDeliveryError as exc:
             # Masked: the raw exception can quote the request, and the API key
             # rides in a header. Host, not full URL, for the same reason.
-            logger.error(
-                "live delivery to %s failed: %s events not posted (%s)",
-                urlparse(str(config.delivery.endpoint or "")).hostname or "unknown host",
-                len(payload.events),
-                mask_secret_in_string(str(exc), api_key),
+            self._log_delivery_failure(
+                config.delivery.mode.value,
+                delivery_idempotency_key,
+                payload,
+                exc,
+                api_key=api_key,
+                # Host, not full URL: the path can carry a token too.
+                detail=f"host={urlparse(str(config.delivery.endpoint or '')).hostname or 'unknown host'}",
             )
             metadata = exc.metadata | {"attempted_event_count": len(payload.events)}
             if delivery_idempotency_key and "idempotency_key" not in metadata:
