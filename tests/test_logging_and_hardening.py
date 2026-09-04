@@ -25,6 +25,7 @@ from fastapi import HTTPException
 
 from app import tenancy
 from app.controller import SimulationController
+from app.delivery import log_delivery_failure
 from app.engine import LegitFlowEngine
 from app.fda_export import render_fda_request_csv
 from app.mock_service import MockRegEngineService
@@ -137,18 +138,16 @@ def test_a_store_write_failure_is_logged_before_it_propagates(tmp_path, caplog):
     assert [r for r in caplog.records if "EventStore append failed" in r.message]
 
 
-def test_the_delivery_log_line_does_not_leak_the_api_key(tmp_path, caplog):
-    controller = _controller(tmp_path)
+def test_the_delivery_log_line_does_not_leak_the_api_key(caplog):
     secret = "regengine-live-key-do-not-log"
-    controller.config = controller.config.model_copy(
-        update={"delivery": DeliveryConfig(mode="mock", api_key=secret)}
-    )
     with caplog.at_level(logging.ERROR, logger=LOGGER_NAME):
-        controller._log_delivery_failure(
+        log_delivery_failure(
             "mock",
             "idem-1",
             IngestPayload(source="test", events=[_record().event]),
             RuntimeError(f"upstream rejected key {secret}"),
+            tenant_id="test-tenant",
+            api_key=secret,
         )
 
     assert secret not in caplog.text

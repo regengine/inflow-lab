@@ -1,10 +1,11 @@
-"""Pins for the #165 refactor: the shared ``_build_stored_records`` helper.
+"""Pins for the #165 refactor: the shared ``build_stored_records`` helper.
 
 ``SimulationController.step``, ``.import_csv``, and ``.load_demo_fixture``
 used to each rebuild the same block inline -- pair delivery responses via
-``_pair_event_responses``, loop to build a ``StoredEventRecord`` per event
-via ``_event_delivery_fields``, then persist. That loop is now one shared
-module-level helper, ``_build_stored_records``, that all three call.
+``pair_event_responses``, loop to build a ``StoredEventRecord`` per event
+via ``event_delivery_fields``, then persist. That loop is now one shared
+module-level helper, ``build_stored_records``, that all three call (it
+lives in app/delivery.py since #212).
 
 This is a pure refactor: the full existing suite (361 tests as of #165)
 already pins the externally observable behavior of ``step``/``import_csv``/
@@ -16,10 +17,10 @@ extracted helper, or the helper itself mis-indexing between events,
 per-event lineage, and paired responses. The tests below target exactly
 that -- both the helper directly and each call site's wiring into it.
 
-``retry_failed_delivery`` deliberately does NOT use ``_build_stored_records``
+``retry_failed_delivery`` deliberately does NOT use ``build_stored_records``
 (it patches existing records via ``model_copy`` and accumulates
 ``delivery_attempts`` rather than building fresh records -- see the
-docstring on ``_build_stored_records`` in app/controller.py) and this
+docstring on ``build_stored_records`` in app/delivery.py) and this
 refactor does not touch it. One light test below pins that its
 accumulate-not-reset behavior survives regardless, per the task's own
 example of what could plausibly regress.
@@ -33,7 +34,7 @@ from __future__ import annotations
 
 import asyncio
 
-from app.controller import DeliveryOutcome, _build_stored_records
+from app.delivery import DeliveryOutcome, build_stored_records
 from app.demo_fixtures import get_demo_fixture
 from app.main import controller
 from app.schemas.domain import (
@@ -75,12 +76,12 @@ def _event(cte_type: CTEType, lot_code: str) -> RegEngineEvent:
 
 
 # ---------------------------------------------------------------------------
-# _build_stored_records itself: identity-based pairing and index-aligned
+# build_stored_records itself: identity-based pairing and index-aligned
 # parent_lot_codes, in one place, directly against the helper.
 # ---------------------------------------------------------------------------
 
 
-def test_build_stored_records_pairs_by_identity_and_threads_parent_lot_codes_by_index():
+def testbuild_stored_records_pairs_by_identity_and_threads_parent_lot_codes_by_index():
     """Rejected-first response, like real RegEngine returns for a mixed
     batch -- exactly the shape ``_pair_event_responses``'s own docstring
     describes. Each record must end up with its OWN event's parent_lot_codes
@@ -110,7 +111,7 @@ def test_build_stored_records_pairs_by_identity_and_threads_parent_lot_codes_by_
         metadata={"delivery_mode": "mock", "idempotency_key": "idem-1"},
     )
 
-    records = _build_stored_records("src-refactor-test", events, parent_lot_codes, DestinationMode.MOCK, outcome)
+    records = build_stored_records("src-refactor-test", events, parent_lot_codes, DestinationMode.MOCK, outcome)
 
     assert len(records) == 3
     a, b, c = records
@@ -206,7 +207,7 @@ def test_step_wires_source_and_parent_lot_codes_through_shared_builder(monkeypat
 def test_import_csv_wires_parent_lot_codes_per_row_through_shared_builder():
     asyncio.run(controller.reset(SimulationConfig()))
     # delivery=NONE short-circuits _deliver_payload to a bare DeliveryOutcome
-    # (see app/controller.py), keeping this test focused on CSV-parsing ->
+    # (see deliver_payload in app/delivery.py), keeping this test focused on CSV-parsing ->
     # shared-builder wiring rather than coupling it to mock validation rules.
     csv_text = """cte_type,traceability_lot_code,product_description,quantity,unit_of_measure,location_name,timestamp,kde_input_traceability_lot_codes
 transformation,TLC-REFACTOR-CSV-OUT-1,Fresh Cut Salad Mix,50,cases,ReadyFresh Processing Plant,2026-02-07T12:00:00Z,TLC-REFACTOR-CSV-IN-1|TLC-REFACTOR-CSV-IN-2
@@ -282,7 +283,7 @@ def test_load_demo_fixture_wires_parent_lot_codes_per_fixture_event():
 
 # ---------------------------------------------------------------------------
 # retry_failed_delivery: untouched by this refactor (it does not use
-# _build_stored_records -- see that helper's docstring), pinned anyway per
+# build_stored_records -- see that helper's docstring), pinned anyway per
 # the task's own example of a plausible regression to guard against.
 # ---------------------------------------------------------------------------
 
