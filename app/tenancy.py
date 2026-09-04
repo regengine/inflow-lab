@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import logging
 import os
 from pathlib import Path
@@ -92,8 +93,30 @@ _tenants_being_deleted: set[str] = set()
 
 
 async def shutdown_tenant_controllers() -> None:
-    for tenant_controller in set(_tenant_controllers.values()):
-        await tenant_controller.shutdown()
+    """Stop every tenant's run loop, concurrently and without giving up on one.
+
+    Awaiting these serially made container shutdown pay the sum of every
+    tenant's stop latency, and a platform's shutdown grace period is a fixed
+    budget for all of them together (#208). `return_exceptions=True` so one
+    wedged or already-broken tenant cannot stop the others from shutting down
+    cleanly; each `shutdown()` is separately bounded and cancels its own run
+    loop past the cap.
+    """
+    with _tenant_lock:
+        tenant_controllers = list(set(_tenant_controllers.values()))
+    if not tenant_controllers:
+        return
+    outcomes = await asyncio.gather(
+        *(tenant_controller.shutdown() for tenant_controller in tenant_controllers),
+        return_exceptions=True,
+    )
+    for tenant_controller, outcome in zip(tenant_controllers, outcomes):
+        if isinstance(outcome, BaseException):
+            logger.warning(
+                "tenant controller shutdown failed: tenant=%s (%s)",
+                tenant_controller.tenant_id,
+                outcome,
+            )
 
 
 def active_controller_for_context(context: TenantContext) -> SimulationController:
