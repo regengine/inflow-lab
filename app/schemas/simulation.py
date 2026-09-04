@@ -5,7 +5,7 @@ import os
 import socket
 from typing import Any, Literal
 
-from pydantic import BaseModel, ConfigDict, Field, HttpUrl, field_validator
+from pydantic import BaseModel, ConfigDict, Field, HttpUrl, RootModel, field_validator
 
 from ..scenarios import ScenarioId
 from .domain import DestinationMode, OperationScale
@@ -326,10 +326,54 @@ class SimulationConfig(BaseModel):
 
 
 class StartRequest(BaseModel):
+    # extra="forbid" (#143): a misspelled key beside `config` -- "autostart",
+    # a stray "batch_size" meant for the config -- was silently dropped and
+    # the run started with settings the caller did not ask for. There is no
+    # field here but `config`, so anything else is a mistake worth a 422.
+    model_config = ConfigDict(extra="forbid")
+
     config: SimulationConfig
 
 
+class ConfigEnvelope(BaseModel):
+    """`{"config": {...}}` -- the shape /start takes."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    config: SimulationConfig
+
+
+class ResetRequest(RootModel[ConfigEnvelope | SimulationConfig]):
+    """The body /api/simulate/reset accepts: either shape, never a typo (#143).
+
+    /reset historically took a bare SimulationConfig at the top level while
+    /start took one wrapped under `config`. Nothing forbade extras, so posting
+    /start's shape to /reset returned 200 having silently discarded the whole
+    override and reset to hard-coded defaults -- the bug #143 is about.
+
+    Forbidding extras alone would turn that silent discard into a 422, which
+    is better but still refuses a body a caller reasonably expects to work:
+    the two endpoints sit side by side and take the same settings. So both
+    shapes are accepted and applied, and only a body matching NEITHER is
+    rejected.
+
+    A union rather than an optional `config` plus a fallback parse, because
+    `extra="forbid"` on both members is what makes the discrimination exact:
+    `{"config": {...}}` fails SimulationConfig (unknown key "config") and
+    matches the envelope; a bare config matches SimulationConfig and fails
+    the envelope. A typo, or a field alongside `config`, fails both and 422s
+    naming the offending key -- which is the whole point of #143.
+    """
+
+    @property
+    def config(self) -> SimulationConfig:
+        root = self.root
+        return root.config if isinstance(root, ConfigEnvelope) else root
+
+
 class StepRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
     config: SimulationConfig | None = None
 
 

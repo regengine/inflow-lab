@@ -20,7 +20,11 @@ from ..fda_export import (
 )
 from ..mock_service import MockRegEngineHTTPError, _verify_webhook_signature
 from ..schemas.domain import FDAExportPreset
-from ..schemas.exports import FDAExportPresetListResponse, FDAExportPresetSummary
+from ..schemas.exports import (
+    EPCISDocumentResponse,
+    FDAExportPresetListResponse,
+    FDAExportPresetSummary,
+)
 from ..schemas.ingestion import IngestPayload, MockIngestResponse
 
 
@@ -111,7 +115,10 @@ async def mock_fda_request_export(
     )
 
 
-@router.get("/export/epcis")
+# responses= rather than response_model=, deliberately (#146): this
+# documents the envelope without putting a validation/serialization pass
+# in front of a payload whose shape GS1 owns and epcis_export.py builds.
+@router.get("/export/epcis", responses={200: {"model": EPCISDocumentResponse}})
 async def mock_epcis_export(
     start_date: str | None = Query(default=None, description="Inclusive YYYY-MM-DD"),
     end_date: str | None = Query(default=None, description="Inclusive YYYY-MM-DD"),

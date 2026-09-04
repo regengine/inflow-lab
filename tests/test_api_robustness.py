@@ -342,15 +342,29 @@ def test_events_endpoint_limit_still_refuses_past_its_existing_maximum() -> None
     assert response.status_code == 422
 
 
-def test_wrapped_reset_body_is_rejected_instead_of_silently_ignored() -> None:
-    """#143's headline repro: /api/simulate/reset validates the raw body as
-    SimulationConfig, so a caller who wrapped it the way /start expects used
-    to get a 200 and an unchanged scenario. It must be a 422."""
+def test_wrapped_reset_body_is_applied_instead_of_silently_ignored() -> None:
+    """#143's headline repro: /api/simulate/reset validated the raw body as
+    SimulationConfig, so a caller who wrapped it the way /start expects got a
+    200 and an unchanged scenario -- the override discarded in silence.
+
+    This asserted a 422 while the fix was mid-flight. #143's closing change
+    went further and made the wrapped shape *canonical*: /reset accepts both
+    it and the legacy bare-config form, and the two are unambiguous because
+    SimulationConfig has no `config` field and both forbid unknown keys. So
+    the silent discard is still closed -- the override is now honoured rather
+    than refused, which is the better answer for two endpoints that sit side
+    by side and take the same settings.
+
+    The property this test exists for is unchanged and is what it checks: a
+    wrapped body never leaves the scenario at its default. A typo, or a field
+    alongside `config`, is still a 422 -- see tests/test_request_strictness.py.
+    """
     response = client.post(
         "/api/simulate/reset",
         json={"config": {"scenario": "dairy_continuous_flow"}},
     )
-    assert response.status_code == 422
+    assert response.status_code == 200, response.text
+    assert client.get("/api/simulate/status").json()["config"]["scenario"] == "dairy_continuous_flow"
 
 
 def test_unknown_key_inside_inline_delivery_block_is_rejected() -> None:

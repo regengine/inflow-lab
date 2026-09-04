@@ -9,7 +9,6 @@ the whole override and reset to hard-coded defaults.
 
 from __future__ import annotations
 
-import pytest
 
 from fastapi.testclient import TestClient
 
@@ -22,7 +21,6 @@ def _status_scenario() -> str:
     return client.get("/api/simulate/status").json()["config"]["scenario"]
 
 
-@pytest.mark.xfail(strict=True, reason="reverted by PR #225's HEAD-side conflict resolution; re-landing tracked in #232")
 def test_reset_accepts_start_wrapped_shape_and_applies_it():
     # The exact body from #143: /start's shape posted to /reset. It used to
     # return 200 and fall back to the SimulationConfig default.
@@ -45,7 +43,6 @@ def test_reset_still_accepts_the_legacy_bare_config_shape():
     assert _status_scenario() == "leafy_greens_supplier"
 
 
-@pytest.mark.xfail(strict=True, reason="reverted by PR #225's HEAD-side conflict resolution; re-landing tracked in #232")
 def test_start_and_reset_accept_an_identical_body():
     body = {"config": {"scenario": "dairy_continuous_flow", "batch_size": 1, "seed": 204}}
 
@@ -76,7 +73,6 @@ def test_unknown_field_alongside_config_is_rejected():
     assert response.status_code == 422
 
 
-@pytest.mark.xfail(strict=True, reason="reverted by PR #225's HEAD-side conflict resolution; re-landing tracked in #232")
 def test_unknown_field_in_start_body_is_rejected():
     response = client.post(
         "/api/simulate/start",

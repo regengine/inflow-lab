@@ -8,7 +8,6 @@ returned a bare `JSONResponse` whose documented schema was literally `{}`.
 
 from __future__ import annotations
 
-import pytest
 
 from fastapi.testclient import TestClient
 
@@ -27,7 +26,6 @@ def _response_schema(path: str, method: str = "get") -> dict:
     return body
 
 
-@pytest.mark.xfail(strict=True, reason="reverted by PR #225's HEAD-side conflict resolution; re-landing tracked in #232")
 def test_health_publishes_concrete_fields():
     model = _response_schema("/api/health")
 
@@ -43,7 +41,6 @@ def test_health_publishes_concrete_fields():
     }
 
 
-@pytest.mark.xfail(strict=True, reason="reverted by PR #225's HEAD-side conflict resolution; re-landing tracked in #232")
 def test_healthz_publishes_concrete_fields():
     model = _response_schema("/api/healthz")
 
@@ -51,7 +48,6 @@ def test_healthz_publishes_concrete_fields():
     assert set(model["properties"]) == {"ok", "utc_time", "build", "contract_version"}
 
 
-@pytest.mark.xfail(strict=True, reason="reverted by PR #225's HEAD-side conflict resolution; re-landing tracked in #232")
 def test_epcis_export_publishes_a_non_empty_schema():
     model = _response_schema("/api/mock/regengine/export/epcis")
 
@@ -60,7 +56,6 @@ def test_epcis_export_publishes_a_non_empty_schema():
     assert "epcisBody" in model["properties"]
 
 
-@pytest.mark.xfail(strict=True, reason="reverted by PR #225's HEAD-side conflict resolution; re-landing tracked in #232")
 def test_health_endpoints_still_answer_the_documented_shape():
     for path in ("/api/health", "/api/healthz"):
         response = client.get(path)
@@ -80,3 +75,28 @@ def test_epcis_export_still_streams_the_jsonld_document():
     assert response.headers["content-type"].startswith("application/ld+json")
     assert "attachment;" in response.headers["content-disposition"]
     assert response.json()["type"] == "EPCISDocument"
+
+
+def test_epcis_export_answers_the_shape_it_documents():
+    """A documented schema that lies is worse than none at all.
+
+    The health endpoints have `test_health_endpoints_still_answer_the_documented
+    _shape` for exactly this; the EPCIS export had no equivalent, so the
+    envelope could drift from `render_epcis_document` and OpenAPI would keep
+    advertising the old keys.
+
+    Also pins the two facts the `responses=`-rather-than-`response_model=`
+    choice exists to preserve: the handler still returns its own JSONResponse,
+    so the JSON-LD media type survives, and nothing re-serializes a payload
+    whose shape GS1 owns.
+    """
+    client.post("/api/simulate/step")
+    response = client.get("/api/mock/regengine/export/epcis")
+
+    assert response.status_code == 200, response.text
+    assert response.headers["content-type"].startswith("application/ld+json")
+
+    documented = set(_response_schema("/api/mock/regengine/export/epcis")["properties"])
+    assert set(response.json()) == documented, (
+        "the EPCIS envelope and its published schema have drifted apart"
+    )
