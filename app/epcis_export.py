@@ -27,8 +27,21 @@ _BIZ_STEPS = {
 # The only sourceDestinationType issue #187 asks for -- CBV also defines
 # owning_party/possessing_party, but this app has no ownership/possession
 # model distinct from location, so "location" is the one type it can back
-# with real data.
-_SDT_LOCATION = "urn:epcglobal:cbv:sdt:location"
+# with real data. Emitting the other two would be asserting an ownership or
+# possession handoff the simulator does not model.
+#
+# The BARE TOKEN, not the urn:epcglobal:cbv:sdt:location alias. GS1's own
+# epcis-context.jsonld declares sourceList/destinationList `type` as
+# "@type": "@vocab" over exactly three short names -- owning_party,
+# possessing_party, location -- so only the token expands to cbv:SDT-location.
+# The URN is a legitimate sameAs alias of that term, but it is not one of the
+# declared vocabulary entries, so it fails JSON-LD expansion; and the official
+# EPCIS 2.0 JSON Schema's source-dest-type carries a negative lookahead
+# ("^(?!(urn:epcglobal:cbv|https?://ns\.gs1\.org/cbv/))") that rejects this
+# exact prefix outright. Emitting the URN made every shipping and receiving
+# document schema-invalid, which is the opposite of what #187 asked for.
+# Both facts re-verified against the published context and schema.
+_SDT_LOCATION = "location"
 
 _DISPOSITIONS = {
     CTEType.HARVESTING: "urn:epcglobal:cbv:disp:active",
@@ -293,6 +306,11 @@ def _input_quantity_element(
         lot_code=lot_code,
         quantity=detail.get("quantity"),
         unit_of_measure=detail.get("unit_of_measure"),
+        # _input_lot_details already reads input_products positionally against
+        # input_traceability_lot_codes; passing it on is what puts each input
+        # lot's own product description in the document rather than leaving a
+        # consumer to guess which of the batch's inputs an epcClass refers to.
+        product_description=detail.get("product_description"),
     )
 
 
