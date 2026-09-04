@@ -7,7 +7,7 @@ partitioned rejected-first. Inflow Lab used to zip that list against the
 request by array index, which attaches one event's verdict to a different
 event as soon as a rejection follows an acceptance.
 
-The consequences are not cosmetic. ``_event_delivery_fields`` flips a
+The consequences are not cosmetic. ``event_delivery_fields`` flips a
 record to ``delivery_status="failed"`` carrying another lot's validation
 errors, and ``event_id``/``sha256_hash``/``chain_hash`` — the evidence —
 get copied onto the wrong lot.
@@ -23,7 +23,7 @@ from __future__ import annotations
 import asyncio
 from datetime import UTC, datetime
 
-from app.controller import DeliveryOutcome, _pair_event_responses
+from app.delivery import DeliveryOutcome, pair_event_responses
 from app.main import controller
 from app.schemas.domain import CTEType
 from app.schemas.simulation import SimulationConfig
@@ -64,7 +64,7 @@ def test_rejected_first_partition_attaches_each_verdict_to_its_own_event():
         _response("LOT-C", "shipping", "accepted", event_id="evt-c", sha256_hash="sha-c"),
     ]
 
-    paired = _pair_event_responses(events, response_events)
+    paired = pair_event_responses(events, response_events)
 
     assert [entry["traceability_lot_code"] for entry in paired] == ["LOT-A", "LOT-B", "LOT-C"]
     assert paired[0]["status"] == "accepted" and paired[0]["event_id"] == "evt-a"
@@ -87,7 +87,7 @@ def test_repeated_join_key_within_one_batch_is_consumed_in_order():
         _response("LOT-DUP", "harvesting", "accepted", event_id="evt-second"),
     ]
 
-    paired = _pair_event_responses(events, response_events)
+    paired = pair_event_responses(events, response_events)
 
     assert [entry["event_id"] for entry in paired] == ["evt-first", "evt-second"]
 
@@ -104,7 +104,7 @@ def test_absent_verdict_is_none_and_never_falls_back_to_position():
     ]
     response_events = [_response("LOT-A", "harvesting", "accepted", event_id="evt-a")]
 
-    paired = _pair_event_responses(events, response_events)
+    paired = pair_event_responses(events, response_events)
 
     assert paired[0]["event_id"] == "evt-a"
     assert paired[1] is None
