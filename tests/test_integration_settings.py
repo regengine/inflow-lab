@@ -55,6 +55,10 @@ class ProbeAsyncClient:
         *,
         headers: dict[str, str] | None = None,
         params: dict[str, Any] | None = None,
+        # extensions: the live client attaches {"sni_hostname": ...} when it
+        # pins the validated address for the dial (#207). Accepted and
+        # ignored here so this fake keeps working on either path.
+        extensions: dict[str, Any] | None = None,
     ) -> FakeProbeResponse:
         if url.endswith("/health"):
             return FakeProbeResponse(200, ProbeAsyncClient.health_payload)

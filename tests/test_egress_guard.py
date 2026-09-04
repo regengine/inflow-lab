@@ -10,21 +10,40 @@ Covers three things:
      `model_copy(update=...)`, which never re-runs field validators.
   3. `POST /api/integration/test` no longer lets a stored api_key/tenant_id
      ride along to a caller-supplied endpoint on a different host.
+
+Plus, for issue #207, the connect-time pin that closes DNS rebinding: the
+address the guard validated is the address the request is dialed at, the
+hostname is resolved exactly once, and the certificate is still verified
+against the original hostname rather than the pinned IP.
 """
 
 from __future__ import annotations
 
 import asyncio
 import ipaddress
+import json
+import shutil
+import socket
+import ssl
+import subprocess
+import threading
 from datetime import UTC, datetime
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from pathlib import Path
 from typing import Any
 
+import httpx
 import pytest
 from fastapi.testclient import TestClient
 from pydantic import HttpUrl
 
+from app import regengine_client
 from app.main import app, controller
-from app.regengine_client import DEFAULT_LIVE_INGEST_ENDPOINT, LiveRegEngineClient
+from app.regengine_client import (
+    DEFAULT_LIVE_INGEST_ENDPOINT,
+    LiveRegEngineClient,
+    LiveRegEngineDeliveryError,
+)
 from app.schemas import simulation as simulation_schemas
 from app.schemas.domain import CTEType, RegEngineEvent
 from app.schemas.ingestion import IngestPayload
@@ -42,6 +61,26 @@ client = TestClient(app)
 
 def setup_function() -> None:
     asyncio.run(controller.reset(SimulationConfig()))
+
+
+@pytest.fixture(autouse=True)
+def _no_ambient_proxy(monkeypatch: Any) -> None:
+    """Pin the proxy dimension of every test in this file to "no proxy".
+
+    The connect-time pin (#207) is deliberately skipped whenever a proxy is
+    configured for the endpoint's scheme -- behind a proxy the socket is
+    opened by the proxy, not by this process, so a locally pinned IP is not
+    honored and would break certificate verification (see _proxy_is_configured
+    in app/regengine_client.py). That is the right production behavior and it
+    is asserted directly below, but left to ambient environment it would make
+    every OTHER test here silently take a different code path depending on
+    whether the developer's shell happens to export HTTPS_PROXY. Clearing it
+    means these tests exercise the pinned path everywhere, the same way CI
+    does.
+    """
+    for name in ("HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY", "NO_PROXY"):
+        monkeypatch.delenv(name, raising=False)
+        monkeypatch.delenv(name.lower(), raising=False)
 
 
 # ---------------------------------------------------------------------------
@@ -85,10 +124,19 @@ class SpyAsyncClient:
         *,
         headers: dict[str, str] | None = None,
         params: dict[str, Any] | None = None,
+        extensions: dict[str, Any] | None = None,
     ) -> FakeResponse:
         if url.endswith("/health"):
             return FakeResponse(200, {"status": "healthy"})
-        SpyAsyncClient.calls.append({"method": "GET", "url": url, "headers": headers or {}, "params": params})
+        SpyAsyncClient.calls.append(
+            {
+                "method": "GET",
+                "url": url,
+                "headers": headers or {},
+                "params": params,
+                "extensions": extensions or {},
+            }
+        )
         return FakeResponse(SpyAsyncClient.status_code, {"accepted": 1})
 
     async def post(
@@ -97,8 +145,17 @@ class SpyAsyncClient:
         *,
         headers: dict[str, str] | None = None,
         content: bytes | None = None,
+        extensions: dict[str, Any] | None = None,
     ) -> FakeResponse:
-        SpyAsyncClient.calls.append({"method": "POST", "url": url, "headers": headers or {}, "content": content})
+        SpyAsyncClient.calls.append(
+            {
+                "method": "POST",
+                "url": url,
+                "headers": headers or {},
+                "content": content,
+                "extensions": extensions or {},
+            }
+        )
         return FakeResponse(SpyAsyncClient.status_code, {"accepted": 1})
 
 
@@ -627,3 +684,664 @@ def test_a_local_destination_is_reported_as_local_even_when_it_is_also_cleartext
         validate_egress_endpoint(HttpUrl(endpoint))
     assert expected in str(excinfo.value)
     assert "cleartext" not in str(excinfo.value)
+
+
+# ---------------------------------------------------------------------------
+# #207: DNS rebinding IS closed -- the validated address is the dialed address
+# ---------------------------------------------------------------------------
+
+
+def _rebinding_resolver(lookups: list[str], first: str, later: str):
+    """A resolver whose FIRST answer is *first* and every later answer *later*.
+
+    The shape of a hostile zone serving a zero/short TTL record: answer the
+    guard with something that passes, answer the dial with loopback.
+
+    8.8.8.8 is the usual `first` rather than a TEST-NET documentation range:
+    Python's ipaddress marks 192.0.2.0/24, 198.51.100.0/24 and 203.0.113.0/24
+    as is_private, so the guard would refuse those on their own merits and a
+    test would pass for the wrong reason.
+    """
+
+    def resolver(host, *args, **kwargs):
+        lookups.append(host)
+        address = first if len(lookups) == 1 else later
+        family = socket.AF_INET6 if ":" in address else socket.AF_INET
+        sockaddr = (address, 443, 0, 0) if family == socket.AF_INET6 else (address, 443)
+        return [(family, socket.SOCK_STREAM, 6, "", sockaddr)]
+
+    return resolver
+
+
+def test_ingest_dials_the_validated_address_not_a_second_lookup(monkeypatch: Any) -> None:
+    """Replaces this file's former limitation test (#207).
+
+    That test asserted the gap: the guard did its own getaddrinfo() and then
+    returned, httpx resolved the same hostname a second time when it opened
+    the socket, and a hostile zone could answer the two lookups differently
+    so the request landed on loopback with the caller's API key attached. It
+    said, in as many words, that if someone pinned the validated address at
+    connect time it should be REPLACED by one asserting the pinned address is
+    dialed. This is that replacement.
+
+    What it asserts, against a resolver that answers public once and loopback
+    forever after:
+
+      * the hostname is resolved exactly ONCE for the whole request;
+      * the URL httpx is handed carries the validated address, not the name,
+        so httpx has nothing left to resolve;
+      * loopback appears nowhere in what was dialed;
+      * Host and the TLS SNI/verification name are still the original host,
+        so the endpoint is addressed -- and its certificate checked -- by the
+        name the operator configured.
+    """
+    lookups: list[str] = []
+    monkeypatch.setattr(socket, "getaddrinfo", _rebinding_resolver(lookups, "8.8.8.8", "127.0.0.1"))
+    SpyAsyncClient.calls = []
+    monkeypatch.setattr("app.regengine_client.httpx.AsyncClient", SpyAsyncClient)
+    config = _bypass_validator_config(
+        endpoint="https://rebind.example.test/ingest", api_key="super-secret-live-key"
+    )
+
+    asyncio.run(LiveRegEngineClient().ingest(make_payload(), config))
+
+    assert lookups == ["rebind.example.test"], (
+        "the endpoint host must be resolved exactly once per request; a second "
+        "lookup is the rebinding window this fix closes"
+    )
+    assert len(SpyAsyncClient.calls) == 1
+    call = SpyAsyncClient.calls[0]
+    assert call["url"] == "https://8.8.8.8/ingest", call["url"]
+    assert "127.0.0.1" not in call["url"]
+    assert call["headers"]["Host"] == "rebind.example.test"
+    assert call["extensions"]["sni_hostname"] == "rebind.example.test"
+    # The credential still goes out -- this is a pin, not a refusal.
+    assert call["headers"]["X-RegEngine-API-Key"] == "super-secret-live-key"
+
+
+def test_check_connection_pins_both_the_probe_and_the_health_read(monkeypatch: Any) -> None:
+    """check_connection makes two requests, so it must pin both.
+
+    A pinned /recent probe followed by an unpinned /health read would still
+    hand the rebinding resolver a second lookup -- and /health is fetched on
+    the same client, with the same credentials in flight.
+    """
+    lookups: list[str] = []
+    monkeypatch.setattr(socket, "getaddrinfo", _rebinding_resolver(lookups, "8.8.8.8", "127.0.0.1"))
+    SpyAsyncClient.calls = []
+    SpyAsyncClient.status_code = 200
+    monkeypatch.setattr("app.regengine_client.httpx.AsyncClient", SpyAsyncClient)
+    config = _bypass_validator_config(endpoint="https://rebind.example.test/api/v1/webhooks/ingest")
+
+    result = asyncio.run(LiveRegEngineClient().check_connection(config))
+
+    assert result.verdict == "connected", result.detail
+    assert lookups == ["rebind.example.test"], "one lookup for the probe AND the health read"
+    call = SpyAsyncClient.calls[0]
+    assert call["url"] == "https://8.8.8.8/api/v1/webhooks/recent", call["url"]
+    assert call["headers"]["Host"] == "rebind.example.test"
+    assert call["extensions"]["sni_hostname"] == "rebind.example.test"
+
+
+def test_the_pin_keeps_a_non_default_port_in_the_host_header(monkeypatch: Any) -> None:
+    """Host must be host:port, which is what httpx would have sent itself.
+
+    Rewriting the URL's host means httpx no longer auto-populates Host from
+    it, so this code sets Host by hand. Setting it to the bare hostname would
+    silently send the wrong Host to every endpoint on a non-default port.
+    """
+    monkeypatch.setattr(
+        simulation_schemas, "_resolved_addresses", lambda host: [ipaddress.ip_address("8.8.8.8")]
+    )
+    SpyAsyncClient.calls = []
+    monkeypatch.setattr("app.regengine_client.httpx.AsyncClient", SpyAsyncClient)
+    config = _bypass_validator_config(endpoint="https://partner.example.net:8443/webhooks/ingest")
+
+    asyncio.run(LiveRegEngineClient().ingest(make_payload(), config))
+
+    call = SpyAsyncClient.calls[0]
+    assert call["url"] == "https://8.8.8.8:8443/webhooks/ingest", call["url"]
+    assert call["headers"]["Host"] == "partner.example.net:8443"
+    assert call["extensions"]["sni_hostname"] == "partner.example.net"
+
+
+def test_an_ipv6_address_is_pinned_with_brackets(monkeypatch: Any) -> None:
+    monkeypatch.setattr(
+        simulation_schemas,
+        "_resolved_addresses",
+        lambda host: [ipaddress.ip_address("2001:4860:4860::8888")],
+    )
+    SpyAsyncClient.calls = []
+    monkeypatch.setattr("app.regengine_client.httpx.AsyncClient", SpyAsyncClient)
+    config = _bypass_validator_config(endpoint="https://partner.example.net/webhooks/ingest")
+
+    asyncio.run(LiveRegEngineClient().ingest(make_payload(), config))
+
+    call = SpyAsyncClient.calls[0]
+    assert call["url"] == "https://[2001:4860:4860::8888]/webhooks/ingest", call["url"]
+    assert call["headers"]["Host"] == "partner.example.net"
+
+
+def test_the_trusted_default_host_is_dialed_by_name_and_never_resolved_here(monkeypatch: Any) -> None:
+    """The allowlisted host is exempt from the pin, deliberately.
+
+    It is trusted by name and never resolved by the guard, so httpx's own
+    lookup is the only one -- still exactly one resolution per request, with
+    no second answer to disagree with. Forcing a lookup here just to have
+    something to pin would tie every default-endpoint test and every offline
+    demo to a working resolver.
+    """
+    def _boom(host, *args, **kwargs):
+        raise AssertionError(f"the trusted host {host!r} must not be resolved by the guard")
+
+    monkeypatch.setattr(socket, "getaddrinfo", _boom)
+    SpyAsyncClient.calls = []
+    monkeypatch.setattr("app.regengine_client.httpx.AsyncClient", SpyAsyncClient)
+    config = SimulationConfig(delivery=DeliveryConfig(mode="live", api_key="k", tenant_id="t"))
+
+    asyncio.run(LiveRegEngineClient().ingest(make_payload(), config))
+
+    call = SpyAsyncClient.calls[0]
+    assert call["url"] == DEFAULT_LIVE_INGEST_ENDPOINT
+    assert "Host" not in call["headers"], "no pin means httpx populates Host from the URL, as before"
+    assert call["extensions"] == {}
+
+
+def test_a_configured_proxy_disables_the_pin(monkeypatch: Any) -> None:
+    """Behind a proxy the pin is skipped -- on purpose, and this pins that.
+
+    An HTTP proxy opens the socket on this process's behalf, so a pinned IP
+    becomes the CONNECT target rather than a destination we dial. httpcore's
+    tunnel connection ignores the sni_hostname extension entirely and
+    verifies the certificate against that tunnel target, i.e. the IP, which
+    no ordinary certificate satisfies. Pinning through a proxy would
+    therefore either break every live request or invite exactly the weakened
+    certificate verification #207 warns is worse than the gap it closes.
+
+    The trade is stated plainly rather than hidden: with a proxy configured
+    this process performs no lookup for the connection at all, so the two
+    disagreeing lookups rebinding needs do not exist on this side either --
+    what the proxy connects to is the proxy's egress policy to enforce.
+    """
+    monkeypatch.setenv("HTTPS_PROXY", "http://proxy.internal:3128")
+    monkeypatch.setattr(
+        simulation_schemas, "_resolved_addresses", lambda host: [ipaddress.ip_address("8.8.8.8")]
+    )
+    SpyAsyncClient.calls = []
+    monkeypatch.setattr("app.regengine_client.httpx.AsyncClient", SpyAsyncClient)
+    config = _bypass_validator_config(endpoint="https://partner.example.net/webhooks/ingest")
+
+    asyncio.run(LiveRegEngineClient().ingest(make_payload(), config))
+
+    call = SpyAsyncClient.calls[0]
+    assert call["url"] == "https://partner.example.net/webhooks/ingest"
+    assert call["extensions"] == {}, "no sni_hostname override may reach a CONNECT tunnel"
+    assert "Host" not in call["headers"]
+    # ...and the guard itself is untouched: a proxied endpoint that resolves
+    # to loopback is still refused before anything is dialed.
+    SpyAsyncClient.calls = []
+    monkeypatch.setattr(
+        simulation_schemas, "_resolved_addresses", lambda host: [ipaddress.ip_address("127.0.0.1")]
+    )
+    with pytest.raises(EgressBlockedError):
+        asyncio.run(LiveRegEngineClient().ingest(make_payload(), config))
+    assert SpyAsyncClient.calls == []
+
+
+def test_a_proxy_for_a_different_scheme_does_not_disable_the_pin(monkeypatch: Any) -> None:
+    # HTTPS_PROXY set with an http:// endpoint (this sandbox's own shape, and
+    # a common corporate one) must still pin: nothing proxies plain http here.
+    monkeypatch.setenv("HTTPS_PROXY", "http://proxy.internal:3128")
+    monkeypatch.setenv(PRIVATE_ENDPOINTS_ENV, "")
+    # The cleartext refusal is a separate guard with its own tests; relaxing
+    # the scheme check only is what lets this one stay about proxy matching.
+    monkeypatch.setenv(simulation_schemas.ALLOW_CLEARTEXT_DELIVERY_ENV, "1")
+    monkeypatch.setattr(
+        simulation_schemas, "_resolved_addresses", lambda host: [ipaddress.ip_address("8.8.8.8")]
+    )
+    SpyAsyncClient.calls = []
+    monkeypatch.setattr("app.regengine_client.httpx.AsyncClient", SpyAsyncClient)
+    config = _bypass_validator_config(endpoint="http://partner.example.net/webhooks/ingest")
+
+    asyncio.run(LiveRegEngineClient().ingest(make_payload(), config))
+
+    assert SpyAsyncClient.calls[0]["url"] == "http://8.8.8.8/webhooks/ingest"
+
+
+def test_a_name_exempt_from_the_proxy_still_skips_the_pin_if_its_address_is_not(
+    monkeypatch: Any,
+) -> None:
+    """The trap this nearly fell into, found against a live proxy.
+
+    httpx picks a transport from the URL it is handed, and pinning rewrites
+    that URL's host to an IP. A NO_PROXY entry naming a hostname does not
+    cover the address that hostname resolves to -- so an environment where
+    ``https://partner.example.net/...`` goes direct will still tunnel
+    ``https://8.8.8.8/...`` through the proxy. Pinning there would hand a
+    bare IP to a CONNECT tunnel that verifies the certificate against it.
+    (Measured, not theorised: with NO_PROXY exempting pypi.org, httpx routed
+    the hostname direct and the resolved-address URL through the proxy,
+    which reset the connection.)
+
+    So the proxy question is asked of the rewritten URL too, and either
+    answer being "proxied" means dial by hostname.
+    """
+    monkeypatch.setenv("HTTPS_PROXY", "http://proxy.internal:3128")
+    monkeypatch.setenv("NO_PROXY", "partner.example.net")
+    monkeypatch.setattr(
+        simulation_schemas, "_resolved_addresses", lambda host: [ipaddress.ip_address("8.8.8.8")]
+    )
+    SpyAsyncClient.calls = []
+    monkeypatch.setattr("app.regengine_client.httpx.AsyncClient", SpyAsyncClient)
+    config = _bypass_validator_config(endpoint="https://partner.example.net/webhooks/ingest")
+
+    asyncio.run(LiveRegEngineClient().ingest(make_payload(), config))
+
+    call = SpyAsyncClient.calls[0]
+    assert call["url"] == "https://partner.example.net/webhooks/ingest", call["url"]
+    assert call["extensions"] == {}, "no sni_hostname override may reach a CONNECT tunnel"
+
+
+def test_the_pin_applies_when_neither_the_name_nor_its_address_is_proxied(
+    monkeypatch: Any,
+) -> None:
+    # The flip side: an environment that exempts both the name and the
+    # address it resolves to is a direct connection either way, so the pin
+    # is not skipped just because a proxy exists for other traffic.
+    monkeypatch.setenv("HTTPS_PROXY", "http://proxy.internal:3128")
+    monkeypatch.setenv("NO_PROXY", "partner.example.net,8.8.8.8")
+    monkeypatch.setattr(
+        simulation_schemas, "_resolved_addresses", lambda host: [ipaddress.ip_address("8.8.8.8")]
+    )
+    SpyAsyncClient.calls = []
+    monkeypatch.setattr("app.regengine_client.httpx.AsyncClient", SpyAsyncClient)
+    config = _bypass_validator_config(endpoint="https://partner.example.net/webhooks/ingest")
+
+    asyncio.run(LiveRegEngineClient().ingest(make_payload(), config))
+
+    call = SpyAsyncClient.calls[0]
+    assert call["url"] == "https://8.8.8.8/webhooks/ingest", call["url"]
+    assert call["extensions"]["sni_hostname"] == "partner.example.net"
+
+
+@pytest.mark.parametrize(
+    "environment",
+    [
+        {},
+        {"HTTPS_PROXY": "http://proxy.internal:3128"},
+        {"HTTP_PROXY": "http://proxy.internal:3128"},
+        {"ALL_PROXY": "http://proxy.internal:3128"},
+        {"HTTPS_PROXY": "http://proxy.internal:3128", "NO_PROXY": "partner.example.net"},
+        {"HTTPS_PROXY": "http://proxy.internal:3128", "NO_PROXY": ".example.net"},
+        {"HTTPS_PROXY": "http://proxy.internal:3128", "NO_PROXY": "other.example.net"},
+        {"HTTPS_PROXY": "http://proxy.internal:3128", "NO_PROXY": "*"},
+        {"ALL_PROXY": "http://proxy.internal:3128", "NO_PROXY": "127.0.0.1,localhost"},
+    ],
+)
+@pytest.mark.parametrize(
+    "endpoint",
+    [
+        "https://partner.example.net/webhooks/ingest",
+        "http://partner.example.net/webhooks/ingest",
+        "https://other.example.net:8443/webhooks/ingest",
+        "http://localhost:8000/webhooks/ingest",
+        # The IP-host spellings a pinned request actually hands httpx.
+        "https://8.8.8.8/webhooks/ingest",
+        "https://[2001:4860:4860::8888]/webhooks/ingest",
+    ],
+)
+def test_proxy_detection_agrees_with_the_transport_httpx_would_choose(
+    monkeypatch: Any, environment: dict[str, str], endpoint: str
+) -> None:
+    """The one assertion holding _proxy_is_configured to httpx's behavior.
+
+    Deciding "is this request proxied" from the environment means agreeing
+    with a library's own reading of that environment, and disagreeing in the
+    False direction is the dangerous one: it would pin a request that then
+    gets tunneled, whose certificate httpcore verifies against the pinned IP.
+    So rather than trusting the reimplementation, this compares the answer to
+    the transport a real httpx.AsyncClient picks for the same URL under the
+    same environment. If an httpx upgrade moves get_environment_proxies or
+    changes URLPattern's matching, this fails here instead of in production.
+    """
+    for name in ("HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY", "NO_PROXY"):
+        monkeypatch.delenv(name, raising=False)
+        monkeypatch.delenv(name.lower(), raising=False)
+    for name, value in environment.items():
+        monkeypatch.setenv(name, value)
+
+    url = httpx.URL(endpoint)
+    # Never dialed, so there is no pool to drain and nothing to close.
+    client = httpx.AsyncClient()
+    httpx_would_proxy = client._transport_for_url(url) is not client._transport
+
+    assert regengine_client._proxy_is_configured(url) is httpx_would_proxy, (
+        f"{endpoint} under {environment}: this module and httpx disagree about "
+        "whether the request is proxied"
+    )
+
+
+def test_the_escape_hatch_dials_localhost_by_name_without_pinning(monkeypatch: Any) -> None:
+    """Criterion 4: REGENGINE_ALLOW_PRIVATE_ENDPOINTS=1 is unchanged by #207.
+
+    The escape hatch is an explicit opt-out of this guard, so the guard does
+    not resolve and there is nothing to pin -- the request goes out exactly
+    as it always did. Pinning here would also throw away the dual-stack
+    fallback httpx gets for free from `localhost` (try ::1, then 127.0.0.1),
+    which is precisely the setup the built-in mock and local dev run on, and
+    it would buy nothing: loopback is the intended destination.
+    """
+    monkeypatch.setenv(PRIVATE_ENDPOINTS_ENV, "1")
+
+    def _boom(host, *args, **kwargs):
+        raise AssertionError("the escape hatch must not make the guard resolve")
+
+    monkeypatch.setattr(socket, "getaddrinfo", _boom)
+    SpyAsyncClient.calls = []
+    monkeypatch.setattr("app.regengine_client.httpx.AsyncClient", SpyAsyncClient)
+    config = _bypass_validator_config(endpoint="http://localhost:8000/api/v1/webhooks/ingest")
+
+    asyncio.run(LiveRegEngineClient().ingest(make_payload(), config))
+
+    call = SpyAsyncClient.calls[0]
+    assert call["url"] == "http://localhost:8000/api/v1/webhooks/ingest"
+    assert call["extensions"] == {}
+    assert "Host" not in call["headers"]
+
+
+# ---------------------------------------------------------------------------
+# #207: the same claim again, but over real sockets and a real TLS handshake
+#
+# Everything above proves the request this client BUILDS. These prove the
+# connection it actually MAKES -- which is the half a fake httpx client can
+# never speak to, and the half where "getting SNI or hostname verification
+# subtly wrong would be a worse security outcome than the rebinding gap it
+# closes" would show up.
+# ---------------------------------------------------------------------------
+
+
+# The address the guard validates and the request must land on...
+_VALIDATED_IP = "127.0.0.2"
+# ...and the address the hostile zone answers with on every later lookup.
+# Both are loopback so the test needs no network; what matters is that they
+# are DIFFERENT, so "which one did we connect to" is observable.
+_REBIND_IP = "127.0.0.1"
+
+_TLS_HOST = "pinned.test"
+
+
+def _require_two_loopback_addresses() -> None:
+    probe = socket.socket()
+    try:
+        probe.bind((_VALIDATED_IP, 0))
+    except OSError as exc:  # pragma: no cover - platform dependent (macOS needs an lo0 alias)
+        pytest.skip(f"cannot bind {_VALIDATED_IP}, so the two addresses are indistinguishable: {exc}")
+    finally:
+        probe.close()
+
+
+def _openssl(*args: str) -> None:
+    subprocess.run(["openssl", *args], check=True, capture_output=True)
+
+
+@pytest.fixture(scope="module")
+def tls_material(tmp_path_factory: Any) -> dict[str, Path]:
+    """A throwaway CA plus two leaf certificates, built with the openssl CLI.
+
+    Generated per run rather than committed: a checked-in private key is a
+    standing secret-scanner finding and a checked-in certificate eventually
+    expires. Two leaves, because proving verification still WORKS is only
+    half the claim -- the other half is proving it still REJECTS:
+
+      * ``host_cert``: SAN DNS:pinned.test -- the name the operator configured.
+      * ``ip_cert``:   SAN IP:127.0.0.2 -- the address actually dialed, and a
+        subject that mentions pinned.test nowhere. A client that had drifted
+        into verifying the pinned IP instead of the original hostname would
+        accept this one. It must not. The separate subject matters: OpenSSL
+        falls back to the common name when a certificate carries no dNSName
+        SAN at all, so an IP-only certificate that still said CN=pinned.test
+        would be accepted for the right reason and the test would prove
+        nothing.
+    """
+    if shutil.which("openssl") is None:  # pragma: no cover - environment dependent
+        pytest.skip("openssl is required to build the throwaway certificate chain")
+    root = tmp_path_factory.mktemp("egress-tls")
+    ca_key, ca_pem = root / "ca.key", root / "ca.pem"
+    leaf_key = root / "leaf.key"
+    host_cert, ip_cert = root / "leaf-host.pem", root / "leaf-ip.pem"
+
+    ec = ("-newkey", "ec", "-pkeyopt", "ec_paramgen_curve:prime256v1", "-nodes")
+    _openssl(
+        "req", "-x509", *ec, "-keyout", str(ca_key), "-out", str(ca_pem), "-days", "3650",
+        "-subj", "/CN=Inflow Lab egress test CA",
+        "-addext", "basicConstraints=critical,CA:TRUE",
+        "-addext", "keyUsage=critical,keyCertSign",
+    )
+    # One key, two certificates: the server loads whichever leaf a given test
+    # needs and always pairs it with this single key.
+    _openssl(
+        "genpkey", "-algorithm", "EC", "-pkeyopt", "ec_paramgen_curve:P-256",
+        "-out", str(leaf_key),
+    )
+    leaves = (
+        (host_cert, f"/CN={_TLS_HOST}", f"subjectAltName = DNS:{_TLS_HOST}"),
+        (ip_cert, "/CN=egress pin ip-only leaf", f"subjectAltName = IP:{_VALIDATED_IP}"),
+    )
+    for index, (out, subject, san) in enumerate(leaves):
+        csr, ext = root / f"leaf-{index}.csr", root / f"leaf-{index}.ext"
+        ext.write_text(f"{san}\nbasicConstraints = CA:FALSE\n")
+        _openssl("req", "-new", "-key", str(leaf_key), "-out", str(csr), "-subj", subject)
+        _openssl(
+            "x509", "-req", "-in", str(csr), "-CA", str(ca_pem), "-CAkey", str(ca_key),
+            "-CAcreateserial", "-out", str(out), "-days", "3650", "-extfile", str(ext),
+        )
+    return {"ca": ca_pem, "key": leaf_key, "host_cert": host_cert, "ip_cert": ip_cert}
+
+
+class _PinnedEndpointServers:
+    """One HTTPS endpoint on the validated address, one bare listener on the
+    rebind target, both on the SAME port.
+
+    Same port because the endpoint URL carries exactly one, so the only thing
+    that can decide where the request lands is the address -- which is the
+    thing under test. The rebind listener answers nothing; it exists purely to
+    record that a connection arrived, because "no connection to loopback" is
+    the actual acceptance criterion and an unbound port cannot tell the
+    difference between "never dialed" and "dialed and refused".
+    """
+
+    def __init__(self, certfile: Path, keyfile: Path) -> None:
+        self.received: list[dict[str, Any]] = []
+        self.rebind_connections: list[Any] = []
+        self._certfile, self._keyfile = certfile, keyfile
+
+    def __enter__(self) -> "_PinnedEndpointServers":
+        last: OSError | None = None
+        for _ in range(10):
+            rebind = socket.socket()
+            rebind.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            rebind.bind((_REBIND_IP, 0))
+            self.port = rebind.getsockname()[1]
+            try:
+                self._httpd = ThreadingHTTPServer((_VALIDATED_IP, self.port), self._handler())
+            except OSError as exc:  # pragma: no cover - only on a port-allocation race
+                rebind.close()
+                last = exc
+                continue
+            self._rebind = rebind
+            break
+        else:  # pragma: no cover - only on a port-allocation race
+            raise AssertionError(f"could not bind the same port on both addresses: {last}")
+
+        context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+        context.load_cert_chain(self._certfile, self._keyfile)
+        self._httpd.socket = context.wrap_socket(self._httpd.socket, server_side=True)
+        self._stop = threading.Event()
+        self._threads = [
+            threading.Thread(target=self._httpd.serve_forever, daemon=True),
+            threading.Thread(target=self._accept_rebind, daemon=True),
+        ]
+        for thread in self._threads:
+            thread.start()
+        return self
+
+    def __exit__(self, *exc: object) -> None:
+        self._stop.set()
+        self._httpd.shutdown()
+        self._httpd.server_close()
+        self._rebind.close()
+        for thread in self._threads:
+            thread.join(timeout=5)
+
+    def _accept_rebind(self) -> None:
+        self._rebind.listen(5)
+        self._rebind.settimeout(0.1)
+        while not self._stop.is_set():
+            try:
+                connection, address = self._rebind.accept()
+            except (TimeoutError, socket.timeout):
+                continue
+            except OSError:  # pragma: no cover - socket closed during teardown
+                return
+            self.rebind_connections.append(address)
+            connection.close()
+
+    def _handler(self) -> type[BaseHTTPRequestHandler]:
+        received = self.received
+
+        class _Handler(BaseHTTPRequestHandler):
+            protocol_version = "HTTP/1.1"
+
+            # Capitalised per BaseHTTPRequestHandler's do_<METHOD> contract.
+            def do_POST(self) -> None:
+                length = int(self.headers.get("Content-Length", "0"))
+                received.append(
+                    {
+                        "path": self.path,
+                        "host": self.headers.get("Host"),
+                        "api_key": self.headers.get("X-RegEngine-API-Key"),
+                        "body": self.rfile.read(length),
+                    }
+                )
+                body = json.dumps({"accepted": 1}).encode("utf-8")
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+
+            def log_message(self, *args: Any) -> None:
+                return None
+
+        return _Handler
+
+
+def _pin_the_classifier(monkeypatch: Any) -> None:
+    """Let the guard treat _VALIDATED_IP -- and only it -- as a public address.
+
+    These tests are about WHICH address gets connected to, not about how
+    addresses are classified; the classifier has its own tests further up
+    this file and is left alone everywhere else. Narrowing the exemption to
+    one literal keeps the interesting property intact: _REBIND_IP is still
+    classified unsafe, so if the pin ever regressed into validating the
+    rebound answer the guard would refuse it outright rather than dial it.
+    """
+    classify = simulation_schemas._is_unsafe_address
+    monkeypatch.setattr(
+        simulation_schemas,
+        "_is_unsafe_address",
+        lambda address: False if str(address) == _VALIDATED_IP else classify(address),
+    )
+
+
+def test_over_real_sockets_a_rebinding_resolver_never_reaches_loopback(
+    monkeypatch: Any, tls_material: dict[str, Path]
+) -> None:
+    """The whole of #207, end to end, with nothing faked below httpx.
+
+    A resolver that answers 127.0.0.2 once and 127.0.0.1 forever after; a
+    real HTTPS endpoint on 127.0.0.2 holding a certificate for pinned.test;
+    a real listener on 127.0.0.1 recording anything that reaches it. The
+    request must land on 127.0.0.2, complete a verified TLS handshake against
+    the name pinned.test, and 127.0.0.1 must see no connection at all.
+    """
+    _require_two_loopback_addresses()
+    with _PinnedEndpointServers(tls_material["host_cert"], tls_material["key"]) as servers:
+        lookups: list[str] = []
+        monkeypatch.setattr(socket, "getaddrinfo", _rebinding_resolver(lookups, _VALIDATED_IP, _REBIND_IP))
+        _pin_the_classifier(monkeypatch)
+        # httpx builds its SSL context from SSL_CERT_FILE when trust_env is on
+        # (the default), so this makes the client under test trust the
+        # throwaway CA above -- and only it. Nothing here sets verify=False.
+        monkeypatch.setenv("SSL_CERT_FILE", str(tls_material["ca"]))
+        config = _bypass_validator_config(
+            endpoint=f"https://{_TLS_HOST}:{servers.port}/ingest", api_key="super-secret-live-key"
+        )
+
+        result = asyncio.run(LiveRegEngineClient().ingest(make_payload(), config))
+
+    assert result.response == {"accepted": 1}
+    assert lookups == [_TLS_HOST], "exactly one resolution for the whole request"
+    assert servers.rebind_connections == [], (
+        "the rebound answer was connected to; the validated address was not pinned"
+    )
+    assert len(servers.received) == 1
+    assert servers.received[0]["host"] == f"{_TLS_HOST}:{servers.port}"
+    assert servers.received[0]["api_key"] == "super-secret-live-key"
+
+
+def test_over_real_tls_a_certificate_for_another_name_is_rejected(
+    monkeypatch: Any, tls_material: dict[str, Path]
+) -> None:
+    """Verification is still on, and still checks the ORIGINAL hostname.
+
+    Same server, same trusted CA, same pinned dial -- only the configured
+    hostname differs from the one the certificate covers. If pinning had
+    disabled hostname checking (or pointed it at the IP), this would sail
+    through; #207 is explicit that such a silent weakening would be a worse
+    outcome than the rebinding gap. It must fail, and it must fail on the
+    certificate.
+    """
+    _require_two_loopback_addresses()
+    with _PinnedEndpointServers(tls_material["host_cert"], tls_material["key"]) as servers:
+        monkeypatch.setattr(
+            socket, "getaddrinfo", _rebinding_resolver([], _VALIDATED_IP, _VALIDATED_IP)
+        )
+        _pin_the_classifier(monkeypatch)
+        monkeypatch.setenv("SSL_CERT_FILE", str(tls_material["ca"]))
+        config = _bypass_validator_config(endpoint=f"https://wrong.test:{servers.port}/ingest")
+
+        with pytest.raises(LiveRegEngineDeliveryError) as exc_info:
+            asyncio.run(LiveRegEngineClient().ingest(make_payload(), config))
+
+    message = str(exc_info.value)
+    assert "CERTIFICATE_VERIFY_FAILED" in message or "certificate verify failed" in message, message
+    assert "wrong.test" in message, message
+    assert servers.received == [], "the request body must never reach a server whose cert failed"
+
+
+def test_over_real_tls_a_certificate_for_the_pinned_ip_is_rejected(
+    monkeypatch: Any, tls_material: dict[str, Path]
+) -> None:
+    """The precise way SNI could have been got subtly wrong.
+
+    This server's certificate covers IP:127.0.0.2 -- the address dialed --
+    and nothing else. A client verifying the pinned address would accept it.
+    The client must reject it, because the name being verified is the one the
+    operator configured, not the address the connection went to.
+    """
+    _require_two_loopback_addresses()
+    with _PinnedEndpointServers(tls_material["ip_cert"], tls_material["key"]) as servers:
+        monkeypatch.setattr(
+            socket, "getaddrinfo", _rebinding_resolver([], _VALIDATED_IP, _VALIDATED_IP)
+        )
+        _pin_the_classifier(monkeypatch)
+        monkeypatch.setenv("SSL_CERT_FILE", str(tls_material["ca"]))
+        config = _bypass_validator_config(endpoint=f"https://{_TLS_HOST}:{servers.port}/ingest")
+
+        with pytest.raises(LiveRegEngineDeliveryError) as exc_info:
+            asyncio.run(LiveRegEngineClient().ingest(make_payload(), config))
+
+    message = str(exc_info.value)
+    assert "CERTIFICATE_VERIFY_FAILED" in message or "certificate verify failed" in message, message
+    assert servers.received == []

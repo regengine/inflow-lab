@@ -8,12 +8,13 @@ import uuid
 from dataclasses import dataclass
 from typing import Any
 from urllib.parse import urlparse
+from urllib.request import getproxies
 
 import httpx
 
 from .contract import INFLOW_CONTRACT_VERSION
 from .schemas.ingestion import IngestPayload
-from .schemas.simulation import SimulationConfig, async_validate_egress_endpoint
+from .schemas.simulation import SimulationConfig, async_resolve_egress_endpoint
 # Same masking convention store.py persists with and controller.py logs
 # with -- see _extract_error_body below (#138).
 from .store import mask_secret_in_payload, mask_secret_in_string
@@ -126,11 +127,15 @@ class LiveRegEngineClient:
         tenant_id = config.delivery.tenant_id
         if not api_key or not tenant_id:
             raise ValueError("Live delivery requires both api_key and tenant_id")
-        # SSRF/credential-exfiltration guard — see validate_egress_endpoint's
-        # docstring. This is the enforcement point: the check has to sit
-        # immediately before the request, where the address it resolves is
-        # the address actually dialed.
-        await async_validate_egress_endpoint(config.delivery.endpoint)
+        # SSRF/credential-exfiltration guard — see resolve_egress_endpoint's
+        # docstring. This is the enforcement point: the check sits immediately
+        # before the request, and the address it validated comes back so
+        # _pinned_dial below can aim the POST at THAT address instead of
+        # letting httpx resolve the hostname a second time on its own -- the
+        # second lookup a hostile zone answered with 127.0.0.1 to walk through
+        # this guard entirely (#207). None means there is nothing to pin, and
+        # the request is dialed by hostname exactly as before.
+        pinned_address = await async_resolve_egress_endpoint(config.delivery.endpoint)
 
         idempotency_key = idempotency_key or uuid.uuid4().hex
         # Serialize the body exactly once so the bytes we sign are the same
@@ -159,9 +164,12 @@ class LiveRegEngineClient:
         }
         if signature_header is not None:
             headers["X-Webhook-Signature"] = signature_header
+        dial_url, dial_headers, dial_kwargs = _pinned_dial(endpoint, headers, pinned_address)
         try:
             async with httpx.AsyncClient(timeout=_live_timeout_seconds()) as client:
-                response = await client.post(endpoint, headers=headers, content=body_bytes)
+                response = await client.post(
+                    dial_url, headers=dial_headers, content=body_bytes, **dial_kwargs
+                )
         except httpx.HTTPError as exc:
             raise LiveRegEngineDeliveryError(str(exc), metadata) from exc
 
@@ -212,26 +220,34 @@ class LiveRegEngineClient:
                 detail="Both an API key and a tenant id are required before testing the connection.",
                 endpoint_host=host,
             )
-        # SSRF/credential-exfiltration guard — see validate_egress_endpoint's
-        # docstring. Enforced here, immediately before the probe goes out, so
-        # the address checked is the address dialed. The caller (the /test
+        # SSRF/credential-exfiltration guard — see resolve_egress_endpoint's
+        # docstring. Enforced here, immediately before the probe goes out, and
+        # as in ingest() above the validated address is pinned for the dial,
+        # so the address checked IS the address connected to and the hostname
+        # is resolved exactly once (#207). Both requests this method makes --
+        # the /recent probe and the /health contract read -- go through the
+        # same pin, so neither of them re-resolves. The caller (the /test
         # route) turns a raised EgressBlockedError into a clean 4xx rather
         # than letting it become an unhandled 500.
-        await async_validate_egress_endpoint(config.delivery.endpoint)
+        pinned_address = await async_resolve_egress_endpoint(config.delivery.endpoint)
 
         probe_url = f"{parsed.scheme}://{parsed.netloc}/api/v1/webhooks/recent"
         headers = {
             "X-RegEngine-API-Key": api_key,
             "X-Tenant-ID": tenant_id,
         }
+        dial_url, dial_headers, dial_kwargs = _pinned_dial(probe_url, headers, pinned_address)
         try:
             async with httpx.AsyncClient(timeout=_live_timeout_seconds()) as client:
                 response = await client.get(
-                    probe_url,
-                    headers=headers,
+                    dial_url,
+                    headers=dial_headers,
                     params={"tenant_id": tenant_id, "limit": 1},
+                    **dial_kwargs,
                 )
-                remote_contract = await _fetch_remote_contract_version(client, parsed)
+                remote_contract = await _fetch_remote_contract_version(
+                    client, parsed, pinned_address
+                )
         except httpx.HTTPError as exc:
             return ConnectionCheckResult(
                 verdict="unreachable",
@@ -259,15 +275,24 @@ class LiveRegEngineClient:
         )
 
 
-async def _fetch_remote_contract_version(client: httpx.AsyncClient, parsed) -> str | None:
+async def _fetch_remote_contract_version(
+    client: httpx.AsyncClient, parsed, pinned_address: str | None = None
+) -> str | None:
     """Best-effort read of RegEngine's advertised inflow contract version.
 
     Returns None when the health endpoint is unreachable, non-JSON (some
     deployments serve the frontend at /health), or predates the version
     field — skew detection only engages when both sides advertise.
+
+    Takes the caller's already-validated *pinned_address* so this second
+    request reuses the one lookup check_connection made rather than
+    resolving the host again on its own (#207).
     """
+    health_url, health_headers, health_kwargs = _pinned_dial(
+        f"{parsed.scheme}://{parsed.netloc}/health", {}, pinned_address
+    )
     try:
-        health = await client.get(f"{parsed.scheme}://{parsed.netloc}/health")
+        health = await client.get(health_url, headers=health_headers, **health_kwargs)
         payload = health.json()
     except (httpx.HTTPError, ValueError):
         return None
@@ -321,6 +346,121 @@ def _extract_error_body(response: httpx.Response, api_key: str | None) -> str:
         omitted = len(text) - _MAX_ERROR_BODY_CHARS
         text = f"{text[:_MAX_ERROR_BODY_CHARS]}... [truncated, {omitted} more chars]"
     return text
+
+
+def _proxy_is_configured(url: httpx.URL) -> bool:
+    """Would httpx send *url* through an HTTP proxy?
+
+    This decides whether the connect-time pin (#207) applies, and it must
+    never answer False when httpx would in fact proxy. With a proxy the
+    socket is opened by the proxy, so a pinned IP becomes the CONNECT
+    target -- and httpcore's tunnel connection ignores the sni_hostname
+    extension entirely, verifying the certificate against that tunnel
+    target, i.e. the IP. No ordinary certificate satisfies that, and every
+    obvious "fix" for it ends in weakened verification, which is a worse
+    security outcome than the rebinding gap #207 closes. So: proxied means
+    dial by hostname, exactly as before.
+
+    Answered with httpx's own machinery rather than a hand-rolled NO_PROXY
+    matcher, because it has to agree with httpx exactly. These are the same
+    two pieces ``httpx.AsyncClient(trust_env=True)`` -- the default this
+    module uses -- builds its proxy mounts from, applied in httpx's own
+    order: mounts sorted most-specific-first, first match wins
+    (``Client._init_proxy_map`` and ``Client._transport_for_url``). A test
+    in tests/test_egress_guard.py cross-checks this function against a real
+    client's transport choice, so an httpx release that moves or changes
+    them fails CI loudly instead of silently mis-deciding.
+
+    Note that _pinned_dial asks this about BOTH the original URL and the
+    pinned one, and that the second question is the load-bearing one: httpx
+    chooses a transport from the URL it is handed, so a NO_PROXY entry
+    naming a hostname does not cover the address that hostname resolves to.
+    An environment that exempts ``pypi.org`` from its proxy still sends
+    ``https://151.101.192.223/...`` through it, which is precisely the
+    tunneled-pin case that must never happen.
+
+    If that import ever disappears the fallback is the coarsest safe
+    answer: any proxy configured for the scheme counts as proxied, NO_PROXY
+    unread. That errs only in the safe direction -- it can skip a pin that
+    would have been fine, never pin a request that then gets tunneled.
+
+    What skipping costs is honest and bounded, and differs by shape:
+
+      * Fully proxied: this process performs no lookup for the connection at
+        all (the proxy resolves), so the two disagreeing lookups a rebinding
+        attack needs do not exist on this side either. The guard's own lookup
+        becomes advisory and what the proxy connects to is the proxy's egress
+        policy to enforce.
+      * Proxied except for a NO_PROXY hostname (the hybrid shape): the
+        request goes direct, so httpx does resolve -- but the pinned URL
+        would be tunneled, so the pin is skipped and #207's gap stays open
+        for that endpoint. This is a real residual limitation, recorded here
+        rather than papered over. Closing it means either exempting the
+        resolved address in NO_PROXY too (which makes both URLs direct and
+        the pin engage), or removing the proxy for that host. Making this
+        code force a direct connection instead would be a deliberate egress
+        policy bypass, which is not the kind of decision a delivery client
+        should be making on its own.
+    """
+    try:
+        from httpx._utils import URLPattern, get_environment_proxies
+    except ImportError:  # pragma: no cover - only on an httpx that moved these
+        proxies = getproxies()
+        return bool(proxies.get(url.scheme.lower()) or proxies.get("all"))
+    mounts = get_environment_proxies()
+    for pattern in sorted(URLPattern(key) for key in mounts):
+        if pattern.matches(url):
+            # A None mount is httpx's spelling of "NO_PROXY covers this".
+            return mounts[pattern.pattern] is not None
+    return False
+
+
+def _pinned_dial(
+    endpoint: str,
+    headers: dict[str, str],
+    pinned_address: str | None,
+) -> tuple[str, dict[str, str], dict[str, Any]]:
+    """Aim one request at *pinned_address* while it still speaks to *endpoint*'s host.
+
+    Returns the ``(url, headers, extra kwargs)`` to hand httpx. With no
+    address to pin -- or with a proxy in the way, see _proxy_is_configured --
+    it returns the caller's own arguments untouched, so the un-pinned path is
+    byte-for-byte the request this client has always sent.
+
+    When it does pin, three things move together and all three matter:
+
+      * The URL's host becomes the validated IP, so httpx opens the socket to
+        that address and never performs a lookup of its own. This is the
+        actual fix for #207: the address the guard checked is the address
+        connected to. Rewriting the host also re-decides httpx's proxy
+        routing, which is why the proxy question is asked of the rewritten
+        URL as well as the original -- see _proxy_is_configured.
+      * ``Host`` is set explicitly to the ORIGINAL netloc -- host plus port
+        when the port is not the scheme default -- which is exactly what
+        httpx auto-populates from an un-pinned URL (``Request._prepare`` uses
+        ``url.netloc``). Sending the bare hostname instead would break any
+        endpoint on a non-default port, and sending the IP would break
+        name-based virtual hosting.
+      * ``sni_hostname`` is the original bare hostname. httpcore passes it to
+        ``start_tls`` as ``server_hostname``, and httpx's default SSL context
+        is ``ssl.create_default_context()`` with ``check_hostname`` on, so
+        that one value drives BOTH the SNI extension and the certificate
+        hostname check. The certificate is therefore verified against the
+        name the operator configured, never against the pinned IP -- nothing
+        here relaxes verification, and there is no code path in this module
+        that sets ``verify=False`` or hands httpx a permissive SSL context.
+    """
+    if not pinned_address:
+        return endpoint, headers, {}
+    url = httpx.URL(endpoint)
+    pinned_url = url.copy_with(host=pinned_address)
+    if _proxy_is_configured(url) or _proxy_is_configured(pinned_url):
+        return endpoint, headers, {}
+    return (
+        str(pinned_url),
+        {**headers, "Host": url.netloc.decode("ascii")},
+        {"extensions": {"sni_hostname": url.host}},
+    )
 
 
 def _build_signature_header(body_bytes: bytes) -> str | None:
