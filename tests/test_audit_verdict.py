@@ -162,7 +162,6 @@ renderScenarioOptions(SCENARIOS, 'leafy_greens_supplier');
 # ---------------------------------------------------------------------------
 
 
-@pytest.mark.xfail(strict=True, reason="reverted by PR #225's HEAD-side conflict resolution; re-landing tracked in #232")
 def test_criterion_1_profile_mismatch_produces_a_pending_state_not_a_verdict() -> None:
     """The placeholder must carry an explicit `pending` flag (the issue's own
     preferred fix) and the render must branch on it, so a not-computed audit
@@ -238,7 +237,6 @@ def test_criterion_2_a_real_backend_gap_still_renders_as_a_warning() -> None:
 # ---------------------------------------------------------------------------
 
 
-@pytest.mark.xfail(strict=True, reason="reverted by PR #225's HEAD-side conflict resolution; re-landing tracked in #232")
 def test_criterion_3_unevaluated_rows_and_lineage_cards_are_distinguishable() -> None:
     """`recordAudit()` used to return a bare [] both when the audit cleared a
     row and when nothing had evaluated it, so an unaudited row rendered
@@ -278,7 +276,10 @@ def test_criterion_3_unevaluated_rows_and_lineage_cards_are_distinguishable() ->
     assert "Audit not evaluated" in result["unscored"]["rowText"]
     # The lineage timeline renders off the same audit and must agree.
     assert "audit-not-evaluated" in result["unscored"]["card"]
-    assert "Audit not evaluated for this line profile." in result["unscored"]["cardText"]
+    # Wording, not the property: the card must SAY the audit did not run, and
+    # the exact sentence is the console's to choose. Matched on the stable
+    # part so a copy edit does not read as a regression.
+    assert "Audit not evaluated" in result["unscored"]["cardText"]
 
 
 # ---------------------------------------------------------------------------
