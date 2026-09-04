@@ -190,7 +190,10 @@ def _parse_seed_lot(
 
     # _parse_timestamp records an error whenever it returns None, so past the
     # errors check above the timestamp is always present; say so for mypy.
-    assert timestamp is not None
+    # Bandit's B101 is suppressed on the next line: this is a type-narrowing
+    # aid, not a runtime guard, so nothing depends on it under `python -O`,
+    # which is the case that rule exists to catch.
+    assert timestamp is not None  # nosec B101
     kdes.setdefault("harvest_date", timestamp.date().isoformat())
     kdes.setdefault("farm_location", row["location_name"])
     if row.get("field_name"):
