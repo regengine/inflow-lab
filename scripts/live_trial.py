@@ -184,19 +184,33 @@ def run_live_trial(
         # other exception (e.g. a dropped connection mid-batch), or a
         # KeyboardInterrupt -- because they live in this `finally`, not
         # after a `return` on the happy path (#105).
-        if owns_client:
-            client.close()
-        stop_simulation(client, config)
-        if confirm_live:
-            # Only --confirm-live can arm live delivery, so only that path
-            # needs to disarm it again. A dry run never leaves delivery on
-            # anything but mock, and run_mock_dry_run's own reset already
-            # proves that. Guarded on the flag rather than on whether this
-            # run actually reached run_one_live_batch: the tenant may
-            # already have been armed by an earlier run (that is the exact
-            # failure mode #105 reports), so --confirm-live always tries to
-            # disarm it, even if this run's own mock dry-run failed first.
-            revert_delivery_to_mock(client, config)
+        #
+        # The client is closed AFTER them, not before. Closing an owned
+        # client is right -- it is this function's to release -- but doing it
+        # first made every one of these cleanup calls raise "Cannot send a
+        # request, as the client has been closed", which is precisely the
+        # cleanup this `finally` exists to guarantee. The visible cost was
+        # the whole script exiting non-zero on a RuntimeError; the dangerous
+        # one was silent, because revert_delivery_to_mock never ran, so a
+        # --confirm-live trial left the tenant ARMED for live delivery. That
+        # is the failure #105 reports, reintroduced by the fix for a
+        # resource-leak lint.
+        try:
+            stop_simulation(client, config)
+            if confirm_live:
+                # Only --confirm-live can arm live delivery, so only that
+                # path needs to disarm it again. A dry run never leaves
+                # delivery on anything but mock, and run_mock_dry_run's own
+                # reset already proves that. Guarded on the flag rather than
+                # on whether this run actually reached run_one_live_batch:
+                # the tenant may already have been armed by an earlier run
+                # (that is the exact failure mode #105 reports), so
+                # --confirm-live always tries to disarm it, even if this
+                # run's own mock dry-run failed first.
+                revert_delivery_to_mock(client, config)
+        finally:
+            if owns_client:
+                client.close()
 
 
 def run_mock_dry_run(client: httpx.Client, config: LiveTrialConfig) -> dict[str, Any]:

@@ -555,3 +555,63 @@ def test_preflight_usage_message_unchanged():
     )
     assert result.returncode == 2
     assert "usage:" in result.stderr
+
+
+def test_a_script_owned_client_is_closed_after_cleanup_not_before(capsys):
+    """The owns-client path must still run stop + revert (#105 again).
+
+    Every other test in this file, and in tests/test_live_trial.py, injects a
+    client -- so `owns_client` is False and the close branch never executes.
+    That blind spot is how a resource-leak lint fix came to close the client
+    at the TOP of the cleanup `finally`, making every call below it raise
+    "Cannot send a request, as the client has been closed".
+
+    Two costs, and the quiet one is the bad one. Visibly, the script exited
+    non-zero on a RuntimeError, which is how it was noticed. Silently,
+    `revert_delivery_to_mock` never ran -- so a --confirm-live trial left the
+    tenant ARMED for live delivery, which is exactly the failure #105 exists
+    to prevent.
+
+    This drives `main()` with no client, the way the CLI (and RegEngine's
+    cross-repo contract job) invokes it, and asserts the full reset sequence
+    still lands and the client is closed afterwards.
+    """
+    server = ScriptedLiveServer()
+    created: list[httpx.Client] = []
+    real_client = httpx.Client
+
+    def recording_client(*args, **kwargs):
+        # Same construction the script performs, but over the mock transport
+        # so nothing leaves the process.
+        kwargs.pop("verify", None)
+        client = real_client(
+            base_url=kwargs.get("base_url", LIVE_ENV["REGENGINE_REMOTE_BASE_URL"]),
+            transport=httpx.MockTransport(server.handle),
+        )
+        created.append(client)
+        return client
+
+    with contextlib.ExitStack() as stack:
+        stack.enter_context(_patched(httpx, "Client", recording_client))
+        exit_code = main(["--confirm-live"], environ=LIVE_ENV)
+
+    captured = capsys.readouterr()
+
+    assert exit_code == 0, captured.err
+    assert created, "the script should have constructed its own client"
+    assert created[0].is_closed, "an owned client must still be closed"
+    # The cleanup that the premature close used to skip:
+    assert server.reset_modes == ["mock", "live", "mock"], (
+        "delivery was left armed -- the revert did not run"
+    )
+    assert "delivery reverted to mock" in captured.out
+
+
+@contextlib.contextmanager
+def _patched(target, name, value):
+    original = getattr(target, name)
+    setattr(target, name, value)
+    try:
+        yield
+    finally:
+        setattr(target, name, original)
