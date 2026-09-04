@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import asyncio
-from datetime import UTC, datetime, timedelta
+from datetime import timedelta
 from typing import Any
 
 import pytest
@@ -10,6 +10,12 @@ from fastapi.testclient import TestClient
 from app.main import app, controller
 from app.schemas.domain import CTEType, DestinationMode, RegEngineEvent, StoredEventRecord
 from app.schemas.simulation import SimulationConfig
+from tests.support.timestamps import recent_event_timestamp
+
+# The mock enforces the 90-day replay window by default, so a request body
+# posted by these tests needs a timestamp inside it -- see
+# tests/support/timestamps.py for why a literal cannot serve.
+RECENT_TIMESTAMP_JSON = recent_event_timestamp().isoformat().replace("+00:00", "Z")
 
 
 # Regression tests for #143 (reject unknown/misplaced request body fields),
@@ -20,7 +26,7 @@ from app.schemas.simulation import SimulationConfig
 
 client = TestClient(app)
 
-_BASE_TIME = datetime(2026, 3, 1, 8, 0, tzinfo=UTC)
+_BASE_TIME = recent_event_timestamp()
 
 
 def setup_function() -> None:
@@ -87,7 +93,7 @@ def _make_stored_record(
                         "quantity": 100,
                         "unit_of_measure": "cases",
                         "location_name": "Valley Fresh Farms",
-                        "timestamp": "2026-03-01T08:00:00Z",
+                        "timestamp": RECENT_TIMESTAMP_JSON,
                         "kdes": {},
                     }
                 ],
@@ -158,7 +164,7 @@ def test_ingest_with_well_formed_body_still_succeeds() -> None:
                     "quantity": 100,
                     "unit_of_measure": "cases",
                     "location_name": "Valley Fresh Farms",
-                    "timestamp": "2026-03-01T08:00:00Z",
+                    "timestamp": RECENT_TIMESTAMP_JSON,
                     "kdes": {"harvest_date": "2026-03-01", "reference_document": "Harvest Log HL-ROBUST-001"},
                 }
             ],

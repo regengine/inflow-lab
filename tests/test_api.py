@@ -11,9 +11,16 @@ from fastapi.testclient import TestClient
 from app.build_info import BRANCH_ENV_VARS, COMMIT_SHA_ENV_VARS, DEPLOYMENT_ID_ENV_VARS
 from app.cors import DEFAULT_CORS_ORIGINS
 from app.main import app, controller, cors_origins_from_env, scenario_saves
+from app.schemas.domain import CTEType, DemoFixtureId
 from app.schemas.simulation import SimulationConfig
 from app.regengine_client import LiveIngestResult, LiveRegEngineDeliveryError
 from app.scenarios import ScenarioId, get_scenario
+
+from tests.support.timestamps import recent_event_timestamp
+# The mock enforces the 90-day replay window by default, so a request body
+# posted by these tests needs a timestamp inside it -- see
+# tests/support/timestamps.py for why a literal cannot serve.
+RECENT_TIMESTAMP_JSON = recent_event_timestamp().isoformat().replace("+00:00", "Z")
 
 
 client = TestClient(app)
@@ -816,7 +823,7 @@ def test_mock_ingest_endpoint_returns_hashes():
                 "quantity": 500,
                 "unit_of_measure": "cases",
                 "location_name": "Distribution Center #4",
-                "timestamp": "2026-02-05T08:30:00Z",
+                "timestamp": RECENT_TIMESTAMP_JSON,
                 "kdes": {
                     "receive_date": "2026-02-05",
                     "receiving_location": "Distribution Center #4",
@@ -848,7 +855,7 @@ def test_mock_ingest_rejects_events_missing_required_kdes_like_regengine():
                 "quantity": 500,
                 "unit_of_measure": "cases",
                 "location_name": "Distribution Center #4",
-                "timestamp": "2026-02-05T08:30:00Z",
+                "timestamp": RECENT_TIMESTAMP_JSON,
                 # reference_document_type/number deliberately do NOT satisfy
                 # the combined reference_document key: the live validator uses
                 # strict string lookup, and the mock must match it.
@@ -1037,7 +1044,7 @@ def test_epcis_export_scaffold_maps_lineage_to_jsonld_without_changing_ingest_co
                     "quantity": 12,
                     "unit_of_measure": "cases",
                     "location_name": "Distribution Center #4",
-                    "timestamp": "2026-02-05T08:30:00Z",
+                    "timestamp": RECENT_TIMESTAMP_JSON,
                     "kdes": {
                         "receive_date": "2026-02-05",
                         "receiving_location": "Distribution Center #4",
@@ -1069,8 +1076,24 @@ def test_epcis_export_supports_date_filters_and_missing_lot_errors(tmp_path):
         json={"delivery": {"mode": "none"}},
     )
 
+    # #199: fixture events are rebased onto the current date at load time, so
+    # the day the receiving event lands on is derived from the fixture rather
+    # than hardcoded. The subject of this test is the date *filter*, not which
+    # calendar date the fixture happens to carry.
+    from app.demo_fixtures import get_demo_fixture
+
+    fixture = get_demo_fixture(DemoFixtureId.FRESH_CUT_TRANSFORMATION)
+    (receiving_day,) = {
+        fixture_event.event.timestamp.date().isoformat()
+        for fixture_event in fixture.events
+        if fixture_event.event.cte_type is CTEType.RECEIVING
+        and fixture_event.event.traceability_lot_code == "TLC-DEMO-FC-OUT-001"
+    }
+    # The whole set shifts by one uniform whole-day offset, so this day still
+    # isolates exactly the one event the literal 2026-02-07 filter isolated.
+
     filtered_response = client.get(
-        "/api/mock/regengine/export/epcis?start_date=2026-02-07&end_date=2026-02-07"
+        f"/api/mock/regengine/export/epcis?start_date={receiving_day}&end_date={receiving_day}"
     )
     assert filtered_response.status_code == 200
     filtered_events = filtered_response.json()["epcisBody"]["eventList"]

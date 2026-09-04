@@ -37,6 +37,7 @@ from app.schemas.domain import CTEType, DestinationMode, RegEngineEvent, StoredE
 from app.schemas.ingestion import IngestPayload
 from app.schemas.simulation import SimulationConfig
 from app.store import EventStore
+from tests.support.timestamps import recent_event_timestamp
 
 
 client = TestClient(app)
@@ -64,7 +65,7 @@ def _valid_event(lot: str = "TLC-PARITY-000001", *, timestamp: datetime | None =
         quantity=100,
         unit_of_measure="cases",
         location_name="Valley Fresh Farms",
-        timestamp=timestamp or datetime(2026, 2, 5, 8, 0, tzinfo=UTC),
+        timestamp=timestamp or recent_event_timestamp(),
         kdes={
             "harvest_date": "2026-02-05",
             "reference_document": "Harvest Log HAR-0001",

@@ -67,6 +67,7 @@ from app.mock_service import (
 from app.schemas.domain import CTEType, RegEngineEvent
 from app.schemas.ingestion import IngestPayload
 from app.schemas.simulation import SimulationConfig
+from tests.support.timestamps import recent_event_timestamp
 
 
 client = TestClient(app)
@@ -103,7 +104,7 @@ def _valid_event(
         quantity=quantity,
         unit_of_measure="cases",
         location_name="Valley Fresh Farms",
-        timestamp=timestamp or datetime(2026, 2, 5, 8, 0, tzinfo=UTC),
+        timestamp=timestamp or recent_event_timestamp(),
         kdes={
             "harvest_date": "2026-02-05",
             "reference_document": "Harvest Log HAR-0001",
@@ -256,7 +257,7 @@ def test_missing_kde_is_still_a_per_event_200_rejection_not_a_422() -> None:
         quantity=100,
         unit_of_measure="cases",
         location_name="Valley Fresh Farms",
-        timestamp=datetime(2026, 2, 5, 8, 0, tzinfo=UTC),
+        timestamp=recent_event_timestamp(),
         kdes={},
     )
     payload = IngestPayload(source="field-fatal-test", events=[good, missing_kdes])
@@ -288,14 +289,25 @@ def test_validate_event_like_regengine_still_reports_field_constraint_errors_dir
 # ---------------------------------------------------------------------------
 
 
-def test_age_window_is_off_by_default_even_with_an_injected_clock() -> None:
-    """The core #102 design decision under test: an unconfigured
-    MockRegEngineService() -- what every pre-existing test and
-    SimulationController's real construction actually use -- never rejects
-    an event for being old, no matter how old, because
-    enforce_event_age_window defaults to False. Uses an injected (not
-    wall-clock) reference point so this holds deterministically rather
-    than by coincidence of when the suite happens to run.
+def test_age_window_is_enforced_by_default_even_with_an_injected_clock() -> None:
+    """The #102 decision, as #209 finally settled it: an unconfigured
+    MockRegEngineService() -- what SimulationController's real construction
+    uses -- DOES reject an event for being too old.
+
+    This test previously asserted the opposite, and was right to at the time:
+    the default was False because flipping it would have rejected this repo's
+    own shipped demo fixtures and every test carrying a fixed-date event. Both
+    of those are now fixed -- #199 rebases the fixtures onto the current date
+    at load time, and tests/support/timestamps.py gives tests an in-window
+    canonical timestamp -- so the mock can be faithful to live by default.
+
+    A mock whose default is to skip a check live always applies accepts
+    batches that live 422s outright, which is the precise "green demo, failing
+    live post" divergence this simulator exists to surface. It was shipping
+    inside the simulator itself.
+
+    Uses an injected (not wall-clock) reference point so this holds
+    deterministically rather than by coincidence of when the suite runs.
     """
     clock_state = {"now": datetime(2026, 6, 1, tzinfo=UTC)}
     service = MockRegEngineService(clock=lambda: clock_state["now"])
@@ -303,6 +315,22 @@ def test_age_window_is_off_by_default_even_with_an_injected_clock() -> None:
     payload = IngestPayload(source="age-window-test", events=[ancient_event])
 
     response = service.ingest(payload)
+
+    assert response.accepted == 0
+    assert response.rejected == 1
+    assert any("replay window exceeded" in error for error in response.events[0].errors)
+
+
+def test_age_window_can_still_be_opted_out_of() -> None:
+    """Opting out stays available and explicit, for a caller whose subject IS
+    a stale event or who is knowingly ingesting historical data."""
+    clock_state = {"now": datetime(2026, 6, 1, tzinfo=UTC)}
+    service = MockRegEngineService(
+        clock=lambda: clock_state["now"], enforce_event_age_window=False
+    )
+    ancient_event = _harvest_event_at(clock_state["now"] - timedelta(days=1000))
+
+    response = service.ingest(IngestPayload(source="age-window-test", events=[ancient_event]))
 
     assert response.accepted == 1
     assert response.rejected == 0

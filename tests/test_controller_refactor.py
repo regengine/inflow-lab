@@ -32,7 +32,6 @@ must not be edited.
 from __future__ import annotations
 
 import asyncio
-from datetime import UTC, datetime
 
 from app.controller import DeliveryOutcome, _build_stored_records
 from app.demo_fixtures import get_demo_fixture
@@ -48,9 +47,10 @@ from app.schemas.domain import (
 from app.schemas.ingestion import CSVImportRequest, DeliveryRetryRequest
 from app.schemas.scenarios import DemoFixtureLoadRequest
 from app.schemas.simulation import DeliveryConfig, SimulationConfig
+from tests.support.timestamps import recent_event_timestamp
 
 
-_BASE_TIME = datetime(2026, 3, 1, 8, 0, tzinfo=UTC)
+_BASE_TIME = recent_event_timestamp()
 
 
 def _response(lot_code: str, cte_type: str, status: str, **extra) -> dict:
