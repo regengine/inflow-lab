@@ -103,7 +103,6 @@ def _make_slow(store: ScenarioSaveStore, method_name: str) -> None:
     setattr(store, method_name, slow)
 
 
-@pytest.mark.xfail(strict=True, reason="reverted by PR #225's HEAD-side conflict resolution; re-landing tracked in #232")
 def test_listing_saves_does_not_stall_the_loop(tmp_path):
     controller = _controller(tmp_path)
     _make_slow(controller.scenario_saves, "list")
@@ -113,7 +112,6 @@ def test_listing_saves_does_not_stall_the_loop(tmp_path):
     assert ticks >= _MIN_EXPECTED_TICKS, f"loop stalled: only {ticks} ticks"
 
 
-@pytest.mark.xfail(strict=True, reason="reverted by PR #225's HEAD-side conflict resolution; re-landing tracked in #232")
 def test_saving_a_scenario_does_not_stall_the_loop(tmp_path):
     controller = _controller(tmp_path)
     controller.store.add_many([_record(index) for index in range(5)])
@@ -127,7 +125,6 @@ def test_saving_a_scenario_does_not_stall_the_loop(tmp_path):
     assert ticks >= _MIN_EXPECTED_TICKS, f"loop stalled: only {ticks} ticks"
 
 
-@pytest.mark.xfail(strict=True, reason="reverted by PR #225's HEAD-side conflict resolution; re-landing tracked in #232")
 def test_loading_a_scenario_save_does_not_stall_the_loop(tmp_path):
     controller = _controller(tmp_path)
     controller.store.add_many([_record(index) for index in range(5)])
@@ -190,7 +187,6 @@ def test_a_concurrent_reset_cannot_land_mid_save(tmp_path):
     assert response.status == "saved"
 
 
-@pytest.mark.xfail(strict=True, reason="reverted by PR #225's HEAD-side conflict resolution; re-landing tracked in #232")
 def test_listing_tenants_does_not_stall_the_loop(tmp_path, monkeypatch):
     from app.routers.operator import list_operator_tenants
 

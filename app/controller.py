@@ -504,12 +504,13 @@ class SimulationController:
         await self._publish_update()
         return result
 
-    def list_scenario_saves(self) -> ScenarioSaveListResponse:
+    async def list_scenario_saves(self) -> ScenarioSaveListResponse:
+        # `list()` reads and JSON-parses one file per scenario. On the event
+        # loop that is a stall on a plain listing, so it goes to a thread (#216).
+        # No lock: a listing takes no consistent view across saves.
+        snapshots = await asyncio.to_thread(self.scenario_saves.list)
         return ScenarioSaveListResponse(
-            saves=[
-                self._scenario_save_summary(snapshot)
-                for snapshot in self.scenario_saves.list()
-            ]
+            saves=[self._scenario_save_summary(snapshot) for snapshot in snapshots]
         )
 
     async def save_scenario(
@@ -523,10 +524,20 @@ class SimulationController:
             config = config.model_copy(update={"scenario": scenario_id}, deep=True)
             config = self._sanitize_saved_config(config)
             records = self.store.all_between()
-            snapshot = self.scenario_saves.save_snapshot(
-                scenario=scenario_id,
-                config=config,
-                records=records,
+            # Offloaded (#216) but deliberately still under `self._lock`.
+            # Hoisting the write out would let a `reset()` land between
+            # snapshotting `records` above and writing them here, so the save
+            # would persist a store state that never existed. Holding a lock
+            # across an await is what the delivery paths must not do (#208) --
+            # but this await is local disk, bounded by the filesystem, not by a
+            # remote endpoint's timeout. Two tests pin both halves: that the
+            # lock is held at the moment the write runs, and that a real
+            # concurrent `reset()` cannot tear the saved snapshot.
+            snapshot = await asyncio.to_thread(
+                self.scenario_saves.save_snapshot,
+                scenario_id,
+                config,
+                records,
             )
             result = ScenarioSaveResponse(
                 status="saved",
@@ -537,7 +548,11 @@ class SimulationController:
 
     async def load_scenario_save(self, scenario_id: ScenarioId) -> ScenarioLoadResponse:
         await self.stop()
-        snapshot = self.scenario_saves.get(scenario_id)
+        # Read outside the lock, as it already was: nothing here needs a
+        # consistent view of the store, and the reconfigure below takes the
+        # lock for itself. Offloaded because `get()` reads and parses a whole
+        # snapshot file (#216).
+        snapshot = await asyncio.to_thread(self.scenario_saves.get, scenario_id)
         if snapshot is None:
             raise KeyError(scenario_id.value)
 

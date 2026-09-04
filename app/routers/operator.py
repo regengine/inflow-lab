@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import shutil
 
 from fastapi import APIRouter, Depends, HTTPException
@@ -14,11 +15,18 @@ router = APIRouter(prefix="/api/operator", tags=["Operator"])
 
 @router.get("/tenants", response_model=TenantListResponse)
 async def list_operator_tenants(_: None = Depends(require_operator_auth)) -> TenantListResponse:
+    # `tenant_summary` stats the tenant's JSONL and, for uncached tenants,
+    # counts its lines -- blocking work that scales with the store and used to
+    # run on the event loop once per tenant (#216). Both the enumeration and
+    # the per-tenant summaries go to a thread; the summaries are gathered in
+    # one hop rather than one per tenant, so a deployment with many tenants
+    # does not pay a thread-pool round trip each.
+    tenant_ids = await asyncio.to_thread(tenancy.known_tenant_ids)
+    summaries = await asyncio.to_thread(
+        lambda: [tenancy.tenant_summary(tenant_id) for tenant_id in tenant_ids]
+    )
     return TenantListResponse(
-        tenants=[
-            TenantSummary.model_validate(tenancy.tenant_summary(tenant_id))
-            for tenant_id in tenancy.known_tenant_ids()
-        ]
+        tenants=[TenantSummary.model_validate(summary) for summary in summaries]
     )
 
 
