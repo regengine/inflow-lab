@@ -93,6 +93,7 @@ REQUIRED_KDES: dict[CTEType, tuple[str, ...]] = {
         "location_name",
         "reference_document",
         "harvester_business_name",
+        "harvester_business_phone",
     ),
     # Matches RegEngine webhook_models.REQUIRED_KDES_BY_CTE exactly
     # (§1.1325(c)(7)); vessel/receiver detail is recommended, not required.

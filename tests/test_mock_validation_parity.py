@@ -540,3 +540,19 @@ def test_enforced_window_sets_mode_and_zero_bypass_count() -> None:
     assert response.out_of_window_events == 0
     assert response.event_age_window_mode == "enforced"
     assert response.event_age_window_days == MAX_EVENT_AGE_DAYS
+
+
+@pytest.mark.parametrize("phone", [None, "", "  ", 123, {"phone": "555"}])
+def test_contract_v2_rejects_missing_or_non_string_harvester_phone(phone):
+    event = _valid_event().model_copy(update={"cte_type": CTEType.INITIAL_PACKING,
+        "kdes": {"packing_date": "2026-02-05", "reference_document": "PACK-1",
+                 "harvester_business_name": "Example farm", "harvester_business_phone": phone,
+                 "from_entity_reference": "entity-1"}})
+    assert any("phone" in error.lower() for error in validate_event_like_regengine(event))
+
+
+def test_contract_v2_accepts_an_explicit_harvester_phone():
+    event = _valid_event().model_copy(update={"cte_type": CTEType.INITIAL_PACKING,
+        "kdes": {"packing_date": "2026-02-05", "reference_document": "PACK-1",
+                 "harvester_business_name": "Example farm", "harvester_business_phone": "+1-202-555-0100"}})
+    assert validate_event_like_regengine(event) == []

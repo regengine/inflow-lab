@@ -127,6 +127,7 @@ DEMO_FIXTURES: dict[DemoFixtureId, DemoFixture] = {
                         "source_traceability_lot_code": "TLC-DEMO-LG-HARVEST-001",
                         "farm_location": "Valley Fresh Farms",
                         "harvester_business_name": "Valley Fresh Farms",
+                        "harvester_business_phone": "+1-202-555-0100",  # Fictional simulator contact.
                         "reference_document": "GS1 Packout Record PACK-DEMO-LG-001",
                         "reference_document_type": "Packout Record",
                         "reference_document_number": "PACK-DEMO-LG-001",
@@ -302,6 +303,7 @@ DEMO_FIXTURES: dict[DemoFixtureId, DemoFixture] = {
                         "source_traceability_lot_code": "TLC-DEMO-FC-HARVEST-001",
                         "farm_location": "Valley Fresh Farms",
                         "harvester_business_name": "Valley Fresh Farms",
+                        "harvester_business_phone": "+1-202-555-0100",  # Fictional simulator contact.
                         "reference_document": "GS1 Packout Record PACK-DEMO-FC-001",
                         "reference_document_type": "Packout Record",
                         "reference_document_number": "PACK-DEMO-FC-001",
@@ -335,6 +337,7 @@ DEMO_FIXTURES: dict[DemoFixtureId, DemoFixture] = {
                         "source_traceability_lot_code": "TLC-DEMO-FC-HARVEST-002",
                         "farm_location": "Coastal Leaf Farm",
                         "harvester_business_name": "Coastal Leaf Farm",
+                        "harvester_business_phone": "+1-202-555-0100",  # Fictional simulator contact.
                         "reference_document": "GS1 Packout Record PACK-DEMO-FC-002",
                         "reference_document_type": "Packout Record",
                         "reference_document_number": "PACK-DEMO-FC-002",
@@ -582,6 +585,7 @@ DEMO_FIXTURES: dict[DemoFixtureId, DemoFixture] = {
                         "source_traceability_lot_code": "TLC-DEMO-RT-HARVEST-001",
                         "farm_location": "SunCoast Produce Ranch",
                         "harvester_business_name": "SunCoast Produce Ranch",
+                        "harvester_business_phone": "+1-202-555-0100",  # Fictional simulator contact.
                         "reference_document": "GS1 Packout Record PACK-DEMO-RT-001",
                         "reference_document_type": "Packout Record",
                         "reference_document_number": "PACK-DEMO-RT-001",
