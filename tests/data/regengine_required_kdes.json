@@ -4,10 +4,10 @@
     "source_path": "services/ingestion/app/webhook_models.py",
     "source_symbol": "REQUIRED_KDES_BY_CTE",
     "source_enum": "WebhookCTEType",
-    "source_commit": "fa614d4d9d90261116cc17636bf98173c7d057c4",
+    "source_commit": "71c0aebbc7af0826d6dd3e5a9424df13ee636290",
     "extracted_by": "scripts/regengine_kde_contract.py",
-    "extracted_at": "2026-08-27",
-    "table_sha256": "01952b0674c1be77a8de300d8b830122215720cba2cbb83b0ecd73fd3661529c",
+    "extracted_at": "2026-09-05",
+    "table_sha256": "9b46583f75e0d21786d04c3ca00d89926b1bfb15a2421a51bbfcf57c65dd79d0",
     "regenerate": "python scripts/regengine_kde_contract.py snapshot --regengine-root <regengine checkout> --source-commit <sha>",
     "enforced_by": "tests/test_contract_provenance.py (checksum + shape, offline) and the regengine-contract job in .github/workflows/ci.yml, which re-extracts this table from a real RegEngine checkout and fails on any difference."
   },
@@ -47,7 +47,8 @@
       "packing_date",
       "location_name",
       "reference_document",
-      "harvester_business_name"
+      "harvester_business_name",
+      "harvester_business_phone"
     ],
     "receiving": [
       "traceability_lot_code",

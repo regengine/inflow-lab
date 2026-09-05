@@ -502,6 +502,8 @@ def _handler_level_errors(event: RegEngineEvent, *, now: datetime | None = None,
 
     required = REQUIRED_KDES.get(event.cte_type, ())
     missing = [field for field in required if not _has_value(available.get(field))]
+    if "harvester_business_phone" in required and not isinstance(available.get("harvester_business_phone"), str):
+        errors.append("Harvester business phone must be a non-empty string")
     if missing:
         errors.append(
             f"Missing required KDEs for {event.cte_type.value}: {', '.join(missing)}"
