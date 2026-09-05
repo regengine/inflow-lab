@@ -34,9 +34,13 @@ from __future__ import annotations
 import json
 import logging
 import os
+import stat
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
+import pytest
+
+import app.store as store_module
 from app.schemas.domain import CTEType, DestinationMode, RegEngineEvent, StoredEventRecord
 from app.store import EventStore
 
@@ -241,14 +245,23 @@ def test_a_healthy_store_is_completely_unaffected_by_the_binary_read(tmp_path, c
 
 
 class FsyncSpy:
-    """Records every fd handed to ``os.fsync`` and calls the real one."""
+    """Records every fd handed to ``os.fsync`` and calls the real one.
+
+    ``directory_fds`` additionally notes which of those fds referred to a
+    directory (#217). Classified *at call time*, deliberately: the store
+    closes each fd right after syncing it, so by the time a test looks the
+    number could be closed or recycled onto something else entirely.
+    """
 
     def __init__(self, real_fsync) -> None:
         self._real_fsync = real_fsync
         self.fds: list[int] = []
+        self.directory_fds: list[int] = []
 
     def __call__(self, fd: int) -> None:
         self.fds.append(fd)
+        if stat.S_ISDIR(os.fstat(fd).st_mode):
+            self.directory_fds.append(fd)
         self._real_fsync(fd)
 
 
@@ -377,3 +390,68 @@ def test_a_corrupt_line_never_puts_its_own_content_in_the_log_or_the_record(tmp_
     assert recorded.line_number == 1
     assert str(path) == recorded.path
     assert recorded.error, "a skipped line must still say why it was skipped"
+
+
+# ---------------------------------------------------------------------------
+# #217 -- the rewrite path: the swap itself must be durable, a failed rewrite
+# must never orphan its temp file, and a temp file a killed rewrite left
+# behind is cleared on load.
+# ---------------------------------------------------------------------------
+
+
+def test_a_rewrite_fsyncs_the_new_file_and_then_its_directory(tmp_path, monkeypatch):
+    """``os.replace`` swaps a directory entry; fsyncing the new file's bytes
+    says nothing about whether that rename survives a power loss. Before
+    #217 a rewrite fsynced exactly one descriptor -- the temp file -- so
+    ``spy.fds`` had one entry and ``spy.directory_fds`` none.
+    """
+    store, _ = _seeded_store(tmp_path, ["TLC-REWRITE-1", "TLC-REWRITE-2"])
+    oldest = store.recent()[-1]
+
+    spy = FsyncSpy(os.fsync)
+    monkeypatch.setattr(os, "fsync", spy)
+    store.update_many([oldest.model_copy(update={"delivery_status": "posted"})])
+
+    assert len(spy.fds) == 2, f"expected the temp file and then its directory to be fsynced, got {len(spy.fds)}"
+    assert len(spy.directory_fds) == 1, "the parent directory was not fsynced after the swap"
+
+
+def test_a_rewrite_that_fails_for_a_non_os_reason_still_raises_and_leaves_no_tmp_file(tmp_path, monkeypatch):
+    """The cleanup used to catch ``OSError`` only. A serialization failure --
+    here a bare ValueError out of ``_serialize_record`` -- is not one, so it
+    propagated correctly but left the half-written ``.tmp`` orphaned beside
+    the live log. The exception must still propagate unchanged (callers
+    order their in-memory commit around it), and the live log must be
+    exactly what it was.
+    """
+    store, persist_path = _seeded_store(tmp_path, ["TLC-INTACT"])
+    before = persist_path.read_bytes()
+
+    def explode(_record):
+        raise ValueError("simulated serialization failure")
+
+    monkeypatch.setattr(store_module, "_serialize_record", explode)
+    with pytest.raises(ValueError, match="simulated serialization failure"):
+        store.update_many([store.recent()[0].model_copy(update={"delivery_status": "posted"})])
+
+    assert list(tmp_path.glob("*.tmp")) == [], "a failed rewrite left its temp file behind"
+    assert persist_path.read_bytes() == before
+
+
+def test_a_stale_tmp_left_by_a_killed_rewrite_is_removed_on_load(tmp_path):
+    """A SIGKILL between building ``<persist>.tmp`` and swapping it in leaves
+    the half-built file behind. It is never read as data, but nothing
+    cleared it either. The live log is the complete pre-rewrite file, so
+    every record still loads.
+    """
+    _, persist_path = _seeded_store(tmp_path, ["TLC-SURVIVOR-1", "TLC-SURVIVOR-2"])
+    stale_tmp = persist_path.with_suffix(".jsonl.tmp")
+    stale_tmp.write_text('{"half": "writt', encoding="utf-8")
+
+    reloaded = EventStore(persist_path=str(persist_path))
+
+    assert not stale_tmp.exists(), "the orphaned .tmp from a killed rewrite was not cleared"
+    assert sorted(record.event.traceability_lot_code for record in reloaded.recent()) == [
+        "TLC-SURVIVOR-1",
+        "TLC-SURVIVOR-2",
+    ]

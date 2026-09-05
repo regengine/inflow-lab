@@ -381,6 +381,11 @@ class StatusResponse(BaseModel):
     running: bool
     config: SimulationConfig
     stats: dict[str, Any]
+    # Why the run loop stopped on its own, as "ExceptionName: message", or
+    # None while it is healthy (#217). `controller.status()` has carried this
+    # since #211, but /status, /start and /stop validate through this model,
+    # so a key it did not declare was published to SSE and dropped from HTTP.
+    last_error: str | None = None
 
 
 class StepResponse(BaseModel):

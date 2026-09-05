@@ -796,6 +796,57 @@ def test_controller_revision_notifies_after_step():
     assert len(snapshot["events"]) == 1
 
 
+def test_status_endpoint_reports_the_run_loop_crash_reason(monkeypatch, tmp_path):
+    """#217: a run loop that dies on its own must say why on GET /status.
+
+    ``controller.status()`` has carried ``last_error`` since #211, but the
+    route validates through ``StatusResponse``, which silently dropped any
+    key it did not declare -- so the SSE snapshot knew the reason and the
+    HTTP status did not. Healthy first: the field is published as null, not
+    omitted, so a client can tell "no error" from "old server".
+    """
+    healthy = client.get("/api/simulate/status")
+    assert healthy.status_code == 200
+    assert healthy.json()["last_error"] is None
+
+    # Same crash as tests/test_start_semantics.py's run-loop test: step()
+    # itself raises, so the loop's own except-branch records the reason.
+    async def crashing_step(batch_size=None, config=None):
+        raise RuntimeError("simulated engine failure")
+
+    monkeypatch.setattr(controller, "step", crashing_step)
+
+    async def crash_the_run_loop() -> None:
+        await controller.start(
+            SimulationConfig(
+                interval_seconds=60,
+                batch_size=1,
+                seed=204,
+                persist_path=str(tmp_path / "crash-status-events.jsonl"),
+            )
+        )
+        task = controller._task
+        assert task is not None
+        # _run_loop swallows the exception and returns, so awaiting the task
+        # is how "the loop has crashed" is observed -- no timing sleep.
+        await asyncio.wait_for(task, timeout=5.0)
+        assert controller.running is False
+
+    try:
+        asyncio.run(crash_the_run_loop())
+
+        response = client.get("/api/simulate/status")
+
+        assert response.status_code == 200
+        body = response.json()
+        assert body["running"] is False
+        assert "RuntimeError" in body["last_error"]
+        assert "simulated engine failure" in body["last_error"]
+    finally:
+        # Clear the dead task so no later test inherits it.
+        asyncio.run(controller.stop())
+
+
 def test_stop_interrupts_long_interval_sleep(tmp_path):
     async def start_and_stop() -> bool:
         await controller.start(

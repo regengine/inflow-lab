@@ -12,7 +12,7 @@ from typing import Any
 from pydantic import ValidationError
 
 from .cte_rules import validate_event_kdes
-from .mock_service import MAX_EVENT_AGE_DAYS
+from .mock_service import configured_max_event_age_days
 from .schemas.domain import CSVImportType, CTEType, RegEngineEvent
 from .schemas.ingestion import CSVImportError, CSVImportWarning
 
@@ -324,9 +324,16 @@ def _replay_window_warnings(
     The boundary matches the mock's exactly -- and therefore live's, which
     the mock is pinned against: ``timestamp < now - 90 days`` is stale, so an
     event exactly MAX_EVENT_AGE_DAYS old is still inside the window.
+
+    The window's *length* comes from ``configured_max_event_age_days()``
+    rather than the raw MAX_EVENT_AGE_DAYS constant (#217): an operator who
+    shortens or lengthens the mock's window via
+    REGENGINE_WEBHOOK_MAX_EVENT_AGE_DAYS needs this warning to move with it,
+    or it stops predicting the rejection the mock is about to issue.
     """
+    max_age_days = configured_max_event_age_days()
     timestamp = _ensure_timezone(event.timestamp)
-    cutoff = now - timedelta(days=MAX_EVENT_AGE_DAYS)
+    cutoff = now - timedelta(days=max_age_days)
     if timestamp >= cutoff:
         return []
     return [
@@ -335,7 +342,7 @@ def _replay_window_warnings(
             field="timestamp",
             message=(
                 f"timestamp is {(now - timestamp).days} days old, past RegEngine's "
-                f"{MAX_EVENT_AGE_DAYS}-day replay window (WEBHOOK_MAX_EVENT_AGE_DAYS) \u2014 live "
+                f"{max_age_days}-day replay window (WEBHOOK_MAX_EVENT_AGE_DAYS) \u2014 live "
                 "ingest rejects this row with 'replay window exceeded'. The built-in mock "
                 "accepts it, so this warning is the only signal you get before delivery."
             ),

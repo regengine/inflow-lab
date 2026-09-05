@@ -125,12 +125,13 @@ def _event_with_nonpositive_quantity() -> RegEngineEvent:
 
 
 def _event_with_far_future_timestamp() -> RegEngineEvent:
-    # The future ceiling is not clock-injectable (see
-    # _field_constraint_errors's docstring in app/mock_service.py for why),
-    # so this -- like the pre-existing behavior it is reclassifying, not
-    # replacing -- necessarily compares against real wall-clock time. That
-    # is unchanged by #101; only its consequence (batch-fatal vs
-    # per-event) is new.
+    # Built relative to the wall clock because the default `clock` IS the
+    # wall clock, and this helper feeds services constructed without one.
+    # Since #217 the ceiling also follows an injected clock wound ahead of
+    # real time (see _field_constraint_errors's docstring in
+    # app/mock_service.py for the rule); the two tests after the age-floor
+    # section below exercise that path. #101 itself changed only the
+    # consequence of this check (batch-fatal vs per-event), not its clock.
     return _valid_event(timestamp=datetime.now(UTC) + timedelta(hours=MAX_FUTURE_HOURS + 1))
 
 
@@ -430,6 +431,59 @@ def test_age_window_is_driven_by_injected_clock_not_wall_clock_and_not_sleep() -
         )
     )
     assert now_within_window.accepted == 1
+
+
+def test_the_future_ceiling_uses_the_same_injected_clock_as_the_age_floor() -> None:
+    """Mirror of the age-floor test above, for the other end of the window
+    (#217). The clock is wound AHEAD of real time -- the direction in which
+    the ceiling honours it (a backdated clock leaves the wall clock in
+    charge; see _field_constraint_errors for why) -- and one fixed event is
+    walked across the 24h boundary by moving only the clock.
+
+    The first half also passes on wall time (the event is far ahead of real
+    now); the second half is what discriminates: with the ceiling still on
+    the wall clock, the same event stays 422 however far the injected clock
+    is advanced.
+    """
+    clock_state = {"now": datetime.now(UTC) + timedelta(days=30)}
+    service = MockRegEngineService(clock=lambda: clock_state["now"])
+    fixed_timestamp = clock_state["now"] + timedelta(hours=MAX_FUTURE_HOURS + 1)
+
+    with pytest.raises(MockRegEngineHTTPError) as exc_info:
+        service.ingest(
+            IngestPayload(
+                source="future-ceiling-test",
+                events=[_harvest_event_at(fixed_timestamp, lot="TLC-FUTURE-000001")],
+            )
+        )
+    assert exc_info.value.status_code == 422
+    assert f"timestamp is more than {MAX_FUTURE_HOURS} hours in the future" in exc_info.value.detail
+
+    # Wind the clock forward two hours: the same event timestamp is now 23h
+    # ahead of it, inside the ceiling -- same service, only the clock moved.
+    clock_state["now"] += timedelta(hours=2)
+    now_within_ceiling = service.ingest(
+        IngestPayload(
+            source="future-ceiling-test",
+            events=[_harvest_event_at(fixed_timestamp, lot="TLC-FUTURE-000002")],
+        )
+    )
+    assert now_within_ceiling.accepted == 1
+
+
+def test_a_clock_wound_behind_real_time_leaves_the_wall_clock_governing_the_ceiling() -> None:
+    """The other half of the #217 rule, pinned directly rather than only as a
+    side effect of the #120 TTL test: an event that has really already
+    happened is not "in the future" because the mock's clock was backdated.
+    A ceiling that honoured `now` unconditionally would 422 this batch.
+    """
+    service = MockRegEngineService(clock=lambda: datetime(2026, 1, 1, tzinfo=UTC))
+
+    response = service.ingest(
+        IngestPayload(source="backdated-clock-test", events=[_valid_event(lot="TLC-BACKDATED-000001")])
+    )
+
+    assert response.accepted == 1
 
 
 def test_validate_event_like_regengine_only_flags_age_when_now_is_provided() -> None:

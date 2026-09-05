@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import os
 from pathlib import Path
 from threading import RLock
 from typing import Iterable
@@ -46,10 +47,16 @@ class ScenarioSaveStore:
             self.save_dir.mkdir(parents=True, exist_ok=True)
             path = self._path_for(snapshot.scenario)
             tmp_path = path.with_suffix(f"{path.suffix}.tmp")
-            tmp_path.write_text(
-                json.dumps(snapshot.model_dump(mode="json"), indent=2) + "\n",
-                encoding="utf-8",
-            )
+            # flush + fsync before the swap (#217), as EventStore._write_records
+            # does. ``replace`` makes the new file visible atomically, but
+            # without the fsync its bytes can still be in the page cache when
+            # the rename is already durable -- a power loss then leaves an
+            # empty or truncated save under the final name, which is worse
+            # than the previous save it replaced.
+            with tmp_path.open("w", encoding="utf-8") as handle:
+                handle.write(json.dumps(snapshot.model_dump(mode="json"), indent=2) + "\n")
+                handle.flush()
+                os.fsync(handle.fileno())
             tmp_path.replace(path)
         return snapshot
 

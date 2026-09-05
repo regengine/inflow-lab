@@ -95,6 +95,16 @@ STALE_COMMIT_NOTE = (
     "flight, so these records were not committed locally."
 )
 
+# What a replay caller is told when the store moved between its chunks (#217).
+# A replay commits nothing, so STALE_COMMIT_NOTE would be false on both counts:
+# delivery did not complete, and there was never a local record to drop. The
+# chunks already posted did land; the ones after the reset were never sent, and
+# `replayed` counts only the former.
+STALE_REPLAY_NOTE = (
+    "Replay stopped early: the store was reset or reconfigured while it was in "
+    "flight, so the remaining events were not re-posted."
+)
+
 
 def _shutdown_timeout_seconds() -> float:
     """Seconds to wait for a run loop to stop before cancelling it.
@@ -119,17 +129,20 @@ def _shutdown_timeout_seconds() -> float:
     return value if value > 0 else DEFAULT_SHUTDOWN_TIMEOUT_SECONDS
 
 
-def _with_stale_note(error_message: str | None, committed: bool) -> str | None:
+def _with_stale_note(
+    error_message: str | None, committed: bool, note: str = STALE_COMMIT_NOTE
+) -> str | None:
     """Fold the dropped-commit note into a response's `error` field.
 
     A caller has to be able to tell "your events were delivered and stored"
-    from "your events were delivered and then thrown away".
+    from "your events were delivered and then thrown away". `replay()` passes
+    STALE_REPLAY_NOTE instead, with `committed` meaning "ran to completion".
     """
     if committed:
         return error_message
     if error_message:
-        return f"{error_message} {STALE_COMMIT_NOTE}"
-    return STALE_COMMIT_NOTE
+        return f"{error_message} {note}"
+    return note
 
 
 
@@ -164,6 +177,27 @@ class SimulationController:
         # where both are taken (only `start()`): `_lifecycle_lock` first, then
         # `_lock`. Nothing ever takes them the other way round.
         self._lifecycle_lock = asyncio.Lock()
+        # Makes a reconfigure -- `reset()`, `load_demo_fixture()`,
+        # `load_scenario_save()` -- atomic against `start()` and against each
+        # other (#217). Each of the three is "stop the run loop, then repoint
+        # the store and engine", and `stop()` releases `_lifecycle_lock` before
+        # it returns, so with nothing spanning the two steps a `start()` could
+        # land in the gap: it took both of its locks uncontended and installed
+        # a run loop that kept stepping into the very store the reset was about
+        # to clear, and `reset()` returned with `running` True. `_store_epoch`
+        # does not catch that -- it voids a commit whose snapshot predates the
+        # bump, but a loop installed after the bump reads the new epoch.
+        #
+        # Lock order, always: `_reconfigure_lock` -> `_lifecycle_lock` ->
+        # `_lock`, never reversed. Only the four entry points named above take
+        # this one. `stop()`, `shutdown()`, `step()`, `configure_integration()`
+        # and `save_scenario()` deliberately do not: `reset()` holds it while
+        # awaiting `stop()`, which awaits the run loop, whose `step()` takes
+        # only `_lock` -- a `step()` or a bare POST /stop that needed this lock
+        # would deadlock a reset against its own loop, and `shutdown()`'s
+        # `wait_for` would no longer be bounded by anything but a reconfigure
+        # in progress. tests/test_reconfigure_atomicity.py pins both halves.
+        self._reconfigure_lock = asyncio.Lock()
         # Bumped, under `_lock`, whenever the store is cleared or repointed.
         # Delivery now runs outside `_lock` (#208), so between snapshotting what
         # to send and committing the outcome, a `reset()` or a fixture load can
@@ -186,12 +220,15 @@ class SimulationController:
         return self._revision
 
     async def start(self, config: SimulationConfig) -> None:
-        # `_lifecycle_lock` is what makes this mutually exclusive with `stop()`
-        # (#156): both mutate `_task`/`_stop_event`, and stop() no longer takes
-        # the data-plane lock. `_lock` is still taken, inside it, for the config
-        # and engine/store mutations below -- the one place both are held, and
-        # always in this order.
-        async with self._lifecycle_lock, self._lock:
+        # `_reconfigure_lock` first (#217): a start() has to wait out a reset
+        # or load that has already stopped the previous loop but not yet
+        # repointed the store, or it installs a loop into a store that is about
+        # to be cleared. `_lifecycle_lock` is what makes this mutually exclusive
+        # with `stop()` (#156): both mutate `_task`/`_stop_event`, and stop()
+        # no longer takes the data-plane lock. `_lock` is still taken, inside
+        # it, for the config and engine/store mutations below -- the one place
+        # all three are held, and always in this order.
+        async with self._reconfigure_lock, self._lifecycle_lock, self._lock:
             _validate_live_delivery(config.delivery)
             previous_config = self.config
             if self.running and (
@@ -334,15 +371,20 @@ class SimulationController:
             self._task = None
 
     async def reset(self, config: SimulationConfig | None = None) -> None:
-        await self.stop()
-        async with self._lock:
-            if config is not None:
-                self.config = config
-            await self._store_configure(self.config.persist_path)
-            self.engine.reset(self.config.seed, scenario=self.config.scenario, scale=self.config.scale)
-            self.store.reset()
-            self.mock_service.reset()
-            self._store_epoch += 1
+        # Held across stop() AND the repoint below (#217): see the lock's
+        # declaration for the gap this closes. No cycle -- stop() awaits the
+        # run loop with only this lock held, and the loop's step() takes only
+        # `_lock`.
+        async with self._reconfigure_lock:
+            await self.stop()
+            async with self._lock:
+                if config is not None:
+                    self.config = config
+                await self._store_configure(self.config.persist_path)
+                self.engine.reset(self.config.seed, scenario=self.config.scenario, scale=self.config.scale)
+                self.store.reset()
+                self.mock_service.reset()
+                self._store_epoch += 1
         await self._publish_update()
 
     async def step(self, batch_size: int | None = None, config: SimulationConfig | None = None) -> StepResponse:
@@ -406,6 +448,7 @@ class SimulationController:
         request = request or ReplayRequest()
         # Phase 1 -- snapshot under the lock.
         async with self._lock:
+            epoch = self._store_epoch
             persist_path = request.persist_path or self.config.persist_path
             source = request.source or self.config.source
             delivery = request.delivery or self.config.delivery
@@ -421,9 +464,12 @@ class SimulationController:
             events = [record.event for record in records]
 
         # Phase 2 -- deliver with the lock released. Replay re-posts what is
-        # already on disk and writes nothing back, so there is no phase 3 and no
-        # epoch check: a concurrent reset cannot make this commit wrong, because
-        # there is no commit to invalidate.
+        # already on disk and writes nothing back, so there is no phase 3: a
+        # concurrent reset cannot make a commit wrong, because there is no
+        # commit to invalidate. The epoch is still consulted between chunks
+        # (#217) -- not to protect the store, but so a reset does not leave
+        # hundreds of chunks of a store the operator just cleared still going
+        # out to RegEngine behind their back.
         if not events:
             result = ReplayResponse(
                 status="empty",
@@ -448,14 +494,24 @@ class SimulationController:
             # back into one summary so an early chunk's posted events
             # are still reported even if a later chunk fails.
             chunks = await deliver_in_chunks(
-                self._deliver_payload, source, events, replay_config, chunk_size=MAX_BATCH_EVENTS
+                self._deliver_payload,
+                source,
+                events,
+                replay_config,
+                chunk_size=MAX_BATCH_EVENTS,
+                # Read without `_lock` -- see import_csv for why that is safe.
+                should_continue=lambda: epoch == self._store_epoch,
             )
             outcome = aggregate_outcomes([chunk_outcome for _, chunk_outcome in chunks])
             replay_status = _REPLAY_STATUS_BY_DELIVERY[outcome.delivery_status]
+            # What actually went out, not what was read (#217): a replay cut
+            # short by a reset never posted the chunks after it, and saying it
+            # did would be the same lie the stale-commit note exists to avoid.
+            replayed = sum(len(chunk_events) for chunk_events, _ in chunks)
             result = ReplayResponse(
                 status=replay_status,
                 read=len(records),
-                replayed=len(events),
+                replayed=replayed,
                 posted=outcome.posted,
                 failed=outcome.failed,
                 source=source,
@@ -463,7 +519,9 @@ class SimulationController:
                 delivery_mode=delivery.mode,
                 delivery_attempts=outcome.delivery_attempts,
                 response=outcome.response,
-                error=outcome.error_message,
+                error=_with_stale_note(
+                    outcome.error_message, replayed == len(events), note=STALE_REPLAY_NOTE
+                ),
             )
         await self._publish_update()
         return result
@@ -505,7 +563,20 @@ class SimulationController:
         chunks: list[tuple[list[RegEngineEvent], DeliveryOutcome]] = []
         if parsed.events:
             chunks = await deliver_in_chunks(
-                self._deliver_payload, source, parsed.events, import_config, chunk_size=MAX_BATCH_EVENTS
+                self._deliver_payload,
+                source,
+                parsed.events,
+                import_config,
+                chunk_size=MAX_BATCH_EVENTS,
+                # #217: re-check between chunks, so a reset landing mid-import
+                # stops the remaining POSTs instead of only voiding the commit
+                # once every chunk has gone out. `_store_epoch` is read here
+                # without `_lock` on purpose: it is a plain int that only ever
+                # changes under `_lock`, on this one event-loop thread, so the
+                # read can never be torn -- and a bump this misses by a turn
+                # merely lets one more chunk out before phase 3 drops the
+                # commit exactly as it would have anyway.
+                should_continue=lambda: epoch == self._store_epoch,
             )
             # Response-level counts only, aggregated across every chunk (#103) --
             # per-record fields below use each chunk's own outcome instead.
@@ -541,7 +612,11 @@ class SimulationController:
 
             rejected = parsed.total - len(parsed.events)
             status: CSVImportStatus
-            if outcome.delivery_status == "failed":
+            if parsed.events and (outcome.delivery_status == "failed" or not committed):
+                # An import that stored nothing must not answer "accepted"
+                # (#217). `error` carries the stale note, but a caller keying
+                # off the machine-readable status has to see the drop there
+                # too -- the fixture load already does this.
                 status = "delivery_failed"
             elif parsed.events and parsed.errors:
                 status = "partial"
@@ -580,32 +655,39 @@ class SimulationController:
     ) -> DemoFixtureLoadResponse:
         request = request or DemoFixtureLoadRequest()
         fixture = get_demo_fixture(fixture_id)
-        await self.stop()
 
-        async with self._lock:
-            source = request.source or self.config.source
-            delivery = request.delivery or self.config.delivery
-            _validate_live_delivery(delivery)
-            self.config = self.config.model_copy(
-                update={
-                    "source": source,
-                    "scenario": fixture.scenario,
-                    "delivery": delivery,
-                },
-                deep=True,
-            )
-            await self._store_configure(self.config.persist_path)
-            self.engine.reset(self.config.seed, scenario=fixture.scenario, scale=self.config.scale)
-            if request.reset:
-                self.store.reset()
-                self.mock_service.reset()
-            # Bumped, then read, AFTER this path's own reset -- so a fixture
-            # load does not treat its own clearing of the store as somebody
-            # else's and drop the very records it just generated.
-            self._store_epoch += 1
-            epoch = self._store_epoch
-            fixture_config = self.config
-            events = [fixture_event.event for fixture_event in fixture.events]
+        # Phase 1 -- stop, then repoint, as one unit (#217): `_reconfigure_lock`
+        # is held across both so a start() cannot slip in between and install
+        # a loop into the store this is about to reset. Released before phase
+        # 2 -- no lock may be held across delivery (#208), and once the epoch
+        # is bumped below, a start() landing during the POST is caught by the
+        # phase 3 check like any other mid-flight reconfigure.
+        async with self._reconfigure_lock:
+            await self.stop()
+            async with self._lock:
+                source = request.source or self.config.source
+                delivery = request.delivery or self.config.delivery
+                _validate_live_delivery(delivery)
+                self.config = self.config.model_copy(
+                    update={
+                        "source": source,
+                        "scenario": fixture.scenario,
+                        "delivery": delivery,
+                    },
+                    deep=True,
+                )
+                await self._store_configure(self.config.persist_path)
+                self.engine.reset(self.config.seed, scenario=fixture.scenario, scale=self.config.scale)
+                if request.reset:
+                    self.store.reset()
+                    self.mock_service.reset()
+                # Bumped, then read, AFTER this path's own reset -- so a fixture
+                # load does not treat its own clearing of the store as somebody
+                # else's and drop the very records it just generated.
+                self._store_epoch += 1
+                epoch = self._store_epoch
+                fixture_config = self.config
+                events = [fixture_event.event for fixture_event in fixture.events]
 
         # Phase 2 -- deliver with the lock released.
         payload = IngestPayload(source=source, events=events)
@@ -699,29 +781,35 @@ class SimulationController:
         return result
 
     async def load_scenario_save(self, scenario_id: ScenarioId) -> ScenarioLoadResponse:
-        await self.stop()
-        # Read outside the lock, as it already was: nothing here needs a
-        # consistent view of the store, and the reconfigure below takes the
-        # lock for itself. Offloaded because `get()` reads and parses a whole
-        # snapshot file (#216).
-        snapshot = await asyncio.to_thread(self.scenario_saves.get, scenario_id)
-        if snapshot is None:
-            raise KeyError(scenario_id.value)
+        # Held from stop() through the repoint (#217) -- the same gap reset()
+        # closes. The file read sits inside it too: it is local disk, bounded
+        # by the filesystem rather than a remote timeout (the same reasoning
+        # save_scenario() gives for its own await), and letting a start() in
+        # while the snapshot is being read is exactly the race this is for.
+        async with self._reconfigure_lock:
+            await self.stop()
+            # Read outside `_lock`, as it already was: nothing here needs a
+            # consistent view of the store, and the reconfigure below takes
+            # that lock for itself. Offloaded because `get()` reads and parses
+            # a whole snapshot file (#216).
+            snapshot = await asyncio.to_thread(self.scenario_saves.get, scenario_id)
+            if snapshot is None:
+                raise KeyError(scenario_id.value)
 
-        async with self._lock:
-            self.config = snapshot.config
-            await self._store_configure(self.config.persist_path)
-            loaded_records = await self._store_replace_all(snapshot.records)
-            # replace_all rewrites the whole log: any batch snapshotted before
-            # this point describes a store that no longer exists.
-            self._store_epoch += 1
-            self.engine.reset(self.config.seed, scenario=self.config.scenario, scale=self.config.scale)
-            result = ScenarioLoadResponse(
-                status="loaded",
-                save=self._scenario_save_summary(snapshot),
-                config=self.config,
-                loaded_records=len(loaded_records),
-            )
+            async with self._lock:
+                self.config = snapshot.config
+                await self._store_configure(self.config.persist_path)
+                loaded_records = await self._store_replace_all(snapshot.records)
+                # replace_all rewrites the whole log: any batch snapshotted
+                # before this point describes a store that no longer exists.
+                self._store_epoch += 1
+                self.engine.reset(self.config.seed, scenario=self.config.scenario, scale=self.config.scale)
+                result = ScenarioLoadResponse(
+                    status="loaded",
+                    save=self._scenario_save_summary(snapshot),
+                    config=self.config,
+                    loaded_records=len(loaded_records),
+                )
         await self._publish_update()
         return result
 
@@ -802,6 +890,14 @@ class SimulationController:
             updated_records: list[StoredEventRecord] = []
             responses: list[dict[str, Any]] = []
             for (source, idempotency_key), records in grouped_records.items():
+                # #217: a reset landing mid-retry voids the commit below, so
+                # every group still to go would be POSTed for nothing -- and
+                # would re-send records the operator has just deleted. Stop
+                # here instead; the group in flight when the store moved
+                # cannot be un-sent. `_store_epoch` is read without `_lock`
+                # on purpose: see import_csv.
+                if epoch != self._store_epoch:
+                    break
                 retry_config = retry_config_base.model_copy(
                     update={
                         "source": source,
@@ -895,7 +991,13 @@ class SimulationController:
                         len(updated_records),
                     )
             status: RetryStatus
-            if posted and failed:
+            if not committed:
+                # Nothing above was written back, so the records these POSTs
+                # were meant to repair still read as failed -- or are gone.
+                # "posted" would claim a repair that did not happen (#217);
+                # `error` carries the note either way.
+                status = "failed"
+            elif posted and failed:
                 status = "partial"
             elif failed:
                 status = "failed"
@@ -905,7 +1007,9 @@ class SimulationController:
                 status=status,
                 requested=requested,
                 retryable=len(candidates),
-                attempted=len(candidates),
+                # One updated record per record actually sent, so this stays
+                # len(candidates) unless a reset cut the retry short (#217).
+                attempted=len(updated_records),
                 posted=posted,
                 failed=failed,
                 skipped=skipped,

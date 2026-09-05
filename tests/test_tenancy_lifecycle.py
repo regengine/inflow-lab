@@ -22,6 +22,7 @@ loses the race gets a clean error instead of a 500.
 from __future__ import annotations
 
 import base64
+import logging
 import shutil
 
 import pytest
@@ -277,6 +278,28 @@ def test_delete_endpoint_race_returns_sane_error_not_500(monkeypatch):
         assert after.status_code == 200
     finally:
         _cleanup_tenant_dir(tenant_id)
+
+
+@pytest.mark.parametrize("raw", ["not-a-number", "0"])
+def test_parse_tenant_cap_degrades_to_fifty_with_a_warning_on_a_bad_value(monkeypatch, caplog, raw):
+    """Pins the degrade-to-default the cap's parser has always had but nothing
+    exercised (#217). The cap is read at import time, so a typo in
+    REGENGINE_MAX_TENANT_CONTROLLERS must fall back to the documented 50 and
+    say so in the log -- never crash the app or silently run uncapped."""
+    monkeypatch.setenv("REGENGINE_MAX_TENANT_CONTROLLERS", raw)
+
+    with caplog.at_level(logging.WARNING, logger="inflow_lab"):
+        assert tenancy._parse_tenant_cap() == 50
+
+    assert any(
+        "REGENGINE_MAX_TENANT_CONTROLLERS" in record.getMessage() and raw in record.getMessage()
+        for record in caplog.records
+    ), "a rejected override must be named in the log"
+
+
+def test_parse_tenant_cap_honours_a_valid_override(monkeypatch):
+    monkeypatch.setenv("REGENGINE_MAX_TENANT_CONTROLLERS", "7")
+    assert tenancy._parse_tenant_cap() == 7
 
 
 def test_tenant_cap_counts_on_disk_directories_across_restarts(monkeypatch):

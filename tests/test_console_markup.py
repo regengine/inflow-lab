@@ -9,6 +9,12 @@ away from an attribute breakout.
 This is a static check rather than a browser test on purpose: the point is the
 convention holding everywhere, not one call site behaving today. It scans every
 console module, so a new one cannot quietly opt out.
+
+The #217 accessibility pins at the bottom live here for the same reason: this
+is the one test module that already reads app/static, and the properties they
+guard -- which live regions announce atomically, and that an error escalates
+its region to assertive -- are markup facts, not behaviour a browser has to be
+driven to observe.
 """
 
 from __future__ import annotations
@@ -16,8 +22,11 @@ from __future__ import annotations
 import re
 from pathlib import Path
 
+import pytest
+
 STATIC_DIR = Path(__file__).resolve().parents[1] / "app" / "static"
 CONSOLE_MODULES = sorted(STATIC_DIR.glob("*.js"))
+INDEX_HTML = STATIC_DIR / "index.html"
 
 # An attribute value in a template literal: name="...${...}...".
 _ATTRIBUTE = re.compile(r'([a-zA-Z-]+)="([^"]*\$\{[^"]*)"')
@@ -85,3 +94,36 @@ def test_the_check_would_catch_a_regression():
 
     assert offenders == ["readiness.tone"]
     assert not _LITERAL_TERNARY.match("readiness.tone")
+
+
+# ---------------------------------------------------------------------------
+# #217 -- the console's live regions, pinned as markup.
+# ---------------------------------------------------------------------------
+
+
+def _opening_tag(element_id: str) -> str:
+    """The `<... id="element_id" ...>` opening tag from index.html, attributes included."""
+    source = INDEX_HTML.read_text(encoding="utf-8")
+    match = re.search(r'<[^<>]*\bid="' + re.escape(element_id) + r'"[^<>]*>', source)
+    assert match is not None, f'index.html has no element with id="{element_id}"'
+    return match.group(0)
+
+
+@pytest.mark.parametrize("element_id", ["statusMessage", "deliverySummary"])
+def test_live_regions_the_console_rewrites_wholesale_announce_atomically(element_id):
+    # Both regions are replaced as a unit on every update (setStatus() and the
+    # delivery summary render). Without aria-atomic="true" a screen reader
+    # announces only the text nodes that changed, which for a sentence
+    # rewritten in place is a fragment with no subject.
+    tag = _opening_tag(element_id)
+
+    assert 'aria-live="' in tag, f"#{element_id} is not a live region"
+    assert 'aria-atomic="true"' in tag
+
+
+def test_an_error_status_escalates_the_live_region_to_assertive():
+    # setStatus() promotes #statusMessage from the polite default the markup
+    # declares to assertive for an error tone: an error interrupts, everything
+    # else waits its turn. Pinned as the literal expression so the escalation
+    # cannot quietly become unconditional in either direction.
+    assert "tone === 'error' ? 'assertive' : 'polite'" in _console_source()
