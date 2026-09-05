@@ -33,6 +33,7 @@ webhooks replayed months later with a freshly-computed signature").
 from __future__ import annotations
 
 import asyncio
+import logging
 from datetime import UTC, datetime, timedelta
 
 import pytest
@@ -41,8 +42,14 @@ from fastapi.testclient import TestClient
 from app import tenancy
 from app.csv_importer import parse_csv_import
 from app.main import app, controller
-from app.mock_service import MAX_EVENT_AGE_DAYS
-from app.schemas.domain import CSVImportType
+from app.mock_service import (
+    MAX_EVENT_AGE_DAYS,
+    MAX_EVENT_AGE_DAYS_ENV,
+    MockRegEngineService,
+    configured_max_event_age_days,
+)
+from app.schemas.domain import CSVImportType, RegEngineEvent
+from app.schemas.ingestion import IngestPayload
 from app.schemas.simulation import SimulationConfig
 
 
@@ -304,3 +311,133 @@ def test_the_window_bounds_replay_rather_than_closing_it() -> None:
         "an event-age window does not stop replay of a fresh capture -- "
         "that needs a per-request nonce, which is not what #209 delivers"
     )
+
+
+# ---------------------------------------------------------------------------
+# #217 -- the window's length is env-configurable, and both ends move together.
+# ---------------------------------------------------------------------------
+
+
+def _harvest_event(timestamp: datetime, lot: str) -> RegEngineEvent:
+    return RegEngineEvent.model_validate(_harvest_event_payload(timestamp, lot))
+
+
+def test_the_env_override_shortens_the_window_for_a_fresh_service_and_the_importer(monkeypatch) -> None:
+    """REGENGINE_WEBHOOK_MAX_EVENT_AGE_DAYS=7: a 10-day-old event the 90-day
+    default accepts is refused by a freshly built service, in live's wording
+    with the configured number in it, and the importer's pre-flight warning
+    fires at 8 days. The two ends must move together, or the warning stops
+    predicting the rejection it exists to give advance notice of.
+    """
+    monkeypatch.setenv(MAX_EVENT_AGE_DAYS_ENV, "7")
+    service = MockRegEngineService(clock=lambda: _NOW)
+
+    rejected = service.ingest(
+        IngestPayload(source="env-window", events=[_harvest_event(_NOW - timedelta(days=10), "TLC-ENV-10D")])
+    )
+    assert rejected.rejected == 1
+    assert rejected.event_age_window_days == 7
+    assert "WEBHOOK_MAX_EVENT_AGE_DAYS=7" in rejected.events[0].errors[0]
+
+    accepted = service.ingest(
+        IngestPayload(source="env-window", events=[_harvest_event(_NOW - timedelta(days=6), "TLC-ENV-6D")])
+    )
+    assert accepted.accepted == 1
+
+    parsed = parse_csv_import(
+        CSVImportType.SCHEDULED_EVENTS,
+        _csv_at(_NOW - timedelta(days=8)),
+        default_timestamp=_NOW,
+    )
+    warnings = _replay_warnings(parsed)
+    assert len(warnings) == 1, "the importer must warn at the configured window, not the 90-day default"
+    assert "7-day replay window" in warnings[0].message
+
+
+@pytest.mark.parametrize("raw", ["banana", "-3", "0"])
+def test_a_malformed_env_override_falls_back_to_ninety_days_with_a_warning(monkeypatch, caplog, raw) -> None:
+    monkeypatch.setenv(MAX_EVENT_AGE_DAYS_ENV, raw)
+
+    with caplog.at_level(logging.WARNING, logger="inflow_lab"):
+        assert configured_max_event_age_days() == MAX_EVENT_AGE_DAYS == 90
+        assert MockRegEngineService().max_event_age_days == 90
+
+    assert any(
+        MAX_EVENT_AGE_DAYS_ENV in record.getMessage() and raw in record.getMessage() for record in caplog.records
+    ), "a rejected override must be named in the log"
+
+
+def test_with_no_env_override_the_window_is_regengines_ninety_day_default(monkeypatch) -> None:
+    monkeypatch.delenv(MAX_EVENT_AGE_DAYS_ENV, raising=False)
+
+    assert configured_max_event_age_days() == 90
+    assert MockRegEngineService().max_event_age_days == MAX_EVENT_AGE_DAYS == 90
+
+
+# ---------------------------------------------------------------------------
+# #217 -- a bypass is visible on the wire and names its events in the log.
+# ---------------------------------------------------------------------------
+
+
+def test_a_bypassing_service_reports_the_bypass_in_headers_and_names_each_event_in_the_log(caplog) -> None:
+    """A service with enforcement off accepts a stale event live would refuse.
+    That must never look like a clean success at a glance: the route echoes
+    the window mode, its length and the bypass count as headers, and the log
+    carries both the aggregate warning and one line naming the lot and CTE
+    of each event that slipped through.
+
+    The bypassing service is installed on the controller the route actually
+    serves, then restored, so this exercises the real endpoint end to end.
+    """
+    original = controller.mock_service
+    controller.mock_service = MockRegEngineService(enforce_event_age_window=False)
+    stale = datetime.now(UTC) - timedelta(days=MAX_EVENT_AGE_DAYS + 10)
+    try:
+        with caplog.at_level(logging.INFO, logger="inflow_lab"):
+            response = client.post(
+                "/api/mock/regengine/ingest",
+                json={
+                    "source": "bypass-headers",
+                    "events": [_harvest_event_payload(stale, "TLC-AGE-BYPASS-HDR")],
+                },
+            )
+    finally:
+        controller.mock_service = original
+
+    assert response.status_code == 200, response.text
+    assert response.json()["accepted"] == 1, "with enforcement off the stale event is accepted"
+    assert response.headers["X-Mock-Event-Age-Window-Mode"] == "bypassed"
+    assert response.headers["X-Mock-Event-Age-Window-Days"] == str(MAX_EVENT_AGE_DAYS)
+    assert response.headers["X-Mock-Out-Of-Window-Events"] == "1"
+
+    aggregate = [
+        record for record in caplog.records
+        if record.levelno == logging.WARNING and "bypassed 1 event(s)" in record.getMessage()
+    ]
+    assert len(aggregate) == 1, "the aggregate bypass warning must still be emitted"
+    per_event = [
+        record.getMessage()
+        for record in caplog.records
+        if record.levelno == logging.INFO and "bypassed out-of-window event" in record.getMessage()
+    ]
+    assert len(per_event) == 1, "exactly one line per bypassed event"
+    assert "traceability_lot_code=TLC-AGE-BYPASS-HDR" in per_event[0]
+    assert "cte_type=harvesting" in per_event[0]
+
+
+def test_an_enforcing_service_reports_enforced_mode_and_a_zero_bypass_count_in_headers() -> None:
+    """The deployed default: the stale event is rejected, and the headers say
+    so in the same vocabulary -- so a caller can tell "refused" from
+    "let through" without reading the body."""
+    stale = datetime.now(UTC) - timedelta(days=MAX_EVENT_AGE_DAYS + 10)
+
+    response = client.post(
+        "/api/mock/regengine/ingest",
+        json={"source": "enforced-headers", "events": [_harvest_event_payload(stale, "TLC-AGE-ENFORCED-HDR")]},
+    )
+
+    assert response.status_code == 200, response.text
+    assert response.json()["rejected"] == 1
+    assert response.headers["X-Mock-Event-Age-Window-Mode"] == "enforced"
+    assert response.headers["X-Mock-Event-Age-Window-Days"] == str(MAX_EVENT_AGE_DAYS)
+    assert response.headers["X-Mock-Out-Of-Window-Events"] == "0"

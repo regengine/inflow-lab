@@ -4,7 +4,7 @@ import re
 from datetime import date
 from typing import Any
 
-from fastapi import APIRouter, Depends, Header, HTTPException, Query, Request
+from fastapi import APIRouter, Depends, Header, HTTPException, Query, Request, Response
 from fastapi.responses import JSONResponse, PlainTextResponse
 from pydantic import ValidationError
 
@@ -34,6 +34,7 @@ router = APIRouter(prefix="/api/mock/regengine", tags=["Mock RegEngine"])
 @router.post("/ingest", response_model=MockIngestResponse)
 async def mock_regengine_ingest(
     request: Request,
+    response: Response,
     active_controller: SimulationController = Depends(get_active_controller),
     idempotency_key: str | None = Header(default=None, alias="Idempotency-Key"),
     x_webhook_signature: str | None = Header(default=None, alias="X-Webhook-Signature"),
@@ -64,13 +65,28 @@ async def mock_regengine_ingest(
     )
 
     try:
-        return active_controller.mock_service.ingest(
+        result = active_controller.mock_service.ingest(
             payload,
             idempotency_key=idempotency_key,
             friction=friction,
         )
     except MockRegEngineHTTPError as exc:
         raise HTTPException(status_code=exc.status_code, detail=exc.detail) from exc
+
+    # Same pattern as /api/lineage's truncation headers (routers/events.py,
+    # #145): the body already carries these three fields, but a caller
+    # tailing the wire -- a curl in a runbook, a proxy or load-balancer log
+    # -- sees headers without parsing JSON, and a batch the mock let through
+    # only because window enforcement is off must never look like a clean
+    # success at a glance (#217). The mock always populates mode and days;
+    # the None guards only keep a differently-built service from producing
+    # a literal "None" header.
+    if result.event_age_window_mode is not None:
+        response.headers["X-Mock-Event-Age-Window-Mode"] = result.event_age_window_mode
+    if result.event_age_window_days is not None:
+        response.headers["X-Mock-Event-Age-Window-Days"] = str(result.event_age_window_days)
+    response.headers["X-Mock-Out-Of-Window-Events"] = str(result.out_of_window_events)
+    return result
 
 
 @router.get("/export/presets", response_model=FDAExportPresetListResponse)

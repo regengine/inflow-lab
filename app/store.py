@@ -17,6 +17,45 @@ from .schemas.domain import LineageEdge, LineageNode, StoredEventRecord
 logger = logging.getLogger("inflow_lab")
 
 
+# Retention bound for the live on-disk log (#217). Every history read --
+# stats(), lineage(), all_between(), both exports, and /api/simulate/status
+# on the console's poll timer -- parses the WHOLE live log through Pydantic
+# via _all_records(), so a log that only ever grows makes each of those
+# slower for the life of the deployment. Once the log holds more than this
+# many records (plus a slack, see EventStore._rotate_history_if_needed) the
+# oldest are moved to an archive beside it and the live log is rewritten to
+# the newest max_history. Override with REGENGINE_STORE_MAX_HISTORY.
+MAX_HISTORY_ENV = "REGENGINE_STORE_MAX_HISTORY"
+DEFAULT_MAX_HISTORY = 50_000
+
+
+def default_max_history() -> int:
+    """Resolve the live-log retention bound from the environment (#217).
+
+    Same degrade-to-default convention as tenancy._parse_tenant_cap: a
+    malformed or non-positive value is logged and falls back to
+    DEFAULT_MAX_HISTORY rather than raising, because this runs at import
+    time through app/tenancy.py's default store and a typo in one env var
+    must not stop the app from starting.
+    """
+    raw = os.getenv(MAX_HISTORY_ENV, "").strip()
+    if not raw:
+        return DEFAULT_MAX_HISTORY
+    try:
+        value = int(raw)
+        if value < 1:
+            raise ValueError
+        return value
+    except ValueError:
+        logger.warning(
+            "%s=%r is not a valid positive integer; falling back to default (%d)",
+            MAX_HISTORY_ENV,
+            raw,
+            DEFAULT_MAX_HISTORY,
+        )
+        return DEFAULT_MAX_HISTORY
+
+
 class RetiredStoreError(ValueError):
     """Raised when a write is attempted through a deleted tenant's store (#175).
 
@@ -52,6 +91,32 @@ def _serialize_record(record: StoredEventRecord) -> str:
     append and a rewrite of the same record.
     """
     return json.dumps(_scrub_secrets(record.model_dump(mode="json")))
+
+
+def _fsync_directory(directory: Path) -> None:
+    """Flush ``directory``'s entries to stable storage, best-effort (#217).
+
+    ``os.replace`` swaps a directory *entry*, and that entry lives in the
+    directory's own metadata: fsyncing the new file's bytes says nothing
+    about whether the rename itself survives a power loss. Without this a
+    rewrite could be acknowledged and then, after a hard restart, the OLD
+    file is still what the directory points at.
+
+    Best-effort in the same way ``_fsync_appended`` is: a filesystem that
+    refuses to open or fsync a directory (some FUSE, overlay and network
+    mounts) must not turn an otherwise-successful rewrite into a failure
+    the caller then rolls its in-memory state back for.
+    """
+    try:
+        fd = os.open(directory, os.O_RDONLY)
+    except OSError:
+        return
+    try:
+        os.fsync(fd)
+    except OSError:
+        pass
+    finally:
+        os.close(fd)
 
 
 def mask_secret_in_string(message: str | None, secret: str | None) -> str | None:
@@ -125,11 +190,33 @@ class CorruptRecordLine(NamedTuple):
 
 
 class EventStore:
-    def __init__(self, persist_path: str = "data/events.jsonl", max_records: int = 5000) -> None:
+    def __init__(
+        self,
+        persist_path: str = "data/events.jsonl",
+        max_records: int = 5000,
+        max_history: int | None = None,
+    ) -> None:
         self.persist_path = Path(persist_path)
         self.max_records = max_records
         self._records: deque[StoredEventRecord] = deque(maxlen=max_records)
         self._counter = 0
+        # Live-log retention bound (#217); see _rotate_history_if_needed. An
+        # explicit argument wins so a test can pick a small bound without
+        # touching the environment; otherwise REGENGINE_STORE_MAX_HISTORY,
+        # else DEFAULT_MAX_HISTORY. Refused rather than clamped when it is
+        # explicitly non-positive: `records[-0:]` is the whole list, so a
+        # zero here would silently disable the trim instead of tightening it.
+        if max_history is not None and max_history < 1:
+            raise ValueError("max_history must be a positive integer")
+        self.max_history = max_history if max_history is not None else default_max_history()
+        # Records currently in the live log, maintained by every write path,
+        # so deciding WHETHER to rotate is an integer compare on the append
+        # hot path rather than a re-parse of the whole file per batch. Only
+        # the trigger relies on it: the rotation itself re-reads the log and
+        # trims from what is actually there, so an estimate that has drifted
+        # (another writer, a skipped corrupt line) can only mis-time a
+        # rotation, never archive the wrong records.
+        self._persisted_count = 0
         # Freshly overwritten by every read_persisted_records() call (#93);
         # see that method and last_read_was_complete for why this exists.
         # Initialized empty here so the attribute always exists even before
@@ -218,11 +305,41 @@ class EventStore:
         # would inherit a permanently unwritable store.
         self.retired = False
         self.persist_path.parent.mkdir(parents=True, exist_ok=True)
+        self._discard_stale_rewrite_tmp()
         records = self.read_persisted_records(str(self.persist_path))
         counter = max((record.sequence_no for record in records), default=0)
 
         self._set_records(records)
         self._counter = counter
+        self._persisted_count = len(records)
+
+    def _rewrite_tmp_path(self) -> Path:
+        """Where ``_write_records`` builds a rewrite before swapping it in.
+
+        One definition, so the cleanup in ``_discard_stale_rewrite_tmp`` can
+        never look for a different name than the writer actually uses.
+        """
+        return self.persist_path.with_suffix(f"{self.persist_path.suffix}.tmp")
+
+    def _discard_stale_rewrite_tmp(self) -> None:
+        """Remove a ``.tmp`` a rewrite never got to swap in (#217).
+
+        ``_write_records`` builds the new log at ``<persist>.tmp`` and
+        ``replace``s it over the live one. A process SIGKILLed -- or a
+        machine powered off -- between those two steps leaves the half-built
+        file behind. It is never read as data (the live log is still the
+        old, complete file), but nothing cleared it either, so it sat beside
+        the log until the next rewrite happened to reuse the name.
+
+        Best-effort: this runs at import time through app/tenancy.py's
+        default store, and a stray file that cannot be removed must not stop
+        the app from starting (the same rule #93 set for a corrupt log).
+        """
+        tmp_path = self._rewrite_tmp_path()
+        try:
+            tmp_path.unlink(missing_ok=True)
+        except OSError:
+            logger.warning("could not remove stale event store temp file %s", tmp_path)
 
     def read_persisted_records(self, persist_path: str | None = None) -> list[StoredEventRecord]:
         """Read the full persisted log from disk, synchronously.
@@ -331,6 +448,7 @@ class EventStore:
         with self._lock:
             self._records.clear()
             self._counter = 0
+            self._persisted_count = 0
             # The file backing last_read_corrupt_lines is about to be
             # deleted; carrying its stale diagnostics forward would make a
             # freshly reset (empty, healthy) store still report a past
@@ -356,9 +474,13 @@ class EventStore:
         nothing about in-memory state: this only guarantees the file: each
         caller is responsible for its own ordering of ``_set_records``/
         ``_counter`` around the call.
+
+        After the swap the parent directory is fsynced as well (#217): the
+        file's bytes being on disk does not make the *rename* durable -- see
+        ``_fsync_directory`` for why that is best-effort.
         """
         self.persist_path.parent.mkdir(parents=True, exist_ok=True)
-        tmp_path = self.persist_path.with_suffix(f"{self.persist_path.suffix}.tmp")
+        tmp_path = self._rewrite_tmp_path()
         try:
             with tmp_path.open("w", encoding="utf-8") as handle:
                 for record in records_oldest_first:
@@ -366,12 +488,17 @@ class EventStore:
                 handle.flush()
                 os.fsync(handle.fileno())
             tmp_path.replace(self.persist_path)
-        except OSError:
+        except Exception:
             # Re-raised, never swallowed: callers order their in-memory
             # commit around this and depend on the failure propagating.
+            # ``Exception`` rather than ``OSError`` (#217): a serialization
+            # failure out of _serialize_record is a ValueError, not an
+            # OSError, and it used to propagate correctly while leaving the
+            # half-built .tmp orphaned beside the live log.
             logger.exception("event store rewrite failed for %s", self.persist_path)
             tmp_path.unlink(missing_ok=True)
             raise
+        _fsync_directory(self.persist_path.parent)
 
     def retire(self) -> None:
         """Mark this store dead because its tenant is being deleted (#175).
@@ -435,11 +562,90 @@ class EventStore:
                     # leave a phantom record that recent()/stats() report
                     # until the next reload silently drops it again.
                     self._counter = next_sequence_no
+                    self._persisted_count += 1
                     self._records.appendleft(record)
                     stored.append(record)
                 if stored:
                     self._fsync_appended(handle)
+            # Only once the batch is durably appended and the append handle
+            # is closed: rotation may replace the file this handle points at.
+            if stored:
+                self._rotate_history_if_needed()
         return stored
+
+    def _rotate_history_if_needed(self) -> None:
+        """Bound the live log to the newest ``max_history`` records (#217).
+
+        Called under ``self._lock`` after a batch has been durably appended.
+        Once the log exceeds ``max_history`` by a slack of
+        ``max(1, max_history // 10)`` records, the oldest overflow is
+        appended to an archive beside the log (``<persist>.1``, fsynced) and
+        the live log is rewritten to the newest ``max_history`` records
+        through ``_write_records`` -- the same atomic swap + fsync path the
+        retry and scenario-load rewrites already use. The slack is what
+        keeps the append path O(1) amortized: a rewrite costs
+        O(max_history), so it must happen once per slack-many appended
+        records, not once per batch that lands at the bound.
+
+        Archive first, then trim, deliberately: a failure between the two
+        steps duplicates the overflow in the archive on the next successful
+        rotation, whereas the other order would lose those records outright.
+
+        Best-effort: the append that triggered this has already been
+        acknowledged to its caller and is on disk, so an OSError here is
+        logged and swallowed -- a rotation problem must not turn a
+        successful ingest into a reported failure. Sequence numbers are
+        untouched: ``_counter`` keeps its high-water mark, and because the
+        newest record is always retained, a fresh store loading the trimmed
+        log recomputes that same mark, so numbering never restarts.
+        """
+        slack = max(1, self.max_history // 10)
+        if self._persisted_count <= self.max_history + slack:
+            return
+        try:
+            records = self._all_records()
+            if len(records) <= self.max_history:
+                # The estimate ran ahead of the file (see __init__); nothing
+                # to trim after all, so just correct it.
+                self._persisted_count = len(records)
+                return
+            overflow = records[: -self.max_history]
+            retained = records[-self.max_history :]
+            self._archive_records(overflow)
+            self._write_records(retained)
+            self._set_records(retained)
+            self._persisted_count = len(retained)
+            logger.info(
+                "event store rotated: %d oldest record(s) archived to %s; %s trimmed to the newest %d",
+                len(overflow),
+                self._archive_path(),
+                self.persist_path,
+                len(retained),
+            )
+        except OSError:
+            logger.exception(
+                "event store rotation failed for %s; the append that triggered it succeeded",
+                self.persist_path,
+            )
+
+    def _archive_path(self) -> Path:
+        return self.persist_path.with_name(f"{self.persist_path.name}.1")
+
+    def _archive_records(self, records_oldest_first: list[StoredEventRecord]) -> None:
+        """Append rotated-out records to ``<persist>.1``, durably (#217).
+
+        A plain append + fsync, like ``_append_many``'s own path: the archive
+        is written once per rotation and never read back by this class, so
+        it needs no tmp + swap. Still routed through ``_serialize_record``
+        like every other persisted-record write, so the secret scrub (#90)
+        cannot be bypassed here either -- it is idempotent on records that
+        were already scrubbed when they were first appended.
+        """
+        with self._archive_path().open("a", encoding="utf-8") as handle:
+            for record in records_oldest_first:
+                handle.write(_serialize_record(record) + "\n")
+            handle.flush()
+            os.fsync(handle.fileno())
 
     def _fsync_appended(self, handle: Any) -> None:
         """Force this batch's appended bytes to stable storage (#93).
@@ -498,6 +704,7 @@ class EventStore:
             self._write_records(persisted_records)
             self._set_records(updated_records)
             self._counter = max((record.sequence_no for record in persisted_records), default=0)
+            self._persisted_count = len(persisted_records)
 
         return [record for record in updated_records if record.record_id in replacements]
 
@@ -508,6 +715,7 @@ class EventStore:
             self._write_records(persisted_records)
             self._set_records(persisted_records)
             self._counter = max((record.sequence_no for record in persisted_records), default=0)
+            self._persisted_count = len(persisted_records)
         return persisted_records
 
     def recent(self, limit: int = 100) -> list[StoredEventRecord]:

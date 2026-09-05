@@ -35,6 +35,14 @@ MAX_FUTURE_HOURS = 24
 # MockRegEngineService's `enforce_event_age_window` for how the mock
 # applies it.
 MAX_EVENT_AGE_DAYS = 90
+# Operator override for the window's length (#217). RegEngine reads its own
+# WEBHOOK_MAX_EVENT_AGE_DAYS from the environment, so a simulator paired with
+# a RegEngine deployment running a tighter or looser window can match it
+# without a code change. MAX_EVENT_AGE_DAYS above stays the parity pin for
+# RegEngine's *default*; this changes only what a freshly constructed
+# MockRegEngineService -- and the CSV importer's pre-flight warning, which
+# must predict the same rejection -- actually enforces.
+MAX_EVENT_AGE_DAYS_ENV = "REGENGINE_WEBHOOK_MAX_EVENT_AGE_DAYS"
 # Mirrors RegEngine's idempotency-replay window: a repeated Idempotency-Key
 # within this many hours replays the stored response; once an entry ages
 # out it is treated as unseen rather than replayed (#120).
@@ -49,6 +57,36 @@ LOCATION_KDE_FIELDS = (
     "ship_to_gln",
 )
 _IDEMPOTENCY_CACHE_LIMIT = 1024
+
+
+def configured_max_event_age_days() -> int:
+    """The replay window in days: the env override, else the parity pin (#217).
+
+    Evaluated per construction rather than once at import so a test can set
+    the variable and build a fresh service; the deployed default-tenant
+    service (app/tenancy.py) still reads it exactly once, at startup. Same
+    degrade-to-default convention as tenancy._parse_tenant_cap: a malformed
+    or non-positive value is logged and ignored, because silently enforcing
+    a nonsense window (or refusing to start) is worse than RegEngine's own
+    default.
+    """
+    raw = os.getenv(MAX_EVENT_AGE_DAYS_ENV, "").strip()
+    if not raw:
+        return MAX_EVENT_AGE_DAYS
+    try:
+        value = int(raw)
+        if value < 1:
+            raise ValueError
+        return value
+    except ValueError:
+        logger.warning(
+            "%s=%r is not a valid positive integer; falling back to default (%d)",
+            MAX_EVENT_AGE_DAYS_ENV,
+            raw,
+            MAX_EVENT_AGE_DAYS,
+        )
+        return MAX_EVENT_AGE_DAYS
+
 
 # Friction injection codes -> the HTTP failure a real customer hits. Keyed by
 # the DeliveryConfig.mock_friction values so operators can rehearse each
@@ -190,7 +228,7 @@ class MockRegEngineService:
         idempotency_ttl: timedelta = timedelta(hours=IDEMPOTENCY_TTL_HOURS),
         clock: Callable[[], datetime] = lambda: datetime.now(UTC),
         enforce_event_age_window: bool = True,
-        max_event_age_days: int = MAX_EVENT_AGE_DAYS,
+        max_event_age_days: int | None = None,
     ) -> None:
         self._chain_hash = _resume_chain_hash(store) if store is not None else ""
         self._idempotency_cache: OrderedDict[str, _CachedIdempotencyEntry] = OrderedDict()
@@ -200,7 +238,13 @@ class MockRegEngineService:
         # (#120). Production callers get the real 24h window and wall clock.
         self.idempotency_ttl = idempotency_ttl
         self._clock = clock
-        self.max_event_age_days = max_event_age_days
+        # An explicit argument wins; otherwise REGENGINE_WEBHOOK_MAX_EVENT_AGE_DAYS,
+        # else RegEngine's 90-day default (#217). Resolved here, per instance,
+        # rather than in the signature's default, so the env var is read when
+        # the service is built and not once when this module was imported.
+        self.max_event_age_days = (
+            max_event_age_days if max_event_age_days is not None else configured_max_event_age_days()
+        )
         # ON by default (#209, closing the remaining half of #102). Live
         # RegEngine applies this floor unconditionally, so a mock whose
         # default is to skip it accepts batches live 422s outright -- a
@@ -289,15 +333,20 @@ class MockRegEngineService:
         # same way -- these must never fall into the per-event
         # accepted/rejected split below, which would show the "N accepted,
         # 1 rejected" partial success live loses the whole batch instead.
+        #
+        # The clock is resolved once, here, so the field scan's future
+        # ceiling, the idempotency TTL and the age floor all read the same
+        # instant (#217) -- see _field_constraint_errors for how the ceiling
+        # honours it.
+        now = self._clock()
         field_errors = [
             f"events[{index}]: {message}"
             for index, event in enumerate(payload.events)
-            for message in _field_constraint_errors(event)
+            for message in _field_constraint_errors(event, now=now)
         ]
         if field_errors:
             raise MockRegEngineHTTPError(422, "; ".join(field_errors))
 
-        now = self._clock()
         if idempotency_key and idempotency_key in self._idempotency_cache:
             cached = self._idempotency_cache[idempotency_key]
             if now - cached.inserted_at < self.idempotency_ttl:
@@ -329,6 +378,18 @@ class MockRegEngineService:
                 age_errors = _handler_level_errors(event, now=now, max_age_days=self.max_event_age_days)
                 if any("replay window exceeded" in e for e in age_errors):
                     out_of_window_events += 1
+                    # One line per bypassed event, naming it (#217): the
+                    # aggregate warning after the loop says how many slipped
+                    # through, not which, and an operator chasing a "green
+                    # demo, failing live post" needs the lot. Bounded by
+                    # MAX_BATCH_EVENTS per request, so it cannot flood the log.
+                    logger.info(
+                        "mock ingest bypassed out-of-window event: traceability_lot_code=%s cte_type=%s "
+                        "(older than %d days; live RegEngine would reject it)",
+                        event.traceability_lot_code,
+                        event.cte_type.value,
+                        self.max_event_age_days,
+                    )
             batch_key = "|".join(
                 (
                     event.cte_type.value,
@@ -424,7 +485,7 @@ def validate_event_like_regengine(
     return _field_constraint_errors(event) + _handler_level_errors(event, now=now, max_age_days=MAX_EVENT_AGE_DAYS)
 
 
-def _field_constraint_errors(event: RegEngineEvent) -> list[str]:
+def _field_constraint_errors(event: RegEngineEvent, *, now: datetime | None = None) -> list[str]:
     """The four checks that are Pydantic Field()/field_validator constraints
     on RegEngine's real IngestEvent model, not application/handler logic --
     traceability_lot_code and product_description length, quantity's
@@ -436,14 +497,28 @@ def _field_constraint_errors(event: RegEngineEvent) -> list[str]:
     every event in the batch with this function up front for exactly that
     reason; see its docstring there.
 
-    No `now` parameter, unlike _handler_level_errors: the future-timestamp
-    ceiling always compares against the real wall clock, matching this
-    function's behavior before #102 split it out. Do not change this to
-    accept an injectable `now` without first checking
-    tests/test_mock_parity.py's #120 TTL-boundary test, which injects a
-    clock deliberately far from its events' fixed timestamps for
-    idempotency purposes only and would misfire against this check if it
-    started honoring that same clock.
+    ``now`` is the batch's resolved clock, forwarded by
+    MockRegEngineService.ingest() so the future ceiling and
+    _handler_level_errors's age floor read the same injected clock (#217)
+    -- but honoured only in the direction that cannot contradict reality.
+    The ceiling compares against the LATER of ``now`` and the wall clock:
+
+    * a clock wound AHEAD of real time moves the ceiling forward with it,
+      so a test can walk one fixed event across the 24h boundary by moving
+      only the clock, exactly as the age-floor tests already do;
+    * a clock wound BEHIND real time leaves the wall clock in charge. An
+      event that has really already happened cannot become "impossibly far
+      in the future" because the mock's clock was backdated for some other
+      purpose -- which is precisely what tests/test_mock_parity.py's #120
+      TTL-boundary test does: it starts its clock at a fixed past date to
+      walk the idempotency TTL while its events carry real-recent
+      timestamps. Honouring that clock unconditionally here would 422 its
+      whole batch.
+
+    In production ``now`` IS the wall clock, resolved microseconds earlier,
+    so max() picks the same instant this compared against before #217.
+    ``None`` -- validate_event_like_regengine's direct callers -- means the
+    wall clock alone, unchanged.
     """
     errors: list[str] = []
 
@@ -457,7 +532,9 @@ def _field_constraint_errors(event: RegEngineEvent) -> list[str]:
     timestamp = event.timestamp
     if timestamp.tzinfo is None:
         timestamp = timestamp.replace(tzinfo=UTC)
-    if timestamp > datetime.now(UTC) + timedelta(hours=MAX_FUTURE_HOURS):
+    wall_clock = datetime.now(UTC)
+    reference = wall_clock if now is None else max(now, wall_clock)
+    if timestamp > reference + timedelta(hours=MAX_FUTURE_HOURS):
         errors.append(f"timestamp is more than {MAX_FUTURE_HOURS} hours in the future")
     return errors
 
