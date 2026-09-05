@@ -30,15 +30,23 @@ Given that ceiling, three fixes were available:
   2. A RegEngine-side fix: a dedicated preflight endpoint carrying
      /ingest's own gates without writing, or an HMAC-posture field on
      /health this client could diff against REGENGINE_WEBHOOK_HMAC_SECRET
-     the way _fetch_remote_contract_version already diffs contract
-     versions. Rejected: app/mock_service.py and app/contract.py -- the
-     only evidence this repo has for what RegEngine's contract actually
-     offers -- show no such endpoint or field. Building against one
+     the way the contract-version read already diffs contract versions.
+     Rejected at the time: app/mock_service.py and app/contract.py -- the
+     only evidence this repo had for what RegEngine's contract actually
+     offers -- showed no such endpoint or field, and building against one
      anyway would mean inventing contract surface with no confirmed
      evidence it exists, which is the same failure mode #100 is about
-     (trusting an assumption nobody verified). If RegEngine's team adds
-     either of those, _CONNECTION_VERDICTS and check_connection in
-     app/regengine_client.py are the seam to wire it through.
+     (trusting an assumption nobody verified).
+
+     Since then RegEngine's /health has grown exactly that field --
+     `webhook_hmac_configured`, sourced from its webhook router's own
+     posture check -- so the seam named here was wired through (#217):
+     check_connection now reads the whole /health document once and, when
+     the posture is advertised and disagrees with the local secret, answers
+     "signature_mismatch" instead of "connected". The subscription gate
+     and the webhooks.ingest scope remain unobservable from a read, so the
+     tests below about the 200 detail text still stand. The absence of the
+     field must never produce a verdict; that tolerance is pinned below.
   3. A claim-level fix: keep the verdict vocabulary exactly as pinned,
      and instead correct what the HTTP-200 case's *detail* text asserts
      -- say plainly that a read succeeded and name the three gates that
@@ -274,6 +282,114 @@ def test_contract_mismatch_still_overrides_the_reworded_connected_detail(monkeyp
     assert result.verdict == "contract_mismatch"
     assert "ingest contract" in result.detail
     assert "does not confirm" not in result.detail.lower()  # the 200 wording was fully replaced
+
+
+# ---------------------------------------------------------------------------
+# #217: the one ingest-only gate that IS observable without writing.
+# RegEngine's /health advertises `webhook_hmac_configured`; a 200 probe
+# whose local signing posture disagrees with it is a signature_mismatch.
+# ---------------------------------------------------------------------------
+
+
+def _probe_with_health(monkeypatch: Any, health_payload: Any, *, local_secret: str | None) -> Any:
+    from app.regengine_client import WEBHOOK_HMAC_SECRET_ENV
+
+    if local_secret is None:
+        monkeypatch.delenv(WEBHOOK_HMAC_SECRET_ENV, raising=False)
+    else:
+        monkeypatch.setenv(WEBHOOK_HMAC_SECRET_ENV, local_secret)
+    fake = _fake_probe_client(status_code=200, health_payload=health_payload)
+    monkeypatch.setattr("app.regengine_client.httpx.AsyncClient", fake)
+    return asyncio.run(LiveRegEngineClient().check_connection(_live_config()))
+
+
+def test_remote_signing_without_a_local_secret_is_a_signature_mismatch(monkeypatch: Any) -> None:
+    """RegEngine verifies signatures, this side sends none: every live
+    ingest would 401 while the read probe stays green. That is the
+    half-configured demo #217 is about, and it must not read "connected"."""
+    result = _probe_with_health(monkeypatch, {"webhook_hmac_configured": True}, local_secret=None)
+
+    assert result.verdict == "signature_mismatch"
+    assert result.status_code == 200
+    assert "401" in result.detail
+    assert "REGENGINE_WEBHOOK_HMAC_SECRET" in result.detail
+    assert "unset here" in result.detail
+
+
+def test_a_local_secret_the_remote_never_verifies_is_a_signature_mismatch(monkeypatch: Any) -> None:
+    """The opposite direction is quieter and just as wrong: this side
+    signs, RegEngine's verifier no-ops, and bodies go unverified."""
+    result = _probe_with_health(monkeypatch, {"webhook_hmac_configured": False}, local_secret="shared-secret")
+
+    assert result.verdict == "signature_mismatch"
+    assert "unverified" in result.detail
+    assert "REGENGINE_WEBHOOK_HMAC_SECRET" in result.detail
+
+
+@pytest.mark.parametrize(
+    "remote_flag,local_secret",
+    [(True, "shared-secret"), (False, None), ("true", "shared-secret"), ("false", None)],
+)
+def test_agreeing_signing_postures_stay_connected(monkeypatch: Any, remote_flag: Any, local_secret: str | None) -> None:
+    """No false positive when the two sides agree, whether RegEngine spells
+    the flag as a boolean or as its string form."""
+    result = _probe_with_health(monkeypatch, {"webhook_hmac_configured": remote_flag}, local_secret=local_secret)
+
+    assert result.verdict == "connected"
+
+
+@pytest.mark.parametrize(
+    "health_payload",
+    [
+        {"inflow_contract_version": "1"},  # an older RegEngine: no posture field at all
+        {"webhook_hmac_configured": "sometimes"},  # unrecognised spelling
+        {"webhook_hmac_configured": None},
+        None,  # /health unreachable or not JSON
+        "not a document",
+    ],
+)
+def test_an_unadvertised_posture_never_produces_a_verdict(monkeypatch: Any, health_payload: Any) -> None:
+    """The probe must not invent a failure it cannot see: with no readable
+    posture flag the verdict is exactly what it was before #217, whatever
+    the local secret says."""
+    from app.contract import INFLOW_CONTRACT_VERSION
+
+    if isinstance(health_payload, dict) and "inflow_contract_version" in health_payload:
+        health_payload = {"inflow_contract_version": INFLOW_CONTRACT_VERSION}
+    result = _probe_with_health(monkeypatch, health_payload, local_secret="shared-secret")
+
+    assert result.verdict == "connected"
+    assert "does not confirm" in result.detail.lower()
+
+
+def test_contract_mismatch_outranks_signature_mismatch(monkeypatch: Any) -> None:
+    """A contract skew makes every payload wrong regardless of how it is
+    signed, so it keeps precedence when both disagree at once -- which also
+    keeps the existing contract_mismatch pin above intact."""
+    from app.contract import INFLOW_CONTRACT_VERSION
+
+    result = _probe_with_health(
+        monkeypatch,
+        {"inflow_contract_version": f"{INFLOW_CONTRACT_VERSION}-stale-test", "webhook_hmac_configured": True},
+        local_secret=None,
+    )
+
+    assert result.verdict == "contract_mismatch"
+
+
+def test_a_non_200_probe_is_never_upgraded_to_signature_mismatch(monkeypatch: Any) -> None:
+    """The posture comparison only refines a green read. A 401 stays a 401
+    even when the postures also disagree: the operator's first problem is
+    the credential, and saying "signature" would send them the wrong way."""
+    from app.regengine_client import WEBHOOK_HMAC_SECRET_ENV
+
+    monkeypatch.delenv(WEBHOOK_HMAC_SECRET_ENV, raising=False)
+    fake = _fake_probe_client(status_code=401, health_payload={"webhook_hmac_configured": True})
+    monkeypatch.setattr("app.regengine_client.httpx.AsyncClient", fake)
+
+    result = asyncio.run(LiveRegEngineClient().check_connection(_live_config()))
+
+    assert result.verdict == "unauthorized"
 
 
 # ---------------------------------------------------------------------------

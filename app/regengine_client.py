@@ -81,6 +81,16 @@ class ConnectionCheckResult:
 # considered and rejected for exactly that reason -- see
 # tests/test_connection_probe.py for the full reasoning, including what
 # a RegEngine-side change would need to add for a verdict-level fix.
+#
+# #217 -- one of those three gates has since become observable without
+# writing: RegEngine's /health advertises `webhook_hmac_configured`, in
+# the same document _fetch_remote_health already reads for the contract
+# version. When RegEngine advertises it and it disagrees with whether
+# REGENGINE_WEBHOOK_HMAC_SECRET is set here, a 200 probe is reported as
+# SIGNATURE_MISMATCH_VERDICT instead of "connected" (see
+# _signature_posture_detail). When the field is absent -- an older
+# RegEngine, or a /health that is not JSON -- the verdict is left alone
+# rather than guessed: the probe never invents a failure it cannot see.
 _CONNECTION_VERDICTS: dict[int, tuple[str, str]] = {
     200: (
         "connected",
@@ -91,8 +101,10 @@ _CONNECTION_VERDICTS: dict[int, tuple[str, str]] = {
         "subscription status, the separate webhooks.ingest permission "
         "scope (a read-only key passes this probe and then gets HTTP 403 "
         "on ingest), and -- if RegEngine requires it -- the HMAC request "
-        "signature. If live ingests fail after this reports connected, "
-        "check those three first.",
+        "signature (a signing-posture disagreement is reported separately "
+        "as signature_mismatch when RegEngine advertises its posture). If "
+        "live ingests fail after this reports connected, check those three "
+        "first.",
     ),
     401: ("unauthorized", "RegEngine rejected the API key (HTTP 401). Check the key value and that it has not expired or been revoked."),
     # #100: per the issue's route audit, RegEngine's subscription gate
@@ -107,6 +119,13 @@ _CONNECTION_VERDICTS: dict[int, tuple[str, str]] = {
     429: ("rate_limited", "RegEngine is rate limiting this tenant (HTTP 429). Wait for the window shown in Retry-After and try again."),
     503: ("service_unavailable", "RegEngine is up but a required backing service is unavailable (HTTP 503). Try again shortly."),
 }
+
+# Verdict for a 200 probe whose signing posture disagrees with RegEngine's
+# advertised one (#217). Not keyed by status code because it is not one:
+# it is an upgrade applied on top of "connected", the way
+# "contract_mismatch" is, and it ranks below that one because a contract
+# skew makes every payload wrong regardless of how it is signed.
+SIGNATURE_MISMATCH_VERDICT = "signature_mismatch"
 
 
 class LiveRegEngineDeliveryError(RuntimeError):
@@ -165,8 +184,9 @@ class LiveRegEngineClient:
         if signature_header is not None:
             headers["X-Webhook-Signature"] = signature_header
         dial_url, dial_headers, dial_kwargs = _pinned_dial(endpoint, headers, pinned_address)
+        client_kwargs = _pinned_client_kwargs(endpoint, pinned_address)
         try:
-            async with httpx.AsyncClient(timeout=_live_timeout_seconds()) as client:
+            async with httpx.AsyncClient(timeout=_live_timeout_seconds(), **client_kwargs) as client:
                 response = await client.post(
                     dial_url, headers=dial_headers, content=body_bytes, **dial_kwargs
                 )
@@ -237,17 +257,16 @@ class LiveRegEngineClient:
             "X-Tenant-ID": tenant_id,
         }
         dial_url, dial_headers, dial_kwargs = _pinned_dial(probe_url, headers, pinned_address)
+        client_kwargs = _pinned_client_kwargs(probe_url, pinned_address)
         try:
-            async with httpx.AsyncClient(timeout=_live_timeout_seconds()) as client:
+            async with httpx.AsyncClient(timeout=_live_timeout_seconds(), **client_kwargs) as client:
                 response = await client.get(
                     dial_url,
                     headers=dial_headers,
                     params={"tenant_id": tenant_id, "limit": 1},
                     **dial_kwargs,
                 )
-                remote_contract = await _fetch_remote_contract_version(
-                    client, parsed, pinned_address
-                )
+                remote_health = await _fetch_remote_health(client, parsed, pinned_address)
         except httpx.HTTPError as exc:
             return ConnectionCheckResult(
                 verdict="unreachable",
@@ -259,6 +278,7 @@ class LiveRegEngineClient:
             response.status_code,
             ("error", f"Unexpected HTTP {response.status_code} from RegEngine."),
         )
+        remote_contract = _remote_contract_version(remote_health)
         if verdict == "connected" and remote_contract is not None and remote_contract != INFLOW_CONTRACT_VERSION:
             verdict = "contract_mismatch"
             detail = (
@@ -267,6 +287,17 @@ class LiveRegEngineClient:
                 "One side is running an older deploy — update it before ingesting, or "
                 "payloads may validate here and be rejected there (or vice versa)."
             )
+        if verdict == "connected":
+            # The read probe cannot see the ingest route's signature check,
+            # so compare signing posture across the two sides instead: the
+            # one ingest-only gate observable without writing, and the one
+            # most likely to be half-configured in a shared demo (#217).
+            # Ranked after the contract check on purpose -- see
+            # SIGNATURE_MISMATCH_VERDICT.
+            signature_detail = _signature_posture_detail(_remote_hmac_configured(remote_health))
+            if signature_detail is not None:
+                verdict = SIGNATURE_MISMATCH_VERDICT
+                detail = signature_detail
         return ConnectionCheckResult(
             verdict=verdict,
             detail=detail,
@@ -275,14 +306,16 @@ class LiveRegEngineClient:
         )
 
 
-async def _fetch_remote_contract_version(
+async def _fetch_remote_health(
     client: httpx.AsyncClient, parsed, pinned_address: str | None = None
-) -> str | None:
-    """Best-effort read of RegEngine's advertised inflow contract version.
+) -> dict[str, Any] | None:
+    """Best-effort read of RegEngine's /health document.
 
-    Returns None when the health endpoint is unreachable, non-JSON (some
-    deployments serve the frontend at /health), or predates the version
-    field — skew detection only engages when both sides advertise.
+    Returns None when the health endpoint is unreachable or non-JSON (some
+    deployments serve the frontend at /health). Every skew check built on
+    it -- the contract version, the signing posture -- engages only when
+    the remote actually advertises the field it needs, so an older
+    RegEngine simply yields no extra verdict.
 
     Takes the caller's already-validated *pinned_address* so this second
     request reuses the one lookup check_connection made rather than
@@ -296,10 +329,73 @@ async def _fetch_remote_contract_version(
         payload = health.json()
     except (httpx.HTTPError, ValueError):
         return None
-    if not isinstance(payload, dict):
+    return payload if isinstance(payload, dict) else None
+
+
+def _remote_contract_version(health: dict[str, Any] | None) -> str | None:
+    """RegEngine's advertised inflow contract version, when it advertises one."""
+    if health is None:
         return None
-    value = payload.get("inflow_contract_version")
+    value = health.get("inflow_contract_version")
     return str(value) if value is not None else None
+
+
+# Key names RegEngine's /health may use for its webhook-signing posture
+# flag (`webhook_hmac_configured` today, per its routes_health_metrics).
+# Only a real boolean, or its string spelling, counts: a missing or
+# unrecognised value leaves the posture unknown, and unknown never
+# produces a verdict (#217).
+_REMOTE_HMAC_KEYS = ("webhook_hmac_configured", "hmac_configured")
+_TRUTHY_POSTURE = {"1", "true", "yes", "on"}
+_FALSY_POSTURE = {"0", "false", "no", "off"}
+
+
+def _remote_hmac_configured(health: dict[str, Any] | None) -> bool | None:
+    """Whether RegEngine says it verifies webhook signatures; None if unknown."""
+    if health is None:
+        return None
+    for key in _REMOTE_HMAC_KEYS:
+        value = health.get(key)
+        if isinstance(value, bool):
+            return value
+        if isinstance(value, str):
+            normalized = value.strip().lower()
+            if normalized in _TRUTHY_POSTURE:
+                return True
+            if normalized in _FALSY_POSTURE:
+                return False
+    return None
+
+
+def _signature_posture_detail(remote_hmac_configured: bool | None) -> str | None:
+    """Explain a webhook-signing mismatch between the two sides, if any.
+
+    Returns None when the posture matches or when RegEngine does not
+    advertise its posture at all -- the probe never invents a failure it
+    cannot see. Both directions are named because both bite: a remote
+    that verifies while this side does not sign rejects every ingest with
+    HTTP 401, and a remote that does not verify while this side signs
+    accepts bodies nobody checked.
+    """
+    if remote_hmac_configured is None:
+        return None
+    local_configured = bool(os.getenv(WEBHOOK_HMAC_SECRET_ENV, "").strip())
+    if local_configured == remote_hmac_configured:
+        return None
+    if remote_hmac_configured:
+        return (
+            "Credentials are valid for reads, but RegEngine has webhook HMAC signing "
+            f"enabled while {WEBHOOK_HMAC_SECRET_ENV} is unset here. Every live ingest "
+            "would be sent unsigned and rejected with HTTP 401 -- the read probe cannot "
+            "see this because only the ingest route verifies signatures. Set the same "
+            "secret on both sides."
+        )
+    return (
+        f"Credentials are valid for reads, but {WEBHOOK_HMAC_SECRET_ENV} is set here while "
+        "RegEngine reports webhook HMAC signing disabled. Ingest still succeeds and "
+        "RegEngine's verifier no-ops, so bodies go unverified -- set WEBHOOK_HMAC_SECRET on "
+        "RegEngine, or clear the local secret, so both sides agree."
+    )
 
 
 def _extract_error_body(response: httpx.Response, api_key: str | None) -> str:
@@ -371,36 +467,32 @@ def _proxy_is_configured(url: httpx.URL) -> bool:
     client's transport choice, so an httpx release that moves or changes
     them fails CI loudly instead of silently mis-deciding.
 
-    Note that _pinned_dial asks this about BOTH the original URL and the
-    pinned one, and that the second question is the load-bearing one: httpx
-    chooses a transport from the URL it is handed, so a NO_PROXY entry
-    naming a hostname does not cover the address that hostname resolves to.
-    An environment that exempts ``pypi.org`` from its proxy still sends
-    ``https://151.101.192.223/...`` through it, which is precisely the
-    tunneled-pin case that must never happen.
+    The pin is decided by asking this about the ORIGINAL URL -- the one the
+    operator configured -- because that is the URL whose proxy routing
+    expresses their policy. httpx, though, chooses a transport from the
+    URL it is actually handed, and pinning rewrites that URL's host to an
+    IP: a NO_PROXY entry naming a hostname does not cover the address that
+    hostname resolves to, so an environment that exempts ``pypi.org`` from
+    its proxy still sends ``https://151.101.192.223/...`` through it. That
+    is precisely the tunneled-pin case that must never happen, and it is
+    why _pinned_client_kwargs asks this a second time about the pinned URL:
+    when the name goes direct but its address would be tunneled, the
+    client gets an explicit direct mount for that address, so the request
+    reaches the wire exactly as the operator's NO_PROXY said the host
+    should (#217; measured against a live proxy, see
+    tests/test_egress_guard.py).
 
     If that import ever disappears the fallback is the coarsest safe
     answer: any proxy configured for the scheme counts as proxied, NO_PROXY
     unread. That errs only in the safe direction -- it can skip a pin that
     would have been fine, never pin a request that then gets tunneled.
 
-    What skipping costs is honest and bounded, and differs by shape:
-
-      * Fully proxied: this process performs no lookup for the connection at
-        all (the proxy resolves), so the two disagreeing lookups a rebinding
-        attack needs do not exist on this side either. The guard's own lookup
-        becomes advisory and what the proxy connects to is the proxy's egress
-        policy to enforce.
-      * Proxied except for a NO_PROXY hostname (the hybrid shape): the
-        request goes direct, so httpx does resolve -- but the pinned URL
-        would be tunneled, so the pin is skipped and #207's gap stays open
-        for that endpoint. This is a real residual limitation, recorded here
-        rather than papered over. Closing it means either exempting the
-        resolved address in NO_PROXY too (which makes both URLs direct and
-        the pin engage), or removing the proxy for that host. Making this
-        code force a direct connection instead would be a deliberate egress
-        policy bypass, which is not the kind of decision a delivery client
-        should be making on its own.
+    What skipping costs, for the one shape that still skips, is honest and
+    bounded: fully proxied, this process performs no lookup for the
+    connection at all (the proxy resolves), so the two disagreeing lookups
+    a rebinding attack needs do not exist on this side either. The guard's
+    own lookup becomes advisory and what the proxy connects to is the
+    proxy's egress policy to enforce.
     """
     try:
         from httpx._utils import URLPattern, get_environment_proxies
@@ -433,8 +525,9 @@ def _pinned_dial(
         that address and never performs a lookup of its own. This is the
         actual fix for #207: the address the guard checked is the address
         connected to. Rewriting the host also re-decides httpx's proxy
-        routing, which is why the proxy question is asked of the rewritten
-        URL as well as the original -- see _proxy_is_configured.
+        routing, which _pinned_client_kwargs corrects with an explicit
+        direct mount when the operator's NO_PROXY exempts the name but not
+        its address -- see _proxy_is_configured.
       * ``Host`` is set explicitly to the ORIGINAL netloc -- host plus port
         when the port is not the scheme default -- which is exactly what
         httpx auto-populates from an un-pinned URL (``Request._prepare`` uses
@@ -453,14 +546,51 @@ def _pinned_dial(
     if not pinned_address:
         return endpoint, headers, {}
     url = httpx.URL(endpoint)
-    pinned_url = url.copy_with(host=pinned_address)
-    if _proxy_is_configured(url) or _proxy_is_configured(pinned_url):
+    if _proxy_is_configured(url):
         return endpoint, headers, {}
+    pinned_url = url.copy_with(host=pinned_address)
     return (
         str(pinned_url),
         {**headers, "Host": url.netloc.decode("ascii")},
         {"extensions": {"sni_hostname": url.host}},
     )
+
+
+def _pinned_client_kwargs(endpoint: str, pinned_address: str | None) -> dict[str, Any]:
+    """Extra ``httpx.AsyncClient`` arguments a pinned dial needs, if any.
+
+    Empty in every shape but one. When the operator's environment proxies
+    traffic in general yet exempts this endpoint's HOSTNAME through
+    NO_PROXY, the request is meant to go direct -- and it would, dialled by
+    name. Dialled by the pinned address it would not: httpx picks a
+    transport from the URL it is handed, the address is not in NO_PROXY,
+    and the pinned request would be tunneled through the proxy, which
+    verifies the certificate against the tunnel target (the IP) and fails.
+    Skipping the pin there left #207's gap open for exactly the endpoints
+    an operator had singled out as direct (#217).
+
+    So this mounts an explicit direct transport for the pinned address on
+    the client. httpx keeps building its environment proxy mounts alongside
+    (``trust_env`` is untouched -- only passing ``transport=`` would disable
+    them), and a host-specific mount outranks the scheme-wide proxy mounts
+    in its own precedence order, so: this one address goes direct, the
+    hostname's NO_PROXY exemption is honoured for the connection actually
+    made, and every other host still follows the proxy. The direct
+    transport is httpx's own default -- default SSL context, hostname
+    verification on -- so pinning changes where the socket goes and nothing
+    about how it is verified.
+    """
+    if not pinned_address:
+        return {}
+    url = httpx.URL(endpoint)
+    if _proxy_is_configured(url):
+        return {}
+    pinned_url = url.copy_with(host=pinned_address)
+    if not _proxy_is_configured(pinned_url):
+        return {}
+    # netloc keeps the brackets an IPv6 literal needs and the explicit port
+    # when there is one, which is also what the pinned request URL carries.
+    return {"mounts": {f"all://{pinned_url.netloc.decode('ascii')}": httpx.AsyncHTTPTransport()}}
 
 
 def _build_signature_header(body_bytes: bytes) -> str | None:

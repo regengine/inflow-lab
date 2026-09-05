@@ -1391,6 +1391,7 @@ const CONNECTION_VERDICT_TONES = {
   connected: 'success',
   mock: 'success',
   contract_mismatch: 'error',
+  signature_mismatch: 'error',
   unauthorized: 'error',
   subscription_inactive: 'error',
   forbidden: 'error',

@@ -108,9 +108,14 @@ class SpyAsyncClient:
 
     status_code = 200
     calls: list[dict[str, Any]] = []
+    # How the client itself was constructed. A pinned dial in the hybrid
+    # proxy shape adds an explicit direct mount for the pinned address
+    # (#217); everything else constructs the client bare.
+    constructions: list[dict[str, Any]] = []
 
-    def __init__(self, *, timeout: float) -> None:
+    def __init__(self, *, timeout: float, mounts: dict[str, Any] | None = None) -> None:
         self.timeout = timeout
+        SpyAsyncClient.constructions.append({"timeout": timeout, "mounts": mounts})
 
     async def __aenter__(self) -> "SpyAsyncClient":
         return self
@@ -555,7 +560,19 @@ def test_name_based_blocklist_rejects_localhost() -> None:
     from app.schemas.simulation import EgressBlockedError, validate_egress_endpoint
     from pydantic import HttpUrl
 
-    for hostname in ("localhost", "metadata.google.internal", "evil.localhost", "internal.local"):
+    # Every name and suffix the guard lists (#217): the loopback aliases,
+    # the cloud metadata names, and the three suffixes.
+    for hostname in (
+        "localhost",
+        "ip6-localhost",
+        "ip6-loopback",
+        "metadata",
+        "metadata.google.internal",
+        "instance-data",
+        "evil.localhost",
+        "corp.internal",
+        "internal.local",
+    ):
         url = HttpUrl(f"https://{hostname}/api/v1/webhooks/ingest")
         try:
             validate_egress_endpoint(url)
@@ -596,6 +613,37 @@ def test_userinfo_rejection_precedes_address_check() -> None:
 
     with pytest.raises(EgressBlockedError, match="userinfo"):
         validate_egress_endpoint(HttpUrl("https://user:pass@www.regengine.co/api/v1/webhooks/ingest"))
+
+
+def test_the_test_connection_route_refuses_a_userinfo_endpoint_before_dialing(monkeypatch: Any) -> None:
+    """The route-level half of the userinfo finding in #217.
+
+    The /test route compares the probe origin with the stored one using
+    ``parsed.hostname``, which drops userinfo -- so on its own the
+    comparison could not tell ``https://x:y@<stored host>/`` from the
+    stored endpoint, and would have sent the stored key to a URL also
+    carrying caller-supplied basic auth. The validator's userinfo refusal
+    is what closes that, and it has to hold at the route: a clean 4xx, no
+    client constructed, no request out.
+    """
+    SpyAsyncClient.calls = []
+    SpyAsyncClient.constructions = []
+    monkeypatch.setattr("app.regengine_client.httpx.AsyncClient", SpyAsyncClient)
+
+    response = client.post(
+        "/api/integration/test",
+        json={
+            "endpoint": "https://user:pass@www.regengine.co/api/v1/webhooks/ingest",
+            "api_key": "rge_live_probe",
+            "tenant_id": "probe-tenant",
+        },
+    )
+
+    assert response.status_code == 400, response.text
+    assert "userinfo" in response.text
+    assert "rge_live_probe" not in response.text
+    assert SpyAsyncClient.calls == []
+    assert SpyAsyncClient.constructions == []
 
 
 # ---------------------------------------------------------------------------
@@ -908,23 +956,28 @@ def test_a_proxy_for_a_different_scheme_does_not_disable_the_pin(monkeypatch: An
     assert SpyAsyncClient.calls[0]["url"] == "http://8.8.8.8/webhooks/ingest"
 
 
-def test_a_name_exempt_from_the_proxy_still_skips_the_pin_if_its_address_is_not(
+def test_a_name_exempt_from_the_proxy_still_pins_through_a_direct_mount_for_its_address(
     monkeypatch: Any,
 ) -> None:
-    """The trap this nearly fell into, found against a live proxy.
+    """The trap this nearly fell into, found against a live proxy -- and the
+    shape #217 records as the pin's one residual gap, now closed.
 
     httpx picks a transport from the URL it is handed, and pinning rewrites
     that URL's host to an IP. A NO_PROXY entry naming a hostname does not
     cover the address that hostname resolves to -- so an environment where
     ``https://partner.example.net/...`` goes direct will still tunnel
-    ``https://8.8.8.8/...`` through the proxy. Pinning there would hand a
-    bare IP to a CONNECT tunnel that verifies the certificate against it.
-    (Measured, not theorised: with NO_PROXY exempting pypi.org, httpx routed
-    the hostname direct and the resolved-address URL through the proxy,
-    which reset the connection.)
+    ``https://8.8.8.8/...`` through the proxy, and a pinned request would
+    hand a bare IP to a CONNECT tunnel that verifies the certificate
+    against it. (Measured, not theorised: with NO_PROXY exempting pypi.org,
+    httpx routed the hostname direct and the resolved-address URL through
+    the proxy, which reset the connection.)
 
-    So the proxy question is asked of the rewritten URL too, and either
-    answer being "proxied" means dial by hostname.
+    Skipping the pin here used to be the answer, which left #207's gap open
+    for exactly the endpoints an operator had singled out as direct. Now
+    the client is built with an explicit direct mount for the pinned
+    address, so the connection honours the hostname's NO_PROXY exemption
+    and the pin engages: the request goes to the IP, under the original
+    Host, with the certificate checked against the name.
     """
     monkeypatch.setenv("HTTPS_PROXY", "http://proxy.internal:3128")
     monkeypatch.setenv("NO_PROXY", "partner.example.net")
@@ -932,14 +985,19 @@ def test_a_name_exempt_from_the_proxy_still_skips_the_pin_if_its_address_is_not(
         simulation_schemas, "_resolved_addresses", lambda host: [ipaddress.ip_address("8.8.8.8")]
     )
     SpyAsyncClient.calls = []
+    SpyAsyncClient.constructions = []
     monkeypatch.setattr("app.regengine_client.httpx.AsyncClient", SpyAsyncClient)
     config = _bypass_validator_config(endpoint="https://partner.example.net/webhooks/ingest")
 
     asyncio.run(LiveRegEngineClient().ingest(make_payload(), config))
 
     call = SpyAsyncClient.calls[0]
-    assert call["url"] == "https://partner.example.net/webhooks/ingest", call["url"]
-    assert call["extensions"] == {}, "no sni_hostname override may reach a CONNECT tunnel"
+    assert call["url"] == "https://8.8.8.8/webhooks/ingest", call["url"]
+    assert call["headers"]["Host"] == "partner.example.net"
+    assert call["extensions"]["sni_hostname"] == "partner.example.net"
+    mounts = SpyAsyncClient.constructions[0]["mounts"]
+    assert mounts is not None and set(mounts) == {"all://8.8.8.8"}, mounts
+    assert isinstance(mounts["all://8.8.8.8"], httpx.AsyncHTTPTransport)
 
 
 def test_the_pin_applies_when_neither_the_name_nor_its_address_is_proxied(
@@ -947,13 +1005,15 @@ def test_the_pin_applies_when_neither_the_name_nor_its_address_is_proxied(
 ) -> None:
     # The flip side: an environment that exempts both the name and the
     # address it resolves to is a direct connection either way, so the pin
-    # is not skipped just because a proxy exists for other traffic.
+    # is not skipped just because a proxy exists for other traffic -- and no
+    # extra mount is needed, because httpx already routes the address direct.
     monkeypatch.setenv("HTTPS_PROXY", "http://proxy.internal:3128")
     monkeypatch.setenv("NO_PROXY", "partner.example.net,8.8.8.8")
     monkeypatch.setattr(
         simulation_schemas, "_resolved_addresses", lambda host: [ipaddress.ip_address("8.8.8.8")]
     )
     SpyAsyncClient.calls = []
+    SpyAsyncClient.constructions = []
     monkeypatch.setattr("app.regengine_client.httpx.AsyncClient", SpyAsyncClient)
     config = _bypass_validator_config(endpoint="https://partner.example.net/webhooks/ingest")
 
@@ -962,6 +1022,77 @@ def test_the_pin_applies_when_neither_the_name_nor_its_address_is_proxied(
     call = SpyAsyncClient.calls[0]
     assert call["url"] == "https://8.8.8.8/webhooks/ingest", call["url"]
     assert call["extensions"]["sni_hostname"] == "partner.example.net"
+    assert SpyAsyncClient.constructions[0]["mounts"] is None
+
+
+@pytest.mark.parametrize(
+    "endpoint,address,expected_pattern",
+    [
+        ("https://partner.example.net/webhooks/ingest", "8.8.8.8", "all://8.8.8.8"),
+        ("https://partner.example.net:8443/webhooks/ingest", "8.8.8.8", "all://8.8.8.8:8443"),
+        (
+            "https://partner.example.net/webhooks/ingest",
+            "2001:4860:4860::8888",
+            "all://[2001:4860:4860::8888]",
+        ),
+    ],
+)
+def test_the_direct_mount_wins_for_the_pinned_address_and_leaves_the_proxy_for_everything_else(
+    monkeypatch: Any, endpoint: str, address: str, expected_pattern: str
+) -> None:
+    """The assumption the hybrid fix rests on, checked against real httpx.
+
+    Two things have to be true of ``httpx.AsyncClient(mounts=...)`` for the
+    direct mount to be safe rather than an egress-policy bypass: the
+    environment proxy mounts must still be built alongside it (only
+    ``transport=`` disables them), and the host-specific mount must outrank
+    the scheme-wide proxy mount for the pinned address only. So build the
+    client exactly as the live client does and ask it which transport it
+    would use for the pinned URL, for the exempt hostname, and for an
+    unrelated host. If an httpx release changes either rule this fails here
+    instead of routing a pinned request into a CONNECT tunnel.
+    """
+    for name in ("HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY", "NO_PROXY"):
+        monkeypatch.delenv(name, raising=False)
+        monkeypatch.delenv(name.lower(), raising=False)
+    monkeypatch.setenv("HTTPS_PROXY", "http://proxy.internal:3128")
+    monkeypatch.setenv("NO_PROXY", "partner.example.net")
+
+    kwargs = regengine_client._pinned_client_kwargs(endpoint, address)
+    assert set(kwargs) == {"mounts"} and set(kwargs["mounts"]) == {expected_pattern}, kwargs
+    direct = kwargs["mounts"][expected_pattern]
+
+    # Never dialed, so there is no pool to drain and nothing to close.
+    client = httpx.AsyncClient(**kwargs)
+    pinned_url = httpx.URL(endpoint).copy_with(host=address)
+    assert client._transport_for_url(pinned_url) is direct, "the pinned address must go direct"
+    assert client._transport_for_url(httpx.URL(endpoint)) is client._transport, (
+        "the exempt hostname is direct on httpx's own reading of NO_PROXY"
+    )
+    other = httpx.URL("https://other.example.net/webhooks/ingest")
+    assert client._transport_for_url(other) is not client._transport, (
+        "every other host must still follow the operator's proxy"
+    )
+    assert client._transport_for_url(other) is not direct
+
+
+@pytest.mark.parametrize(
+    "environment",
+    [
+        {},
+        {"HTTPS_PROXY": "http://proxy.internal:3128"},  # name proxied: no pin, so nothing to mount
+        {"HTTPS_PROXY": "http://proxy.internal:3128", "NO_PROXY": "partner.example.net,8.8.8.8"},
+    ],
+)
+def test_no_direct_mount_outside_the_hybrid_shape(monkeypatch: Any, environment: dict[str, str]) -> None:
+    for name in ("HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY", "NO_PROXY"):
+        monkeypatch.delenv(name, raising=False)
+        monkeypatch.delenv(name.lower(), raising=False)
+    for name, value in environment.items():
+        monkeypatch.setenv(name, value)
+
+    assert regengine_client._pinned_client_kwargs("https://partner.example.net/webhooks/ingest", "8.8.8.8") == {}
+    assert regengine_client._pinned_client_kwargs("https://partner.example.net/webhooks/ingest", None) == {}
 
 
 @pytest.mark.parametrize(
