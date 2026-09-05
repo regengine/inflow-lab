@@ -37,6 +37,7 @@ from app.schemas.ingestion import CSVImportRequest, DeliveryRetryRequest, Replay
 from app.schemas.scenarios import DemoFixtureLoadRequest
 from app.schemas.simulation import DeliveryConfig, SimulationConfig
 from app.store import EventStore
+from tests.support.timestamps import recent_event_timestamp
 
 DELIVERY_SECONDS = 0.4
 
@@ -83,9 +84,20 @@ def _event(lot_code: str = "TLC-1") -> RegEngineEvent:
 
 
 def _failed_record(lot_code: str = "TLC-FAIL") -> StoredEventRecord:
+    # An event the mock will ACCEPT on retry: inside its replay window, with
+    # the harvesting KDEs it requires. The stale-retry test below asserts the
+    # response status is "failed" because the commit was dropped (#217); an
+    # event the mock rejected would read "failed" for the wrong reason and let
+    # that assertion pass without the fix.
+    event = _event(lot_code).model_copy(
+        update={
+            "timestamp": recent_event_timestamp(),
+            "kdes": {"harvest_date": "2026-03-01", "reference_document": f"Harvest Log HL-{lot_code}"},
+        }
+    )
     return StoredEventRecord(
         payload_source="test",
-        event=_event(lot_code),
+        event=event,
         destination_mode=DestinationMode.MOCK,
         delivery_status="failed",
         delivery_attempts=1,
@@ -233,6 +245,28 @@ def test_a_reset_mid_import_is_not_overwritten(tmp_path):
     assert controller.store.stats()["total_records"] == 0
     assert result.stored == 0, "a dropped commit must not report records as stored"
     assert result.error is not None and STALE_COMMIT_NOTE in result.error
+    # #217: the drop has to be visible to a caller that only reads the
+    # machine-readable status, the way the fixture load already reports it --
+    # "accepted" with stored=0 and the truth buried in `error` is not that.
+    assert result.status == "delivery_failed"
+
+
+def test_an_undisturbed_import_still_reports_accepted(tmp_path):
+    # Companion to test_an_undisturbed_delivery_still_commits: the #217
+    # not-committed branch must not be firing on its own.
+    controller = _controller(tmp_path)
+
+    async def scenario():
+        return await controller.import_csv(
+            CSVImportRequest(import_type="scheduled_events", csv_text=CSV_TEXT)
+        )
+
+    result = asyncio.run(scenario())
+
+    assert result.status == "accepted"
+    assert result.stored == 1
+    assert controller.store.stats()["total_records"] == 1
+    assert result.error is None or STALE_COMMIT_NOTE not in result.error
 
 
 def test_a_reset_mid_fixture_load_is_not_overwritten(tmp_path):
@@ -267,6 +301,9 @@ def test_a_reset_mid_retry_does_not_resurrect_deleted_records(tmp_path):
 
     assert controller.store.stats()["total_records"] == 0, "the retry resurrected deleted records"
     assert result.error is not None and STALE_COMMIT_NOTE in result.error
+    # #217: nothing was written back, so the records this was meant to repair
+    # were not repaired -- "posted" would claim otherwise.
+    assert result.status == "failed"
 
 
 def test_an_undisturbed_delivery_still_commits(tmp_path):

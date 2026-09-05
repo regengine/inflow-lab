@@ -56,6 +56,27 @@ def test_epcis_export_publishes_a_non_empty_schema():
     assert "epcisBody" in model["properties"]
 
 
+def test_simulation_status_publishes_the_run_loop_crash_reason():
+    """#217: ``last_error`` is on the wire, so it has to be in the schema.
+
+    ``controller.status()`` had carried it since #211, but /status, /start
+    and /stop all validate through ``StatusResponse``, which dropped any key
+    it did not declare -- a client generated from this document had no way
+    to learn why a run stopped. Nullable, because None is the healthy answer
+    rather than an absence.
+    """
+    for path, method in (
+        ("/api/simulate/status", "get"),
+        ("/api/simulate/start", "post"),
+        ("/api/simulate/stop", "post"),
+    ):
+        model = _response_schema(path, method)
+
+        assert "last_error" in model["properties"], f"{path} does not document last_error"
+        last_error = model["properties"]["last_error"]
+        assert {"type": "null"} in last_error.get("anyOf", []), f"{path}: last_error must be nullable"
+
+
 def test_health_endpoints_still_answer_the_documented_shape():
     for path in ("/api/health", "/api/healthz"):
         response = client.get(path)

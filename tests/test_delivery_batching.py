@@ -25,6 +25,15 @@ MAX_BATCH_EVENTS cap, and specifically that a failure partway through
 several chunks reports partial progress instead of erasing the chunks
 that already succeeded.
 
+#217 is the other thing that can happen partway through several chunks:
+the store moves. Before it, `import_csv`/`replay` checked `_store_epoch`
+only after every chunk had gone out (and `retry_failed_delivery` only
+after every group), so a reset landing during a large delivery left the
+remaining requests still going out to RegEngine for a commit that was
+then dropped anyway. The last group of tests below pins that delivery
+stops at the chunk in flight, and that the response counts what really
+went out.
+
 Kept in its own file rather than added to an existing one -- strict
 per-file ownership across parallel workstreams means existing test
 files must not be edited, and app/controller.py plus this file are the
@@ -446,3 +455,129 @@ def test_mid_chunk_failure_reports_partial_progress_not_discarded(monkeypatch):
     failed_lots = {record.event.traceability_lot_code for record in stored if record.delivery_status == "failed"}
     assert posted_lots == {lot_codes[0], lot_codes[1], lot_codes[4], lot_codes[5], lot_codes[6]}
     assert failed_lots == {lot_codes[2], lot_codes[3]}
+
+
+# ---------------------------------------------------------------------------
+# #217 -- a reset landing part-way through the chunks stops the rest.
+# ---------------------------------------------------------------------------
+
+
+def _reset_during_the_second_post(monkeypatch) -> list[int]:
+    """Wrap _deliver_payload to count POSTs and land a real reset() on the 2nd.
+
+    Returns the list the wrapper appends each POST's event count to. The
+    reset lands while the 2nd request is in flight -- that one cannot be
+    un-sent, so it still goes out; what the abort seam buys is that nothing
+    after it does. Phase 2 holds no lock, so reset() takes its own locks
+    uncontended here, exactly as a concurrent POST /reset would.
+    """
+    original = controller._deliver_payload
+    posted_sizes: list[int] = []
+
+    async def counting_deliver(payload, config, idempotency_key=None):  # noqa: ANN001
+        posted_sizes.append(len(payload.events))
+        if len(posted_sizes) == 2:
+            await controller.reset()
+        return await original(payload, config, idempotency_key=idempotency_key)
+
+    monkeypatch.setattr(controller, "_deliver_payload", counting_deliver)
+    return posted_sizes
+
+
+def test_csv_import_stops_posting_once_the_store_moves(monkeypatch):
+    """Before #217 import_csv consulted the epoch only after every chunk
+    had gone out, so a reset during a large import left every remaining
+    chunk still POSTing to RegEngine -- for a commit phase 3 was going to
+    drop anyway. 7 rows at 2 per chunk is 4 requests; the reset lands
+    during the 2nd, so that one completes and the last two are never sent.
+    """
+    monkeypatch.setattr(controller_module, "MAX_BATCH_EVENTS", 2)
+    posted_sizes = _reset_during_the_second_post(monkeypatch)
+    lot_codes = [f"TLC-ABANDON217-{index:02d}" for index in range(7)]
+    request = CSVImportRequest(
+        import_type=CSVImportType.SEED_LOTS,
+        csv_text=_seed_lot_csv(lot_codes),
+        delivery=DeliveryConfig(mode=DestinationMode.MOCK),
+    )
+
+    response = asyncio.run(controller.import_csv(request))
+
+    assert posted_sizes == [2, 2], "delivery went on past the reset"
+    # Honest about both halves: the chunks that went out are counted as
+    # posted, nothing was stored, and the status says so rather than only
+    # the note in `error`.
+    assert response.posted == 4
+    assert response.stored == 0
+    assert response.status == "delivery_failed"
+    assert response.error is not None and controller_module.STALE_COMMIT_NOTE in response.error
+    assert controller.store.stats()["total_records"] == 0
+
+
+def test_replay_stops_posting_once_the_store_moves(monkeypatch):
+    """The same seam on the read side. replay() commits nothing, so before
+    #217 it had no epoch check at all and re-posted every chunk of a store
+    the operator had just cleared. `replayed` must count only what went
+    out -- `read` still says what was on disk -- and `error` must say the
+    replay was cut short, since a status of "posted" alone cannot.
+    """
+    monkeypatch.setattr(controller_module, "MAX_BATCH_EVENTS", 2)
+    controller.store.add_many(
+        [
+            StoredEventRecord(
+                payload_source="batching-suite",
+                event=_harvesting_event(f"TLC-REPLAYABANDON217-{index:02d}"),
+                destination_mode=DestinationMode.NONE,
+                delivery_status="generated",
+            )
+            for index in range(7)
+        ]
+    )
+    posted_sizes = _reset_during_the_second_post(monkeypatch)
+
+    response = asyncio.run(
+        controller.replay(ReplayRequest(delivery=DeliveryConfig(mode=DestinationMode.MOCK)))
+    )
+
+    assert posted_sizes == [2, 2], "replay went on past the reset"
+    assert response.read == 7
+    assert response.replayed == 4
+    assert response.posted == 4
+    assert response.failed == 0
+    assert response.error is not None and controller_module.STALE_REPLAY_NOTE in response.error
+
+
+def test_retry_stops_posting_groups_once_the_store_moves(monkeypatch):
+    """retry_failed_delivery posts one request per (source, idempotency_key)
+    group rather than per chunk, so its seam is the group loop. Three
+    records under three distinct stored keys are three groups; the reset
+    lands during the 2nd request, so the 3rd group is never sent -- and
+    the response says two were attempted, not three.
+    """
+    controller.store.add_many(
+        [
+            StoredEventRecord(
+                payload_source="batching-suite",
+                event=_harvesting_event(f"TLC-RETRYABANDON217-{index}"),
+                destination_mode=DestinationMode.MOCK,
+                delivery_status="failed",
+                delivery_attempts=1,
+                error="connection reset",
+                delivery_response=None,
+                delivery_metadata={"delivery_mode": "mock", "idempotency_key": f"retry-abandon-217-{index}"},
+            )
+            for index in range(3)
+        ]
+    )
+    posted_sizes = _reset_during_the_second_post(monkeypatch)
+
+    response = asyncio.run(
+        controller.retry_failed_delivery(DeliveryRetryRequest(delivery=DeliveryConfig(mode=DestinationMode.MOCK)))
+    )
+
+    assert posted_sizes == [1, 1], "retry went on past the reset"
+    assert response.retryable == 3
+    assert response.attempted == 2
+    assert response.posted == 2
+    assert response.status == "failed"
+    assert response.error is not None and controller_module.STALE_COMMIT_NOTE in response.error
+    assert controller.store.stats()["total_records"] == 0, "the retry resurrected deleted records"

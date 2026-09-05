@@ -1306,7 +1306,14 @@ function renderSnapshot(status, events, health = state.health) {
   renderRecordSpotlight(events);
   renderEvents(events);
   if (Date.now() >= state.statusHoldUntil) {
-    setStatus(status.running ? 'Production line is running.' : 'Production line is idle.');
+    if (!status.running && status.last_error) {
+      // The run loop died rather than being stopped. The API carries the
+      // reason (#217); an idle-looking console that hid it would make the
+      // operator hunt the server log for why their run ended.
+      setStatus(`Production line stopped: ${status.last_error}`, 'error');
+    } else {
+      setStatus(status.running ? 'Production line is running.' : 'Production line is idle.');
+    }
   }
 }
 

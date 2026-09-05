@@ -282,8 +282,21 @@ async def deliver_in_chunks(
     config: SimulationConfig,
     *,
     chunk_size: int,
+    should_continue: Callable[[], bool] | None = None,
 ) -> list[tuple[list[RegEngineEvent], DeliveryOutcome]]:
     """POST *events* through *deliver* in slices of at most *chunk_size* (#103).
+
+    *should_continue*, when given, is asked before every chunk -- the first
+    included -- and a False answer ends the loop, returning only the chunks
+    already posted (#217). The controller passes its `_store_epoch` check: a
+    reset or reconfigure landing mid-way through a long import or replay
+    already voids the commit afterwards, but without this seam every
+    remaining chunk was still POSTed to RegEngine for nothing -- hundreds of
+    requests describing a store the operator had just cleared. The chunk in
+    flight when the answer changes is not interrupted (a POST cannot be
+    un-sent), so a caller sees at most one chunk past the point the store
+    moved, and its own counts must be built from what came back here rather
+    than from the length of *events*.
 
     RegEngine's real webhook route -- and the mock mirroring it, see
     app/mock_service.py's MAX_BATCH_EVENTS -- rejects the entire
@@ -316,6 +329,8 @@ async def deliver_in_chunks(
     """
     chunks: list[tuple[list[RegEngineEvent], DeliveryOutcome]] = []
     for start in range(0, len(events), chunk_size):
+        if should_continue is not None and not should_continue():
+            break
         chunk_events = events[start : start + chunk_size]
         payload = IngestPayload(source=source, events=chunk_events)
         outcome = await deliver(payload, config)
