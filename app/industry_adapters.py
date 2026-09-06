@@ -87,6 +87,7 @@ class IndustryAdapter:
             "reference_document_type": packed_lot.current_reference_type,
             "reference_document_number": packed_lot.current_reference_number,
             "harvester_business_name": source_lot.origin_location,
+            "harvester_business_phone": "+1-202-555-0100",  # Fictional simulator contact.
             "tlc_source_reference": packed_lot.tlc_source_reference,
             "traceability_lot_code_source_reference": packed_lot.tlc_source_reference,
         }

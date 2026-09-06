@@ -42,6 +42,7 @@ REGENGINE_REQUIRED_KDES_BY_CTE: dict[CTEType, tuple[str, ...]] = {
         "location_name",
         "reference_document",
         "harvester_business_name",
+        "harvester_business_phone",
     ),
     CTEType.FIRST_LAND_BASED_RECEIVING: (
         "traceability_lot_code",

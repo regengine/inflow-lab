@@ -828,3 +828,16 @@ Inflow Lab is deliberately permissive, unlike the main RegEngine engine: it is
 adoption infrastructure. Integrators, ERP vendors, and design partners are
 encouraged to copy the payload contract, reuse the client patterns (idempotency,
 HMAC signing, retry semantics), and fork the simulator for their own testing.
+
+## Ingest contract v2 (2026-09-04)
+
+Initial packing now requires `kdes.harvester_business_phone` alongside
+`harvester_business_name` (21 CFR §1.1330(a)(7)). The generator and built-in
+fixtures use an explicitly fictional contact number. Imported customer records
+must supply the actual harvester contact; missing values are rejected.
+Deploy with RegEngine contract v2; connection probes reject mismatched versions.
+
+Validation: the Linux Python 3.12 suite passed 771 tests with one optional
+checkout-provenance test skipped; that test suite is also run separately against
+the local RegEngine checkout. On macOS, the existing `/dev/full` ENOSPC test fails
+with EPERM (767 passed, four skipped, one failed). No runtime dependencies changed.

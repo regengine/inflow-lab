@@ -7,7 +7,7 @@ contract — keep these in sync when the live webhook contract changes.
 ## Endpoints
 
 - Ingest endpoint: `POST /api/v1/webhooks/ingest`
-- Export endpoint: `GET /v1/fsma/export/fda-request`
+- Export endpoint: `GET /api/v1/fda/export/recall (requires tenant_id query parameter)`
 - Forward trace: `GET /v1/fsma/trace/forward/{tlc}`
 - Backward trace: `GET /v1/fsma/trace/backward/{tlc}`
 
@@ -48,7 +48,7 @@ RegEngine's `WebhookCTEType` (services/ingestion/app/webhook_models.py line 41):
 - `harvesting`
 - `cooling`
 - `initial_packing`
-- `first_land_based_receiving` — 21 CFR §1.1325, seafood / first-receiver flows.
+- `first_land_based_receiving` — 21 CFR §1.1335, seafood / first-receiver flows.
   Simulator's `CTEType` enum includes this for hand-crafted fixture / CSV
   parity, but the default `LegitFlowEngine` does not emit it (no seafood
   scenario exists yet).
@@ -100,13 +100,13 @@ event to be rejected with `Missing required KDE '<n>' for <cte> CTE`.
 
 | CTE | Required KDEs (beyond top-level fields) |
 |---|---|
-| `harvesting` | `harvest_date`, `reference_document` (§1.1327(b)(5)) |
-| `cooling` | `cooling_date`, `reference_document` (§1.1330(b)(6)) |
-| `initial_packing` | `packing_date`, `reference_document` (§1.1335(c)(7)), `harvester_business_name` (§1.1335(c)(8)) |
-| `first_land_based_receiving` | `landing_date`, `receiving_location`, `reference_document` (§1.1325(c)(7)) |
-| `shipping` | `ship_date`, `ship_from_location`, `ship_to_location`, `reference_document` (§1.1340(c)(6)), `tlc_source_reference` (§1.1340(c)(7)) |
-| `receiving` | `receive_date`, `receiving_location`, `immediate_previous_source` (§1.1345(c)(5)), `reference_document` (§1.1345(c)(6)), `tlc_source_reference` (§1.1345(c)(7)) |
-| `transformation` | `transformation_date`, `reference_document` (§1.1350(c)(6)) |
+| `harvesting` | `harvest_date`, `reference_document` (§1.1325(a)(1)(viii)) |
+| `cooling` | `cooling_date`, `reference_document` (§1.1325(b)(1)(vii)) |
+| `initial_packing` | `packing_date`, `reference_document` (§1.1330(a)(16)), `harvester_business_name` and `harvester_business_phone` (§1.1330(a)(7)) |
+| `first_land_based_receiving` | `landing_date`, `receiving_location`, `reference_document` (§1.1335(g)) |
+| `shipping` | `ship_date`, `ship_from_location`, `ship_to_location`, `reference_document` (§1.1340(a)(8)), `tlc_source_reference` (§1.1340(a)(7)) |
+| `receiving` | `receive_date`, `receiving_location`, `immediate_previous_source` (§1.1345(a)(4)), `reference_document` (§1.1345(a)(8)), `tlc_source_reference` (§1.1345(a)(7)) |
+| `transformation` | `transformation_date`, `reference_document` (§1.1350(a)(2)(vi)) |
 
 **Top-level fields RegEngine treats as KDEs during validation:**
 `traceability_lot_code`, `product_description`, `quantity`,
@@ -153,3 +153,12 @@ Receiving KDEs and are **not** in RegEngine's mirrored 11-column export yet,
 so the two shapes are currently diverged. `Event Type (CTE)` was previously
 mislabelled `Traceability Lot Code Description`, a column name FSMA 204 does
 not define.
+
+
+## Ingest contract v2 (2026-09-04)
+
+Initial packing now requires `kdes.harvester_business_phone` alongside
+`harvester_business_name` (21 CFR §1.1330(a)(7)). The generator and built-in
+fixtures use an explicitly fictional contact number. Imported customer records
+must supply the actual harvester contact; missing values are rejected.
+Deploy with RegEngine contract v2; connection probes reject mismatched versions.

@@ -114,6 +114,7 @@ def test_engine_emits_regengine_canonical_kdes_for_lab_contract():
     assert initial_packing.kdes["pack_date"]
     assert initial_packing.kdes["reference_document"]
     assert initial_packing.kdes["harvester_business_name"]
+    assert initial_packing.kdes["harvester_business_phone"]
 
     shipping = seen[CTEType.SHIPPING]
     assert shipping.kdes["reference_document"]
