@@ -43,7 +43,9 @@ name: Contract Pin Drift
 # rather than assuming it is clean.
 #
 # Requires the same access as the contract job in ci.yml:
-# secrets.REGENGINE_CONTRACT_TOKEN (contents: read on regengine/regengine),
+# secrets.REGENGINE_CONTRACT_REPO_TOKEN (preferred, legacy-compatible here),
+# or secrets.REGENGINE_CONTRACT_TOKEN
+# (both: contents: read on regengine/regengine),
 # or vars.REGENGINE_CONTRACT_PUBLIC=true if that repository is public.
 # Without it every step below skips with a warning rather than failing.
 
@@ -85,7 +87,7 @@ jobs:
         env:
           # The `secrets` context is unavailable in step-level `if:`, so
           # presence has to become a step output first.
-          REGENGINE_CONTRACT_TOKEN: ${{ secrets.REGENGINE_CONTRACT_TOKEN }}
+          REGENGINE_CONTRACT_TOKEN: ${{ secrets.REGENGINE_CONTRACT_TOKEN || secrets.REGENGINE_CONTRACT_REPO_TOKEN }}
           REGENGINE_CONTRACT_PUBLIC: ${{ vars.REGENGINE_CONTRACT_PUBLIC }}
           REGENGINE_CONTRACT_REPOSITORY: ${{ vars.REGENGINE_CONTRACT_REPOSITORY }}
           REGENGINE_CONTRACT_REF: ${{ vars.REGENGINE_CONTRACT_REF }}
@@ -111,7 +113,7 @@ jobs:
             has_access=true
           else
             has_access=false
-            echo "::warning::Cross-repo pin drift NOT checked: add the repository secret REGENGINE_CONTRACT_TOKEN (contents:read on regengine/regengine), or set the repository variable REGENGINE_CONTRACT_PUBLIC=true if that repository is public. Pull requests from forks never receive secrets."
+            echo "::warning::Cross-repo pin drift NOT checked: add the repository secret REGENGINE_CONTRACT_REPO_TOKEN (or REGENGINE_CONTRACT_TOKEN), with contents:read on regengine/regengine, or set the repository variable REGENGINE_CONTRACT_PUBLIC=true if that repository is public. Pull requests from forks never receive secrets."
             {
               echo "### Contract pin drift: NOT CHECKED"
               echo
@@ -131,7 +133,7 @@ jobs:
         id: upstream_pin
         if: steps.access.outputs.has_access == 'true'
         env:
-          GH_TOKEN: ${{ secrets.REGENGINE_CONTRACT_TOKEN || github.token }}
+          GH_TOKEN: ${{ secrets.REGENGINE_CONTRACT_TOKEN || secrets.REGENGINE_CONTRACT_REPO_TOKEN || github.token }}
           REGENGINE_REPOSITORY: ${{ steps.access.outputs.regengine_repository }}
           ENFORCE: ${{ steps.access.outputs.enforce }}
         run: |
@@ -212,7 +214,7 @@ jobs:
       - name: Check drift of this repository's RegEngine ref
         if: steps.access.outputs.has_access == 'true'
         env:
-          GH_TOKEN: ${{ secrets.REGENGINE_CONTRACT_TOKEN || github.token }}
+          GH_TOKEN: ${{ secrets.REGENGINE_CONTRACT_TOKEN || secrets.REGENGINE_CONTRACT_REPO_TOKEN || github.token }}
           REGENGINE_REPOSITORY: ${{ steps.access.outputs.regengine_repository }}
           REGENGINE_REF: ${{ steps.access.outputs.regengine_ref }}
           ENFORCE: ${{ steps.access.outputs.enforce }}
