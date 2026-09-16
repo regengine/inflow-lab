@@ -23,7 +23,6 @@ from __future__ import annotations
 
 from datetime import UTC, datetime, timedelta
 
-
 # Far enough inside the 90-day window that a slow suite, a timezone edge or a
 # test that walks its events forward by a few days stays comfortably within it.
 RECENT_EVENT_AGE_DAYS = 3

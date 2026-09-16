@@ -28,7 +28,6 @@ from app.main import app, controller
 from app.routers.health import _store_write_error
 from app.store import EventStore
 
-
 client = TestClient(app)
 
 

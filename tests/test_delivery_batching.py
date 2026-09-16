@@ -59,7 +59,6 @@ from app.schemas.ingestion import CSVImportRequest, DeliveryRetryRequest, Ingest
 from app.schemas.simulation import DeliveryConfig, SimulationConfig
 from tests.support.timestamps import recent_event_timestamp
 
-
 _BASE_TIME = recent_event_timestamp()
 _VALID_KDES = {"harvest_date": "2026-03-01", "reference_document": "Harvest Log HL-BATCHING-DEFAULT"}
 

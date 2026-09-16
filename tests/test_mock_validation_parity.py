@@ -69,7 +69,6 @@ from app.schemas.ingestion import IngestPayload
 from app.schemas.simulation import SimulationConfig
 from tests.support.timestamps import recent_event_timestamp
 
-
 client = TestClient(app)
 
 

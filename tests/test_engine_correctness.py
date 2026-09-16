@@ -16,8 +16,8 @@ from datetime import UTC, datetime, timedelta
 
 import app.engine as engine_module
 from app.engine import LegitFlowEngine
-from app.schemas.domain import CTEType
 from app.scenarios import _gln
+from app.schemas.domain import CTEType
 
 
 def _assert_valid_sscc(engine: LegitFlowEngine, value: str | None) -> None:

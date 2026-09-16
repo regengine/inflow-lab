@@ -23,7 +23,6 @@ from pathlib import Path
 import pytest
 import yaml
 
-
 WORKFLOWS = Path(__file__).resolve().parents[1] / ".github" / "workflows"
 
 #: Job names branch protection requires by exact string. Renaming one, or

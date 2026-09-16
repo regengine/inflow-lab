@@ -42,7 +42,6 @@ from fnmatch import fnmatchcase
 from pathlib import Path
 from typing import Any, Iterable, Mapping, Sequence
 
-
 # GitHub's compare endpoint caps what it will return in one response: at
 # most 250 commits and at most 300 files. Past either cap the payload is
 # silently partial, so "no surface file in the list" stops meaning "no

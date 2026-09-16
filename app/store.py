@@ -10,7 +10,6 @@ from typing import Any, Iterable, NamedTuple
 
 from .schemas.domain import LineageEdge, LineageNode, StoredEventRecord
 
-
 # Same name-keyed singleton logger main.py configures. A write that never
 # reaches disk is the one failure this store cannot recover from, so it must
 # not be silent even though the exception propagates (#182).

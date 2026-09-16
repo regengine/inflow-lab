@@ -16,7 +16,6 @@ from .mock_service import configured_max_event_age_days
 from .schemas.domain import CSVImportType, CTEType, RegEngineEvent
 from .schemas.ingestion import CSVImportError, CSVImportWarning
 
-
 EVENT_REQUIRED_FIELDS = (
     "cte_type",
     "traceability_lot_code",

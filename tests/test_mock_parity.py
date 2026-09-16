@@ -39,7 +39,6 @@ from app.schemas.simulation import SimulationConfig
 from app.store import EventStore
 from tests.support.timestamps import recent_event_timestamp
 
-
 client = TestClient(app)
 
 

@@ -32,7 +32,6 @@ from pathlib import Path
 
 import pytest
 
-
 REPO_ROOT = Path(__file__).resolve().parent.parent
 DOCKERFILE = REPO_ROOT / "Dockerfile"
 CI_WORKFLOW = REPO_ROOT / ".github" / "workflows" / "ci.yml"

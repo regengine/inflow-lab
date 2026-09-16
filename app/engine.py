@@ -1,14 +1,13 @@
 from __future__ import annotations
 
-import random
 import os
+import random
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 from itertools import count
 from typing import Any
 
 from .industry_adapters import get_industry_adapter
-from .schemas.domain import CTEType, OperationScale, RegEngineEvent
 from .scenarios import (
     SCALE_QUANTITY_MULTIPLIER,
     Location,
@@ -17,7 +16,7 @@ from .scenarios import (
     get_scenario,
     scale_scenario,
 )
-
+from .schemas.domain import CTEType, OperationScale, RegEngineEvent
 
 DEFAULT_MAX_FUTURE_HOURS = 20
 

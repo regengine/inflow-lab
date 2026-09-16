@@ -19,7 +19,6 @@ if str(REPO_ROOT) not in sys.path:
 
 from app.build_info import APP_VERSION
 
-
 CSV_WITH_KDE_WARNINGS = """cte_type,traceability_lot_code,product_description,quantity,unit_of_measure,location_name,timestamp,kdes
 harvesting,TLC-BROWSER-WARN,Romaine Lettuce,10,cases,Valley Fresh Farms,2026-02-10T08:00:00Z,"{""harvest_date"":""2026-02-10""}"
 """

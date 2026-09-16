@@ -48,7 +48,6 @@ from app.schemas.ingestion import IngestPayload
 from app.schemas.simulation import SimulationConfig
 from app.store import MASKED_SECRET
 
-
 # ---------------------------------------------------------------------------
 # #138 -- live ingest failures capture RegEngine's response body
 # ---------------------------------------------------------------------------

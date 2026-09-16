@@ -5,7 +5,6 @@ import re
 from dataclasses import dataclass
 from pathlib import Path
 
-
 APP_VERSION = "0.1.0"
 SHA_RE = re.compile(r"^[0-9a-fA-F]{7,64}$")
 

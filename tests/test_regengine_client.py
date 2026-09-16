@@ -4,10 +4,10 @@ import asyncio
 from datetime import UTC, datetime
 from typing import Any
 
+from app.regengine_client import DEFAULT_LIVE_INGEST_ENDPOINT, LiveRegEngineClient
 from app.schemas.domain import CTEType, RegEngineEvent
 from app.schemas.ingestion import IngestPayload
 from app.schemas.simulation import SimulationConfig
-from app.regengine_client import DEFAULT_LIVE_INGEST_ENDPOINT, LiveRegEngineClient
 
 
 class FakeResponse:

@@ -11,12 +11,12 @@ from fastapi.testclient import TestClient
 from app.cte_rules import validate_event_kdes
 from app.main import app
 from app.schemas.domain import RegEngineEvent
+
 # Ask tenancy where this tenant's directory is instead of assuming ./data:
 # the app resolves its root from REGENGINE_DATA_DIR, so a hardcoded
 # REPO_ROOT/data deleted a path the app never wrote and left the real
 # golden-path-demo directory behind in the configured store (#108).
 from app.tenancy import tenant_dir
-
 
 TENANT_ID = "golden-path-demo"
 LOT_CODE = "TLC-DEMO-FC-OUT-001"

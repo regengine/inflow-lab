@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-
 import csv
 import io
 from datetime import UTC, datetime, timedelta, timezone
@@ -12,7 +11,6 @@ from app.cte_rules import REQUIRED_KDES
 from app.epcis_export import _BIZ_STEPS, render_epcis_document
 from app.fda_export import FDA_EXPORT_COLUMNS, render_fda_request_csv
 from app.schemas.domain import CTEType, RegEngineEvent, StoredEventRecord
-
 
 # The complete CBV bizStep vocabulary (GS1 EPCIS 2.0 JSON-LD context).
 CBV_BIZ_STEPS = {

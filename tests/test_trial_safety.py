@@ -34,7 +34,6 @@ import httpx
 
 from scripts.live_trial import main
 
-
 REPO_ROOT = Path(__file__).resolve().parents[1]
 PREFLIGHT_SCRIPT = REPO_ROOT / "scripts" / "cutover_preflight.sh"
 

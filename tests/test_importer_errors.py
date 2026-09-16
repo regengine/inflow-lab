@@ -19,7 +19,6 @@ import pytest
 from app.csv_importer import parse_csv_import
 from app.schemas.domain import CSVImportType
 
-
 SCHEDULED_HEADER = (
     "cte_type,traceability_lot_code,product_description,quantity,"
     "unit_of_measure,location_name,timestamp"

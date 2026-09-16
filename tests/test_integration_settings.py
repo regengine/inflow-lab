@@ -9,7 +9,6 @@ from fastapi.testclient import TestClient
 from app.main import app, controller
 from app.schemas.simulation import SimulationConfig
 
-
 client = TestClient(app)
 
 
@@ -246,8 +245,8 @@ def test_mock_rate_limit_friction_maps_to_429() -> None:
 
 
 def test_mock_idempotency_replay_returns_cached_response() -> None:
-    from app.mock_service import MockRegEngineService
     from app.demo_fixtures import get_demo_fixture
+    from app.mock_service import MockRegEngineService
     from app.schemas.domain import DemoFixtureId
     from app.schemas.ingestion import IngestPayload
 

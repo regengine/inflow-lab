@@ -8,7 +8,6 @@ from typing import Callable, Iterable
 
 from .schemas.domain import CTEType, FDAExportPreset, RegEngineEvent, StoredEventRecord
 
-
 FDA_EXPORT_COLUMNS = [
     "Traceability Lot Code",
     # Was "Traceability Lot Code Description" holding event.cte_type.value

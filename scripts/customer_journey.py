@@ -52,14 +52,13 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from app.engine import LegitFlowEngine  # noqa: E402
 from app.regengine_client import LiveRegEngineClient, LiveRegEngineDeliveryError  # noqa: E402
+from app.scenarios import ScenarioId  # noqa: E402
 from app.schemas.ingestion import IngestPayload  # noqa: E402
 from app.schemas.simulation import (  # noqa: E402
     PRIVATE_ENDPOINTS_ENV,
     DeliveryConfig,
     SimulationConfig,
 )
-from app.scenarios import ScenarioId  # noqa: E402
-
 
 DEFAULT_BASE_URL = "http://localhost:8000"
 DEFAULT_REDIS_URL = "redis://localhost:6379/0"
