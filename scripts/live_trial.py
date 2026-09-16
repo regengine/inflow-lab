@@ -9,7 +9,6 @@ from urllib.parse import urlparse
 
 import httpx
 
-
 DEFAULT_TIMEOUT_SECONDS = 30.0
 TRIAL_SCENARIO = "fresh_cut_processor"
 

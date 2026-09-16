@@ -50,7 +50,6 @@ from app.schemas.scenarios import DemoFixtureLoadRequest
 from app.schemas.simulation import DeliveryConfig, SimulationConfig
 from tests.support.timestamps import recent_event_timestamp
 
-
 _BASE_TIME = recent_event_timestamp()
 
 

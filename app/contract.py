@@ -43,7 +43,6 @@ import httpx
 
 from .cte_rules import REQUIRED_KDES
 
-
 INFLOW_CONTRACT_VERSION = "2"
 
 

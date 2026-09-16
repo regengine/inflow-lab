@@ -73,12 +73,11 @@ from app.main import app, controller
 from app.regengine_client import (
     _CONNECTION_VERDICTS,
     _MAX_ERROR_BODY_CHARS,
-    _extract_error_body,
     LiveRegEngineClient,
+    _extract_error_body,
 )
 from app.schemas.simulation import DeliveryConfig, EgressBlockedError, SimulationConfig
 from app.store import MASKED_SECRET
-
 
 client = TestClient(app)
 

@@ -12,7 +12,7 @@ import csv
 import io
 from datetime import UTC, datetime
 
-from app.cte_rules import REQUIRED_KDES, RECOMMENDED_KDES, validate_event_kdes
+from app.cte_rules import RECOMMENDED_KDES, REQUIRED_KDES, validate_event_kdes
 from app.demo_fixtures import DEMO_FIXTURES
 from app.epcis_export import _BIZ_STEPS, render_epcis_document
 from app.fda_export import render_fda_request_csv

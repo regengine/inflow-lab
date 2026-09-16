@@ -11,12 +11,12 @@ from fastapi.testclient import TestClient
 from app.build_info import BRANCH_ENV_VARS, COMMIT_SHA_ENV_VARS, DEPLOYMENT_ID_ENV_VARS
 from app.cors import DEFAULT_CORS_ORIGINS
 from app.main import app, controller, cors_origins_from_env, scenario_saves
-from app.schemas.domain import CTEType, DemoFixtureId
-from app.schemas.simulation import SimulationConfig
 from app.regengine_client import LiveIngestResult, LiveRegEngineDeliveryError
 from app.scenarios import ScenarioId, get_scenario
-
+from app.schemas.domain import CTEType, DemoFixtureId
+from app.schemas.simulation import SimulationConfig
 from tests.support.timestamps import recent_event_timestamp
+
 # The mock enforces the 90-day replay window by default, so a request body
 # posted by these tests needs a timestamp inside it -- see
 # tests/support/timestamps.py for why a literal cannot serve.

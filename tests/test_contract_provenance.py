@@ -39,8 +39,10 @@ from scripts.contract_pin_drift import (
     DriftInputError,
     evaluate_drift,
     extract_pinned_ref,
-    main as drift_main,
     matching_surface_files,
+)
+from scripts.contract_pin_drift import (
+    main as drift_main,
 )
 from scripts.regengine_kde_contract import (
     DEFAULT_SNAPSHOT_PATH,
@@ -54,7 +56,6 @@ from scripts.regengine_kde_contract import (
     load_snapshot,
     table_sha256,
 )
-
 
 # Environment variable the cross-repo CI job sets so this file's optional
 # "against the real upstream source" test runs there too. Locally:

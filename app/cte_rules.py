@@ -6,7 +6,6 @@ from typing import Any, Literal
 from .scenarios import ScenarioPreset
 from .schemas.domain import CTEType, RegEngineEvent, StoredEventRecord
 
-
 # How much weight a warning carries. "required" means FDA's CTE/KDE
 # reference makes the field unconditional for that CTE; "recommended" means
 # it is advisory -- industry practice, scenario realism, or a KDE the

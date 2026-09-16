@@ -22,7 +22,6 @@ from app.main import app
 # whatever store the operator's shell actually pointed at (#108).
 from app.tenancy import tenant_dir, tenant_events_path
 
-
 TENANTS = ["release-smoke-main", "release-smoke-other"]
 
 

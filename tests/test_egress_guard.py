@@ -55,7 +55,6 @@ from app.schemas.simulation import (
     validate_egress_endpoint,
 )
 
-
 client = TestClient(app)
 
 
@@ -557,8 +556,9 @@ def test_inline_delivery_on_an_ingestion_route_never_reaches_the_metadata_addres
 
 def test_name_based_blocklist_rejects_localhost() -> None:
     """Name-based blocklist backstops the address check when DNS fails."""
-    from app.schemas.simulation import EgressBlockedError, validate_egress_endpoint
     from pydantic import HttpUrl
+
+    from app.schemas.simulation import EgressBlockedError, validate_egress_endpoint
 
     # Every name and suffix the guard lists (#217): the loopback aliases,
     # the cloud metadata names, and the three suffixes.
@@ -585,8 +585,9 @@ def test_name_based_blocklist_allows_private_endpoints_escape_hatch(
     monkeypatch: Any,
 ) -> None:
     """REGENGINE_ALLOW_PRIVATE_ENDPOINTS=1 bypasses the name blocklist."""
-    from app.schemas.simulation import validate_egress_endpoint
     from pydantic import HttpUrl
+
+    from app.schemas.simulation import validate_egress_endpoint
 
     monkeypatch.setenv("REGENGINE_ALLOW_PRIVATE_ENDPOINTS", "1")
     url = HttpUrl("http://localhost:8000/api/v1/webhooks/ingest")
@@ -595,8 +596,9 @@ def test_name_based_blocklist_allows_private_endpoints_escape_hatch(
 
 def test_userinfo_in_url_is_rejected() -> None:
     """Endpoints with embedded credentials (user:pass@host) must be blocked."""
-    from app.schemas.simulation import EgressBlockedError, validate_egress_endpoint
     from pydantic import HttpUrl
+
+    from app.schemas.simulation import EgressBlockedError, validate_egress_endpoint
 
     for url_str in (
         "https://admin:secret@example.com/api/v1/webhooks/ingest",
@@ -608,8 +610,9 @@ def test_userinfo_in_url_is_rejected() -> None:
 
 def test_userinfo_rejection_precedes_address_check() -> None:
     """Userinfo rejection fires even for the trusted host, before DNS."""
-    from app.schemas.simulation import EgressBlockedError, validate_egress_endpoint
     from pydantic import HttpUrl
+
+    from app.schemas.simulation import EgressBlockedError, validate_egress_endpoint
 
     with pytest.raises(EgressBlockedError, match="userinfo"):
         validate_egress_endpoint(HttpUrl("https://user:pass@www.regengine.co/api/v1/webhooks/ingest"))

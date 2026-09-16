@@ -97,7 +97,6 @@ from app.scenarios import ScenarioId, get_scenario
 from app.schemas.domain import DestinationMode, OperationScale
 from app.schemas.simulation import DeliveryConfig, SimulationConfig
 
-
 client = TestClient(app)
 
 LEAFY = ScenarioId.LEAFY_GREENS_SUPPLIER

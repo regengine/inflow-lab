@@ -20,7 +20,6 @@ from ..schemas.health import (
 )
 from ..store import EventStore
 
-
 router = APIRouter(prefix="/api", tags=["Health"])
 
 # Same convention as app/main.py: logging.getLogger("inflow_lab") is a

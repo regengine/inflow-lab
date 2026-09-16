@@ -11,7 +11,6 @@ import logging
 import os
 from typing import Mapping
 
-
 logger = logging.getLogger(__name__)
 
 

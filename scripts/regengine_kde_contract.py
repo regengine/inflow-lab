@@ -49,7 +49,6 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any, Mapping, Sequence
 
-
 REPO_ROOT = Path(__file__).resolve().parents[1]
 
 # Where RegEngine keeps the table, relative to a RegEngine checkout root.

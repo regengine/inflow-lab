@@ -32,7 +32,6 @@ from fastapi.testclient import TestClient
 from app import tenancy
 from app.main import app
 
-
 client = TestClient(app)
 
 

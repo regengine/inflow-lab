@@ -20,7 +20,6 @@ from .schemas.scenarios import ScenarioSaveRequest
 from .schemas.simulation import SimulationConfig
 from .store import EventStore
 
-
 # Same name-keyed singleton logger main.py configures. Tenant creation is
 # the moment disk and memory get committed on a caller's say-so, so it is
 # worth a line an operator can correlate against (#182).

@@ -15,10 +15,10 @@ import httpx
 from .contract import INFLOW_CONTRACT_VERSION
 from .schemas.ingestion import IngestPayload
 from .schemas.simulation import SimulationConfig, async_resolve_egress_endpoint
+
 # Same masking convention store.py persists with and controller.py logs
 # with -- see _extract_error_body below (#138).
 from .store import mask_secret_in_payload, mask_secret_in_string
-
 
 DEFAULT_LIVE_INGEST_ENDPOINT = "https://www.regengine.co/api/v1/webhooks/ingest"
 DEFAULT_LIVE_TIMEOUT_SECONDS = 30.0

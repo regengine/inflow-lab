@@ -52,7 +52,6 @@ from app.schemas.domain import CSVImportType, RegEngineEvent
 from app.schemas.ingestion import IngestPayload
 from app.schemas.simulation import SimulationConfig
 
-
 client = TestClient(app)
 
 SCHEDULED_HEADER = (

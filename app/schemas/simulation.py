@@ -10,7 +10,6 @@ from pydantic import BaseModel, ConfigDict, Field, HttpUrl, RootModel, field_val
 from ..scenarios import ScenarioId
 from .domain import DestinationMode, OperationScale
 
-
 MockFrictionCode = Literal["invalid_key", "subscription_inactive", "rate_limit"]
 
 # Must match the host in regengine_client.DEFAULT_LIVE_INGEST_ENDPOINT. Kept

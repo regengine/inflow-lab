@@ -28,7 +28,6 @@ from app.schemas.domain import CTEType, RegEngineEvent, StoredEventRecord
 from app.schemas.ingestion import IngestPayload
 from app.store import EventStore
 
-
 SEED = 204
 # fresh_cut_processor is the scenario the other engine-correctness suites
 # already use to exercise multi-input transforms and rework

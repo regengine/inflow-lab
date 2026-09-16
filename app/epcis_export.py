@@ -6,7 +6,6 @@ from urllib.parse import quote
 
 from .schemas.domain import CTEType, StoredEventRecord
 
-
 EPCIS_CONTEXT = "https://ref.gs1.org/standards/epcis/2.0.0/epcis-context.jsonld"
 REGENGINE_EPCIS_CONTEXT = {"regengine": "https://www.regengine.co/ns/epcis#"}
 

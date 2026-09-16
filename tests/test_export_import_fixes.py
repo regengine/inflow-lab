@@ -44,7 +44,6 @@ from app.demo_fixtures import DEMO_FIXTURES
 from app.fda_export import FDA_EXPORT_COLUMNS, render_fda_request_csv
 from app.schemas.domain import CSVImportType, CTEType, DemoFixtureId, StoredEventRecord
 
-
 # ---------------------------------------------------------------------------
 # #94 -- FDA export column mislabel
 # ---------------------------------------------------------------------------

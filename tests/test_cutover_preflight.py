@@ -19,7 +19,6 @@ import pytest
 
 from app.main import app
 
-
 PREFLIGHT = Path(__file__).resolve().parents[1] / "scripts" / "cutover_preflight.sh"
 
 

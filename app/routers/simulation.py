@@ -20,7 +20,6 @@ from ..schemas.simulation import (
     StepResponse,
 )
 
-
 router = APIRouter(prefix="/api/simulate", tags=["Simulation"])
 
 

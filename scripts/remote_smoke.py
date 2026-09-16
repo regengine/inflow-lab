@@ -15,7 +15,6 @@ if str(REPO_ROOT) not in sys.path:
 
 from app.build_info import APP_VERSION
 
-
 DEFAULT_TENANT = "remote-smoke"
 DEFAULT_UNTRUSTED_ORIGIN = "https://untrusted.example"
 FRESH_CUT_OUTPUT_LOT = "TLC-DEMO-FC-OUT-001"
