@@ -26,6 +26,7 @@ from .delivery import (
 )
 from .demo_fixtures import get_demo_fixture
 from .engine import LegitFlowEngine
+from .jev_followup import recommend_import_followup
 
 # MAX_BATCH_EVENTS is imported here, not read inside app/delivery.py, so
 # the chunk size the controller passes is this module's name -- the one
@@ -645,6 +646,14 @@ class SimulationController:
                 response=outcome.response,
                 error=_with_stale_note(outcome.error_message, committed),
             )
+        # Jev follow-up pilot: one atomic Choice over batch statistics
+        # computed in code. Fail-open: no recommendation leaves the
+        # response unchanged. Never alters import/store/delivery behavior.
+        followup = await recommend_import_followup(parsed.events)
+        if followup is not None:
+            response_payload = dict(result.response or {})
+            response_payload["jev_followup"] = followup
+            result = result.model_copy(update={"response": response_payload})
         await self._publish_update()
         return result
 
