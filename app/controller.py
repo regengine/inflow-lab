@@ -649,7 +649,11 @@ class SimulationController:
         # Jev follow-up pilot: one atomic Choice over batch statistics
         # computed in code. Fail-open: no recommendation leaves the
         # response unchanged. Never alters import/store/delivery behavior.
-        followup = await recommend_import_followup(parsed.events)
+        try:
+            followup = await recommend_import_followup(parsed.events)
+        except Exception as exc:  # noqa: BLE001 — optional post-commit advice must fail open
+            logger.warning("Jev follow-up failed after CSV import: %s", type(exc).__name__)
+            followup = None
         if followup is not None:
             response_payload = dict(result.response or {})
             response_payload["jev_followup"] = followup

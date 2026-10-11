@@ -25,8 +25,12 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import math
 import os
 import urllib.request
+
+from .cte_rules import validate_event_kdes
+from .schemas.domain import RegEngineEvent
 
 logger = logging.getLogger(__name__)
 
@@ -38,18 +42,6 @@ _JEV_TIMEOUT_S = 10.0
 # Minimum confidence for a recommendation to be surfaced. Below this the
 # judgment is discarded (fail-open). Starting point — validate and adjust.
 JEV_MIN_CONFIDENCE = 0.6
-
-# KDE fields required by the inflow-lab RegEngine payload contract
-# (see AGENTS.md): presence is checked in code, values never leave.
-_REQUIRED_KDE_FIELDS = (
-    "cte_type",
-    "traceability_lot_code",
-    "product_description",
-    "quantity",
-    "unit_of_measure",
-    "location_name",
-    "timestamp",
-)
 
 # Symmetric option descriptions: each states what the option covers, in
 # parallel structure, without arguing for any of them.
@@ -67,6 +59,40 @@ _FOLLOWUP_INSTRUCTIONS = (
 )
 
 
+class _RejectRedirects(urllib.request.HTTPRedirectHandler):
+    """Keep the Typesafe bearer credential on its fixed origin."""
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        return None
+
+
+def _as_regengine_event(event: object) -> RegEngineEvent:
+    """Normalize documented event-like inputs before canonical validation."""
+    if isinstance(event, RegEngineEvent):
+        return event
+    return RegEngineEvent(
+        cte_type=getattr(event, "cte_type"),
+        traceability_lot_code=getattr(event, "traceability_lot_code"),
+        product_description=getattr(event, "product_description"),
+        quantity=getattr(event, "quantity"),
+        unit_of_measure=getattr(event, "unit_of_measure"),
+        location_name=getattr(event, "location_name"),
+        location_gln=getattr(event, "location_gln", None),
+        timestamp=getattr(event, "timestamp"),
+        kdes=getattr(event, "kdes", {}),
+        input_traceability_lot_codes=getattr(event, "input_traceability_lot_codes", None),
+    )
+
+
+def _rounded_completeness(complete: int, total: int) -> float:
+    """Round for the prompt without turning a mixed batch into a boundary value."""
+    if complete <= 0:
+        return 0.0
+    if complete >= total:
+        return 1.0
+    return min(0.9999, max(0.0001, round(complete / total, 4)))
+
+
 def _jev_choice(state: dict) -> dict | None:
     """Ask Jev the follow-up Choice. Returns the raw answer dict, or None
     when Jev cannot answer. Fail-open by design."""
@@ -74,30 +100,31 @@ def _jev_choice(state: dict) -> dict | None:
     if not api_key:
         logger.debug("TYPESAFE_API_KEY not set; skipping Jev follow-up")
         return None
-    body = json.dumps(
-        {
-            "state": state,
-            "model": _JEV_MODEL,
-            "questions": {
-                "followup": {
-                    "type": "choice",
-                    "instructions": _FOLLOWUP_INSTRUCTIONS,
-                    "criteria": _FOLLOWUP_OPTIONS,
-                }
-            },
-        }
-    ).encode()
-    req = urllib.request.Request(
-        _JEV_API_URL,
-        data=body,
-        method="POST",
-        headers={
-            "Content-Type": "application/json",
-            "Authorization": f"Bearer {api_key}",
-        },
-    )
     try:
-        with urllib.request.urlopen(req, timeout=_JEV_TIMEOUT_S) as resp:
+        body = json.dumps(
+            {
+                "state": state,
+                "model": _JEV_MODEL,
+                "questions": {
+                    "followup": {
+                        "type": "choice",
+                        "instructions": _FOLLOWUP_INSTRUCTIONS,
+                        "criteria": _FOLLOWUP_OPTIONS,
+                    }
+                }
+            }
+        ).encode()
+        req = urllib.request.Request(
+            _JEV_API_URL,
+            data=body,
+            method="POST",
+            headers={
+                "Content-Type": "application/json",
+                "Authorization": f"Bearer {api_key}",
+            },
+        )
+        opener = urllib.request.build_opener(_RejectRedirects())
+        with opener.open(req, timeout=_JEV_TIMEOUT_S) as resp:
             data = json.loads(resp.read().decode())
         answer = data["answers"]["followup"]
         if answer.get("type") != "choice":
@@ -121,22 +148,16 @@ def summarize_batch(events: list) -> dict:
             "cte_types": [],
         }
     with_lot = 0
-    kde_complete_sum = 0
+    kde_complete = 0
     lineage_links = 0
     cte_types: set[str] = set()
-    for e in events:
+    for raw_event in events:
+        e = _as_regengine_event(raw_event)
         tlc = getattr(e, "traceability_lot_code", "") or ""
         if isinstance(tlc, str) and len(tlc.strip()) >= 3:
             with_lot += 1
-        present = 0
-        for field in _REQUIRED_KDE_FIELDS:
-            v = getattr(e, field, None)
-            if v is None:
-                continue
-            if isinstance(v, str) and not v.strip():
-                continue
-            present += 1
-        kde_complete_sum += present / len(_REQUIRED_KDE_FIELDS)
+        if not any(warning.severity == "required" for warning in validate_event_kdes(e)):
+            kde_complete += 1
         cte = getattr(getattr(e, "cte_type", ""), "value", e.cte_type)
         cte_types.add(str(cte))
         inputs = getattr(e, "input_traceability_lot_codes", None) or (
@@ -149,7 +170,7 @@ def summarize_batch(events: list) -> dict:
     return {
         "total_events": total,
         "frac_with_lot_code": round(with_lot / total, 4),
-        "frac_kde_complete": round(kde_complete_sum / total, 4),
+        "frac_kde_complete": _rounded_completeness(kde_complete, total),
         "lineage_links": lineage_links,
         "cte_types": sorted(cte_types),
     }
@@ -161,10 +182,20 @@ def _recommend_sync(summary: dict) -> dict | None:
         return None
     try:
         choice = answer["choice"]
-        confidence = float(answer.get("confidence", 0.0))
-    except (KeyError, TypeError, ValueError):
+        raw_confidence = answer.get("confidence", 0.0)
+        if not isinstance(choice, str) or isinstance(raw_confidence, bool):
+            return None
+        if not isinstance(raw_confidence, (int, float, str)):
+            return None
+        confidence = float(raw_confidence)
+    except (KeyError, TypeError, ValueError, OverflowError):
         return None
-    if choice not in _FOLLOWUP_OPTIONS or confidence < JEV_MIN_CONFIDENCE:
+    if (
+        choice not in _FOLLOWUP_OPTIONS
+        or not math.isfinite(confidence)
+        or not 0.0 <= confidence <= 1.0
+        or confidence < JEV_MIN_CONFIDENCE
+    ):
         return None
     return {
         "action": choice,
