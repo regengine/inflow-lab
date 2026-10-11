@@ -23,8 +23,9 @@ Version history:
   without a human re-checking it against RegEngine's real contract.
   ``check_remote_kde_contract()`` is the seam for actually diffing
   REQUIRED_KDES against a machine-readable upstream artifact instead of
-  just timing out — unwired by default in this environment; see its
-  docstring for exactly what CI wiring would activate it. Neither check
+  just timing out — unwired by default in this local environment; see its
+  docstring for artifact-based consumers. Hosted source verification uses
+  the trusted AST-only contract-pin workflow instead. Neither check
   bumps INFLOW_CONTRACT_VERSION by itself — the wire contract did not
   change; only the tooling that watches it did.
 """
@@ -251,33 +252,26 @@ def check_remote_kde_contract() -> RemoteContractDiff:
       JSON shape (a release asset, an internal artifact store, RegEngine's
       own CI output).
 
-    CI WIRING THIS NEEDS (not implemented here -- .github/workflows/ci.yml
-    is outside this file's ownership, and standing up the artifact feed
-    itself is outside what this session can reach):
+    ARTIFACT WIRING FOR EXTERNAL/LOCAL CONSUMERS (the hosted repository gate
+    instead fetches immutable RegEngine source and invokes the AST-only
+    scripts/regengine_kde_contract.py verifier):
 
     1. RegEngine's side needs to publish REQUIRED_KDES_BY_CTE as that
        ``{cte_type: [kde, ...]}`` JSON artifact somewhere inflow-lab's CI
        can fetch it -- a release asset on RegEngine's repo, an internal
        artifact bucket, or a small shared contract-artifacts repo checked
        out alongside this one.
-    2. A step in .github/workflows/ci.yml sets
+    2. A caller sets
        REGENGINE_CONTRACT_ARTIFACT_URL (or checks the artifact out and
        sets REGENGINE_CONTRACT_ARTIFACT_PATH) and runs
-       ``uv run python -m app.contract``, failing the build on a non-zero
-       exit. Prefer wiring it to the existing weekly
-       ``schedule: cron: '0 7 * * 1'`` trigger rather than every PR, since
-       it depends on a resource external to this repo and PR-blocking a
-       contributor on an artifact-store outage would be worse than the
-       weekly cadence catching real drift a few days late.
+       ``uv run python -m app.contract``, failing on a non-zero exit.
 
-    Until that artifact exists, wiring this into every-PR CI would just
-    turn ContractVerificationUnavailable into a permanent, unactionable
-    red build -- worse than the status quo, not better. That is why this
-    function is a seam and not a CI step: it is correct and fully testable
-    today (see tests/test_client_diagnostics.py, which feeds it a local
-    file so the diff logic itself is exercised without any network), but
-    activating it for real is an infrastructure decision outside this
-    repo.
+    Until that artifact exists, this function intentionally remains a seam
+    rather than pretending no configuration is a pass. It is fully testable
+    with a local artifact (tests/test_client_diagnostics.py). The hosted
+    trusted workflow independently closes the real-source verification gap
+    without changing this API or exposing its cross-repository credential to
+    pull-request code.
     """
     path = os.getenv(REMOTE_ARTIFACT_PATH_ENV, "").strip()
     url = os.getenv(REMOTE_ARTIFACT_URL_ENV, "").strip()

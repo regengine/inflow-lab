@@ -17,9 +17,9 @@ name: Contract Pin Drift
 #      plus job summary) and on the scheduled run it FAILS and files an
 #      issue, which is where someone who can act on it will see it.
 #
-#   2. The RegEngine ref this repository's own cross-repo job checks out
-#      (.github/workflows/ci.yml). It defaults to `main` -- this side
-#      tracks upstream rather than pinning it, so there is normally
+#   2. The RegEngine ref this trusted cross-repo workflow verifies. It
+#      defaults to RegEngine's resolved default branch -- this side tracks
+#      upstream rather than pinning it, so there is normally
 #      nothing to drift. It only becomes a pin when a maintainer sets the
 #      REGENGINE_CONTRACT_REF variable to a SHA to ride out an upstream
 #      breakage, and then this check FAILS once that workaround goes
@@ -42,24 +42,33 @@ name: Contract Pin Drift
 # the count -- and treats a truncated GitHub compare response as drifted
 # rather than assuming it is clean.
 #
-# Requires the same access as the contract job in ci.yml:
+# Requires read access to RegEngine:
 # secrets.REGENGINE_CONTRACT_REPO_TOKEN (preferred, legacy-compatible here),
 # or secrets.REGENGINE_CONTRACT_TOKEN
 # (both: contents: read on regengine/regengine),
 # or vars.REGENGINE_CONTRACT_PUBLIC=true if that repository is public.
-# Without it every step below skips with a warning rather than failing.
+# Pull-request metadata runs execute only the trusted base revision and may
+# report access outages without blocking. Scheduled and maintainer-triggered
+# repository-dispatch runs fail when access is absent or verification cannot
+# complete. Unlike workflow_dispatch, repository_dispatch always loads this
+# credential-bearing workflow from the default branch.
 
 on:
-  pull_request:
+  # This credential-bearing workflow must come from the trusted base branch.
+  # It never checks out, imports, installs or executes pull-request code or
+  # artifacts. Ordinary candidate behavior remains covered by ci.yml.
+  pull_request_target:
+    types: [opened, synchronize, reopened, ready_for_review]
   schedule:
     - cron: '0 8 * * 1'
-  workflow_dispatch:
+  repository_dispatch:
+    types: [contract-pin-drift]
 
 permissions:
   contents: read
 
 concurrency:
-  group: contract-pin-drift-${{ github.ref }}
+  group: contract-pin-drift-${{ github.event.pull_request.number || github.ref }}
   cancel-in-progress: true
 
 env:
@@ -71,11 +80,16 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 10
     outputs:
-      checked: ${{ steps.access.outputs.has_access }}
+      checked: ${{ steps.complete.outputs.checked }}
 
     steps:
-      - name: Check out repository
+      - name: Check out trusted repository revision
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          # Always use the repository's trusted default branch, never a PR
+          # head/base branch or an operator-selected dispatch ref.
+          ref: ${{ github.event.repository.default_branch }}
+          persist-credentials: false
 
       - name: Set up Python
         uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
@@ -96,14 +110,30 @@ jobs:
           set -euo pipefail
 
           repository="${REGENGINE_CONTRACT_REPOSITORY:-regengine/regengine}"
-          ref="${REGENGINE_CONTRACT_REF:-main}"
+          ref="${REGENGINE_CONTRACT_REF:-}"
+
+          if ! [[ "${repository}" =~ ^[A-Za-z0-9][A-Za-z0-9_.-]*/[A-Za-z0-9][A-Za-z0-9_.-]*$ ]] \
+              || [[ "${repository}" == *..* ]]; then
+            echo "::error::Invalid REGENGINE_CONTRACT_REPOSITORY; expected one GitHub owner/name pair."
+            exit 1
+          fi
+          if [ -n "${ref}" ] && { \
+              ! [[ "${ref}" =~ ^[A-Za-z0-9][A-Za-z0-9._/-]{0,254}$ ]] \
+              || [[ "${ref}" == *..* ]] \
+              || [[ "${ref}" == *//* ]] \
+              || [[ "${ref}" == */ ]] \
+              || [[ "${ref}" == *'@{'* ]]; \
+          }; then
+            echo "::error::Invalid REGENGINE_CONTRACT_REF; expected a safe branch name or full commit SHA."
+            exit 1
+          fi
 
           # Whether an inability to reach the other repository (a revoked
           # token, a deleted commit, an API outage) is fatal. On a pull
           # request it is not: none of those are the contributor's to fix,
           # and a check that reddens for them gets ignored for the ones
           # that matter. The scheduled run treats them as failures.
-          if [ "${EVENT_NAME}" = "pull_request" ]; then
+          if [ "${EVENT_NAME}" = "pull_request_target" ]; then
             enforce=false
           else
             enforce=true
@@ -113,7 +143,7 @@ jobs:
             has_access=true
           else
             has_access=false
-            echo "::warning::Cross-repo pin drift NOT checked: add the repository secret REGENGINE_CONTRACT_REPO_TOKEN (or REGENGINE_CONTRACT_TOKEN), with contents:read on regengine/regengine, or set the repository variable REGENGINE_CONTRACT_PUBLIC=true if that repository is public. Pull requests from forks never receive secrets."
+            echo "::warning::Cross-repo pin drift NOT checked: add the repository secret REGENGINE_CONTRACT_REPO_TOKEN (or REGENGINE_CONTRACT_TOKEN), with contents:read on regengine/regengine, or set the repository variable REGENGINE_CONTRACT_PUBLIC=true if that repository is public."
             {
               echo "### Contract pin drift: NOT CHECKED"
               echo
@@ -128,16 +158,89 @@ jobs:
             echo "regengine_ref=${ref}"
           } >> "$GITHUB_OUTPUT"
 
-      # Direction 1: the simulator commit RegEngine's contract test pins.
-      - name: Read the simulator ref RegEngine pins
-        id: upstream_pin
+          if [ "${has_access}" != "true" ] && [ "${enforce}" = "true" ]; then
+            echo "::error::Scheduled/repository-dispatch contract verification is enforced and cannot succeed as NOT CHECKED."
+            exit 1
+          fi
+
+      - name: Resolve immutable RegEngine refs
+        id: regengine_ref
         if: steps.access.outputs.has_access == 'true'
         env:
           GH_TOKEN: ${{ secrets.REGENGINE_CONTRACT_TOKEN || secrets.REGENGINE_CONTRACT_REPO_TOKEN || github.token }}
           REGENGINE_REPOSITORY: ${{ steps.access.outputs.regengine_repository }}
+          REQUESTED_REF: ${{ steps.access.outputs.regengine_ref }}
           ENFORCE: ${{ steps.access.outputs.enforce }}
         run: |
           set -euo pipefail
+          echo "completed=false" >> "$GITHUB_OUTPUT"
+
+          unavailable() {
+            if [ "${ENFORCE}" = "true" ]; then
+              echo "::error::$1"
+              exit 1
+            fi
+            echo "::warning::$1"
+            exit 0
+          }
+
+          if ! default_branch="$(gh api "repos/${REGENGINE_REPOSITORY}" --jq .default_branch)"; then
+            unavailable "Could not read ${REGENGINE_REPOSITORY} repository metadata; contract verification did not run."
+          fi
+          if ! [[ "${default_branch}" =~ ^[A-Za-z0-9][A-Za-z0-9._/-]{0,254}$ ]] \
+              || [[ "${default_branch}" == *..* ]] \
+              || [[ "${default_branch}" == *//* ]] \
+              || [[ "${default_branch}" == */ ]] \
+              || [[ "${default_branch}" == *'@{'* ]]; then
+            unavailable "${REGENGINE_REPOSITORY} returned an invalid default branch name."
+          fi
+
+          requested="${REQUESTED_REF:-${default_branch}}"
+          if [ "${requested}" = "${default_branch}" ]; then
+            tracking=true
+          elif [[ "${requested}" =~ ^[0-9a-fA-F]{40}$ ]]; then
+            tracking=false
+          else
+            unavailable "REGENGINE_CONTRACT_REF must be empty/the current default branch for tracking, or one full 40-character commit SHA."
+          fi
+
+          if ! default_sha="$(gh api --method GET "repos/${REGENGINE_REPOSITORY}/commits" \
+              -f sha="${default_branch}" -f per_page=1 --jq '.[0].sha')" \
+              || ! [[ "${default_sha}" =~ ^[0-9a-fA-F]{40}$ ]]; then
+            unavailable "Could not resolve ${REGENGINE_REPOSITORY}'s default branch to an immutable commit."
+          fi
+          if ! resolved_sha="$(gh api --method GET "repos/${REGENGINE_REPOSITORY}/commits" \
+              -f sha="${requested}" -f per_page=1 --jq '.[0].sha')" \
+              || ! [[ "${resolved_sha}" =~ ^[0-9a-fA-F]{40}$ ]]; then
+            unavailable "Could not resolve REGENGINE_CONTRACT_REF in the configured RegEngine repository."
+          fi
+          if [ "${tracking}" = "false" ] && [ "${resolved_sha,,}" != "${requested,,}" ]; then
+            unavailable "REGENGINE_CONTRACT_REF did not resolve to the exact configured commit SHA."
+          fi
+
+          {
+            echo "completed=true"
+            echo "repository=${REGENGINE_REPOSITORY}"
+            echo "requested=${requested}"
+            echo "sha=${resolved_sha}"
+            echo "default_branch=${default_branch}"
+            echo "default_sha=${default_sha}"
+            echo "tracking=${tracking}"
+          } >> "$GITHUB_OUTPUT"
+          echo "RegEngine ref ${requested} resolves to ${resolved_sha}; default ${default_branch} resolves to ${default_sha}."
+
+      # Direction 1: the simulator commit RegEngine's contract test pins.
+      - name: Fetch RegEngine's trusted contract workflow
+        id: upstream_workflow
+        if: steps.regengine_ref.outputs.completed == 'true'
+        env:
+          GH_TOKEN: ${{ secrets.REGENGINE_CONTRACT_TOKEN || secrets.REGENGINE_CONTRACT_REPO_TOKEN || github.token }}
+          REGENGINE_REPOSITORY: ${{ steps.regengine_ref.outputs.repository }}
+          REGENGINE_DEFAULT_SHA: ${{ steps.regengine_ref.outputs.default_sha }}
+          ENFORCE: ${{ steps.access.outputs.enforce }}
+        run: |
+          set -euo pipefail
+          echo "completed=false" >> "$GITHUB_OUTPUT"
 
           unreachable() {
             if [ "${ENFORCE}" = "true" ]; then
@@ -145,14 +248,35 @@ jobs:
               exit 1
             fi
             echo "::warning::$1"
-            echo "pin=" >> "$GITHUB_OUTPUT"
             exit 0
           }
 
-          if ! gh api "repos/${REGENGINE_REPOSITORY}/contents/.github/workflows/inflow-contract-ci.yml" \
+          if ! gh api --method GET \
+              "repos/${REGENGINE_REPOSITORY}/contents/.github/workflows/inflow-contract-ci.yml" \
+              -f ref="${REGENGINE_DEFAULT_SHA}" \
               -H "Accept: application/vnd.github.raw" > "${RUNNER_TEMP}/inflow-contract-ci.yml"; then
             unreachable "Could not read ${REGENGINE_REPOSITORY}'s inflow-contract-ci.yml; the pin it holds on this repository was not checked."
           fi
+          echo "completed=true" >> "$GITHUB_OUTPUT"
+
+      - name: Read the simulator ref RegEngine pins
+        id: upstream_pin
+        if: steps.upstream_workflow.outputs.completed == 'true'
+        env:
+          REGENGINE_REPOSITORY: ${{ steps.regengine_ref.outputs.repository }}
+          ENFORCE: ${{ steps.access.outputs.enforce }}
+        run: |
+          set -euo pipefail
+          echo "completed=false" >> "$GITHUB_OUTPUT"
+
+          unreachable() {
+            if [ "${ENFORCE}" = "true" ]; then
+              echo "::error::$1"
+              exit 1
+            fi
+            echo "::warning::$1"
+            exit 0
+          }
 
           # Parsed by the tested helper rather than an inline regex: if
           # upstream renames or moves the pin this exits non-zero, which
@@ -166,30 +290,64 @@ jobs:
             unreachable "${REGENGINE_REPOSITORY} no longer pins INFLOW_LAB_REF where this check looks for it; the pin was not checked."
           fi
 
-          echo "pin=${pin}" >> "$GITHUB_OUTPUT"
+          {
+            echo "completed=true"
+            echo "pin=${pin}"
+          } >> "$GITHUB_OUTPUT"
           echo "RegEngine pins this repository at ${pin}"
 
-      - name: Check drift of RegEngine's simulator pin
-        if: steps.access.outputs.has_access == 'true' && steps.upstream_pin.outputs.pin != ''
+      - name: Fetch comparison for RegEngine's simulator pin
+        id: simulator_comparison
+        if: steps.upstream_pin.outputs.completed == 'true'
         env:
           GH_TOKEN: ${{ github.token }}
           PIN: ${{ steps.upstream_pin.outputs.pin }}
           ENFORCE: ${{ steps.access.outputs.enforce }}
         run: |
           set -euo pipefail
+          echo "completed=false" >> "$GITHUB_OUTPUT"
 
-          default_branch="$(gh api "repos/${GITHUB_REPOSITORY}" --jq .default_branch)"
-
-          if ! gh api "repos/${GITHUB_REPOSITORY}/compare/${PIN}...${default_branch}" \
-              > "${RUNNER_TEMP}/inflow-comparison.json"; then
-            message="Could not compare ${PIN}...${default_branch}; the commit RegEngine pins may no longer exist here."
+          unavailable() {
             if [ "${ENFORCE}" = "true" ]; then
-              echo "::error::${message}"
+              echo "::error::$1"
               exit 1
             fi
-            echo "::warning::${message}"
+            echo "::warning::$1"
             exit 0
+          }
+
+          if ! default_branch="$(gh api "repos/${GITHUB_REPOSITORY}" --jq .default_branch)"; then
+            unavailable "Could not resolve this repository's default branch."
           fi
+          if ! [[ "${default_branch}" =~ ^[A-Za-z0-9][A-Za-z0-9._/-]{0,254}$ ]]; then
+            unavailable "This repository returned an invalid default branch name."
+          fi
+          if ! head_sha="$(gh api --method GET "repos/${GITHUB_REPOSITORY}/commits" \
+              -f sha="${default_branch}" -f per_page=1 --jq '.[0].sha')" \
+              || ! [[ "${head_sha}" =~ ^[0-9a-fA-F]{40}$ ]]; then
+            unavailable "Could not resolve this repository's default branch to an immutable commit."
+          fi
+
+          if ! gh api "repos/${GITHUB_REPOSITORY}/compare/${PIN}...${head_sha}" \
+              > "${RUNNER_TEMP}/inflow-comparison.json"; then
+            unavailable "Could not compare RegEngine's simulator pin to this repository's default-branch commit."
+          fi
+
+          {
+            echo "completed=true"
+            echo "head_sha=${head_sha}"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Check drift of RegEngine's simulator pin
+        id: simulator_drift
+        if: steps.simulator_comparison.outputs.completed == 'true'
+        env:
+          PIN: ${{ steps.upstream_pin.outputs.pin }}
+          HEAD_SHA: ${{ steps.simulator_comparison.outputs.head_sha }}
+          ENFORCE: ${{ steps.access.outputs.enforce }}
+        run: |
+          set -euo pipefail
+          echo "completed=false" >> "$GITHUB_OUTPUT"
 
           # A pull request here cannot advance a pin that lives in the
           # other repository, so blocking one on it would only train
@@ -201,60 +359,195 @@ jobs:
             on_breach=warn
           fi
 
+          set +e
           python scripts/contract_pin_drift.py check \
             --comparison "${RUNNER_TEMP}/inflow-comparison.json" \
             --label "RegEngine's INFLOW_LAB_REF pin on this repository" \
             --base-ref "${PIN}" \
-            --head-ref "${default_branch}" \
+            --head-ref "${HEAD_SHA}" \
             --max-commits "${MAX_PIN_DRIFT_COMMITS}" \
             --surface-preset inflow-lab \
             --on-breach "${on_breach}"
+          status=$?
+          set -e
+          if [ "${status}" -eq 0 ]; then
+            echo "completed=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          if [ "${ENFORCE}" != "true" ] && [ "${status}" -eq 3 ]; then
+            echo "::warning::The simulator-pin comparison was malformed; this pull-request metadata run is NOT CHECKED."
+            exit 0
+          fi
+          exit "${status}"
 
       # Direction 2: the RegEngine ref this repository's contract job uses.
-      - name: Check drift of this repository's RegEngine ref
-        if: steps.access.outputs.has_access == 'true'
+      - name: Fetch comparison for this repository's RegEngine ref
+        id: regengine_comparison
+        if: steps.regengine_ref.outputs.completed == 'true'
         env:
           GH_TOKEN: ${{ secrets.REGENGINE_CONTRACT_TOKEN || secrets.REGENGINE_CONTRACT_REPO_TOKEN || github.token }}
-          REGENGINE_REPOSITORY: ${{ steps.access.outputs.regengine_repository }}
-          REGENGINE_REF: ${{ steps.access.outputs.regengine_ref }}
+          REGENGINE_REPOSITORY: ${{ steps.regengine_ref.outputs.repository }}
+          REGENGINE_SHA: ${{ steps.regengine_ref.outputs.sha }}
+          DEFAULT_SHA: ${{ steps.regengine_ref.outputs.default_sha }}
+          TRACKING: ${{ steps.regengine_ref.outputs.tracking }}
           ENFORCE: ${{ steps.access.outputs.enforce }}
         run: |
           set -euo pipefail
+          echo "completed=false" >> "$GITHUB_OUTPUT"
 
-          if ! printf '%s' "${REGENGINE_REF}" | grep -Eq '^[0-9a-fA-F]{7,40}$'; then
-            echo "::notice::This repository tracks '${REGENGINE_REPOSITORY}' at ref '${REGENGINE_REF}' rather than pinning a commit, so there is no pin to drift. A pinned SHA (repository variable REGENGINE_CONTRACT_REF) would be checked here."
+          unavailable() {
+            if [ "${ENFORCE}" = "true" ]; then
+              echo "::error::$1"
+              exit 1
+            fi
+            echo "::warning::$1"
+            exit 0
+          }
+
+          if [ "${TRACKING}" = "true" ]; then
+            echo "completed=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          if ! gh api "repos/${REGENGINE_REPOSITORY}/compare/${REGENGINE_SHA}...${DEFAULT_SHA}" \
+              > "${RUNNER_TEMP}/regengine-comparison.json"; then
+            unavailable "Could not compare the configured RegEngine pin to its default-branch commit."
+          fi
+          echo "completed=true" >> "$GITHUB_OUTPUT"
+
+      - name: Check drift of this repository's RegEngine ref
+        id: regengine_drift
+        if: steps.regengine_comparison.outputs.completed == 'true'
+        env:
+          REGENGINE_REPOSITORY: ${{ steps.regengine_ref.outputs.repository }}
+          REGENGINE_REF: ${{ steps.regengine_ref.outputs.requested }}
+          REGENGINE_SHA: ${{ steps.regengine_ref.outputs.sha }}
+          DEFAULT_SHA: ${{ steps.regengine_ref.outputs.default_sha }}
+          TRACKING: ${{ steps.regengine_ref.outputs.tracking }}
+          ENFORCE: ${{ steps.access.outputs.enforce }}
+        run: |
+          set -euo pipefail
+          echo "completed=false" >> "$GITHUB_OUTPUT"
+
+          if [ "${TRACKING}" = "true" ]; then
+            echo "::notice::This repository tracks ${REGENGINE_REPOSITORY} at resolved commit ${REGENGINE_SHA}; there is no pinned commit to drift."
             {
               echo "### Contract pin drift: this repository's RegEngine ref"
               echo
-              echo "Tracking \`${REGENGINE_REF}\` -- no pinned commit to drift."
+              echo "Tracking the default branch at immutable commit \`${REGENGINE_SHA}\`."
             } >> "$GITHUB_STEP_SUMMARY"
-            exit 0
-          fi
-
-          default_branch="$(gh api "repos/${REGENGINE_REPOSITORY}" --jq .default_branch)"
-
-          if ! gh api "repos/${REGENGINE_REPOSITORY}/compare/${REGENGINE_REF}...${default_branch}" \
-              > "${RUNNER_TEMP}/regengine-comparison.json"; then
-            message="Could not compare ${REGENGINE_REF}...${default_branch} in ${REGENGINE_REPOSITORY}; the pinned commit may no longer exist there."
-            if [ "${ENFORCE}" = "true" ]; then
-              echo "::error::${message}"
-              exit 1
-            fi
-            echo "::warning::${message}"
+            echo "completed=true" >> "$GITHUB_OUTPUT"
             exit 0
           fi
 
           # This pin lives here, so a failure is actionable here: clear
           # REGENGINE_CONTRACT_REF to go back to tracking, or move it
           # forward.
+          set +e
           python scripts/contract_pin_drift.py check \
             --comparison "${RUNNER_TEMP}/regengine-comparison.json" \
             --label "this repository's REGENGINE_CONTRACT_REF pin" \
-            --base-ref "${REGENGINE_REF}" \
-            --head-ref "${default_branch}" \
+            --base-ref "${REGENGINE_SHA}" \
+            --head-ref "${DEFAULT_SHA}" \
             --max-commits "${MAX_PIN_DRIFT_COMMITS}" \
             --surface-preset regengine \
             --on-breach fail
+          status=$?
+          set -e
+          if [ "${status}" -eq 0 ]; then
+            echo "completed=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          if [ "${ENFORCE}" != "true" ] && [ "${status}" -eq 3 ]; then
+            echo "::warning::The RegEngine-pin comparison was malformed; this pull-request metadata run is NOT CHECKED."
+            exit 0
+          fi
+          exit "${status}"
+
+      - name: Fetch RegEngine contract source at the resolved commit
+        id: contract_source
+        if: steps.regengine_ref.outputs.completed == 'true'
+        env:
+          GH_TOKEN: ${{ secrets.REGENGINE_CONTRACT_TOKEN || secrets.REGENGINE_CONTRACT_REPO_TOKEN || github.token }}
+          REGENGINE_REPOSITORY: ${{ steps.regengine_ref.outputs.repository }}
+          REGENGINE_SHA: ${{ steps.regengine_ref.outputs.sha }}
+          ENFORCE: ${{ steps.access.outputs.enforce }}
+        run: |
+          set -euo pipefail
+          echo "completed=false" >> "$GITHUB_OUTPUT"
+
+          unavailable() {
+            if [ "${ENFORCE}" = "true" ]; then
+              echo "::error::$1"
+              exit 1
+            fi
+            echo "::warning::$1"
+            exit 0
+          }
+
+          source_root="${RUNNER_TEMP}/regengine-contract-source"
+          source_dir="${source_root}/services/ingestion/app"
+          mkdir -p "${source_dir}"
+          if ! gh api --method GET \
+              "repos/${REGENGINE_REPOSITORY}/contents/services/ingestion/app/webhook_models.py" \
+              -f ref="${REGENGINE_SHA}" \
+              -H "Accept: application/vnd.github.raw" > "${source_dir}/webhook_models.py"; then
+            unavailable "Could not fetch RegEngine's webhook contract source at the resolved immutable commit."
+          fi
+          echo "completed=true" >> "$GITHUB_OUTPUT"
+
+      - name: Verify real RegEngine KDE table and contract version
+        id: contract_provenance
+        if: steps.contract_source.outputs.completed == 'true'
+        env:
+          REGENGINE_SHA: ${{ steps.regengine_ref.outputs.sha }}
+          ENFORCE: ${{ steps.access.outputs.enforce }}
+        run: |
+          set -euo pipefail
+          echo "completed=false" >> "$GITHUB_OUTPUT"
+
+          set +e
+          python scripts/regengine_kde_contract.py verify \
+            --regengine-root "${RUNNER_TEMP}/regengine-contract-source" \
+            --inflow-contract app/contract.py \
+            > "${RUNNER_TEMP}/contract-verify.out" \
+            2> "${RUNNER_TEMP}/contract-verify.err"
+          status=$?
+          set -e
+
+          if [ "${status}" -eq 0 ]; then
+            cat "${RUNNER_TEMP}/contract-verify.out"
+            echo "Verified RegEngine source commit ${REGENGINE_SHA}"
+            {
+              echo "### Real RegEngine contract provenance -- VERIFIED"
+              echo
+              echo "Verified RegEngine source commit \`${REGENGINE_SHA}\` against the snapshot's exact source-byte SHA-256 before AST extraction; no upstream code was imported or executed."
+            } >> "$GITHUB_STEP_SUMMARY"
+            echo "completed=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          if [ "${status}" -eq 2 ] && [ "${ENFORCE}" != "true" ]; then
+            sed 's/^::error:://' "${RUNNER_TEMP}/contract-verify.err"
+            echo "::warning::RegEngine's contract differs from the trusted base revision; scheduled/repository-dispatch verification enforces this mismatch."
+            echo "completed=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          if [ "${status}" -eq 3 ] && [ "${ENFORCE}" != "true" ]; then
+            sed 's/^::error:://' "${RUNNER_TEMP}/contract-verify.err"
+            echo "::warning::RegEngine contract source could not be parsed; this pull-request metadata run is NOT CHECKED."
+            exit 0
+          fi
+
+          cat "${RUNNER_TEMP}/contract-verify.err" >&2
+          exit "${status}"
+
+      - name: Mark complete contract verification
+        id: complete
+        if: >-
+          steps.simulator_drift.outputs.completed == 'true' &&
+          steps.regengine_drift.outputs.completed == 'true' &&
+          steps.contract_provenance.outputs.completed == 'true'
+        run: echo "checked=true" >> "$GITHUB_OUTPUT"
 
   # A red scheduled run is invisible; a filed issue is not. Same reasoning
   # and same reusable workflow as the smoke checks.
