@@ -34,6 +34,11 @@ def load(name: str) -> dict:
     return yaml.safe_load((WORKFLOWS / name).read_text(encoding="utf-8"))
 
 
+def workflow_events(workflow: dict) -> dict:
+    # PyYAML 1.1 interprets the plain scalar ``on`` as boolean true.
+    return workflow.get("on", workflow.get(True, {}))
+
+
 @pytest.fixture(scope="module")
 def ci_jobs() -> dict:
     return load("ci.yml")["jobs"]
@@ -113,3 +118,96 @@ def test_autopilot_reverts_and_flags_workflow_edits():
     guards = [step for step in steps if step.get("id") == "workflow_guard"]
     assert len(guards) == 1, "the workflow guard step is missing from codex-autopilot"
     assert "git checkout -- .github/workflows" in guards[0]["run"]
+
+
+def test_contract_gate_uses_trusted_base_code_for_credentialed_pr_metadata_checks():
+    workflow = load("contract-pin-drift.yml")
+    events = workflow_events(workflow)
+    job = workflow["jobs"]["drift"]
+    steps = job["steps"]
+
+    assert "pull_request_target" in events
+    assert "pull_request" not in events
+
+    checkout_steps = [step for step in steps if "actions/checkout" in str(step.get("uses", ""))]
+    assert len(checkout_steps) == 1
+    checkout = checkout_steps[0]
+    assert checkout["with"]["ref"] == "${{ github.event.repository.default_branch }}"
+    assert checkout["with"]["persist-credentials"] is False
+
+    serialized = yaml.safe_dump(job)
+    assert "pull_request.head" not in serialized
+    assert "pull_request.base" not in serialized
+    assert "github.head_ref" not in serialized
+    assert "refs/pull" not in serialized
+    assert "actions/download-artifact" not in serialized
+    assert "uv sync" not in serialized
+    assert "pip install" not in serialized
+
+
+def test_contract_gate_manual_trigger_can_only_run_the_default_branch_workflow():
+    """``workflow_dispatch --ref`` may select a branch-authored workflow.
+
+    ``repository_dispatch`` is deliberately used for the maintainer-triggered
+    run because GitHub only loads that event's workflow from the default
+    branch.  That invariant matters while the job can read the cross-repo
+    token.
+    """
+    events = workflow_events(load("contract-pin-drift.yml"))
+
+    assert "workflow_dispatch" not in events
+    assert events["repository_dispatch"] == {"types": ["contract-pin-drift"]}
+
+
+def test_enforced_contract_runs_fail_when_cross_repo_access_is_unconfigured():
+    job = load("contract-pin-drift.yml")["jobs"]["drift"]
+    access = next(step for step in job["steps"] if step.get("id") == "access")
+    script = access["run"]
+
+    assert '[ "${has_access}" != "true" ] && [ "${enforce}" = "true" ]' in script
+    assert "exit 1" in script
+    assert "NOT CHECKED" in script
+
+
+def test_checked_output_is_set_only_after_both_directions_and_contract_provenance_complete():
+    job = load("contract-pin-drift.yml")["jobs"]["drift"]
+
+    assert job["outputs"]["checked"] == "${{ steps.complete.outputs.checked }}"
+    complete = next(step for step in job["steps"] if step.get("id") == "complete")
+    condition = complete["if"]
+    assert "steps.simulator_drift.outputs.completed == 'true'" in condition
+    assert "steps.regengine_drift.outputs.completed == 'true'" in condition
+    assert "steps.contract_provenance.outputs.completed == 'true'" in condition
+    assert "checked=true" in complete["run"]
+
+
+def test_trusted_contract_gate_reextracts_the_real_table_and_version_from_an_immutable_ref():
+    job = load("contract-pin-drift.yml")["jobs"]["drift"]
+    steps = job["steps"]
+    source = next(step for step in steps if step.get("id") == "contract_source")
+    provenance = next(step for step in steps if step.get("id") == "contract_provenance")
+    script = provenance["run"]
+
+    assert "scripts/regengine_kde_contract.py verify" in script
+    assert "steps.regengine_ref.outputs.sha" in yaml.safe_dump(provenance)
+    assert '-f ref="${REGENGINE_SHA}"' in source["run"]
+    assert "Verified RegEngine source commit ${REGENGINE_SHA}" in script
+    assert "exact source-byte SHA-256 before AST extraction" in script
+    assert "python" in script
+
+    # The private-read token exists only in fixed fetch steps. The byte
+    # provenance check and AST parser/verifier run later without credentials
+    # or upstream execution.
+    assert "GH_TOKEN" in source["env"]
+    assert "python" not in source["run"]
+    assert "GH_TOKEN" not in provenance.get("env", {})
+
+
+def test_contract_gate_validates_config_before_writing_step_outputs():
+    job = load("contract-pin-drift.yml")["jobs"]["drift"]
+    access = next(step for step in job["steps"] if step.get("id") == "access")
+    script = access["run"]
+
+    assert "Invalid REGENGINE_CONTRACT_REPOSITORY" in script
+    assert "Invalid REGENGINE_CONTRACT_REF" in script
+    assert script.index("Invalid REGENGINE_CONTRACT_REPOSITORY") < script.index("regengine_repository=${repository}")

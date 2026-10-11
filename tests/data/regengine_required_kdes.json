@@ -4,12 +4,13 @@
     "source_path": "services/ingestion/app/webhook_models.py",
     "source_symbol": "REQUIRED_KDES_BY_CTE",
     "source_enum": "WebhookCTEType",
-    "source_commit": "71c0aebbc7af0826d6dd3e5a9424df13ee636290",
+    "source_commit": "7e80313d848ed1e57055f203c0b2c28daad2dfb8",
+    "source_sha256": "bc95d2fc3795e2d6c9bedb49e55e5f2bb0176ca35595eed8d006c2f509817c43",
     "extracted_by": "scripts/regengine_kde_contract.py",
-    "extracted_at": "2026-09-05",
+    "extracted_at": "2026-10-11",
     "table_sha256": "9b46583f75e0d21786d04c3ca00d89926b1bfb15a2421a51bbfcf57c65dd79d0",
     "regenerate": "python scripts/regengine_kde_contract.py snapshot --regengine-root <regengine checkout> --source-commit <sha>",
-    "enforced_by": "tests/test_contract_provenance.py (checksum + shape, offline) and the regengine-contract job in .github/workflows/ci.yml, which re-extracts this table from a real RegEngine checkout and fails on any difference."
+    "enforced_by": "tests/test_contract_provenance.py (checksum + shape, offline) and the trusted Cross-repo pin drift job in .github/workflows/contract-pin-drift.yml, which fetches RegEngine's source at a resolved immutable commit, verifies its exact source bytes, re-extracts this table and its contract version without executing upstream code, and fails on any difference."
   },
   "required_kdes_by_cte": {
     "cooling": [

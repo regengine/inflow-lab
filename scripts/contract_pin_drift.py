@@ -59,17 +59,33 @@ COMPARE_FILE_LIMIT = 300
 # surface, not a guess made here.
 CONTRACT_SURFACE_PRESETS: dict[str, tuple[str, ...]] = {
     "inflow-lab": (
+        ".github/workflows/contract-pin-drift.yml",
+        # The cross-repo job boots ``app.main:app`` and exercises a signed
+        # live delivery. Python's fnmatch treats ``*`` as matching ``/``, so
+        # this covers every current and future Python module below app/
+        # (including routers and schemas) without another hand-maintained
+        # import list drifting out of date.
+        "app/*.py",
         "app/regengine_client.py",
         "app/controller.py",
         "app/contract.py",
         "app/cte_rules.py",
         "app/mock_service.py",
+        "app/routers/ingestion.py",
+        "app/routers/mock_regengine.py",
         "app/schemas/*",
         # RegEngine's contract job runs this script; changing it changes
         # what the pinned commit actually exercises.
         "scripts/live_trial.py",
+        "scripts/contract_pin_drift.py",
+        "scripts/regengine_kde_contract.py",
+        # The contract runner installs the exact locked runtime before it
+        # starts app.main; either file can change the behavior under test.
+        "pyproject.toml",
+        "uv.lock",
     ),
     "regengine": (
+        ".github/workflows/inflow-contract-ci.yml",
         "alembic/*",
         "requirements.in",
         "requirements.lock",
@@ -114,30 +130,114 @@ class DriftReport:
 def _as_int(value: Any, name: str) -> int:
     if isinstance(value, bool) or not isinstance(value, int):
         raise DriftInputError(f"compare response field {name!r} was {value!r}, expected an integer.")
+    if value < 0:
+        raise DriftInputError(
+            f"compare response field {name!r} was {value!r}, expected a non-negative integer."
+        )
     return value
 
 
-def changed_files(comparison: Mapping[str, Any]) -> tuple[str, ...]:
-    files = comparison.get("files") or []
+def _require_field(comparison: Mapping[str, Any], name: str) -> Any:
+    if name not in comparison:
+        raise DriftInputError(f"compare response has no {name!r} field.")
+    return comparison[name]
+
+
+def _validated_comparison(
+    comparison: Mapping[str, Any],
+) -> tuple[str, int, int, int, list[Any], list[Any]]:
+    if not isinstance(comparison, Mapping):
+        raise DriftInputError("compare response was not a JSON object.")
+
+    status = _require_field(comparison, "status")
+    if not isinstance(status, str) or status not in {"ahead", "identical"}:
+        raise DriftInputError(
+            "compare response field 'status' must be 'ahead' or 'identical' for an "
+            f"ancestral pin comparison; got {status!r}."
+        )
+
+    ahead_by = _as_int(_require_field(comparison, "ahead_by"), "ahead_by")
+    behind_by = _as_int(_require_field(comparison, "behind_by"), "behind_by")
+    total_commits = _as_int(_require_field(comparison, "total_commits"), "total_commits")
+
+    commits = _require_field(comparison, "commits")
+    if not isinstance(commits, list):
+        raise DriftInputError("compare response field 'commits' was not a list.")
+    for index, entry in enumerate(commits):
+        sha = entry.get("sha") if isinstance(entry, Mapping) else None
+        if not isinstance(sha, str) or re.fullmatch(r"[0-9a-fA-F]{40}", sha) is None:
+            raise DriftInputError(
+                f"compare response field 'commits' entry {index} has no full 40-character SHA."
+            )
+
+    files = _require_field(comparison, "files")
     if not isinstance(files, list):
         raise DriftInputError("compare response field 'files' was not a list.")
+    for index, entry in enumerate(files):
+        if not isinstance(entry, Mapping):
+            raise DriftInputError(f"compare response field 'files' entry {index} was not an object.")
+        filename = entry.get("filename")
+        if not isinstance(filename, str) or not filename:
+            raise DriftInputError(
+                f"compare response field 'files' entry {index} has no non-empty filename."
+            )
+        if "previous_filename" in entry:
+            previous = entry["previous_filename"]
+            if not isinstance(previous, str) or not previous:
+                raise DriftInputError(
+                    f"compare response field 'files' entry {index} has an invalid previous_filename."
+                )
+
+    if behind_by != 0:
+        raise DriftInputError(
+            "compare response field 'behind_by' must be zero when the pinned base is an ancestor "
+            f"of the comparison head; got {behind_by}."
+        )
+    if total_commits != ahead_by:
+        raise DriftInputError(
+            "compare response fields 'total_commits' and 'ahead_by' disagree "
+            f"({total_commits} != {ahead_by})."
+        )
+    if len(commits) > total_commits:
+        raise DriftInputError(
+            "compare response lists more commits than total_commits "
+            f"({len(commits)} > {total_commits})."
+        )
+    if status == "identical":
+        if ahead_by != 0 or commits or files:
+            raise DriftInputError(
+                "compare response status 'identical' is inconsistent with non-zero history or changed files."
+            )
+    elif ahead_by == 0:
+        raise DriftInputError("compare response status 'ahead' is inconsistent with ahead_by=0.")
+
+    return status, ahead_by, behind_by, total_commits, commits, files
+
+
+def _changed_files_from_records(files: Sequence[Mapping[str, Any]]) -> tuple[str, ...]:
     names: list[str] = []
     for entry in files:
-        if isinstance(entry, Mapping) and isinstance(entry.get("filename"), str):
-            names.append(entry["filename"])
+        names.append(str(entry["filename"]))
+        previous = entry.get("previous_filename")
+        if isinstance(previous, str):
+            names.append(previous)
     return tuple(names)
+
+
+def changed_files(comparison: Mapping[str, Any]) -> tuple[str, ...]:
+    *_, files = _validated_comparison(comparison)
+    return _changed_files_from_records(files)
 
 
 def is_truncated(comparison: Mapping[str, Any]) -> bool:
     """True when the compare payload may be missing files we care about."""
-    total_commits = _as_int(comparison.get("total_commits", 0), "total_commits")
-    commits = comparison.get("commits")
-    listed_commits = len(commits) if isinstance(commits, list) else 0
+    _, _, _, total_commits, commits, files = _validated_comparison(comparison)
+    listed_commits = len(commits)
     if total_commits > listed_commits:
         return True
     if total_commits >= COMPARE_COMMIT_LIMIT:
         return True
-    return len(changed_files(comparison)) >= COMPARE_FILE_LIMIT
+    return len(files) >= COMPARE_FILE_LIMIT
 
 
 def matching_surface_files(filenames: Iterable[str], patterns: Sequence[str]) -> tuple[str, ...]:
@@ -152,14 +252,13 @@ def evaluate_drift(
     surface_patterns: Sequence[str],
 ) -> DriftReport:
     """Turn a compare response into a pass/breach decision plus its reasons."""
-    if not isinstance(comparison, Mapping):
-        raise DriftInputError("compare response was not a JSON object.")
-    if "ahead_by" not in comparison:
-        raise DriftInputError("compare response has no 'ahead_by' field.")
-
-    ahead_by = _as_int(comparison["ahead_by"], "ahead_by")
-    truncated = is_truncated(comparison)
-    surface_files = matching_surface_files(changed_files(comparison), surface_patterns)
+    _, ahead_by, _, total_commits, commits, files = _validated_comparison(comparison)
+    truncated = (
+        total_commits > len(commits)
+        or total_commits >= COMPARE_COMMIT_LIMIT
+        or len(files) >= COMPARE_FILE_LIMIT
+    )
+    surface_files = matching_surface_files(_changed_files_from_records(files), surface_patterns)
 
     reasons: list[str] = []
     if ahead_by > max_commits:
@@ -185,7 +284,7 @@ def evaluate_drift(
     )
 
 
-PINNED_REF_PATTERN = "^[ \t]*{key}:[ \t]*[\"']?([0-9a-fA-F]{{7,40}})[\"']?[ \t]*(?:#.*)?$"
+PINNED_REF_PATTERN = r"^[ \t]*{key}:[ \t]*(?:\"([^\"]*)\"|'([^']*)'|([^#\s]+))[ \t]*(?:#.*)?$"
 
 
 def extract_pinned_ref(workflow_text: str, key: str = "INFLOW_LAB_REF") -> str:
@@ -200,31 +299,70 @@ def extract_pinned_ref(workflow_text: str, key: str = "INFLOW_LAB_REF") -> str:
     "RegEngine restructured the workflow that pins us" is itself news the
     drift check exists to deliver -- not a condition to silently pass.
     """
-    match = re.search(PINNED_REF_PATTERN.format(key=re.escape(key)), workflow_text, re.MULTILINE)
-    if not match:
+    matches = list(re.finditer(PINNED_REF_PATTERN.format(key=re.escape(key)), workflow_text, re.MULTILINE))
+    if not matches:
         raise DriftInputError(
-            f"Could not find a `{key}: <sha>` line in the workflow. If upstream moved or "
+            f"Could not find a `{key}: <40-character sha>` line in the workflow. If upstream moved or "
             "renamed the pin, this checker needs updating -- do not assume it is fine."
         )
-    return match.group(1)
+    if len(matches) != 1:
+        raise DriftInputError(
+            f"Expected exactly one `{key}` pin in the workflow; found {len(matches)}."
+        )
+    value = next(group for group in matches[0].groups() if group is not None)
+    if re.fullmatch(r"[0-9a-fA-F]{40}", value) is None:
+        raise DriftInputError(f"`{key}` must be one full 40-character commit SHA; got {value!r}.")
+    return value
+
+
+def _markdown_single_line(value: object) -> str:
+    """Render external text on one line without changing Markdown structure."""
+    return (
+        str(value)
+        .replace("\\", "\\\\")
+        .replace("\r", r"\r")
+        .replace("\n", r"\n")
+    )
+
+
+def _markdown_code_span(value: object) -> str:
+    """Wrap external text in a CommonMark code span it cannot terminate."""
+    text = _markdown_single_line(value)
+    longest_run = max((len(match.group()) for match in re.finditer(r"`+", text)), default=0)
+    delimiter = "`" * (longest_run + 1)
+
+    # CommonMark removes one space from each side of a non-blank code span
+    # when both are present. Padding values that touch a delimiter keeps
+    # leading/trailing backticks or spaces part of the rendered content.
+    padding = " " if text.startswith(("`", " ")) or text.endswith(("`", " ")) else ""
+    return f"{delimiter}{padding}{text}{padding}{delimiter}"
+
+
+def _workflow_command_data(value: object) -> str:
+    """Escape GitHub Actions workflow-command data per the runner protocol."""
+    return str(value).replace("%", "%25").replace("\r", "%0D").replace("\n", "%0A")
+
+
+def _print_workflow_command(level: str, message: object, *, file: Any = None) -> None:
+    print(f"::{level}::{_workflow_command_data(message)}", file=file)
 
 
 def render_summary(report: DriftReport, *, label: str, base_ref: str, head_ref: str, blocking: bool) -> str:
     verdict = "OK" if not report.breached else ("FAILED" if blocking else "WARNING")
     lines = [
-        f"### Contract pin drift: {label} -- {verdict}",
+        f"### Contract pin drift: {_markdown_code_span(label)} -- {verdict}",
         "",
-        f"- Pinned commit: `{base_ref}`",
-        f"- Compared against: `{head_ref}`",
+        f"- Pinned commit: {_markdown_code_span(base_ref)}",
+        f"- Compared against: {_markdown_code_span(head_ref)}",
         f"- Commits behind: **{report.ahead_by}** (threshold {report.max_commits})",
         f"- Contract-surface files changed since the pin: **{len(report.surface_files)}**",
     ]
     for name in report.surface_files:
-        lines.append(f"  - `{name}`")
+        lines.append(f"  - {_markdown_code_span(name)}")
     if report.truncated:
         lines.append("- Compare response was truncated by the GitHub API.")
     for reason in report.reasons:
-        lines.append(f"- {verdict.title()} reason: {reason}")
+        lines.append(f"- {verdict.title()} reason: {_markdown_code_span(reason)}")
     lines.append("")
     return "\n".join(lines)
 
@@ -271,16 +409,20 @@ def _cmd_check(args: argparse.Namespace) -> int:
     print(summary)
 
     if not report.breached:
-        print(f"::notice::{args.label} is within the drift threshold ({report.ahead_by} commits behind).")
+        _print_workflow_command(
+            "notice",
+            f"{args.label} is within the drift threshold ({report.ahead_by} commits behind).",
+        )
         return EXIT_OK
 
     level = "error" if blocking else "warning"
     for reason in report.reasons:
-        print(f"::{level}::{args.label}: {reason}")
+        _print_workflow_command(level, f"{args.label}: {reason}")
     if not blocking:
-        print(
-            f"::warning::{args.label} can only be advanced in the other repository, so this run "
-            "reports it instead of blocking; the scheduled run does enforce it."
+        _print_workflow_command(
+            "warning",
+            f"{args.label} can only be advanced in the other repository, so this run "
+            "reports it instead of blocking; the scheduled run does enforce it.",
         )
     return EXIT_BREACH if blocking else EXIT_OK
 
@@ -331,10 +473,10 @@ def main(argv: list[str] | None = None) -> int:
     try:
         return int(args.func(args))
     except DriftInputError as exc:
-        print(f"::error::{exc}", file=sys.stderr)
+        _print_workflow_command("error", exc, file=sys.stderr)
         return EXIT_BAD_INPUT
     except OSError as exc:
-        print(f"::error::{exc}", file=sys.stderr)
+        _print_workflow_command("error", exc, file=sys.stderr)
         return EXIT_BAD_INPUT
 
 
