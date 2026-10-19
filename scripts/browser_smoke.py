@@ -154,6 +154,11 @@ def _run_dashboard_smoke(base_url: str, config: BrowserSmokeConfig) -> None:
             page.reload(wait_until="domcontentloaded")
             expect(page.get_by_role("heading", name="Plant Operations Console", exact=True)).to_be_visible()
             expect(page.locator("#welcomeOverlay")).to_be_hidden()
+            expect(page.locator(".scenario-hero")).to_be_visible()
+            expect(
+                page.get_by_role("region", name="Recent events table, scroll horizontally for more columns")
+            ).to_have_attribute("tabindex", "0")
+            _assert_workspace_fits(page, "scenario loaded")
 
             page.locator("#advancedConfig").evaluate("element => { element.open = true; }")
             page.locator("#batchSize").fill("1")
@@ -189,6 +194,7 @@ def _run_dashboard_smoke(base_url: str, config: BrowserSmokeConfig) -> None:
             page.locator("#stepBtn").click()
             expect(page.locator("#statusMessage")).to_contain_text("Recorded and posted")
             expect(page.locator("#eventsBody tr")).to_have_count(1)
+            _assert_workspace_fits(page, "batch recorded")
 
             page.locator("#testConnectionBtn").click()
             expect(page.locator("#connectionResult")).to_contain_text("mock")
@@ -198,12 +204,14 @@ def _run_dashboard_smoke(base_url: str, config: BrowserSmokeConfig) -> None:
             page.locator("#loadFixtureBtn").click()
             expect(page.locator("#statusMessage")).to_contain_text("Loaded line data and posted")
             expect(page.locator("#eventsBody")).to_contain_text("TLC-DEMO-FC-OUT-001")
+            _assert_workspace_fits(page, "line data loaded")
 
             page.locator("#lotLookup").fill("TLC-DEMO-FC-OUT-001")
             page.locator("#lineageBtn").click()
             expect(page.locator("#statusMessage")).to_contain_text("Loaded lineage for TLC-DEMO-FC-OUT-001")
             expect(page.locator("#lineageResults")).to_contain_text("TLC-DEMO-FC-OUT-001")
             expect(page.locator("#lineageResults")).to_contain_text("Transformation")
+            _assert_workspace_fits(page, "lineage opened")
 
             csv_path = output_dir / "browser_smoke_import.csv"
             output_dir.mkdir(parents=True, exist_ok=True)
@@ -231,6 +239,35 @@ def _run_dashboard_smoke(base_url: str, config: BrowserSmokeConfig) -> None:
     finally:
         if console_errors and not failed:
             raise RuntimeError(f"Browser console errors: {console_errors}")
+
+
+def _assert_workspace_fits(page: Any, stage: str) -> None:
+    original_viewport = page.viewport_size
+    for width, height in ((390, 844), (1440, 900)):
+        page.set_viewport_size({"width": width, "height": height})
+        sizes = page.evaluate(
+            """() => {
+                const table = document.querySelector('.table-wrap');
+                return {
+                    viewport: window.innerWidth,
+                    document: Math.max(document.documentElement.scrollWidth, document.body.scrollWidth),
+                    tableClient: table.clientWidth,
+                    tableScroll: table.scrollWidth,
+                    tableOverflowX: getComputedStyle(table).overflowX,
+                };
+            }"""
+        )
+        if sizes["document"] > sizes["viewport"]:
+            raise RuntimeError(
+                f"Workspace overflow after {stage} at {width}px: "
+                f"document {sizes['document']}px, viewport {sizes['viewport']}px"
+            )
+        if width == 390 and (
+            sizes["tableScroll"] <= sizes["tableClient"] or sizes["tableOverflowX"] not in {"auto", "scroll"}
+        ):
+            raise RuntimeError(f"Recent events table does not scroll inside its region after {stage}")
+    if original_viewport:
+        page.set_viewport_size(original_viewport)
 
 
 def _browser_context_options(config: BrowserSmokeConfig) -> dict[str, Any]:

@@ -663,6 +663,10 @@ input::placeholder {
   min-width: 0;
 }
 
+.center-stack {
+  grid-template-columns: minmax(0, 1fr);
+}
+
 .compact-panel {
   margin-bottom: 0;
 }
