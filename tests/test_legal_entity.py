@@ -19,7 +19,7 @@ FORBIDDEN = re.compile(
     + "|"
     + "REGENGINE" + r",?\s+" + "INC" + r"\.?"
     + "|"
-    + "INC" + r"\.'S"
+    + r"(?:RegEngine|REGENGINE),?\s+" + "INC" + r"\.'S"
 )
 
 SKIP_DIRS = {
@@ -37,6 +37,12 @@ def test_notice_names_regengine_llc():
     notice = (ROOT / "NOTICE").read_text(encoding="utf-8")
     assert "Copyright 2024-2026 RegEngine LLC" in notice.splitlines()
     assert "RegEngine" + " Inc" not in notice
+
+
+def test_possessive_pattern_only_matches_regengine():
+    assert FORBIDDEN.search("ACME " + "INC." + "'S") is None
+    assert FORBIDDEN.fullmatch("REGENGINE " + "INC." + "'S") is not None
+    assert FORBIDDEN.fullmatch("RegEngine " + "INC." + "'S") is not None
 
 
 def _tracked_files() -> list[Path]:
