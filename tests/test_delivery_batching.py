@@ -60,7 +60,7 @@ from app.schemas.simulation import DeliveryConfig, SimulationConfig
 from tests.support.timestamps import recent_event_timestamp
 
 _BASE_TIME = recent_event_timestamp()
-_VALID_KDES = {"harvest_date": "2026-03-01", "reference_document": "Harvest Log HL-BATCHING-DEFAULT"}
+_VALID_KDES = {"harvest_date": "2026-03-01", "immediate_subsequent_recipient": "Coastal Cooler", "reference_document": "Harvest Log HL-BATCHING-DEFAULT"}
 
 
 def setup_function() -> None:
@@ -96,9 +96,9 @@ def _seed_lot_csv(lot_codes: list[str]) -> str:
     that (mock_service.py's strict, non-aliasing lookup), so a bare
     `reference_document` column is added explicitly.
     """
-    header = "traceability_lot_code,product_description,quantity,unit_of_measure,location_name,reference_document"
+    header = "traceability_lot_code,product_description,quantity,unit_of_measure,location_name,immediate_subsequent_recipient,reference_document"
     rows = [
-        f"{lot},Romaine Hearts,10,cases,Valley Fresh Farms,HL-{lot}"
+        f"{lot},Romaine Hearts,10,cases,Valley Fresh Farms,Coastal Cooler,HL-{lot}"
         for lot in lot_codes
     ]
     return "\n".join([header, *rows]) + "\n"
@@ -153,7 +153,7 @@ def test_per_event_rejection_redelivers_on_retry_once_corrected():
         destination_mode=DestinationMode.MOCK,
         delivery_status="failed",
         delivery_attempts=1,
-        error="Missing required KDEs for harvesting: harvest_date, reference_document",
+        error="Missing required KDEs for harvesting: harvest_date, immediate_subsequent_recipient, reference_document",
         delivery_response=bad_verdict,
         delivery_metadata={"delivery_mode": "mock", "idempotency_key": original_key},
     )

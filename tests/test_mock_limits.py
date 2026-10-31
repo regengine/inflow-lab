@@ -30,7 +30,7 @@ def _valid_event(
     """A minimal HARVESTING event that clears every validate_event_like_regengine check.
 
     Mirrors tests/test_mock_parity.py's own helper: HARVESTING has the
-    fewest required KDEs (harvest_date, reference_document), which keeps
+    fewest required KDEs (harvest_date, immediate_subsequent_recipient, reference_document), which keeps
     this cheap to build even called many times over (the eviction test
     below calls it 1000+ times).
     """
@@ -44,6 +44,7 @@ def _valid_event(
         timestamp=timestamp or recent_event_timestamp(),
         kdes={
             "harvest_date": "2026-02-05",
+            "immediate_subsequent_recipient": "Coastal Cooler",
             "reference_document": "Harvest Log HAR-0001",
         },
     )

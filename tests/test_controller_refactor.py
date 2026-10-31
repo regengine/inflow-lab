@@ -298,7 +298,7 @@ def _make_failed_record(lot: str, *, attempts: int = 1) -> StoredEventRecord:
             unit_of_measure="cases",
             location_name="Valley Fresh Farms",
             timestamp=_BASE_TIME,
-            kdes={"harvest_date": "2026-03-01", "reference_document": "Harvest Log HL-REFACTOR-001"},
+            kdes={"harvest_date": "2026-03-01", "immediate_subsequent_recipient": "Coastal Cooler", "reference_document": "Harvest Log HL-REFACTOR-001"},
         ),
         destination_mode=DestinationMode.NONE,
         delivery_status="failed",

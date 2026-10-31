@@ -61,7 +61,7 @@ def _valid_event(lot: str = "TLC-HMAC-000001") -> RegEngineEvent:
     """A minimal HARVESTING event that clears every validate_event_like_regengine check.
 
     Mirrors tests/test_mock_parity.py's own helper: HARVESTING has the
-    fewest required KDEs (harvest_date, reference_document).
+    fewest required KDEs (harvest_date, immediate_subsequent_recipient, reference_document).
     """
     return RegEngineEvent(
         cte_type=CTEType.HARVESTING,
@@ -73,6 +73,7 @@ def _valid_event(lot: str = "TLC-HMAC-000001") -> RegEngineEvent:
         timestamp=recent_event_timestamp(),
         kdes={
             "harvest_date": "2026-02-05",
+            "immediate_subsequent_recipient": "Coastal Cooler",
             "reference_document": "Harvest Log HAR-0001",
         },
     )

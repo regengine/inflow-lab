@@ -92,7 +92,7 @@ def _failed_record(lot_code: str = "TLC-FAIL") -> StoredEventRecord:
     event = _event(lot_code).model_copy(
         update={
             "timestamp": recent_event_timestamp(),
-            "kdes": {"harvest_date": "2026-03-01", "reference_document": f"Harvest Log HL-{lot_code}"},
+            "kdes": {"harvest_date": "2026-03-01", "immediate_subsequent_recipient": "Coastal Cooler", "reference_document": f"Harvest Log HL-{lot_code}"},
         }
     )
     return StoredEventRecord(

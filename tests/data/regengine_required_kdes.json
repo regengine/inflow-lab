@@ -4,11 +4,11 @@
     "source_path": "services/ingestion/app/webhook_models.py",
     "source_symbol": "REQUIRED_KDES_BY_CTE",
     "source_enum": "WebhookCTEType",
-    "source_commit": "7e80313d848ed1e57055f203c0b2c28daad2dfb8",
-    "source_sha256": "bc95d2fc3795e2d6c9bedb49e55e5f2bb0176ca35595eed8d006c2f509817c43",
+    "source_commit": "9753cd95511ffbde46df456518fdc916e5f8dc7f",
+    "source_sha256": "eb74cdf662c7429a86eed37a826a11d2ac0a421acc4251274215480b57698cbe",
     "extracted_by": "scripts/regengine_kde_contract.py",
-    "extracted_at": "2026-10-11",
-    "table_sha256": "9b46583f75e0d21786d04c3ca00d89926b1bfb15a2421a51bbfcf57c65dd79d0",
+    "extracted_at": "2026-10-31",
+    "table_sha256": "483de7fe2a32153c154666594b8b5d88227b08d83d58112e0c2aee6abcc8db81",
     "regenerate": "python scripts/regengine_kde_contract.py snapshot --regengine-root <regengine checkout> --source-commit <sha>",
     "enforced_by": "tests/test_contract_provenance.py (checksum + shape, offline) and the trusted Cross-repo pin drift job in .github/workflows/contract-pin-drift.yml, which fetches RegEngine's source at a resolved immutable commit, verifies its exact source bytes, re-extracts this table and its contract version without executing upstream code, and fails on any difference."
   },
@@ -20,6 +20,8 @@
       "unit_of_measure",
       "cooling_date",
       "location_name",
+      "immediate_subsequent_recipient",
+      "harvest_location_name",
       "reference_document"
     ],
     "first_land_based_receiving": [
@@ -38,6 +40,7 @@
       "unit_of_measure",
       "harvest_date",
       "location_name",
+      "immediate_subsequent_recipient",
       "reference_document"
     ],
     "initial_packing": [
@@ -49,7 +52,11 @@
       "location_name",
       "reference_document",
       "harvester_business_name",
-      "harvester_business_phone"
+      "harvester_business_phone",
+      "harvest_date",
+      "harvest_location_name",
+      "received_date",
+      "received_quantity"
     ],
     "receiving": [
       "traceability_lot_code",
@@ -80,7 +87,11 @@
       "unit_of_measure",
       "transformation_date",
       "location_name",
-      "reference_document"
+      "reference_document",
+      "input_lot_codes",
+      "input_quantities",
+      "input_units_of_measure",
+      "input_product_descriptions"
     ]
   }
 }
