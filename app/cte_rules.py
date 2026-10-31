@@ -72,6 +72,7 @@ REQUIRED_KDES: dict[CTEType, tuple[str, ...]] = {
         "unit_of_measure",
         "harvest_date",
         "location_name",
+        "immediate_subsequent_recipient",  # §1.1325(a)(1); contract v3 / A-2190
         "reference_document",
     ),
     CTEType.COOLING: (
@@ -81,6 +82,8 @@ REQUIRED_KDES: dict[CTEType, tuple[str, ...]] = {
         "unit_of_measure",
         "cooling_date",
         "location_name",
+        "immediate_subsequent_recipient",  # §1.1325(b)(1); contract v3 / A-2190
+        "harvest_location_name",  # farm where harvested; contract v3 / A-2190
         "reference_document",
     ),
     CTEType.INITIAL_PACKING: (
@@ -93,6 +96,10 @@ REQUIRED_KDES: dict[CTEType, tuple[str, ...]] = {
         "reference_document",
         "harvester_business_name",
         "harvester_business_phone",
+        "harvest_date",  # §1.1330(a); contract v3 / A-2190
+        "harvest_location_name",  # farm where harvested; contract v3 / A-2190
+        "received_date",  # date food received; contract v3 / A-2190
+        "received_quantity",  # qty received (distinct from packed); contract v3 / A-2190
     ),
     # Matches RegEngine webhook_models.REQUIRED_KDES_BY_CTE exactly
     # (§1.1325(c)(7)); vessel/receiver detail is recommended, not required.
@@ -135,6 +142,10 @@ REQUIRED_KDES: dict[CTEType, tuple[str, ...]] = {
         "transformation_date",
         "location_name",
         "reference_document",
+        "input_lot_codes",  # §1.1350(a)(1); contract v3 / A-2190
+        "input_quantities",  # §1.1350(a)(1)(iii); contract v3 / A-2190
+        "input_units_of_measure",  # §1.1350(a)(1)(iii); contract v3 / A-2190
+        "input_product_descriptions",  # §1.1350(a)(1); contract v3 / A-2190
     ),
 }
 
@@ -172,6 +183,8 @@ RECOMMENDED_KDES: dict[CTEType, tuple[str, ...]] = {
 # yield_ratio), so it isn't listed anywhere below -- flagging an unpopulated
 # KDE as required would fail every transformation event the simulator itself
 # generates. See issue #189's writeup for what emitting it would take.
+# Legacy aliases still emitted alongside contract-v3 names (input_lot_codes /
+# input_product_descriptions). Kept so CSV import + local lineage keep working.
 TRANSFORMATION_INPUT_LINKAGE_KDES: tuple[str, ...] = (
     "input_traceability_lot_codes",
     "input_products",

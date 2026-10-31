@@ -17,6 +17,11 @@ Version history:
 - "1" (2026-07-29): initial pinned contract — 7 CTE types, strict KDE
   lookup per REQUIRED_KDES_BY_CTE, required Idempotency-Key, optional
   HMAC body signing.
+- "2": harvester_business_phone required on initial_packing.
+- "3" (2026-10-31 / A-2190): harvest/cool immediate_subsequent_recipient;
+  cooling harvest_location_name; packing harvest_date / harvest_location_name /
+  received_date / received_quantity; transformation input_lot_codes /
+  input_quantities / input_units_of_measure / input_product_descriptions.
 - Staleness guard added 2026-08-26 (#140): CONTRACT_LAST_CONFIRMED and
   ``assert_contract_pin_is_fresh()`` below fail a pytest test
   (tests/test_client_diagnostics.py) once this pin has gone too long
@@ -44,7 +49,7 @@ import httpx
 
 from .cte_rules import REQUIRED_KDES
 
-INFLOW_CONTRACT_VERSION = "2"
+INFLOW_CONTRACT_VERSION = "3"
 
 
 # ---------------------------------------------------------------------------
@@ -81,7 +86,7 @@ INFLOW_CONTRACT_VERSION = "2"
 #     artifact source is configured. See its docstring for the exact CI
 #     wiring this needs and why it is not wired in by default.
 
-CONTRACT_LAST_CONFIRMED = date(2026, 9, 4)
+CONTRACT_LAST_CONFIRMED = date(2026, 10, 31)
 # Last date a human actually compared INFLOW_CONTRACT_VERSION and
 # REQUIRED_KDES against RegEngine's real webhook contract -- currently the
 # same date "1" was pinned (see Version history above); nothing has been

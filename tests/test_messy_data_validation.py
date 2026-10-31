@@ -40,11 +40,16 @@ def test_missing_required_kdes_are_flagged() -> None:
     # The required KDEs that aren't covered by top-level fields must be flagged.
     assert "harvest_date" in flagged
     assert "reference_document" in flagged
+    assert "immediate_subsequent_recipient" in flagged
     assert all(w.message for w in warnings)
 
 
 def test_complete_event_has_no_missing_required_warnings() -> None:
-    event = _harvest_event(harvest_date="2026-02-05", reference_document="BOL-2026-0205-001")
+    event = _harvest_event(
+        harvest_date="2026-02-05",
+        reference_document="BOL-2026-0205-001",
+        immediate_subsequent_recipient="Salinas Cooling Hub",  # contract v3 / A-2190
+    )
     missing_required = [w for w in validate_event_kdes(event) if w.message.startswith("Missing expected")]
     assert missing_required == []
 

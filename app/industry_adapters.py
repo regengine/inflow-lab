@@ -31,7 +31,8 @@ class IndustryAdapter:
         return {
             "harvest_date": timestamp.date().isoformat(),
             "farm_location": location.name,
-            "field_name": f"Field-{engine.rng.randint(1, 18)}",
+            "field_name": f"North Block {engine.rng.randint(1, 18)}",
+            "growing_area_name": f"Growing Area {engine.rng.randint(1, 6)}",
             "immediate_subsequent_recipient": next_location,
             "reference_document": engine._reference_document(
                 lot.current_reference_type,
@@ -51,10 +52,17 @@ class IndustryAdapter:
         cooler: Any,
         timestamp: Any,
     ) -> dict[str, Any]:
+        next_location = (
+            engine.rng.choice(engine.packers).name
+            if engine.packers
+            else (engine.rng.choice(engine.processors).name if engine.processors else "")
+        )
         return {
             "cooling_date": timestamp.date().isoformat(),
             "cooling_location": cooler.name,
             "harvest_location": lot.origin_location,
+            "harvest_location_name": lot.origin_location,  # contract v3 / A-2190
+            "immediate_subsequent_recipient": next_location,  # contract v3 / A-2190
             "reference_document": engine._reference_document(
                 lot.current_reference_type,
                 lot.current_reference_number,
@@ -74,7 +82,11 @@ class IndustryAdapter:
         packer: Any,
         timestamp: Any,
     ) -> dict[str, Any]:
-        return {
+        harvest_date = source_lot.source_details.get("harvest_date") or timestamp.date().isoformat()
+        field_name = source_lot.source_details.get("field_name") or "North Block 1"
+        growing_area_name = source_lot.source_details.get("growing_area_name") or "Growing Area 1"
+        cooled = source_lot.stage == "cooled"
+        packing: dict[str, Any] = {
             "packing_date": timestamp.date().isoformat(),
             "pack_date": timestamp.date().isoformat(),
             "packing_location": packer.name,
@@ -88,9 +100,24 @@ class IndustryAdapter:
             "reference_document_number": packed_lot.current_reference_number,
             "harvester_business_name": source_lot.origin_location,
             "harvester_business_phone": "+1-202-555-0100",  # Fictional simulator contact.
+            # contract v3 / A-2190 packing carry-in
+            "harvest_date": harvest_date,
+            "harvest_location_name": source_lot.origin_location,
+            "harvest_location_phone": "+1-831-555-0147",  # Fictional farm phone (Food Safety Lens).
+            "harvest_location_address": f"100 Farm Rd, {source_lot.origin_location}",
+            "received_date": timestamp.date().isoformat(),
+            "received_quantity": source_lot.quantity,
+            "field_name": field_name,
+            "growing_area_name": growing_area_name,
+            # Explicit cooled yes/no; cooling_* only when cooled=yes (do not infer).
+            "cooled": "yes" if cooled else "no",
             "tlc_source_reference": packed_lot.tlc_source_reference,
             "traceability_lot_code_source_reference": packed_lot.tlc_source_reference,
         }
+        if cooled:
+            packing["cooling_location_name"] = source_lot.current_location
+            packing["cooling_date"] = timestamp.date().isoformat()
+        return packing
 
     def transformation_kdes(
         self,
@@ -106,12 +133,17 @@ class IndustryAdapter:
         total_input_qty: float,
         total_output_qty: float,
     ) -> dict[str, Any]:
+        input_lot_codes = [lot.lot_code for lot in inputs]
+        input_product_descriptions = [lot.product_description for lot in inputs]
         return {
             "transformation_date": timestamp.date().isoformat(),
             "transformation_location": processor.name,
             "location_name": processor.name,
-            "input_traceability_lot_codes": [lot.lot_code for lot in inputs],
-            "input_products": [lot.product_description for lot in inputs],
+            # Legacy aliases (local lineage / CSV / mock) + contract v3 wire names.
+            "input_traceability_lot_codes": input_lot_codes,
+            "input_lot_codes": input_lot_codes,  # contract v3 / A-2190
+            "input_products": input_product_descriptions,
+            "input_product_descriptions": input_product_descriptions,  # contract v3 / A-2190
             # 21 CFR 1.1350(a)(6) wants the quantity and unit of measure used
             # *from each* input lot, so an aggregate (`yield_ratio` below, or a
             # single total) does not satisfy it. Every input lot the engine
@@ -124,6 +156,7 @@ class IndustryAdapter:
                 }
                 for lot in inputs
             ],
+            "input_units_of_measure": [lot.unit_of_measure for lot in inputs],  # contract v3 / A-2190
             "output_traceability_lot_codes": [lot.lot_code for lot in outputs],
             "reference_document": engine._reference_document(reference_type, reference_number),
             "reference_document_type": reference_type,
