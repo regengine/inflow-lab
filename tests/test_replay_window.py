@@ -56,7 +56,7 @@ client = TestClient(app)
 
 SCHEDULED_HEADER = (
     "cte_type,traceability_lot_code,product_description,quantity,"
-    "unit_of_measure,location_name,timestamp,harvest_date,reference_document"
+    "unit_of_measure,location_name,timestamp,harvest_date,immediate_subsequent_recipient,reference_document"
 )
 
 _NOW = datetime(2026, 6, 1, 12, 0, tzinfo=UTC)
@@ -71,7 +71,7 @@ def _csv_at(timestamp: datetime, lot: str = "TLC-AGE-000001") -> str:
     return (
         f"{SCHEDULED_HEADER}\n"
         f"harvesting,{lot},Romaine Lettuce,100,cases,Valley Fresh Farms,"
-        f"{stamp},{timestamp.date().isoformat()},Harvest Log HL-AGE-001\n"
+        f"{stamp},{timestamp.date().isoformat()},Coastal Cooler,Harvest Log HL-AGE-001\n"
     )
 
 
@@ -94,6 +94,7 @@ def _harvest_event_payload(timestamp: datetime, lot: str) -> dict:
         "timestamp": stamp,
         "kdes": {
             "harvest_date": timestamp.date().isoformat(),
+            "immediate_subsequent_recipient": "Coastal Cooler",
             "reference_document": f"Harvest Log {lot}",
         },
     }

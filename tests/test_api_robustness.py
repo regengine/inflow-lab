@@ -165,7 +165,7 @@ def test_ingest_with_well_formed_body_still_succeeds() -> None:
                     "unit_of_measure": "cases",
                     "location_name": "Valley Fresh Farms",
                     "timestamp": RECENT_TIMESTAMP_JSON,
-                    "kdes": {"harvest_date": "2026-03-01", "reference_document": "Harvest Log HL-ROBUST-001"},
+                    "kdes": {"harvest_date": "2026-03-01", "immediate_subsequent_recipient": "Coastal Cooler", "reference_document": "Harvest Log HL-ROBUST-001"},
                 }
             ],
         },
@@ -186,7 +186,7 @@ def test_ingest_with_well_formed_body_still_succeeds() -> None:
 def test_retry_with_explicit_empty_record_ids_retries_nothing() -> None:
     failed = _make_stored_record(
         "TLC-RETRY-EMPTY-001",
-        kdes={"harvest_date": "2026-03-01", "reference_document": "Harvest Log HL-EMPTY-001"},
+        kdes={"harvest_date": "2026-03-01", "immediate_subsequent_recipient": "Coastal Cooler", "reference_document": "Harvest Log HL-EMPTY-001"},
         delivery_status="failed",
         error="temporary outage",
     )
@@ -216,14 +216,14 @@ def test_retry_with_omitted_record_ids_retries_all_failed_records() -> None:
     first = _make_stored_record(
         "TLC-RETRY-ALL-001",
         minutes=0,
-        kdes={"harvest_date": "2026-03-01", "reference_document": "Harvest Log HL-ALL-001"},
+        kdes={"harvest_date": "2026-03-01", "immediate_subsequent_recipient": "Coastal Cooler", "reference_document": "Harvest Log HL-ALL-001"},
         delivery_status="failed",
         error="temporary outage",
     )
     second = _make_stored_record(
         "TLC-RETRY-ALL-002",
         minutes=1,
-        kdes={"harvest_date": "2026-03-01", "reference_document": "Harvest Log HL-ALL-002"},
+        kdes={"harvest_date": "2026-03-01", "immediate_subsequent_recipient": "Coastal Cooler", "reference_document": "Harvest Log HL-ALL-002"},
         delivery_status="failed",
         error="temporary outage",
     )
@@ -248,14 +248,14 @@ def test_retry_with_nonempty_record_ids_still_filters_to_that_subset() -> None:
     target = _make_stored_record(
         "TLC-RETRY-FILTER-TARGET",
         minutes=0,
-        kdes={"harvest_date": "2026-03-01", "reference_document": "Harvest Log HL-FILTER-001"},
+        kdes={"harvest_date": "2026-03-01", "immediate_subsequent_recipient": "Coastal Cooler", "reference_document": "Harvest Log HL-FILTER-001"},
         delivery_status="failed",
         error="temporary outage",
     )
     other = _make_stored_record(
         "TLC-RETRY-FILTER-OTHER",
         minutes=1,
-        kdes={"harvest_date": "2026-03-01", "reference_document": "Harvest Log HL-FILTER-002"},
+        kdes={"harvest_date": "2026-03-01", "immediate_subsequent_recipient": "Coastal Cooler", "reference_document": "Harvest Log HL-FILTER-002"},
         delivery_status="failed",
         error="temporary outage",
     )

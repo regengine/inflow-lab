@@ -92,7 +92,7 @@ def _valid_event(
     """A minimal HARVESTING event that clears every validation check.
 
     Mirrors tests/test_mock_parity.py's own helper: HARVESTING has the
-    fewest required KDEs (harvest_date, reference_document), which keeps
+    fewest required KDEs (harvest_date, immediate_subsequent_recipient, reference_document), which keeps
     this cheap to build. Callers of the _event_with_* factories below
     override exactly one field to make the event fail exactly one check.
     """
@@ -106,6 +106,7 @@ def _valid_event(
         timestamp=timestamp or recent_event_timestamp(),
         kdes={
             "harvest_date": "2026-02-05",
+            "immediate_subsequent_recipient": "Coastal Cooler",
             "reference_document": "Harvest Log HAR-0001",
         },
     )
@@ -145,6 +146,7 @@ def _harvest_event_at(timestamp: datetime, lot: str = "TLC-AGE-000001") -> RegEn
         timestamp=timestamp,
         kdes={
             "harvest_date": timestamp.date().isoformat(),
+            "immediate_subsequent_recipient": "Coastal Cooler",
             "reference_document": "Harvest Log HAR-0001",
         },
     )
@@ -595,17 +597,26 @@ def test_enforced_window_sets_mode_and_zero_bypass_count() -> None:
     assert response.event_age_window_days == MAX_EVENT_AGE_DAYS
 
 
+_PACKING_BASE_KDES = {
+    "packing_date": "2026-02-05",
+    "reference_document": "PACK-1",
+    "harvester_business_name": "Example farm",
+    "harvest_date": "2026-02-05",
+    "harvest_location_name": "Valley Fresh Farms",
+    "received_date": "2026-02-05",
+    "received_quantity": 100,
+    "from_entity_reference": "entity-1",
+}
+
+
 @pytest.mark.parametrize("phone", [None, "", "  ", 123, {"phone": "555"}])
 def test_contract_v2_rejects_missing_or_non_string_harvester_phone(phone):
     event = _valid_event().model_copy(update={"cte_type": CTEType.INITIAL_PACKING,
-        "kdes": {"packing_date": "2026-02-05", "reference_document": "PACK-1",
-                 "harvester_business_name": "Example farm", "harvester_business_phone": phone,
-                 "from_entity_reference": "entity-1"}})
+        "kdes": {**_PACKING_BASE_KDES, "harvester_business_phone": phone}})
     assert any("phone" in error.lower() for error in validate_event_like_regengine(event))
 
 
 def test_contract_v2_accepts_an_explicit_harvester_phone():
     event = _valid_event().model_copy(update={"cte_type": CTEType.INITIAL_PACKING,
-        "kdes": {"packing_date": "2026-02-05", "reference_document": "PACK-1",
-                 "harvester_business_name": "Example farm", "harvester_business_phone": "+1-202-555-0100"}})
+        "kdes": {**_PACKING_BASE_KDES, "harvester_business_phone": "+1-202-555-0100"}})
     assert validate_event_like_regengine(event) == []
