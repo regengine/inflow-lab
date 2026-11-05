@@ -18,6 +18,7 @@ class ScenarioId(str, Enum):
     BROADLINE_DISTRIBUTOR = "broadline_distributor"
     FOODSERVICE_RESTAURANT_GROUP = "foodservice_restaurant_group"
     SHELL_EGG_PRODUCER = "shell_egg_producer"
+    PRODUCE_IMPORTER = "produce_importer"
 
 
 @dataclass(frozen=True, slots=True)
@@ -669,6 +670,54 @@ SCENARIO_PRESETS[ScenarioId.SHELL_EGG_PRODUCER] = ScenarioPreset(
     industry_type="produce",
     operation_type="egg_producer",
     reference_format="PLAIN",
+    harvest_target=3,
+    packed_to_processor_probability=0.0,
+)
+
+
+SCENARIO_PRESETS[ScenarioId.PRODUCE_IMPORTER] = ScenarioPreset(
+    id=ScenarioId.PRODUCE_IMPORTER,
+    label="Produce importer (FSVP)",
+    description="US importer of record receiving foreign-grown FTL produce (mangoes, papayas, cucumbers) at ports of entry against customs entries, repacking, and distributing domestically — the source event is a §1.1345 receiving from the foreign shipper, never a domestic harvest.",
+    farms=(
+        Location("Port of Long Beach Cold Store", "import_facility", _gln(1301), {"gps": "33.7542,-118.2165"}),
+        Location("Nogales Crossing Produce Dock", "import_facility", _gln(1302), {"gps": "31.3404,-110.9343"}),
+        Location("PhilaPort Produce Terminal", "import_facility", _gln(1303), {"gps": "39.9078,-75.1372"}),
+    ),
+    coolers=(),
+    packers=(
+        Location("Import Repack & QA Line", "packer", _gln(3301)),
+    ),
+    processors=(),
+    dcs=(
+        Location("Importer DC West", "dc", _gln(5301)),
+        Location("Importer DC East", "dc", _gln(5302)),
+    ),
+    retailers=(
+        Location("Wholesale Market Row 12", "retail", _gln(6301)),
+        Location("Retail Chain DC Receipt", "retail", _gln(6302)),
+        Location("Retail Store #0907", "retail", _gln(6303)),
+    ),
+    products=(
+        ProductSpec("Kent Mangoes", "cases", "tropical_tree_fruit", {"plu": "4959"}),
+        ProductSpec("Maradol Papayas", "cases", "tropical_tree_fruit", {"plu": "3112"}),
+        ProductSpec("Hothouse Cucumbers", "cases", "cucumbers", {"plu": "4593"}),
+    ),
+    transformation_outputs=(),
+    carriers=("TransPacific Drayage", "Border Express Reefer", "SwiftChain Logistics"),
+    action_weights={
+        "harvest": 5,
+        "cool": 0,
+        "initial_pack": 5,
+        "ship": 6,
+        "receive": 6,
+        "transform": 0,
+    },
+    industry_type="imported_produce",
+    operation_type="importer",
+    reference_format="GS1",
+    source_cte_type=CTEType.RECEIVING,
+    requires_cooling=False,
     harvest_target=3,
     packed_to_processor_probability=0.0,
 )

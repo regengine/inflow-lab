@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from datetime import timedelta
 from typing import Any
 
 from .schemas.domain import CTEType
@@ -297,9 +298,102 @@ class DairyAdapter(IndustryAdapter):
         return kdes
 
 
+class ImportedProduceAdapter(IndustryAdapter):
+    """US importer of record receiving foreign-grown FTL produce.
+
+    FSMA 204 has no "import" CTE: the importer's first domestic
+    traceability event is a receiving CTE (§1.1345) at the port-of-entry
+    facility, with the foreign exporter as immediate previous source and
+    the customs entry as the reference document. First land-based
+    receiving (§1.1325(c)) is reserved for food obtained from fishing
+    vessels and deliberately not used here. Foreign harvest context
+    (grower, harvest date, origin country) rides in the source KDEs so
+    any later repack (initial packing) can carry truthful origin data
+    instead of attributing the harvest to the import dock.
+    """
+
+    # Synthetic foreign suppliers — fictional names, like every other
+    # location in the simulator.
+    FOREIGN_SUPPLIERS = (
+        ("Agro Exportadora del Valle", "MX"),
+        ("Tropical Growers Cooperative", "PE"),
+        ("Finca Verde Exports", "GT"),
+    )
+
+    def __init__(self) -> None:
+        super().__init__(
+            industry_type="imported_produce",
+            source_cte_type=CTEType.RECEIVING,
+            source_reference_type="Customs Entry",
+        )
+
+    def source_quantity_range(self, product: Any) -> tuple[float, float]:
+        # Container-load receipts, not field bins.
+        return (280, 960)
+
+    def source_kdes(self, **kwargs: Any) -> dict[str, Any]:
+        engine = kwargs["engine"]
+        location = kwargs["location"]
+        product = kwargs["product"]
+        lot = kwargs["lot"]
+        timestamp = kwargs["timestamp"]
+        supplier_name, origin_country = engine.rng.choice(self.FOREIGN_SUPPLIERS)
+        foreign_supplier = f"{supplier_name} ({origin_country})"
+        # Foreign harvest predates the US receipt by a transit window.
+        harvest_date = (timestamp.date() - timedelta(days=engine.rng.randint(4, 12))).isoformat()
+        entry_number = f"ENTRY-{engine.rng.randint(10000000, 99999999)}"
+        return {
+            "receive_date": timestamp.date().isoformat(),
+            "receiving_location": location.name,
+            "immediate_previous_source": foreign_supplier,
+            "immediate_subsequent_recipient": kwargs["next_location"],
+            "reference_document": engine._reference_document(
+                lot.current_reference_type,
+                lot.current_reference_number,
+            ),
+            "reference_document_type": lot.current_reference_type,
+            "reference_document_number": lot.current_reference_number,
+            "tlc_source_reference": lot.tlc_source_reference,
+            "traceability_lot_code_source_reference": lot.tlc_source_reference,
+            # Import context
+            "country_of_origin": origin_country,
+            "foreign_supplier_name": foreign_supplier,
+            "customs_entry_number": entry_number,
+            "container_identifier": f"MSKU{engine.rng.randint(1000000, 9999999)}",
+            "fsvp_importer_of_record": "Meridian Global Imports LLC",
+            # Foreign harvest context carried for downstream repack KDEs.
+            "harvest_date": harvest_date,
+            "harvest_location_name": f"{supplier_name} Farm Block {engine.rng.randint(1, 9)} ({origin_country})",
+            "plu_code": product.metadata.get("plu", engine._plu_code()),
+        }
+
+    def packing_kdes(self, **kwargs: Any) -> dict[str, Any]:
+        kdes = super().packing_kdes(**kwargs)
+        source_lot = kwargs["source_lot"]
+        details = source_lot.source_details
+        foreign_grower = details.get("harvest_location_name") or details.get("foreign_supplier_name")
+        # The base adapter attributes harvest fields to origin_location,
+        # which for this persona is the import dock — replace them with the
+        # foreign grower context the importer received under FSVP.
+        kdes["harvest_date"] = details.get("harvest_date", kdes["harvest_date"])
+        kdes["harvest_location_name"] = foreign_grower
+        kdes["harvester_business_name"] = foreign_grower
+        kdes["harvest_location_address"] = f"{foreign_grower} (foreign supplier of record)"
+        kdes["farm_location"] = foreign_grower
+        kdes["received_date"] = details.get("receive_date", kdes["received_date"])
+        kdes["country_of_origin"] = details.get("country_of_origin")
+        kdes["customs_entry_number"] = details.get("customs_entry_number")
+        kdes["fsvp_importer_of_record"] = details.get("fsvp_importer_of_record")
+        kdes["plu_code"] = details.get("plu_code")
+        kdes["packaging_hierarchy"] = ["import_pallet", "repack_carton", "master_case"]
+        return kdes
+
+
 def get_industry_adapter(industry_type: str) -> IndustryAdapter:
     if industry_type == "seafood":
         return SeafoodAdapter()
     if industry_type == "dairy":
         return DairyAdapter()
+    if industry_type == "imported_produce":
+        return ImportedProduceAdapter()
     return ProduceAdapter()
