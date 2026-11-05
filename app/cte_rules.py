@@ -215,6 +215,18 @@ INDUSTRY_EVENT_REQUIREMENTS: dict[str, tuple[EventRequirement, ...]] = {
             cte_types=(CTEType.FIRST_LAND_BASED_RECEIVING,),
         ),
     ),
+    "imported_produce": (
+        EventRequirement(
+            field="customs_entry_number",
+            message="Importer receiving events should carry the customs entry number",
+            cte_types=(CTEType.RECEIVING,),
+        ),
+        EventRequirement(
+            field="country_of_origin",
+            message="Importer flows should declare country_of_origin on receipts and repacks",
+            cte_types=(CTEType.RECEIVING, CTEType.INITIAL_PACKING),
+        ),
+    ),
     "dairy": (
         EventRequirement(
             field="flow_type",
@@ -247,6 +259,24 @@ INDUSTRY_AUDIT_CHECKS: dict[str, tuple[AuditCheckDefinition, ...]] = {
             label="Packout hierarchy",
             detail="Expect bulk to clamshell to master-case metadata in pack and transformation events.",
             any_kdes=("packaging_conversion", "packaging_hierarchy"),
+        ),
+    ),
+    "imported_produce": (
+        AuditCheckDefinition(
+            label="Customs entry linkage",
+            detail="Every import receipt should reference its customs entry document.",
+            cte_types=(CTEType.RECEIVING,),
+            any_kdes=("customs_entry_number",),
+        ),
+        AuditCheckDefinition(
+            label="Foreign origin declared",
+            detail="Receipts and repacks should carry country_of_origin and the foreign supplier of record.",
+            any_kdes=("country_of_origin", "foreign_supplier_name"),
+        ),
+        AuditCheckDefinition(
+            label="FSVP importer identified",
+            detail="The FSVP importer of record should be named on import receipts.",
+            any_kdes=("fsvp_importer_of_record",),
         ),
     ),
     "seafood": (

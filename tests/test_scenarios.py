@@ -34,6 +34,7 @@ def test_scenario_catalog_lists_required_presets():
         "broadline_distributor",
         "foodservice_restaurant_group",
         "shell_egg_producer",
+        "produce_importer",
     ]
     assert all(summary["label"] for summary in summaries)
     assert all(summary["description"] for summary in summaries)

@@ -30,6 +30,7 @@ const state = {
     distributor: 'Distributor / wholesaler',
     foodservice: 'Foodservice',
     egg_producer: 'Egg producer',
+    importer: 'Importer (FSVP)',
   },
   exportPresetDescriptions: {
     all_records: 'Full FDA-request export for the selected date range.',
