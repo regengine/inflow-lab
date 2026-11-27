@@ -183,7 +183,12 @@ class LegitFlowEngine:
             quantity_high * self.quantity_multiplier,
         )
         timestamp = self._advance_time(15, 90)
-        reference_prefix = "LAND" if self.scenario.source_cte_type == CTEType.FIRST_LAND_BASED_RECEIVING else "HAR"
+        reference_prefix = {
+            CTEType.FIRST_LAND_BASED_RECEIVING: "LAND",
+            # Importer personas: the source event is a §1.1345 receiving
+            # against a customs entry, not a harvest log.
+            CTEType.RECEIVING: "ENTRY",
+        }.get(self.scenario.source_cte_type, "HAR")
         reference_number = self._reference(reference_prefix)
         next_location = self._default_next_location()
 

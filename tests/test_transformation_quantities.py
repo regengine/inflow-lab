@@ -281,16 +281,14 @@ def test_epcis_input_quantities_land_for_every_scenario(scenario: str) -> None:
 
 
 def test_required_kdes_still_match_the_pinned_regengine_contract() -> None:
-    """#189 asks for input-lot KDEs to become REQUIRED. That half cannot land here.
-
-    `tests/test_regengine_contract_pin.py` pins `REQUIRED_KDES` verbatim to
-    RegEngine's `REQUIRED_KDES_BY_CTE`, whose TRANSFORMATION entry lists no
-    input-lot KDE at all. Promoting them unilaterally would make this mock
-    validate differently from live RegEngine — the exact drift that pin exists
-    to catch. The reclassification belongs to a RegEngine-side change; this
-    test is the tripwire that fails if someone does it here anyway.
+    """Contract v3 / A-2190 coordinated with RegEngine: TRANSFORM requires
+    input_lot_codes / input_quantities / input_units_of_measure /
+    input_product_descriptions. Legacy alias names stay outside the pin.
     """
     transformation_required = REQUIRED_KDES[CTEType.TRANSFORMATION]
+    assert "input_lot_codes" in transformation_required
+    assert "input_quantities" in transformation_required
+    assert "input_units_of_measure" in transformation_required
+    assert "input_product_descriptions" in transformation_required
     assert "input_traceability_lot_codes" not in transformation_required
     assert "input_products" not in transformation_required
-    assert "input_quantities" not in transformation_required

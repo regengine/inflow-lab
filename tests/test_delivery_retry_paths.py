@@ -35,7 +35,7 @@ from tests.support.timestamps import recent_event_timestamp
 client = TestClient(app)
 
 _BASE_TIME = recent_event_timestamp()
-_VALID_KDES = {"harvest_date": "2026-03-01", "reference_document": "Harvest Log HL-RETRY-DEFAULT"}
+_VALID_KDES = {"harvest_date": "2026-03-01", "immediate_subsequent_recipient": "Coastal Cooler", "reference_document": "Harvest Log HL-RETRY-DEFAULT"}
 
 
 def setup_function() -> None:
@@ -166,7 +166,7 @@ def test_retry_batch_with_mixed_per_record_outcomes_returns_partial_status() -> 
     assert still_failed_record["delivery_status"] == "failed"
     assert still_failed_record["delivery_attempts"] == 1
     assert still_failed_record["error"] == (
-        "Missing required KDEs for harvesting: harvest_date, reference_document"
+        "Missing required KDEs for harvesting: harvest_date, immediate_subsequent_recipient, reference_document"
     )
     assert still_failed_record["last_delivery_success_at"] is None
 

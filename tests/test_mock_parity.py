@@ -53,7 +53,7 @@ def setup_function() -> None:
 def _valid_event(lot: str = "TLC-PARITY-000001", *, timestamp: datetime | None = None) -> RegEngineEvent:
     """A minimal HARVESTING event that clears every validate_event_like_regengine check.
 
-    HARVESTING has the fewest required KDEs (harvest_date, reference_document),
+    HARVESTING has the fewest required KDEs (harvest_date, immediate_subsequent_recipient, reference_document),
     which keeps this helper -- and the batch-size tests that reuse it many
     times over -- cheap to build.
     """
@@ -67,6 +67,7 @@ def _valid_event(lot: str = "TLC-PARITY-000001", *, timestamp: datetime | None =
         timestamp=timestamp or recent_event_timestamp(),
         kdes={
             "harvest_date": "2026-02-05",
+            "immediate_subsequent_recipient": "Coastal Cooler",
             "reference_document": "Harvest Log HAR-0001",
         },
     )

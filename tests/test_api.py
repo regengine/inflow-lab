@@ -136,6 +136,7 @@ def test_scenario_catalog_endpoint_lists_supported_presets():
         "broadline_distributor",
         "foodservice_restaurant_group",
         "shell_egg_producer",
+        "produce_importer",
     ]
     assert all(scenario["label"] for scenario in scenarios)
     assert {scenario["industry_type"] for scenario in scenarios} >= {"produce", "seafood", "dairy"}

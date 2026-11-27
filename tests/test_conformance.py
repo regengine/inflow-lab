@@ -278,14 +278,15 @@ def test_engine_generated_transformation_fixture_already_satisfies_the_stricter_
 
 
 def test_transformation_required_kdes_still_matches_the_regengine_pin() -> None:
-    """Documents a deliberate boundary: REQUIRED_KDES itself is pinned
-    byte-for-byte to RegEngine's live contract by
-    tests/test_regengine_contract_pin.py, so input lot linkage is enforced
-    at required severity via a dedicated check in validate_event_kdes
-    instead of by editing REQUIRED_KDES -- promoting RegEngine's actual
-    contract is a coordinated two-repo change outside this repo's scope.
-    If this assertion ever needs to flip, the contract pin needs the
-    matching RegEngine-side update first.
+    """Contract v3 / A-2190: RegEngine now requires input_lot_codes (+ qty/uom/
+    product descriptions) on TRANSFORM. Legacy aliases remain outside
+    REQUIRED_KDES and are still enforced via TRANSFORMATION_INPUT_LINKAGE_KDES.
     """
-    assert "input_traceability_lot_codes" not in REQUIRED_KDES[CTEType.TRANSFORMATION]
-    assert "input_products" not in REQUIRED_KDES[CTEType.TRANSFORMATION]
+    required = REQUIRED_KDES[CTEType.TRANSFORMATION]
+    assert "input_lot_codes" in required
+    assert "input_quantities" in required
+    assert "input_units_of_measure" in required
+    assert "input_product_descriptions" in required
+    # Legacy aliases stay out of the pin (still emitted + linkage-checked).
+    assert "input_traceability_lot_codes" not in required
+    assert "input_products" not in required

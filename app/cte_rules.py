@@ -72,6 +72,7 @@ REQUIRED_KDES: dict[CTEType, tuple[str, ...]] = {
         "unit_of_measure",
         "harvest_date",
         "location_name",
+        "immediate_subsequent_recipient",  # §1.1325(a)(1); contract v3 / A-2190
         "reference_document",
     ),
     CTEType.COOLING: (
@@ -81,6 +82,8 @@ REQUIRED_KDES: dict[CTEType, tuple[str, ...]] = {
         "unit_of_measure",
         "cooling_date",
         "location_name",
+        "immediate_subsequent_recipient",  # §1.1325(b)(1); contract v3 / A-2190
+        "harvest_location_name",  # farm where harvested; contract v3 / A-2190
         "reference_document",
     ),
     CTEType.INITIAL_PACKING: (
@@ -93,6 +96,10 @@ REQUIRED_KDES: dict[CTEType, tuple[str, ...]] = {
         "reference_document",
         "harvester_business_name",
         "harvester_business_phone",
+        "harvest_date",  # §1.1330(a); contract v3 / A-2190
+        "harvest_location_name",  # farm where harvested; contract v3 / A-2190
+        "received_date",  # date food received; contract v3 / A-2190
+        "received_quantity",  # qty received (distinct from packed); contract v3 / A-2190
     ),
     # Matches RegEngine webhook_models.REQUIRED_KDES_BY_CTE exactly
     # (§1.1325(c)(7)); vessel/receiver detail is recommended, not required.
@@ -135,6 +142,10 @@ REQUIRED_KDES: dict[CTEType, tuple[str, ...]] = {
         "transformation_date",
         "location_name",
         "reference_document",
+        "input_lot_codes",  # §1.1350(a)(1); contract v3 / A-2190
+        "input_quantities",  # §1.1350(a)(1)(iii); contract v3 / A-2190
+        "input_units_of_measure",  # §1.1350(a)(1)(iii); contract v3 / A-2190
+        "input_product_descriptions",  # §1.1350(a)(1); contract v3 / A-2190
     ),
 }
 
@@ -172,6 +183,8 @@ RECOMMENDED_KDES: dict[CTEType, tuple[str, ...]] = {
 # yield_ratio), so it isn't listed anywhere below -- flagging an unpopulated
 # KDE as required would fail every transformation event the simulator itself
 # generates. See issue #189's writeup for what emitting it would take.
+# Legacy aliases still emitted alongside contract-v3 names (input_lot_codes /
+# input_product_descriptions). Kept so CSV import + local lineage keep working.
 TRANSFORMATION_INPUT_LINKAGE_KDES: tuple[str, ...] = (
     "input_traceability_lot_codes",
     "input_products",
@@ -200,6 +213,18 @@ INDUSTRY_EVENT_REQUIREMENTS: dict[str, tuple[EventRequirement, ...]] = {
             field="landing_date",
             message="Seafood first receiver flows should include landing_date",
             cte_types=(CTEType.FIRST_LAND_BASED_RECEIVING,),
+        ),
+    ),
+    "imported_produce": (
+        EventRequirement(
+            field="customs_entry_number",
+            message="Importer receiving events should carry the customs entry number",
+            cte_types=(CTEType.RECEIVING,),
+        ),
+        EventRequirement(
+            field="country_of_origin",
+            message="Importer flows should declare country_of_origin on receipts and repacks",
+            cte_types=(CTEType.RECEIVING, CTEType.INITIAL_PACKING),
         ),
     ),
     "dairy": (
@@ -234,6 +259,24 @@ INDUSTRY_AUDIT_CHECKS: dict[str, tuple[AuditCheckDefinition, ...]] = {
             label="Packout hierarchy",
             detail="Expect bulk to clamshell to master-case metadata in pack and transformation events.",
             any_kdes=("packaging_conversion", "packaging_hierarchy"),
+        ),
+    ),
+    "imported_produce": (
+        AuditCheckDefinition(
+            label="Customs entry linkage",
+            detail="Every import receipt should reference its customs entry document.",
+            cte_types=(CTEType.RECEIVING,),
+            any_kdes=("customs_entry_number",),
+        ),
+        AuditCheckDefinition(
+            label="Foreign origin declared",
+            detail="Receipts and repacks should carry country_of_origin and the foreign supplier of record.",
+            any_kdes=("country_of_origin", "foreign_supplier_name"),
+        ),
+        AuditCheckDefinition(
+            label="FSVP importer identified",
+            detail="The FSVP importer of record should be named on import receipts.",
+            any_kdes=("fsvp_importer_of_record",),
         ),
     ),
     "seafood": (

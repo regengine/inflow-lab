@@ -206,6 +206,7 @@ def test_batch_completeness_uses_canonical_cte_requirements() -> None:
     complete = _harvesting_event(
         kdes={
             "harvest_date": "2026-10-10",
+            "immediate_subsequent_recipient": "Coastal Cooler",
             "reference_document": "HARVEST-JEV-TEST",
         }
     )
@@ -218,6 +219,7 @@ def test_batch_completeness_never_rounds_an_incomplete_batch_up_to_complete() ->
     complete = _harvesting_event(
         kdes={
             "harvest_date": "2026-10-10",
+            "immediate_subsequent_recipient": "Coastal Cooler",
             "reference_document": "HARVEST-JEV-TEST",
         }
     )
@@ -239,6 +241,7 @@ def test_batch_summary_preserves_event_like_objects_without_optional_fields() ->
         timestamp=datetime(2026, 10, 10, tzinfo=UTC),
         kdes={
             "harvest_date": "2026-10-10",
+            "immediate_subsequent_recipient": "Coastal Cooler",
             "reference_document": "HARVEST-JEV-DUCK",
         },
     )
